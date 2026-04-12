@@ -4,3 +4,6 @@ __pycache__/
 db.sqlite3
 .env
 staticfiles/
+invoice_processor/credentials/*.json
+invoice_processor/mappings/item_mappings.json
+logs/
