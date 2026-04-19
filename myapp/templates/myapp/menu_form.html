@@ -1,0 +1,92 @@
+{% extends "myapp/base.html" %}
+{% block title %}{{ title }}{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl">
+  {% if menu %}
+    <a href="{% url 'menu_detail' menu.id %}" class="text-sm text-indigo-600 hover:underline">&larr; Back</a>
+  {% else %}
+    <a href="{% url 'calendar_current' %}" class="text-sm text-indigo-600 hover:underline">&larr; Back to calendar</a>
+  {% endif %}
+
+  <div class="mt-4 bg-white rounded shadow-sm p-6">
+    <h1 class="text-xl font-bold mb-4">{{ title }}</h1>
+    <form method="post" class="space-y-5">
+      {% csrf_token %}
+
+      {# Meal name first — typeahead against existing meals. On exact match, HTMX autofills the component list. #}
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">{{ form.dish_freetext.label }}</label>
+        <datalist id="meal-names">
+          {% for r in all_recipes %}<option value="{{ r.name }}"></option>{% endfor %}
+        </datalist>
+        <input type="text" name="dish_freetext" id="id_dish_freetext"
+               value="{{ form.dish_freetext.value|default:'' }}"
+               list="meal-names"
+               autofocus required
+               placeholder="Search existing meals or type a new name"
+               class="border rounded px-2 py-1 w-full text-lg"
+               hx-get="{% url 'menu_autofill_components' %}"
+               hx-trigger="change"
+               hx-target="#components-list"
+               hx-include="[name='dish_freetext']" />
+        <div class="text-xs text-slate-500 mt-1">
+          Start typing to find a saved meal — pick one and its components auto-fill below. Or type a fresh name and build components from scratch.
+        </div>
+        {% if form.dish_freetext.errors %}
+          <div class="text-sm text-red-600 mt-1">{{ form.dish_freetext.errors }}</div>
+        {% endif %}
+      </div>
+
+      {# Components section — dynamic rows with typeahead #}
+      <div>
+        <div class="flex items-center justify-between mb-2">
+          <label class="block text-sm font-medium text-slate-700">Components</label>
+          <button type="button"
+                  hx-get="{% url 'menu_component_row' %}"
+                  hx-target="#components-list"
+                  hx-swap="beforeend"
+                  class="text-sm text-indigo-600 hover:text-indigo-700">+ Add component</button>
+        </div>
+        <div id="components-list" class="space-y-2">
+          {% for row in initial_components %}
+            {% include "myapp/_component_row.html" with row=row %}
+          {% endfor %}
+        </div>
+        <p class="text-xs text-slate-500 mt-2">
+          Each component is either a <strong>linked recipe</strong> (dropdown) or <strong>freetext</strong> (type on the right). Empty rows are ignored on save.
+        </p>
+      </div>
+
+      {# Meta: date, slot, assignee #}
+      <div class="grid grid-cols-3 gap-3 pt-2 border-t">
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">{{ form.date.label }}</label>
+          {{ form.date }}
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">{{ form.meal_slot.label }}</label>
+          {{ form.meal_slot }}
+        </div>
+        <div>
+          <label class="block text-xs font-medium text-slate-600 mb-1">{{ form.assignee.label }}</label>
+          {{ form.assignee }}
+        </div>
+      </div>
+
+      {% if form.non_field_errors %}
+      <div class="bg-red-50 border border-red-200 text-red-700 rounded p-3 text-sm">
+        {{ form.non_field_errors }}
+      </div>
+      {% endif %}
+
+      <div class="flex gap-2 pt-2">
+        <button type="submit" class="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Save</button>
+        {% if menu %}
+        <a href="{% url 'menu_detail' menu.id %}" class="px-4 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Cancel</a>
+        {% endif %}
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

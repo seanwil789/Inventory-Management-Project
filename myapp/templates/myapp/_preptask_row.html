@@ -1,0 +1,19 @@
+{# Single prep task row — target of the HTMX toggle endpoint. #}
+<div id="preptask-{{ t.id }}"
+     class="flex items-center gap-3 px-3 py-2 {% if t.completed %}bg-emerald-50/50{% endif %}">
+  <button hx-post="{% url 'preptask_toggle' t.id %}"
+          hx-target="#preptask-{{ t.id }}"
+          hx-swap="outerHTML"
+          hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'
+          class="w-6 h-6 flex items-center justify-center rounded border-2
+            {% if t.completed %}bg-emerald-500 border-emerald-500 text-white{% else %}border-slate-300 hover:border-emerald-500{% endif %}">
+    {% if t.completed %}✓{% endif %}
+  </button>
+  <div class="flex-1 min-w-0">
+    <a href="{% url 'recipe_detail' t.recipe.id %}"
+       class="text-sm font-medium hover:text-indigo-700 {% if t.completed %}line-through text-slate-400{% endif %}">
+      {{ t.recipe.name }}
+    </a>
+    <div class="text-xs text-slate-500">{{ t.recipe.ingredients.count }} ingredient{{ t.recipe.ingredients.count|pluralize }}</div>
+  </div>
+</div>

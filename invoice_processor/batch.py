@@ -24,7 +24,7 @@ sys.path.insert(0, os.path.dirname(__file__))
 from googleapiclient.http import MediaIoBaseDownload
 import io
 
-from config import DRIVE_INBOX_FOLDER_ID
+from config import DRIVE_INBOX_FOLDER_ID, DOCAI_PROCESSOR_ID
 from ocr import extract_text
 from parser import parse_invoice
 from mapper import load_mappings, map_items
@@ -33,11 +33,127 @@ from db_write import write_invoice_to_db
 from drive import archive_invoice, get_drive_client
 from csv_ingest import ingest_csv
 from synergy_sync import sync_prices_from_items
+from docai import parse_with_docai, ocr_with_docai
 
 SUPPORTED_MIME_TYPES = {
     "image/jpeg", "image/png", "image/jpg", "application/pdf"
 }
+
+# ── Invoice total cache for budget sync ─────────────────────────────────
+import json
+
+_INVOICE_TOTALS_DIR = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".invoice_totals"
+)
+
+
+def _cache_invoice_total(vendor, invoice_date, total, source_file):
+    """
+    Cache an invoice total for later budget sync pickup.
+    Stored as JSON files in .invoice_totals/ keyed by year-month.
+    """
+    os.makedirs(_INVOICE_TOTALS_DIR, exist_ok=True)
+    month_key = str(invoice_date)[:7]  # "2026-04"
+    cache_file = os.path.join(_INVOICE_TOTALS_DIR, f"{month_key}.json")
+
+    # Load existing
+    entries = []
+    if os.path.exists(cache_file):
+        with open(cache_file, "r") as f:
+            entries = json.load(f)
+
+    # Check for duplicate
+    for e in entries:
+        if e["vendor"] == vendor and e["date"] == str(invoice_date) and e["source_file"] == source_file:
+            return  # already cached
+
+    entries.append({
+        "vendor": vendor,
+        "date": str(invoice_date),
+        "total": round(total, 2),
+        "source_file": source_file,
+    })
+
+    with open(cache_file, "w") as f:
+        json.dump(entries, f, indent=2)
+
+    print(f"   [budget] Cached invoice total: ${total:.2f} for {vendor} {invoice_date}")
+
+
+def _ensure_monthly_tab():
+    """
+    Check if the current month's Synergy tab exists. If not, create it
+    automatically. This runs at the start of every batch so the first
+    invoice of a new month triggers tab creation — no manual step needed.
+    """
+    from datetime import date
+    from calendar import month_name as mn
+
+    today = date.today()
+    expected_tab = f"Synergy {mn[today.month][:3]} {today.year}"
+
+    try:
+        from synergy_sync import _list_synergy_tabs, create_month_sheet
+        from sheets import get_sheets_client
+
+        client = get_sheets_client()
+        existing = _list_synergy_tabs(client)
+
+        if expected_tab not in existing:
+            print(f"[auto] Creating new monthly tab '{expected_tab}'...")
+            create_month_sheet(today.year, today.month)
+            print()
+        # else: tab already exists, nothing to do
+    except Exception as e:
+        # Don't let tab creation failure block invoice processing
+        print(f"[!] Could not auto-create monthly tab: {e}")
+        print(f"    Run manually: python synergy_sync.py --create-month {today.year} {today.month}")
+        print()
 CSV_MIME_TYPE = "text/csv"
+
+
+def _backfill_descriptions(docai_items: list[dict], vision_items: list[dict]):
+    """
+    Fill in missing descriptions on DocAI items by matching them to Vision items.
+
+    Matching strategy: for each DocAI item missing a description, find a Vision
+    item with the same price (within $0.01 tolerance). Uses each Vision item
+    at most once to avoid duplicate matches.
+    """
+    used_vision = set()
+
+    for di in docai_items:
+        if di.get("raw_description", "").strip():
+            continue  # already has a description
+
+        di_price = di.get("unit_price")
+        if di_price is None:
+            continue
+
+        # Find best Vision match by price
+        best_idx = None
+        best_diff = float("inf")
+
+        for vi_idx, vi in enumerate(vision_items):
+            if vi_idx in used_vision:
+                continue
+            vi_price = vi.get("unit_price")
+            if vi_price is None:
+                continue
+            diff = abs(di_price - vi_price)
+            if diff < best_diff:
+                best_diff = diff
+                best_idx = vi_idx
+
+        if best_idx is not None and best_diff <= 0.01:
+            vi = vision_items[best_idx]
+            vi_desc = vi.get("raw_description", "").strip()
+            if vi_desc:
+                di["raw_description"] = vi_desc
+                # Also grab case size if DocAI missed it
+                if not di.get("case_size_raw") and vi.get("case_size_raw"):
+                    di["case_size_raw"] = vi["case_size_raw"]
+                used_vision.add(best_idx)
 
 
 def list_inbox_files() -> tuple[list[dict], list[dict]]:
@@ -184,16 +300,54 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
         print("1. Downloading from Drive...")
         tmp_path = download_file(file_id, file_name)
 
-        # 2. OCR
-        print("2. Running OCR...")
-        raw_text = extract_text(tmp_path)
+        # 2. Parse invoice
+        #    Strategy by vendor:
+        #    - Sysco: DocAI OCR → Sysco parser (DocAI text + our parser = no merges)
+        #    - Other vendors: DocAI entity extraction (handles Farm Art, Exceptional
+        #      better than Vision+parser since their parsers need updating)
+        #    Falls back to Vision+regex if DocAI is unavailable.
+        parsed = None
+        parse_method = "Vision+regex"
+        raw_text = None
 
-        # 3. Parse
-        print("3. Parsing invoice...")
-        parsed = parse_invoice(raw_text)
+        if DOCAI_PROCESSOR_ID:
+            print("2. Running Document AI...")
+            docai_ocr = ocr_with_docai(tmp_path)
+            if docai_ocr and docai_ocr.get("raw_text"):
+                vendor = docai_ocr["vendor"]
+                print(f"   [DocAI] vendor={vendor}, date={docai_ocr['invoice_date'] or '?'}")
+
+                if vendor in ("Sysco", "Exceptional Foods", "Farm Art"):
+                    # Sysco + Exceptional + Farm Art: DocAI OCR text + vendor-specific parser
+                    # These vendors have structured column layouts that our parsers
+                    # handle better than DocAI entity extraction
+                    raw_text = docai_ocr["raw_text"]
+                    parsed = parse_invoice(raw_text, vendor=vendor)
+                    parse_method = f"DocAI OCR + {vendor} parser"
+                    # Use DocAI's vendor/date detection
+                    if docai_ocr["vendor"] != "Unknown":
+                        parsed["vendor"] = docai_ocr["vendor"]
+                    if docai_ocr["invoice_date"]:
+                        parsed["invoice_date"] = docai_ocr["invoice_date"]
+                else:
+                    # Other vendors: use DocAI entity extraction
+                    parsed = parse_with_docai(tmp_path)
+                    if parsed and parsed.get("items"):
+                        parse_method = "DocAI entities"
+                    else:
+                        parsed = None
+            else:
+                print("   [DocAI] OCR failed, falling back to Vision API...")
+
+        if parsed is None:
+            print("2. Running Vision API OCR...")
+            raw_text = extract_text(tmp_path)
+            print("3. Parsing invoice...")
+            parsed = parse_invoice(raw_text)
         print(f"   Vendor : {parsed['vendor']}")
         print(f"   Date   : {parsed['invoice_date'] or '(not detected)'}")
         print(f"   Items  : {len(parsed['items'])} line items")
+        print(f"   Method : [{parse_method}]")
 
         if not parsed["invoice_date"]:
             if sys.stdin.isatty():
@@ -242,10 +396,24 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
         append_to_data_sheet(parsed["vendor"], parsed["invoice_date"], mapped_items)
 
         print("\n   Syncing prices to Synergy sheet...")
-        price_summary = sync_prices_from_items(mapped_items, vendor=parsed["vendor"])
-        print(f"   Price sync — Updated: {price_summary['updated']}  |  "
-              f"No match: {price_summary['skipped_no_match']}  |  "
-              f"No price: {price_summary['skipped_no_price']}")
+        price_summary = sync_prices_from_items(
+            mapped_items, vendor=parsed["vendor"],
+            invoice_date=parsed["invoice_date"],
+        )
+        if price_summary.get("skipped_wrong_month"):
+            print(f"   Price sync — Skipped (invoice not in active tab month)")
+        else:
+            print(f"   Price sync — Updated: {price_summary['updated']}  |  "
+                  f"No match: {price_summary['skipped_no_match']}  |  "
+                  f"No price: {price_summary['skipped_no_price']}")
+
+        # 5b. Cache invoice total for budget sync
+        invoice_total = parsed.get("invoice_total")
+        if invoice_total and parsed["invoice_date"]:
+            _cache_invoice_total(
+                parsed["vendor"], parsed["invoice_date"],
+                invoice_total, file_name,
+            )
 
         # 6. Move original file from inbox to archive hierarchy in Drive
         if parsed["invoice_date"]:
@@ -283,6 +451,9 @@ def main():
     if not DRIVE_INBOX_FOLDER_ID:
         print("[!] DRIVE_INBOX_FOLDER_ID is not set in .env")
         return
+
+    # ── Auto-create monthly Synergy tab if needed ──────────────────────────
+    _ensure_monthly_tab()
 
     print(f"Checking Drive inbox for new files...")
     csv_files, invoice_files = list_inbox_files()

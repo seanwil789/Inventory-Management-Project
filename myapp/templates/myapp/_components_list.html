@@ -1,0 +1,4 @@
+{# Used as an HTMX swap target when meal-name autofill picks a match. #}
+{% for row in rows %}
+  {% include "myapp/_component_row.html" with row=row %}
+{% endfor %}

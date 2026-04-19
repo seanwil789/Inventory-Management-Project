@@ -1,0 +1,44 @@
+{% extends "myapp/base.html" %}
+{% block title %}Prep List{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl">
+  <div class="mb-5">
+    <h1 class="text-2xl font-bold">Prep List</h1>
+    <p class="text-sm text-slate-500">Next 7 days · {{ today|date:"M j" }} – {{ window_end|date:"M j" }}</p>
+  </div>
+
+  {% if overdue %}
+  <section class="mb-6 bg-red-50 border border-red-200 rounded p-4">
+    <h2 class="text-sm font-semibold text-red-700 uppercase tracking-wide mb-2">
+      ⚠ Overdue ({{ overdue|length }})
+    </h2>
+    <div class="bg-white rounded divide-y border border-red-200">
+      {% for t in overdue %}
+      {% include "myapp/_preptask_row.html" %}
+      {% endfor %}
+    </div>
+  </section>
+  {% endif %}
+
+  {% for prep_date, tasks in date_groups %}
+  <section class="mb-5">
+    <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-2 flex items-center gap-2">
+      <span>{{ prep_date|date:"l, M j" }}</span>
+      {% if prep_date == today %}<span class="text-xs bg-amber-200 text-amber-800 rounded px-2">Today</span>{% endif %}
+      <span class="text-xs font-normal bg-slate-200 text-slate-600 rounded px-2">{{ tasks|length }}</span>
+    </h2>
+    <div class="bg-white rounded shadow-sm border divide-y">
+      {% for t in tasks %}
+      {% include "myapp/_preptask_row.html" %}
+      {% endfor %}
+    </div>
+  </section>
+  {% empty %}
+  <div class="bg-white border rounded p-6 text-sm text-slate-500 italic text-center">
+    No prep tasks in the next 7 days.
+    Run <code class="bg-slate-100 rounded px-1">python manage.py regenerate_preptasks</code> after authoring menus.
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

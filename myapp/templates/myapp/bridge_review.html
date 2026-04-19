@@ -1,0 +1,103 @@
+{% extends "myapp/base.html" %}
+{% block title %}Bridge Review · ingredients → products{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl">
+  <div class="mb-5 flex items-start justify-between gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-bold">Bridge Review</h1>
+      <p class="text-sm text-slate-500">
+        {{ remaining }} RecipeIngredient{{ remaining|pluralize }} still need a Product link.
+        Apply the right match, or skip with a note for the catalog pass.
+      </p>
+    </div>
+    <div class="text-sm flex gap-3 items-center">
+      {% if skipped_count %}
+      <a href="{% url 'bridge_skipped' %}" class="text-amber-700 hover:underline">
+        {{ skipped_count }} skipped →
+      </a>
+      {% endif %}
+      {% if show_skipped %}
+      <a href="{% url 'bridge_review' %}" class="text-slate-500 hover:underline">Hide skipped</a>
+      {% else %}
+      <a href="?show_skipped=1" class="text-slate-500 hover:underline">Show skipped</a>
+      {% endif %}
+    </div>
+  </div>
+
+  <div id="review-list" class="space-y-3">
+    {% for g in groups %}
+    <div id="group-{{ forloop.counter }}" class="bg-white rounded shadow-sm border p-4">
+      <div class="flex items-start justify-between mb-3">
+        <div class="min-w-0">
+          <div class="font-semibold text-slate-800">{{ g.name_raw }}</div>
+          <div class="text-xs text-slate-500 mt-0.5">
+            Used in {{ g.count }} recipe{{ g.count|pluralize }}: {{ g.recipes|join:", " }}{% if g.more_recipes %} +{{ g.more_recipes }} more{% endif %}
+          </div>
+        </div>
+        <div class="flex items-center gap-1 flex-shrink-0">
+          <input type="text" name="reason" placeholder="skip reason (optional)"
+                 id="reason-{{ forloop.counter }}"
+                 class="border rounded px-2 py-1 text-xs w-48" />
+          <button
+            type="button"
+            hx-post="{% url 'bridge_skip' %}"
+            hx-include="#reason-{{ forloop.counter }}"
+            hx-vals='{"name_raw": "{{ g.name_raw|escapejs }}"}'
+            hx-target="#group-{{ forloop.counter }}"
+            hx-swap="outerHTML"
+            hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'
+            class="text-xs text-slate-500 hover:text-slate-800 px-2 py-1 border rounded">skip</button>
+        </div>
+      </div>
+
+      {% if g.candidates %}
+      <div class="space-y-1">
+        {% for c in g.candidates %}
+        <div class="flex items-center justify-between text-sm border rounded px-3 py-2">
+          <div class="min-w-0">
+            <span class="font-medium">{{ c.product.canonical_name }}</span>
+            <span class="text-xs text-slate-400 ml-2">[{{ c.product.category }}]</span>
+          </div>
+          <div class="flex items-center gap-2">
+            <span class="text-xs text-slate-500 font-mono">{{ c.score }}</span>
+            <button
+              type="button"
+              hx-post="{% url 'bridge_link' %}"
+              hx-vals='{"name_raw": "{{ g.name_raw|escapejs }}", "product_id": "{{ c.product.id }}"}'
+              hx-target="#group-{{ forloop.parentloop.counter }}"
+              hx-swap="outerHTML"
+              hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'
+              class="px-2 py-1 bg-indigo-600 text-white text-xs rounded hover:bg-indigo-700">Apply</button>
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+      {% else %}
+      <div class="text-xs text-amber-700 bg-amber-50 border border-amber-200 rounded px-3 py-2">
+        No close matches. Search below or skip to add this as a Product later.
+      </div>
+      {% endif %}
+
+      <div class="mt-3 pt-3 border-t">
+        <input type="text"
+               hx-get="{% url 'bridge_search_products' %}"
+               hx-trigger="input changed delay:250ms"
+               hx-target="#search-{{ forloop.counter }}"
+               hx-include="this"
+               hx-vals='{"name_raw": "{{ g.name_raw|escapejs }}"}'
+               name="q"
+               placeholder="Search all products…"
+               class="border rounded px-2 py-1 text-sm w-full" />
+        <div id="search-{{ forloop.counter }}" class="mt-2 space-y-1"></div>
+      </div>
+    </div>
+    {% empty %}
+    <div class="bg-emerald-50 border border-emerald-200 rounded p-6 text-center">
+      <div class="text-emerald-800 font-semibold">✓ All ingredients linked.</div>
+      <div class="text-sm text-emerald-600 mt-1">Every RecipeIngredient has a Product or sub_recipe.</div>
+    </div>
+    {% endfor %}
+  </div>
+</div>
+{% endblock %}

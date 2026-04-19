@@ -73,13 +73,18 @@ _SKIP_LINE = re.compile(
 def _is_description(line: str) -> bool:
     """True if the line looks like product description text."""
     line = line.strip()
-    if not line:
+    if not line or len(line) < 5:
         return False
     if _SECTION_HEADER.match(line):
         return False
     if _SKIP_LINE.match(line):
         return False
     if not re.search(r'[A-Za-z]{3,}', line):
+        return False
+    # Reject single-word brand fragments (LAYS, KIND, KONTOS, etc.)
+    # Real descriptions have at least 2 words with 3+ letters each
+    letter_words = re.findall(r'[A-Za-z]{3,}', line)
+    if len(letter_words) < 2:
         return False
     return True
 
@@ -110,6 +115,198 @@ def _extract_case_size(text: str) -> str:
     return m.group(1).upper() if m else ""
 
 
+# Sysco PACK SIZE column: appears between QTY (e.g. "2 CS") and DESCRIPTION
+# Formats: "124 OZ", "41GAL", "482.6OZ", "230 CT", "612 CT", "135LB"
+_PACK_SIZE_COL_RE = re.compile(
+    r'^\d+\s*(?:CS|S)\s+'                             # QTY + unit (consumed, not captured)
+    r'(\d+\.?\d*\s*(?:[O0]Z|LB|GAL|CT|LTR|#|FL\s*[O0]Z))'  # PACK SIZE (OCR reads O as 0)
+    r'\s+',                                             # space before description
+    re.IGNORECASE,
+)
+# Handle ONLY-prefixed lines: "1S ONLY1LB ...", "1S ONLY 4.5LB ...",
+# or standalone "ONLY1 GAL AREZCLS...", "ONLY5 LB SYS REL HONEY..."
+_PACK_SIZE_ONLY_RE = re.compile(
+    r'^(?:\d+\s*S\s+)?ONLY\s*(\d+\.?\d*\s*(?:LB|OZ|GAL|CT|#))',
+    re.IGNORECASE,
+)
+
+
+# Sysco catch-weight / variable-weight patterns
+# These indicate the item is priced per-pound, with weight in the pack column.
+# Formats:
+#   "42.5 LE..." or "42.5 LB..." — actual shipped weight (42.5 lbs)
+#   "110#AVG..." — 1×10# average weight
+#   "116#AVG..." — 1×16# average weight
+#   "86-9#AV..." — 8 pieces, 6-9# average each
+#   "27-9#AV..." — 2 pieces, 7-9# average each
+def _extract_catch_weight(text: str) -> dict | None:
+    """
+    Extract catch-weight / variable-weight info from a Sysco description line.
+    Returns {"weight_lbs": float, "is_catch_weight": True} or None.
+
+    Formats:
+      "42.5 LE..."  or "42.5 LB..."  → 42.5 lbs shipped weight
+      "25 LB ..."                     → 25 lbs
+      "115LB ..."                     → 1×15LB (first digit is qty, rest is weight)
+      "110 LB ..."                    → 1×10LB
+      "110#AVGPORTPRD SALMON..."      → 1×10# average weight
+      "116#AVGBELGIO CHEESE..."       → 1×16# average
+      "86-9#AVBCH PORK BUTT..."       → 8 pieces, 6-9# avg each
+      "27-9#AVBTRBALL TURKEY..."      → 2 pieces, 7-9# avg each
+    """
+    # Merged qty+weight (no space between digits and LB): "115LB" = 1×15LB
+    # First digit is case count (usually 1), rest is weight per case
+    m = re.match(r'^(\d)(\d+\.?\d*)(?:LB|LE)\s', text, re.IGNORECASE)
+    if m:
+        count = int(m.group(1))
+        weight = float(m.group(2))
+        return {"weight_lbs": count * weight, "is_catch_weight": True}
+
+    # Direct weight with space: "42.5 LE..." or "25 LB ..."
+    # Only match as direct weight if ≤ 50 lbs (larger values are likely
+    # merged qty+weight that the previous regex missed, e.g. "110 LB")
+    m = re.match(r'^(\d+\.?\d*)\s+(?:LE|LB)\s*[A-Z]', text, re.IGNORECASE)
+    if m:
+        wt = float(m.group(1))
+        if wt <= 50:
+            return {"weight_lbs": wt, "is_catch_weight": True}
+        # >50: try splitting as qty+weight (e.g. "110" → 1×10)
+        wt_str = m.group(1)
+        if len(wt_str) >= 2:
+            qty = int(wt_str[0])
+            per = float(wt_str[1:])
+            if qty <= 3 and per <= 50:
+                return {"weight_lbs": qty * per, "is_catch_weight": True}
+        return {"weight_lbs": wt, "is_catch_weight": True}
+
+    # Average weight: "110#AVGPORTPRD..." = 1 piece × 10# avg
+    # The format is: first digit = count, remaining digits = weight, then #AVG or #AV
+    m = re.match(r'^(\d)(\d+\.?\d*)\s*#\s*AV', text, re.IGNORECASE)
+    if m:
+        count = int(m.group(1))
+        per_piece = float(m.group(2))
+        return {"weight_lbs": count * per_piece, "is_catch_weight": True}
+
+    # Range average: "86-9#AV..." = 8 pieces, 6-9# avg each
+    m = re.match(r'^(\d)(\d)-(\d+)\s*#\s*AV', text, re.IGNORECASE)
+    if m:
+        count = int(m.group(1))
+        low = int(m.group(2))
+        high = int(m.group(3))
+        avg = (low + high) / 2
+        return {"weight_lbs": count * avg, "is_catch_weight": True}
+
+    return None
+
+
+def _extract_pack_size(text: str) -> str:
+    """
+    Extract the PACK SIZE column value from a Sysco invoice line.
+    This is the column between QTY and DESCRIPTION that shows what's
+    in each case (e.g. "124 OZ", "41GAL", "612 CT").
+
+    Also handles OCR-mangled formats where count+size run together:
+      "482.60Z"  → "48/2.6OZ"  (48 cups × 2.6oz)
+      "203.80Z"  → "20/3.8OZ"  (20 packs × 3.8oz)
+      "24200Z"   → "24/20OZ"   (24 bottles × 20oz)
+
+    Returns the pack size uppercased, or "" if not found.
+    """
+    # Standard column format: "2 CS 124 OZ DESCRIPTION"
+    m = _PACK_SIZE_COL_RE.match(text)
+    if m:
+        return m.group(1).strip().upper()
+
+    # ONLY-prefixed: "ONLY1LB", "ONLY 4.5LB", "ONLY1#", "ONLY1 GAL"
+    m = _PACK_SIZE_ONLY_RE.match(text)
+    if m:
+        return m.group(1).strip().upper()
+
+    # Mangled OCR: digits+unit merged at start of line — e.g. "24200Z DESCRIPTION"
+    # Extract the raw number+unit and let _normalize_pack_size split it correctly
+    m = re.match(
+        r'^(\d+\.?\d*(?:[O0]Z|LB|GAL|CT))\s+[A-Z]',
+        text, re.IGNORECASE
+    )
+    if m:
+        raw = m.group(1).strip().upper()
+        return _normalize_pack_size(raw)
+
+    return ""
+
+
+def _normalize_pack_size(pack: str) -> str:
+    """
+    Normalize a raw pack size string. Handles Sysco's merged qty+size format
+    where the OCR runs count and size together:
+      "120 LB"  → "1/20LB"   (1 case × 20 lbs — e.g. black beans)
+      "210 LB"  → "2/10LB"   (2 cases × 10 lbs)
+      "123LB"   → "1/23LB"   (1 case × 23 lbs)
+      "124 OZ"  → "12/4OZ"   (12 cups × 4 oz — e.g. yogurt)
+      "434 OZ"  → "4/34OZ"   (4 bags × 34 oz — e.g. cereal)
+      "2416 OZ" → "24/16OZ"  (24 cans × 16 oz — e.g. Arizona tea)
+      "230 CT"  → "2/30CT"   ... or leave as "230 CT"?
+    """
+    if not pack:
+        return pack
+
+    # Common Sysco pack counts (units per case) — used to split merged PACK+SIZE
+    _COMMON_PACKS = [48, 36, 30, 24, 20, 16, 15, 12, 10, 8, 6, 4, 3, 2, 1]
+
+    # Check for LB packs that need splitting (> 50 lbs unlikely as single unit)
+    m = re.match(r'^(\d+)\s*LB$', pack, re.IGNORECASE)
+    if m:
+        val = int(m.group(1))
+        if val > 50:
+            val_str = str(val)
+            qty = int(val_str[0])
+            per = int(val_str[1:])
+            if qty <= 3 and per > 0:
+                return f"{qty}/{per}LB"
+
+    # Normalize 0Z → OZ (OCR misreads letter O as zero)
+    pack = re.sub(r'(\d)0Z$', r'\1OZ', pack)
+
+    # Check for OZ packs that need splitting (merged PACK+SIZE across column line)
+    # "124 OZ" = PACK(12) + SIZE(4 OZ), "2416 OZ" = PACK(24) + SIZE(16 OZ)
+    m = re.match(r'^(\d+)\s*OZ$', pack, re.IGNORECASE)
+    if m:
+        val_str = m.group(1)
+        if len(val_str) >= 3:
+            for pack_count in _COMMON_PACKS:
+                pc_str = str(pack_count)
+                if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
+                    size = int(val_str[len(pc_str):])
+                    if 1 <= size <= 64:
+                        return f"{pack_count}/{size}OZ"
+
+    # Check for CT packs: "230 CT" = PACK(2) + SIZE(30 CT), "612 CT" = PACK(6) + SIZE(12 CT)
+    m = re.match(r'^(\d+)\s*CT$', pack, re.IGNORECASE)
+    if m:
+        val_str = m.group(1)
+        if len(val_str) >= 3:
+            for pack_count in _COMMON_PACKS:
+                pc_str = str(pack_count)
+                if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
+                    size = int(val_str[len(pc_str):])
+                    if 1 <= size <= 100:
+                        return f"{pack_count}/{size}CT"
+
+    # Check for GAL packs: "41GAL" = PACK(4) + SIZE(1 GAL)
+    m = re.match(r'^(\d+)\s*GAL$', pack, re.IGNORECASE)
+    if m:
+        val_str = m.group(1)
+        if len(val_str) >= 2:
+            for pack_count in _COMMON_PACKS:
+                pc_str = str(pack_count)
+                if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
+                    size = val_str[len(pc_str):]
+                    if size and int(size) <= 5:
+                        return f"{pack_count}/{size}GAL"
+
+    return pack
+
+
 def _clean_description(text: str) -> str:
     """
     Strip leading QTY/unit tokens and trailing barcodes/item codes
@@ -126,6 +323,11 @@ def _clean_description(text: str) -> str:
         r'^\d+\.?\d*\s*(?:LB|OZ|CT|GAL?|EA|PK|#)\s*',
         '', text, flags=re.IGNORECASE,
     ).strip()
+    # Remove leading stray single/double characters from OCR column bleed
+    # e.g. "Z NABISCO...", "D SYS CLS...", "NS05C CHOBANI..."
+    text = re.sub(r'^[A-Z]{1,2}\s+(?=[A-Z]{3,})', '', text).strip()
+    # No-space OCR bleed: only strip Z (rare as word-start) attached to 5+ char words
+    text = re.sub(r'^Z(?=[A-Z]{5,})', '', text).strip()
     # Remove trailing long barcodes (12+ digits)
     text = re.sub(r'\s+\d{12,}\s*$', '', text).strip()
     # Remove trailing short reference codes (4-6 digits)
@@ -133,129 +335,544 @@ def _clean_description(text: str) -> str:
     return text
 
 
+def extract_sysco_metadata(text: str) -> dict:
+    """
+    Extract invoice-level metadata from a Sysco invoice page.
+    Used for multi-page grouping and delivery date detection.
+
+    Returns:
+        invoice_number: str or None
+        delivery_date: str or None (M/DD/YY format)
+        manifest: str or None
+        page: int or None
+        is_last_page: bool
+    """
+    lines = [l.strip() for l in text.splitlines()]
+    meta = {
+        "invoice_number": None,
+        "delivery_date": None,
+        "manifest": None,
+        "page": None,
+        "is_last_page": "LAST PAGE" in text.upper(),
+    }
+
+    for i, line in enumerate(lines):
+        # DELV. DATE → next line has the date
+        if re.match(r'^DELV\.?\s*DATE', line, re.IGNORECASE) and meta["delivery_date"] is None:
+            if i + 1 < len(lines):
+                dm = re.match(r'^(\d{1,2}/\d{1,2}/\d{2,4})', lines[i + 1].strip())
+                if dm:
+                    meta["delivery_date"] = dm.group(1)
+
+        # INVOICE NUMBER → next line has the number
+        if re.match(r'^INVOICE\s+NUMBER', line, re.IGNORECASE) and meta["invoice_number"] is None:
+            if i + 1 < len(lines):
+                nm = re.match(r'^(\d{6,})', lines[i + 1].strip())
+                if nm:
+                    meta["invoice_number"] = nm.group(1)
+
+        # MANIFEST# inline
+        m = re.search(r'MANIFEST#?\s*(\d+)', line, re.IGNORECASE)
+        if m and meta["manifest"] is None:
+            meta["manifest"] = m.group(1)
+
+    return meta
+
+
 def _parse_sysco(text: str) -> list[dict]:
     """
     Sysco invoices are printed in columns.  The OCR reads them top-to-bottom,
-    so within each category block the item descriptions appear in order
-    *before* the matching item-code/price pairs.
+    so descriptions appear in order BEFORE the matching item-code/price anchors.
+
+    When the OCR reads left-column first (descriptions) then right-column
+    (codes+prices), all the anchors can cluster together 20+ lines after
+    the descriptions.  A simple backward walk from each anchor to the previous
+    anchor misses descriptions that are further back.
 
     Strategy:
-    1. Find every price anchor  (7-digit item-code  +  price).
-    2. For each anchor, walk backward through the lines to find the nearest
-       unused description fragment.
-    3. If the anchor line itself carries description text (inline items),
-       use that directly.
+    1. Collect all price anchors (7-digit item-code + price).
+    2. Collect all description lines (with pack size and line index).
+    3. For anchors with inline descriptions, use those directly.
+    4. For remaining anchors, zip with unclaimed descriptions in order.
     """
     lines = [l.strip() for l in text.splitlines()]
-    items = []
+
+    # ── Pass 0: find section boundaries + GROUP TOTAL values ──────────────
+    # GROUP TOTAL amounts appear as standalone numbers near the section
+    # boundary. We identify these so they're excluded from item price data.
+    sections = []       # list of {"name", "start_line", "end_line", "total"}
+    group_total_lines = set()  # lines that are GROUP TOTAL markers or amounts
+    current_section = None
+
+    for i, line in enumerate(lines):
+        if _SECTION_HEADER.match(line):
+            if current_section:
+                current_section["end_line"] = i - 1
+                sections.append(current_section)
+            current_section = {"name": line, "start_line": i, "end_line": None, "total": None}
+        if re.search(r'GROUP\s*TOTAL', line, re.IGNORECASE):
+            group_total_lines.add(i)
+            # The group total VALUE appears as standalone numbers within ~5 lines
+            # Mark those lines so they're not used as item prices
+            for j in range(max(0, i - 2), min(len(lines), i + 6)):
+                l = lines[j].strip()
+                if re.match(r'^(\d+\.\d{2})\s*\*?$', l):
+                    group_total_lines.add(j)
+
+    if current_section:
+        current_section["end_line"] = len(lines) - 1
+        sections.append(current_section)
 
     # ── Pass 1: locate every price anchor ──────────────────────────────────
+    # Primary: CODE PRICE on same line (e.g. "7250644 52.99")
+    # Secondary: CODE on one line, PRICE on the next (OCR split)
+    # Skip lines that are GROUP TOTAL amounts.
     anchors = []   # (line_index, item_code, price, prefix_text)
+    anchor_lines = set()
+    used_as_split_price = set()
+
     for i, line in enumerate(lines):
+        if i in group_total_lines:
+            continue  # skip GROUP TOTAL lines
         m = _PRICE_ANCHOR.search(line)
         if m:
             prefix = line[:m.start()].strip()
             anchors.append((i, m.group(1), float(m.group(2)), prefix))
+            anchor_lines.add(i)
 
-    # ── Pass 2: find a description for each anchor ─────────────────────────
-    used_lines = set()
+    # Now find split anchors: standalone 7-digit code followed by price on next line
+    found_codes = {a[1] for a in anchors}
+    for i, line in enumerate(lines):
+        if i in anchor_lines or i in group_total_lines:
+            continue
+        # Standalone 7-digit code (possibly preceded by barcode)
+        m = re.match(r'^(?:\d{8,}\s+)?(\d{7})\s*$', line)
+        if not m:
+            m = re.match(r'^(\d{7})\s*$', line)
+        if not m:
+            continue
+        code = m.group(1)
+        if code in found_codes:
+            continue  # already detected
+        # Check next line for a price (skip group total lines)
+        if i + 1 < len(lines) and i + 1 not in group_total_lines:
+            price_m = re.match(r'^(\d+\.\d{2})\b', lines[i + 1].strip())
+            if price_m:
+                price = float(price_m.group(1))
+                if 1.0 <= price <= 500:  # reasonable price range
+                    anchors.append((i, code, price, ""))
+                    anchor_lines.add(i)
+                    used_as_split_price.add(i + 1)
+                    found_codes.add(code)
 
-    for anchor_pos, (line_idx, item_code, price, prefix) in enumerate(anchors):
+    # Sort anchors by line position
+    anchors.sort(key=lambda a: a[0])
 
-        # Option A: the price line itself has readable description text
-        inline_desc = _clean_description(prefix)
-        if inline_desc and len(inline_desc) >= 5 and re.search(r'[A-Za-z]{3,}', inline_desc):
-            description = inline_desc
-            case_size   = _extract_case_size(prefix)
-        else:
-            # Option B: scan backward for the nearest unused description line,
-            # stopping at the previous anchor or a section header.
-            prev_anchor_line = anchors[anchor_pos - 1][0] if anchor_pos > 0 else -1
-            description = None
-            case_size   = ""
+    # ── Find item block boundaries ────────────────────────────────────────
+    # Strategy: find the block that contains the actual product data.
+    # 1. Best: first section header (**** DAIRY ****, **** FROZEN ****)
+    # 2. Fallback: last column header line ("EXTENDED PRICE", "PRICE" at end)
+    #    which appears right before items start
+    # 3. Last resort: first anchor line minus a generous lookback window
+    block_start = 0
+    block_end = len(lines)
 
-            for look in range(line_idx - 1, prev_anchor_line, -1):
-                if look in used_lines:
-                    continue
-                candidate = lines[look]
-                if _is_description(candidate):
-                    case_size   = _extract_case_size(candidate)
-                    description = _clean_description(candidate)
-                    used_lines.add(look)
+    # Try section headers first
+    for i, line in enumerate(lines):
+        if _SECTION_HEADER.match(line.strip()):
+            block_start = i
+            break
+
+    # Fallback: find "EXTENDED" + "PRICE" column headers (appear right before items)
+    if block_start == 0:
+        for i, line in enumerate(lines):
+            if line.strip().upper() == 'EXTENDED' and i + 1 < len(lines):
+                if lines[i + 1].strip().upper() == 'PRICE':
+                    block_start = i + 2
+                    break
+        # Also try "PRICE" as last header followed by non-header content
+        if block_start == 0:
+            for i, line in enumerate(lines):
+                if (line.strip().upper() in ('PRICE', 'EXTENDED PRICE')
+                        and i > 10):  # must be well into the page, not the first "PRICE"
+                    block_start = i + 1
                     break
 
-            if not description:
-                description = f"[Sysco #{item_code}]"
+    # Last resort: use first anchor minus lookback window
+    if block_start == 0 and anchors:
+        block_start = max(0, anchors[0][0] - 30)
 
-        items.append({
+    _FOOTER_RE = re.compile(
+        r'^(EQUAL\s+OPPORTUNITY|REMIT\s+TO|CONT\.\s+ON'
+        r'|IMPORTANT\s+PACA|DRIVER.S\s+SIGN|PAYABLE\s+ON'
+        r'|NO\.\s+PCS|CUST\.\s+SIGNED|CASES\s+SPLIT'
+        r'|SYSCO\s+PHILADELPHIA|OPEN:\s*\d|SUB\s*$'
+        r'|P\.O\.\s*BOX'
+        r'|AUTHORIZED\s+BY\s+SECTION'
+        r'|RETAINS\s+A\s+TRUST'
+        r'|RECEIVABLES\s+OR\s+PROCEEDS'
+        r'|REPRESENTATIVE\s+CAPACITY'
+        r'|RESPECT\s+TO\s+ANY\s+DISPUTE'
+        r'|PERISHABLE\s+AGRICULTURAL'
+        r'|STATUTORY\s+TRUST'
+        r'|INVENTORIES\s+OF\s+FOOD'
+        r')',
+        re.IGNORECASE,
+    )
+    for i in range(block_start, len(lines)):
+        if _FOOTER_RE.match(lines[i]):
+            block_end = i
+            break
+
+    # ── Pass 2: collect all description lines (within item block only) ────
+    desc_entries = []  # list of { line, description, case_size }
+    for i in range(block_start, block_end):
+        line = lines[i]
+        if i in anchor_lines:
+            continue
+        if not _is_description(line):
+            continue
+        # Extract catch weight BEFORE cleaning (variable-weight/per-lb items)
+        # Only applies to MEATS, POULTRY, SEAFOOD sections — not dry goods
+        current_section_name = ""
+        for sec in sections:
+            if sec["start_line"] <= i <= (sec["end_line"] or len(lines)):
+                current_section_name = sec["name"].upper()
+                break
+        is_protein_section = any(k in current_section_name
+                                 for k in ["MEAT", "POULTRY", "SEAFOOD"])
+        catch_wt = _extract_catch_weight(line) if is_protein_section else None
+
+        # Extract pack size BEFORE cleaning
+        case_size = _extract_pack_size(line)
+        if not case_size:
+            m = re.match(
+                r'^(\d+\.?\d*\s*(?:[O0]Z|LB|GAL|CT|LTR|#))\s+',
+                line, re.IGNORECASE
+            )
+            if m:
+                case_size = m.group(1).strip().upper()
+        if not case_size:
+            case_size = _extract_case_size(line)
+        # Check line above for standalone pack size
+        if not case_size and i > 0:
+            above = lines[i - 1].strip()
+            m = re.match(
+                r'^(\d+\.?\d*\s*(?:[O0]Z|LB|GAL|CT|LTR|#|FL\s*[O0]Z))\s*(?:\w{0,3})?$',
+                above, re.IGNORECASE
+            )
+            if m:
+                case_size = m.group(1).strip().upper()
+
+        # For catch-weight items, the "case_size" is actually the shipped weight
+        if catch_wt:
+            case_size = f"{catch_wt['weight_lbs']}LB"
+        else:
+            # Normalize pack size (e.g. "120 LB" → "1/20LB")
+            case_size = _normalize_pack_size(case_size)
+
+        desc_entries.append({
+            "line": i,
+            "description": _clean_description(line),
+            "case_size": case_size,
+            "catch_weight": catch_wt,
+        })
+
+    # ── Load code_map for reliable product identification ────────────────
+    try:
+        from mapper import load_mappings as _load_code_map
+        _mappings = _load_code_map()
+        _code_map = _mappings.get("code_map", {})
+    except Exception:
+        _code_map = {}
+
+    # ── Pass 3: match anchors to descriptions ─────────────────────────────
+    # Strategy: known-code-first matching.
+    #   1. Anchors with known SUPC codes → use code_map canonical directly.
+    #      Remove their OCR descriptions from the pool.
+    #   2. Remaining anchors (unknown codes) → match against the remaining
+    #      description pool by ordered position.
+    # This avoids OCR column-order misalignment for known products and
+    # gives unknown codes a cleaner pool to match against.
+
+    items = []
+    used_descs = set()
+    anchor_matches = [None] * len(anchors)  # (description, case_size) per anchor
+
+    # ── Step A: handle known-code anchors ─────────────────────────────────
+    # For each anchor with a code in the code_map, we already know the product.
+    # Find and consume the nearest OCR description by LINE PROXIMITY — the
+    # item code and its description always appear near each other in the raw
+    # text, regardless of column reading order. This is more reliable than
+    # fuzzy matching canonical names against OCR descriptions.
+    known_anchor_indices = set()
+
+    # First, find where each item code appears in the raw text (not just
+    # the anchor line — the code might also appear near the description)
+    code_positions = {}  # item_code → list of line positions
+    for i, line in enumerate(lines):
+        for ai, (_, item_code, _, _) in enumerate(anchors):
+            if item_code in line:
+                code_positions.setdefault(item_code, []).append(i)
+
+    for ai, (line_idx, item_code, price, prefix) in enumerate(anchors):
+        canonical = _code_map.get(item_code)
+        if not canonical:
+            continue  # unknown code — handle in step B
+
+        known_anchor_indices.add(ai)
+
+        # Find the nearest unclaimed description to any occurrence of this code
+        code_lines = code_positions.get(item_code, [line_idx])
+        best_di = None
+        best_dist = 999
+
+        for di, de in enumerate(desc_entries):
+            if di in used_descs:
+                continue
+            for cl in code_lines:
+                dist = abs(de["line"] - cl)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_di = di
+
+        if best_di is not None and best_dist <= 40:
+            # Found nearby description — use its case_size and catch_weight
+            used_descs.add(best_di)
+            de = desc_entries[best_di]
+            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
+        else:
+            # Mark for ordered fallback — will try in step A2
+            anchor_matches[ai] = (canonical, "", None)
+
+    # ── Step A2: ordered fallback for known-code anchors without a match ──
+    # When proximity fails (clustered anchors far from descriptions),
+    # consume unclaimed descriptions in order — the OCR reads descriptions
+    # top-to-bottom, and anchors top-to-bottom, so the ordering is preserved.
+    unmatched_known = [ai for ai in range(len(anchors))
+                       if ai in known_anchor_indices
+                       and anchor_matches[ai] is not None
+                       and anchor_matches[ai][1] == ""]
+    remaining_for_known = [(di, de) for di, de in enumerate(desc_entries)
+                           if di not in used_descs]
+    remaining_for_known.sort(key=lambda x: x[1]["line"])
+
+    known_desc_iter = iter(remaining_for_known)
+    for ai in sorted(unmatched_known, key=lambda x: anchors[x][0]):
+        pair = next(known_desc_iter, None)
+        if pair:
+            di, de = pair
+            used_descs.add(di)
+            canonical = anchor_matches[ai][0]
+            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
+
+    # ── Step B: handle unknown-code anchors ───────────────────────────────
+    # Match remaining descriptions to remaining anchors in order.
+    unknown_anchors = [ai for ai in range(len(anchors)) if ai not in known_anchor_indices]
+    remaining_descs = [(di, de) for di, de in enumerate(desc_entries) if di not in used_descs]
+    remaining_descs.sort(key=lambda x: x[1]["line"])
+
+    desc_iter = iter(remaining_descs)
+    for ai in unknown_anchors:
+        line_idx, item_code, price, prefix = anchors[ai]
+
+        # Check inline description first
+        inline_desc = _clean_description(prefix)
+        if inline_desc and len(inline_desc) >= 5 and re.search(r'[A-Za-z]{3,}', inline_desc):
+            cs = _extract_pack_size(prefix) or _extract_case_size(prefix)
+            anchor_matches[ai] = (inline_desc, cs, None)
+            continue
+
+        # Consume next remaining description
+        pair = next(desc_iter, None)
+        if pair:
+            di, de = pair
+            used_descs.add(di)
+            anchor_matches[ai] = (de["description"], de["case_size"], de.get("catch_weight"))
+
+    # Build final items, tagging each with its section
+    for ai, (line_idx, item_code, price, prefix) in enumerate(anchors):
+        # Best source: code_map canonical name (reliable, code-based)
+        code_canonical = _code_map.get(item_code, "")
+
+        if anchor_matches[ai]:
+            ocr_description, case_size, catch_wt = anchor_matches[ai]
+        else:
+            ocr_description = ""
+            case_size = ""
+            catch_wt = None
+
+        # Use code_map canonical as the description when available.
+        # It's more reliable than OCR text (which can be misaligned
+        # when columns are read in different orders).
+        # Fall back to OCR description for unknown codes.
+        if code_canonical:
+            description = code_canonical
+        elif ocr_description:
+            description = ocr_description
+        else:
+            description = f"[Sysco #{item_code}]"
+
+        # Find which section this anchor belongs to
+        section_name = ""
+        for sec in sections:
+            if sec["start_line"] <= line_idx <= (sec["end_line"] or len(lines)):
+                section_name = sec["name"]
+                break
+        if not section_name and sections:
+            section_name = sections[-1]["name"]
+
+        item = {
             "raw_description": description,
             "sysco_item_code": item_code,
             "unit_price":      price,
+            "extended_amount": price,  # Sysco prices are per-line totals (qty usually 1)
             "case_size_raw":   case_size,
-        })
+            "section":         re.sub(r'[*\s]+', ' ', section_name).strip(),
+        }
 
-    return items
+        # For catch-weight items, the price on the invoice is the TOTAL
+        # (weight × price_per_lb). Calculate the per-lb price.
+        if catch_wt and catch_wt.get("weight_lbs") and catch_wt["weight_lbs"] > 0:
+            item["unit_of_measure"] = "LB"
+            item["price_per_unit"] = round(price / catch_wt["weight_lbs"], 4)
+
+        items.append(item)
+
+    # ── Extract invoice total ────────────────────────────────────────────
+    # Sysco multi-page invoices: the LAST PAGE has the invoice total.
+    # Pattern: "LAST PAGE" followed by subtotal, tax, invoice total
+    # (the last standalone number is the invoice total).
+    # Single-page or non-last pages: fall back to GROUP TOTAL sums.
+    invoice_total = None
+
+    # Method 1: Look for "LAST PAGE" indicator (definitive total)
+    # Numbers may appear BEFORE or AFTER "LAST PAGE" depending on OCR layout.
+    # Search both directions, filter out dates, take the largest number.
+    for i, line in enumerate(lines):
+        if re.match(r'^\s*LAST PAGE\s*$', line, re.IGNORECASE):
+            nums = []
+            # Look backwards (up to 10 lines before LAST PAGE)
+            for j in range(max(0, i - 10), i):
+                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if m:
+                    val = float(m.group(1).replace(",", ""))
+                    if val > 1.0:  # skip tiny numbers like fuel surcharges
+                        nums.append(val)
+            # Look forwards (up to 10 lines after LAST PAGE)
+            for j in range(i + 1, min(i + 10, len(lines))):
+                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if m:
+                    val = float(m.group(1).replace(",", ""))
+                    if val > 1.0:
+                        nums.append(val)
+            if nums:
+                invoice_total = max(nums)  # largest number = invoice total
+                print(f"  [✓] Sysco invoice total from LAST PAGE: ${invoice_total:.2f}")
+            break
+
+    # Method 2: Fall back to GROUP TOTAL sums (partial pages)
+    if invoice_total is None:
+        group_totals = []
+        for i, line in enumerate(lines):
+            if re.match(r'^\s*GROUP TOTAL', line):
+                last_num = None
+                for j in range(i + 1, min(i + 15, len(lines))):
+                    if re.search(r'\*{3,}', lines[j]) and 'GROUP' not in lines[j]:
+                        break
+                    m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                    if m:
+                        last_num = float(m.group(1).replace(",", ""))
+                if last_num is not None:
+                    group_totals.append(last_num)
+        if group_totals:
+            invoice_total = round(sum(group_totals), 2)
+            print(f"  [~] Sysco partial total from GROUP TOTALs: ${invoice_total:.2f} "
+                  f"(not last page — may be incomplete)")
+
+    items_total = round(sum(it.get("extended_amount", 0) or 0 for it in items), 2)
+    if invoice_total is not None:
+        diff = abs(invoice_total - items_total)
+        if diff > 0.50:
+            print(f"  [!] Sysco total vs items gap: "
+                  f"total=${invoice_total:.2f}, items=${items_total:.2f}, "
+                  f"gap=${diff:.2f}")
+
+    return items, invoice_total
 
 
 # ---------------------------------------------------------------------------
-# Exceptional Foods parser
+# Exceptional Foods parser (v2 — DocAI OCR column-aware)
 # ---------------------------------------------------------------------------
+
+def _extract_exceptional_invoice_total(lines: list[str]) -> float | None:
+    """Extract invoice total from Exceptional Foods footer.
+
+    Handles two OCR layouts:
+      Layout A (grouped): Labels block → Numbers block
+        Sales Amt / Misc Amt / Freight / Sales Tax / Total → 298.95 / 0.00 / 5.00 / 0.00 / 303.95
+      Layout B (interleaved): Label → Value → Label → Value
+        Sales Amt / 373.23 / Misc Amt / 0.00 / ... / Total / 378.23
+
+    In both cases, the definitive total is the number immediately after
+    a standalone "Total" label (not "Sales Amt Total" or "QTY Total").
+    """
+    # The footer has varying OCR layouts (grouped vs interleaved).
+    # Most reliable: find "Balance Due" label, then take the LAST
+    # standalone dollar amount between Balance Due and end of invoice
+    # (or "T = Taxable" marker). That's always the invoice total.
+    balance_due_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r'^Balance Due\s*$', line, re.IGNORECASE):
+            balance_due_idx = i
+            break  # take the LAST occurrence in case there are multiple
+
+    # Search backwards from end to find the last "Balance Due"
+    for i in range(len(lines) - 1, -1, -1):
+        if re.match(r'^Balance Due\s*$', lines[i], re.IGNORECASE):
+            balance_due_idx = i
+            break
+
+    if balance_due_idx is not None:
+        # Collect all dollar amounts after Balance Due until end/marker
+        nums = []
+        for j in range(balance_due_idx + 1, min(balance_due_idx + 10, len(lines))):
+            if re.match(r'^T\s*=\s*Taxable', lines[j], re.IGNORECASE):
+                break
+            m = re.match(r'^(\d+[,\d]*\.\d{2})\s*$', lines[j])
+            if m:
+                nums.append(float(m.group(1).replace(",", "")))
+        if nums:
+            # The last non-zero number is the Balance Due (= invoice total)
+            non_zero = [n for n in nums if n > 0]
+            if non_zero:
+                return non_zero[-1]
+
+    return None
+
 
 def _parse_exceptional(text: str) -> list[dict]:
     """
-    Exceptional invoices are multi-column PDFs. Vision API OCR reads the columns
-    independently, so the output interleaves item codes, quantities, descriptions,
-    and prices in separate clusters rather than row-by-row.
+    Parse Exceptional Foods invoices from DocAI OCR text.
+
+    Invoice columns: Item ID | Qty Ordered | Description | Qty Shipped | Price | Per | Total
+
+    DocAI OCR reads columns somewhat separately, so we get:
+      - Description lines: "1.00 CS Bacon Applewood L/O 10/14 Martins 30530"
+      - Price+Per lines: "4.69 LB" or "4.69\nLB" (per-lb price)
+      - Total lines: standalone "70.35"
+      - Qty shipped lines: standalone numbers between descriptions and prices
 
     Strategy:
-    1. Find the item block (after "Item ID" header, before "Sale Amount").
-    2. Extract description lines — product name text that isn't a code, qty, or price.
-       Also handle the occasional inline format: "2.00CS Pork Butt Bone In IBP".
-    3. Extract line-item totals by anchoring on per-unit price lines
-       (e.g. "4.6900 LE") and taking the next standalone XX.XX value.
-    4. Zip descriptions with totals in order. If counts differ (e.g. per-CS items
-       lack a per-unit anchor), fall back to collecting all standalone decimals
-       above a minimum threshold.
+      1. Find item block (after "Item ID", before footer)
+      2. Preprocess: merge "number\\nLB" into "number LB"
+      3. Extract descriptions (lines starting with qty + CS/EA/LB + product name)
+      4. Extract price+per patterns ("N.NN LB" = per-lb price)
+      5. After each price+per, find the total (next standalone number)
+      6. Zip descriptions with (price_per_unit, per, total)
+      7. Store unit_price=per-unit price, extended_amount=total for budget sync
     """
     lines = [l.strip() for l in text.splitlines()]
-
-    # Per-unit price: 4 decimal places followed by optional unit abbreviation
-    # e.g. "4.6900 LE", "6.2900 LB", "1.7800"
-    per_unit_re = re.compile(r'^\d+\.\d{4}\s*(?:LE|LB|CS|EA|PK|OZ)?\s*$', re.IGNORECASE)
-    standalone_re = re.compile(r'^\d+\.\d{2}$')
-    qty_unit_re   = re.compile(r'^\d+\.?\d*\s*(?:CS|LB|EA|PK|OZ)\s*$', re.IGNORECASE)
-    inline_re     = re.compile(r'^\d+\.?\d*\s*(?:CS|LB|EA|PK|OZ)\s+(.+)', re.IGNORECASE)
-
-    SKIP = re.compile(
-        r'^(INVOICE|EXCEPTIONAL|\*FOODS\*?|Est\s+\d{4}|U\.S\.|INSPECTED|PASSED|'
-        r'DEPARTMENT|AGRICULTURE|EST\.\s*\d+|NC\.|INC\.|'
-        r'SOLD|SHIP\b|Route\b|Stop\b|Sales\b|Customer\b|Order\b|P\.O\.|Terms\b|Ship Via|'
-        r'Quantity Shipped|Qty Shipped|Qty Ordered|Qty\b|'
-        r'Description\s*$|Weight\s*$|Price\s*$|Per\s*$|Total\s*$|'
-        r'Sale Amount|Freight|Tax\s*$|Amount Paid|BALANCE|TOTAL PIECES|BOXES|DUE\s*$|'
-        r'Received By|Print Name|CUSTOMER COPY|'
-        r'Net \d+|Delivery\s*$|'
-        r'Claims|service charge|HANDLING|returns|credit|minimum|'
-        r'Ph:|Fx:|www\.|Invoice No\.|Invoice Date|Page\s*$|Item ID)',
-        re.IGNORECASE,
-    )
-
-    def is_product_line(line: str) -> bool:
-        if not line or len(line) < 6:
-            return False
-        if SKIP.match(line):
-            return False
-        if per_unit_re.match(line):
-            return False
-        if standalone_re.match(line):
-            return False
-        if qty_unit_re.match(line):
-            return False
-        if re.match(r'^[\d\s.,\-/]+$', line):   # pure numbers / punctuation
-            return False
-        if re.match(r'^[A-Z0-9]{1,10}$', line): # short item codes (all-caps/digits)
-            return False
-        return bool(re.search(r'[A-Za-z]{3,}', line))
 
     # ── Locate item block ────────────────────────────────────────────────────
     start = None
@@ -269,67 +886,214 @@ def _parse_exceptional(text: str) -> list[dict]:
     end = len(lines)
     for i in range(start, len(lines)):
         if re.match(
-            r'^(Sale Amount|Received By|CUSTOMER COPY|'
-            r'DUE TO RISING|NOTICE:|ALL ORDERS|'
-            r'service charge|HANDLING CHARGE|No returns|No credit)',
+            r'^(Sale Amount|Misc Amt|RECEIVED|CUSTOMER COPY|PLEASE CHECK|'
+            r'NOTICE:|ALL ORDERS|'
+            r'service charge|HANDLING CHARGE|No returns|No credit|'
+            r'Claims for|DUE TO RISING)',
             lines[i], re.IGNORECASE
         ):
             end = i
             break
-        # Footer logo reprint (EXCEPTIONAL appears again after the item list)
-        if lines[i].upper() == 'EXCEPTIONAL' and i > start + 5:
+        if lines[i].strip().upper() == 'EXCEPTIONAL' and i > start + 5:
             end = i
             break
 
     block = lines[start:end]
 
+    # ── Preprocess: merge "number\nLB" into "number LB" ──────────────────────
+    merged = []
+    i = 0
+    while i < len(block):
+        line = block[i]
+        if (i + 1 < len(block)
+                and re.match(r'^(LB|CS|EA)$', block[i + 1], re.IGNORECASE)
+                and re.match(r'^\d+\.\d{2}$', line)):
+            merged.append(f"{line} {block[i + 1]}")
+            i += 2
+            continue
+        merged.append(line)
+        i += 1
+    block = merged
+
     # ── Extract descriptions ─────────────────────────────────────────────────
+    desc_re = re.compile(
+        r'^(\d+\.?\d*)\s+(CS|EA|LB)\s+(.+)', re.IGNORECASE
+    )
+    SKIP_DESC = re.compile(
+        r'Qty|Description|Price|Per\b|Total|Ship Via|Terms|Route|Stop|'
+        r'Sales ID|Customer ID|Order|PHONE|FAX|Invoice|Page|Powered|'
+        r'SOLD TO|SHIP TO|Net \d|Delivery',
+        re.IGNORECASE,
+    )
+
     descriptions = []
-    for line in block:
-        m = inline_re.match(line)
+    for line_idx, line in enumerate(block):
+        m = desc_re.match(line)
         if m:
-            desc = m.group(1).strip()
-            if re.search(r'[A-Za-z]{3,}', desc) and not SKIP.match(desc):
-                descriptions.append(desc)
-        elif is_product_line(line):
-            descriptions.append(line)
+            qty = float(m.group(1))
+            order_unit = m.group(2).upper()
+            desc = m.group(3).strip()
+            # Must look like a product (3+ letter word), not a header
+            if (len(desc) >= 4
+                    and re.search(r'[A-Za-z]{3,}', desc)
+                    and not SKIP_DESC.search(desc)):
+                descriptions.append({
+                    "qty_ordered": qty,
+                    "order_unit": order_unit,
+                    "description": desc,
+                    "line_idx": line_idx,
+                })
 
-    # ── Extract totals anchored on per-unit price lines ──────────────────────
-    # Per-LB/unit items: description … weight … PRICE.XXXX UNIT … TOTAL.XX
-    totals = []
-    for i, line in enumerate(block):
-        if per_unit_re.match(line):
-            for look in range(i + 1, min(i + 4, len(block))):
-                if standalone_re.match(block[look]):
-                    totals.append(float(block[look]))
+    # ── Extract price-per-pound patterns ─────────────────────────────────────
+    # "4.69 LB" — the per-unit price. One per item since Exceptional prices
+    # everything by the pound (even cases are avg-weight at $/LB).
+    price_per_re = re.compile(r'^(\d+\.\d{2})\s+(LB|CS|EA)$', re.IGNORECASE)
+    standalone_re = re.compile(r'^(\d+\.\d{2})$')
+
+    price_pers = []
+    for idx, line in enumerate(block):
+        m = price_per_re.match(line)
+        if m:
+            price = float(m.group(1))
+            per = m.group(2).upper()
+            # Try to find the total: next standalone number after this
+            total = None
+            for look in range(idx + 1, min(idx + 4, len(block))):
+                tm = standalone_re.match(block[look])
+                if tm:
+                    total = float(tm.group(1))
                     break
-
-    # ── Fallback: count mismatch (e.g. per-CS items lack a per-unit anchor) ──
-    # Collect all standalone XX.XX values above a floor; take the last N.
-    if len(totals) < len(descriptions):
-        FLOOR = 10.0
-        all_decimals = [float(l) for l in block if standalone_re.match(l) and float(l) >= FLOOR]
-        if len(all_decimals) >= len(descriptions):
-            totals = all_decimals[-len(descriptions):]
-        else:
-            totals = all_decimals
-
-    # ── Zip together ─────────────────────────────────────────────────────────
-    items = []
-    for desc, price in zip(descriptions, totals):
-        if price > 0:
-            items.append({
-                "raw_description": desc,
-                "unit_price": price,
-                "case_size_raw": "",
+            price_pers.append({
+                "price_per_unit": price,
+                "per": per,
+                "total": total,
+                "line_idx": idx,
             })
 
-    return items
+    # ── Collect all standalone numbers for cross-multiply solving ────────────
+    standalone_re = re.compile(r'^(\d+\.?\d*)$')
+    number_pool = []
+    for line in block:
+        m = standalone_re.match(line)
+        if m:
+            val = float(m.group(1))
+            if 0.5 <= val <= 1000:
+                number_pool.append(val)
+
+    # Known P/# values — can't also be weights
+    known_ppus = {round(pp["price_per_unit"], 2) for pp in price_pers}
+
+    # ── Match descriptions to nearest price by line proximity ──────────────
+    items = []
+    used_pool = set()
+    used_prices = set()
+
+    for desc in descriptions:
+        # Find the nearest unused price_per pattern AFTER this description
+        best_pp = None
+        best_dist = float("inf")
+        best_pp_idx = None
+        for pp_idx, pp in enumerate(price_pers):
+            if pp_idx in used_prices:
+                continue
+            dist = pp["line_idx"] - desc["line_idx"]
+            if dist > 0 and dist < best_dist:
+                best_dist = dist
+                best_pp = pp
+                best_pp_idx = pp_idx
+
+        if best_pp is None:
+            # No price found after this description — item has no price
+            items.append({
+                "raw_description": desc["description"],
+                "unit_price": None,
+                "case_size_raw": "",
+                "quantity": desc["qty_ordered"],
+                "unit_of_measure": "",
+            })
+            continue
+
+        used_prices.add(best_pp_idx)
+        price_per_unit = best_pp["price_per_unit"]
+        per = best_pp["per"]
+
+        # Cross-multiply: find (weight, total) pair where weight × P/# ≈ total
+        best = None
+        best_diff = float("inf")
+        for i, cw in enumerate(number_pool):
+            if i in used_pool or round(cw, 2) in known_ppus:
+                continue  # skip P/# values as weights
+            expected = round(cw * price_per_unit, 2)
+            for j, ct in enumerate(number_pool):
+                if j in used_pool or j == i:
+                    continue
+                diff = abs(ct - expected)
+                if diff <= 0.10 and diff < best_diff:
+                    best_diff = diff
+                    best = {"wi": i, "ti": j, "w": cw, "t": ct}
+
+        if best:
+            used_pool.add(best["wi"])
+            used_pool.add(best["ti"])
+            total = best["t"]
+            weight = best["w"]
+        else:
+            # Fallback: use the total found after price+per in the block
+            total = best_pp.get("total")
+            weight = round(total / price_per_unit, 2) if total and price_per_unit > 0 else None
+
+        items.append({
+            "raw_description": desc["description"],
+            "unit_price": total,           # case total (weight × $/lb) — for DB + sheet
+            "extended_amount": total,      # same as unit_price for Exceptional (qty already in weight)
+            "case_size_raw": f"{weight}LB" if weight and per == "LB" else "",
+            "quantity": desc["qty_ordered"],
+            "unit_of_measure": per,
+            "price_per_unit": price_per_unit,  # $/lb — for P/# column
+        })
+
+    # ── Extract and validate invoice total ────────────────────────────
+    all_lines = [l.strip() for l in text.splitlines()]
+    invoice_total = _extract_exceptional_invoice_total(all_lines)
+    items_total = round(sum(it.get("extended_amount", 0) or 0 for it in items), 2)
+
+    if invoice_total is not None:
+        diff = abs(invoice_total - items_total)
+        if diff > 0.50:
+            print(f"  [!] Exceptional invoice total mismatch: "
+                  f"parsed=${invoice_total:.2f}, items=${items_total:.2f}, "
+                  f"gap=${diff:.2f}")
+        else:
+            print(f"  [✓] Exceptional invoice total verified: ${invoice_total:.2f}")
+
+    return items, invoice_total
 
 
 # ---------------------------------------------------------------------------
 # FarmArt parser
 # ---------------------------------------------------------------------------
+
+def _extract_farmart_invoice_total(lines: list[str]) -> float | None:
+    """Extract the invoice total from a Farm Art invoice OCR text."""
+    for i, line in enumerate(lines):
+        # Look for "Nontaxable" or "Invoice Total" followed by a number
+        if re.match(r'^Nontaxable\s*$', line, re.IGNORECASE):
+            # Number is on the same line or next line
+            for j in range(i, min(i + 2, len(lines))):
+                m = re.search(r'(\d+[,\d]*\.\d{2})', lines[j])
+                if m and lines[j].strip() != line.strip():
+                    return float(m.group(1).replace(",", ""))
+        if re.match(r'^Invoice Total\s*$', line, re.IGNORECASE):
+            for j in range(i, min(i + 2, len(lines))):
+                m = re.search(r'(\d+[,\d]*\.\d{2})', lines[j])
+                if m and lines[j].strip() != line.strip():
+                    return float(m.group(1).replace(",", ""))
+        # Also catch inline: "Nontaxable 222.07"
+        m = re.match(r'^(?:Nontaxable|Invoice Total)\s+(\d+[,\d]*\.\d{2})', line, re.IGNORECASE)
+        if m:
+            return float(m.group(1).replace(",", ""))
+    return None
+
 
 def _parse_farmart(text: str) -> list[dict]:
     """
@@ -338,84 +1102,235 @@ def _parse_farmart(text: str) -> list[dict]:
     - Regular stock items (no prefix) that appear after the column headers
 
     Both formats follow: Description → "United States" → unit price → amount
-    We skip items with a zero or missing amount (unavailable items).
+    OCR sometimes bunches all descriptions together, then all prices — so we
+    use two-pass extraction with proximity matching (same as Exceptional).
+
+    Returns items with both unit_price (per case) and extended_amount (qty × price).
+    Also extracts invoice_total for budget sync validation.
     """
-    items = []
     lines = [l.strip() for l in text.splitlines()]
 
     # Headers/footers to skip
     skip_patterns = re.compile(
         r'^(Bill To|Ship To|Received By|Invoice|Customer|Date|Purchase|Driver|'
         r'Route|Terms|Salesperson|Picker|Order|Quantity|U/M|Item|Description|'
-        r'COOL|United States|Nontaxable|Taxable|Tax|Discount|Invoice Total|'
-        r'Payments|Invoice Balance|Page|All returns|\*\*\*|zz BAKING|NOT AVAIL|'
+        r'COOL|United States|Peru|Mexico|Canada|Nontaxable|Taxable|Tax|Discount|Invoice Total|'
+        r'Payments|Invoice Balance|Page|All returns|\*\*\*|NOT AVAIL|'
         r'Unit Price|Amount|'       # column headers
         r'"zz"|'                    # "zz" non-stock delivery note lines
         r'\d+\.\d{3})',             # quantity lines (1.000 HALF, 4.000 EACH CAU, etc.)
         re.IGNORECASE
     )
 
-    i = 0
-    while i < len(lines):
-        line = lines[i]
-
-        # Match both "zz ITEM NAME" and plain "ITEM NAME, details" descriptions
-        is_zz   = line.upper().startswith("ZZ ")
+    # ── Pass 1: Extract all descriptions with line positions ──────────────
+    descriptions = []
+    for i, line in enumerate(lines):
+        is_zz = line.upper().startswith("ZZ ")
         is_desc = (
             not is_zz
-            and len(line) > 8
-            and re.search(r'[A-Za-z]{4,}', line)
+            and len(line) > 12
+            and re.search(r'[A-Z]{3,}', line)
+            and (re.search(r',', line) or re.search(r'[A-Z]{4,}\s+[A-Z]{2,}', line))
             and not skip_patterns.match(line)
             and not re.match(r'^[\d\s.,]+$', line)
         )
 
         if is_zz or is_desc:
-            description = line[3:].strip() if is_zz else line
-            description = re.sub(r'\s*\*+.*$', '', description).strip()
+            desc = line[3:].strip() if is_zz else line
+            desc = re.sub(r'\s*\*+.*$', '', desc).strip()
+            if desc:
+                descriptions.append({"description": desc, "line_idx": i})
 
-            # Look ahead for two consecutive standalone numbers (unit price, amount)
-            prices_found = []
-            for look in range(i + 1, min(i + 8, len(lines))):
-                if re.match(r'^\d+\.\d{2}$', lines[look]):
-                    prices_found.append(float(lines[look]))
-                    if len(prices_found) == 2:
-                        break
-
-            # Use the extended amount (second number); skip if zero/missing
-            amount = prices_found[1] if len(prices_found) == 2 else (
-                     prices_found[0] if len(prices_found) == 1 else None)
-
-            if amount and amount > 0:
-                items.append({
-                    "raw_description": description,
-                    "unit_price": amount,
-                    "case_size_raw": "",
-                })
+    # ── Pass 2: Extract all price pairs (unit_price, amount) with positions ──
+    price_pairs = []
+    i = 0
+    while i < len(lines):
+        m = re.match(r'^\s*-?\d+\.\d{2}\s*$', lines[i])
+        if m:
+            price1 = float(lines[i].strip())
+            # Look for second price within next 2 lines
+            for j in range(i + 1, min(i + 3, len(lines))):
+                m2 = re.match(r'^\s*-?\d+\.\d{2}\s*$', lines[j])
+                if m2:
+                    price2 = float(lines[j].strip())
+                    price_pairs.append({
+                        "unit_price": price1,
+                        "amount": price2,
+                        "line_idx": i,
+                    })
+                    i = j + 1  # skip past this pair
+                    break
+            else:
+                i += 1
+                continue
+            continue
         i += 1
 
-    return items
+    # ── Pass 3: Match descriptions to nearest subsequent price pair ────────
+    items = []
+    used_prices = set()
+
+    for desc in descriptions:
+        best_pp = None
+        best_dist = float("inf")
+        best_idx = None
+        for pp_idx, pp in enumerate(price_pairs):
+            if pp_idx in used_prices:
+                continue
+            dist = pp["line_idx"] - desc["line_idx"]
+            if dist > 0 and dist < best_dist:
+                best_dist = dist
+                best_pp = pp
+                best_idx = pp_idx
+
+        if best_pp and best_pp["amount"] > 0:
+            used_prices.add(best_idx)
+            items.append({
+                "raw_description": desc["description"],
+                "unit_price": best_pp["unit_price"],
+                "extended_amount": best_pp["amount"],
+                "case_size_raw": "",
+            })
+
+    # ── Pass 4: Extract and validate invoice total ────────────────────────
+    invoice_total = _extract_farmart_invoice_total(lines)
+    items_total = round(sum(it["extended_amount"] for it in items), 2)
+
+    if invoice_total is not None:
+        diff = abs(invoice_total - items_total)
+        if diff > 0.50:
+            print(f"  [!] Farm Art invoice total mismatch: "
+                  f"parsed=${invoice_total:.2f}, items=${items_total:.2f}, "
+                  f"gap=${diff:.2f}")
+        else:
+            print(f"  [✓] Farm Art invoice total verified: ${invoice_total:.2f}")
+
+    return items, invoice_total
 
 
 # ---------------------------------------------------------------------------
 # PBM (Philadelphia Bakery Merchants) parser
 # ---------------------------------------------------------------------------
 
+def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
+    """
+    PBM old-style invoices (Jan-Feb 2026 and earlier).
+    Items appear as: "2 0290/AsstDo... Assorted Donuts"
+    Prices in "Price Each" / "Amount" block.
+    Total as "$XX.XX".
+    """
+    lines = [l.strip() for l in text.splitlines()]
+
+    # Find Description header
+    desc_idx = None
+    for i, line in enumerate(lines):
+        if re.match(r'^Description\s*$', line, re.IGNORECASE):
+            desc_idx = i
+            break
+    if desc_idx is None:
+        return [], None
+
+    # Extract descriptions: lines matching "N code/abbrev... Product Name"
+    # or just product name lines after the delivery instructions
+    descriptions = []
+    in_delivery_note = False
+    for i in range(desc_idx + 1, len(lines)):
+        line = lines[i]
+        if re.match(r'^(Price Each|Amount|Total)\b', line, re.IGNORECASE):
+            break
+        if line.startswith('***'):
+            in_delivery_note = True
+            continue
+        if in_delivery_note and '***' in line:
+            in_delivery_note = False
+            continue
+        if in_delivery_note:
+            continue
+
+        # Pattern: "N code/abbrev... Product Name"
+        m = re.match(r'^\d+\s+\S+/\S+\.{2,}\s*(.+)', line)
+        if m:
+            descriptions.append(m.group(1).strip())
+            continue
+        # Standalone product name (no code prefix)
+        if (re.search(r'[A-Za-z]{3,}', line)
+                and not re.match(r'^\d+\s+[A-Z]\d+$', line)
+                and len(line) >= 4):
+            descriptions.append(line)
+
+    # Extract prices: after "Price Each" / "Amount", alternating (unit, ext)
+    raw_amounts = []
+    price_start = None
+    for i, line in enumerate(lines):
+        if re.match(r'^(Price Each|Amount)\s*$', line, re.IGNORECASE):
+            price_start = i
+    if price_start:
+        for i in range(price_start + 1, len(lines)):
+            if re.match(r'^(Total|\$)', lines[i], re.IGNORECASE):
+                break
+            m = re.match(r'^(\d+\.\d{2})$', lines[i])
+            if m:
+                raw_amounts.append(float(m.group(1)))
+
+    # Parse total: "$XX.XX"
+    invoice_total = None
+    for line in lines:
+        m = re.match(r'^\$(\d+[,\d]*\.\d{2})$', line)
+        if m:
+            invoice_total = float(m.group(1).replace(",", ""))
+
+    # Pair descriptions with prices (alternating: unit, ext)
+    n = len(descriptions)
+    items = []
+    if n > 0 and len(raw_amounts) >= n * 2:
+        for i in range(n):
+            unit = raw_amounts[i * 2]
+            ext = raw_amounts[i * 2 + 1]
+            items.append({
+                "raw_description": descriptions[i],
+                "unit_price": unit,
+                "extended_amount": ext,
+                "case_size_raw": "",
+            })
+    elif n > 0 and raw_amounts:
+        # Fallback: just pair what we have
+        for i, desc in enumerate(descriptions):
+            if i < len(raw_amounts):
+                items.append({
+                    "raw_description": desc,
+                    "unit_price": raw_amounts[i],
+                    "extended_amount": raw_amounts[i],
+                    "case_size_raw": "",
+                })
+
+    items_sum = round(sum(it.get("extended_amount", 0) for it in items), 2)
+    if invoice_total is not None:
+        diff = abs(invoice_total - items_sum)
+        if diff > 0.50:
+            print(f"  [!] PBM (old format) invoice total mismatch: "
+                  f"parsed=${invoice_total:.2f}, items=${items_sum:.2f}, gap=${diff:.2f}")
+        else:
+            print(f"  [✓] PBM (old format) invoice total verified: ${invoice_total:.2f}")
+
+    return items, invoice_total
+
+
 def _parse_pbm(text: str) -> list[dict]:
     """
-    PBM invoices come in two layouts depending on OCR column reading order:
+    PBM invoices come in two formats:
 
-    Layout A (row-by-row): Description | Unit Price | Amount headers appear
-      together, then item rows: ItemCode | Qty | U/M | Description | UnitPrice | Amount
+    Format 1 (old, Jan-Feb 2026): handwritten-style with "Price Each" header,
+      items as "N code/abbrev... Product Name", total as "$XX.XX".
 
-    Layout B (column format): Left column has item data (ItemCode/Qty/U/M/Desc),
-      right column has prices (Unit Price | Amount pairs) read separately.
+    Format 2 (new, March+ 2026): digital with "Unit Price"/"Amount" columns,
+      DZ/EA U/M tokens, "Invoice Total($):" footer.
 
-    Detection: if "Unit Price" appears within 5 lines of "Description", it's Layout A.
-    Otherwise Layout B (prices come in a separate block later in the text).
-
-    Descriptions are extracted by finding lines that immediately follow a U/M line
-    (DZ, EA, LB, etc.) — this works for both layouts.
+    Detection: presence of "Price Each" → Format 1, else Format 2.
     """
+    # Detect format
+    if re.search(r'Price Each', text, re.IGNORECASE):
+        return _parse_pbm_format1(text)
+
     lines = [l.strip() for l in text.splitlines()]
 
     um_pattern   = re.compile(r'^(DZ|EA|LB|CS|OZ|PK|BG|CTN)$', re.IGNORECASE)
@@ -437,61 +1352,196 @@ def _parse_pbm(text: str) -> list[dict]:
             amount_idx = i
 
     if desc_idx is None:
-        return []
+        return [], None
 
     # Layout detection: prices right after Description = row-by-row; far away = column
     is_column_format = (
         unit_price_idx is not None and unit_price_idx > desc_idx + 5
     )
 
-    # ── Extract descriptions: lines following a U/M token in the item block ───
+    # ── Extract descriptions ────────────────────────────────────────────────
+    # PBM OCR layouts vary — U/M tokens may or may not precede descriptions.
+    # Strategy: scan for ALL product-name-like lines after the Description header,
+    # filtering out codes, numbers, and header text.
+    skip_desc = re.compile(
+        r'^(Item\s*Number|Order|Ship|Qty|U/M|PO\s*Number|Salesperson|'
+        r'Routeperson|Contact|Reference|Sequence|Shift|Route|Terms|'
+        r'Ship Via|DEF|Page|Vanessa|Kimberly|Unit\s*Price|Amount)\b',
+        re.IGNORECASE
+    )
+
     descriptions = []
     for i in range(desc_idx + 1, len(lines)):
-        line = lines[i]
+        line = lines[i].strip()
         if stop_pattern.match(line):
             break
-        if re.match(r'^\d+\.\d{2}$', line):   # skip standalone decimals
+        if not line or len(line) < 4:
             continue
-        if i > 0 and um_pattern.match(lines[i - 1]):
-            # Exclude bare item codes (all uppercase alphanumeric, no spaces/symbols)
-            # but allow product names like "100% Whole Wheat"
-            if re.search(r'[A-Za-z]{3,}', line) and not re.match(r'^[A-Z0-9]+$', line):
-                descriptions.append(line)
+        if re.match(r'^[\d.]+$', line):            # pure number
+            continue
+        if re.match(r'^[\d.]+\s*$', line):         # number with whitespace
+            continue
+        if um_pattern.match(line):                  # bare U/M token (DZ, EA, etc.)
+            continue
+        if re.match(r'^[A-Z]\d{2,}$', line):       # item code like L202, H106, G105
+            continue
+        if re.match(r'^0\d{2,}$', line):           # item code like 0290, 0389
+            continue
+        if re.match(r'^[A-Z]{1,2}\d+$', line):     # item code like R1012
+            continue
+        if skip_desc.match(line):                   # header text
+            continue
+        if re.match(r'^[\u1780-\u17FF\s]+$', line): # OCR garbage (Khmer chars etc.)
+            continue
+        # Must contain a word with 3+ letters (product name, not code)
+        if re.search(r'[A-Za-z]{3,}', line):
+            # Strip leading "DZ " or "PACK " if merged into description
+            clean = re.sub(r'^(DZ|EA|LB|CS|PACK)\s+', '', line, flags=re.IGNORECASE).strip()
+            if clean and len(clean) >= 4:
+                descriptions.append(clean)
 
-    # ── Collect extended amounts ───────────────────────────────────────────────
-    if is_column_format:
-        # Prices are in a right-column block that starts after the "Amount" header
-        price_start = amount_idx if amount_idx is not None else unit_price_idx
-        raw_amounts = []
-        for i in range((price_start or 0) + 1, len(lines)):
-            if re.match(r'^(Subtotal|Invoice\s+Total)', lines[i], re.IGNORECASE):
+    # ── Collect all standalone prices between Description and Subtotal ────────
+    # PBM OCR has varying layouts — prices can be before/after descriptions,
+    # alternating (unit, ext, unit, ext) or grouped (all units, all exts).
+    # Strategy: collect ALL prices, then pair with descriptions using the
+    # subtotal as a validation check.
+    subtotal = None
+    for i, line in enumerate(lines):
+        m = re.match(r'^Subtotal\s*\(\$\)\s*:\s*$', line, re.IGNORECASE)
+        if m:
+            for j in range(i + 1, min(i + 3, len(lines))):
+                nm = re.match(r'^(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if nm:
+                    subtotal = float(nm.group(1).replace(",", ""))
+                    break
+            break
+
+    # Collect prices — strategy depends on whether descriptions were found via U/M (method 1)
+    # or fallback (method 2). Method 1 = row-by-row (prices between desc and Subtotal).
+    # Method 2 = column format (prices may be AFTER Subtotal).
+    used_fallback = len(descriptions) > 0 and not any(
+        i > 0 and re.match(r'^(DZ|EA|LB|CS|OZ|PK|BG|CTN)$', lines[i - 1], re.IGNORECASE)
+        for i in range(desc_idx + 1, len(lines))
+        if lines[i].strip() in [d for d in descriptions]
+    )
+
+    raw_amounts = []
+    search_start = desc_idx + 1
+    if used_fallback:
+        # Column format: prices are after Subtotal, up to Invoice Total
+        for i in range(search_start, len(lines)):
+            if re.match(r'^(Invoice\s+Total|Page\s+\d)', lines[i], re.IGNORECASE):
+                break
+            if re.match(r'^Subtotal', lines[i], re.IGNORECASE):
+                continue
+            if re.match(r'^\d+\.\d{2}$', lines[i]):
+                val = float(lines[i])
+                if subtotal and abs(val - subtotal) < 0.01:
+                    continue
+                raw_amounts.append(val)
+    else:
+        # Row-by-row: prices are between items, stop at Subtotal
+        for i in range(search_start, len(lines)):
+            if re.match(r'^(QTY\s+Totals|Subtotal|Invoice\s+Total)', lines[i], re.IGNORECASE):
                 break
             if re.match(r'^\d+\.\d{2}$', lines[i]):
                 raw_amounts.append(float(lines[i]))
-        # Pairs alternate: unit_price, extended_amount → take extended (odd indices)
-        ext_amounts = raw_amounts[1::2]
-    else:
-        # Row-by-row: after the Amount header, numbers appear as qty/unit/extended triples
-        raw_amounts = []
-        for i in range((amount_idx or desc_idx) + 1, len(lines)):
-            line = lines[i]
-            if re.match(r'^(QTY\s+Totals|Subtotal|Invoice\s+Total)', line, re.IGNORECASE):
+
+    n_desc = len(descriptions)
+    unit_prices = []
+    ext_amounts = []
+
+    if n_desc > 0 and len(raw_amounts) >= n_desc:
+        # Try multiple pairing strategies, validate against subtotal
+        candidates = []
+
+        # Strategy 1a: triples (qty, unit, ext) — row-by-row, qty first
+        if len(raw_amounts) >= n_desc * 3:
+            tri_ext = raw_amounts[2::3][:n_desc]
+            tri_unit = raw_amounts[1::3][:n_desc]
+            tri_sum = round(sum(tri_ext), 2)
+            candidates.append(("triples_que", tri_unit, tri_ext, tri_sum))
+
+        # Strategy 1b: triples (unit, ext, qty) — row-by-row, prices first
+        if len(raw_amounts) >= n_desc * 3:
+            tri_ext2 = raw_amounts[1::3][:n_desc]
+            tri_unit2 = raw_amounts[0::3][:n_desc]
+            tri_sum2 = round(sum(tri_ext2), 2)
+            candidates.append(("triples_ueq", tri_unit2, tri_ext2, tri_sum2))
+
+        # Strategy 2: alternating (unit, ext, unit, ext)
+        if len(raw_amounts) >= n_desc * 2:
+            alt_ext = raw_amounts[1::2][:n_desc]
+            alt_unit = raw_amounts[0::2][:n_desc]
+            alt_sum = round(sum(alt_ext), 2)
+            candidates.append(("alternating", alt_unit, alt_ext, alt_sum))
+
+        # Strategy 3: grouped (unit1..unitN, ext1..extN)
+        if len(raw_amounts) >= n_desc * 2:
+            grp_unit = raw_amounts[:n_desc]
+            grp_ext = raw_amounts[n_desc:n_desc * 2]
+            grp_sum = round(sum(grp_ext), 2)
+            candidates.append(("grouped", grp_unit, grp_ext, grp_sum))
+
+        # Strategy 4: just the amounts (single column)
+        single = raw_amounts[:n_desc]
+        single_sum = round(sum(single), 2)
+        candidates.append(("single", single, single, single_sum))
+
+        # Pick the strategy that matches subtotal
+        best = None
+        for name, units, exts, total in candidates:
+            if subtotal and abs(total - subtotal) < 0.50:
+                best = (name, units, exts)
                 break
-            if re.match(r'^\d+\.\d{2}$', line):
-                raw_amounts.append(float(line))
-        # Pattern per item: qty, unit_price, extended → take extended (index 2, 5, 8, ...)
-        ext_amounts = raw_amounts[2::3]
+
+        if best:
+            _, unit_prices, ext_amounts = best
+        else:
+            # No subtotal match — pick the one with the largest sum (most likely extended)
+            candidates.sort(key=lambda x: x[3], reverse=True)
+            _, unit_prices, ext_amounts = candidates[0][1], candidates[0][1], candidates[0][2]
 
     items = []
-    for desc, price in zip(descriptions, ext_amounts):
-        if price > 0:
+    for i, desc in enumerate(descriptions):
+        ext = ext_amounts[i] if i < len(ext_amounts) else 0
+        up = unit_prices[i] if i < len(unit_prices) else ext
+        if ext > 0:
             items.append({
                 "raw_description": desc,
-                "unit_price": price,
+                "unit_price": up,
+                "extended_amount": ext,
                 "case_size_raw": "",
             })
 
-    return items
+    # ── Extract and validate invoice total ────────────────────────────
+    invoice_total = None
+    for i, line in enumerate(lines):
+        m = re.match(r'^Invoice\s+Total\s*\(\$\)\s*:\s*$', line, re.IGNORECASE)
+        if m:
+            for j in range(i + 1, min(i + 3, len(lines))):
+                nm = re.match(r'^(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if nm:
+                    invoice_total = float(nm.group(1).replace(",", ""))
+                    break
+            break
+        # Inline: "Invoice Total($): 142.55"
+        m = re.match(r'^Invoice\s+Total\s*\(\$\)\s*:\s*(\d+[,\d]*\.\d{2})', line, re.IGNORECASE)
+        if m:
+            invoice_total = float(m.group(1).replace(",", ""))
+            break
+
+    items_total = round(sum(it.get("extended_amount", 0) for it in items), 2)
+    if invoice_total is not None:
+        diff = abs(invoice_total - items_total)
+        if diff > 0.50:
+            print(f"  [!] PBM invoice total mismatch: "
+                  f"parsed=${invoice_total:.2f}, items=${items_total:.2f}, "
+                  f"gap=${diff:.2f}")
+        else:
+            print(f"  [✓] PBM invoice total verified: ${invoice_total:.2f}")
+
+    return items, invoice_total
 
 
 # ---------------------------------------------------------------------------
@@ -583,17 +1633,44 @@ def _parse_delaware_linen(text: str) -> list[dict]:
                         break
 
             if unit_price is not None and not skip.search(description):
-                final_price = amount if amount is not None else unit_price
-                if final_price > 0:
+                ext = amount if amount is not None else unit_price
+                if ext > 0:
                     items.append({
                         "raw_description": description,
-                        "unit_price": final_price,
+                        "unit_price": unit_price,
+                        "extended_amount": ext,
                         "case_size_raw": "",
                     })
 
         i += 1
 
-    return items
+    # ── Extract and validate invoice total ────────────────────────────
+    invoice_total = None
+    for idx, line in enumerate(lines):
+        m = re.match(r'^Total\s+Due\s*$', line, re.IGNORECASE)
+        if m:
+            for j in range(idx + 1, min(idx + 3, len(lines))):
+                nm = re.match(r'^(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if nm:
+                    invoice_total = float(nm.group(1).replace(",", ""))
+                    break
+            break
+        m = re.match(r'^Total\s*:?\s*(\d+[,\d]*\.\d{2})', line, re.IGNORECASE)
+        if m:
+            invoice_total = float(m.group(1).replace(",", ""))
+            break
+
+    items_total = round(sum(it.get("extended_amount", 0) for it in items), 2)
+    if invoice_total is not None:
+        diff = abs(invoice_total - items_total)
+        if diff > 0.50:
+            print(f"  [!] Delaware Linen invoice total mismatch: "
+                  f"parsed=${invoice_total:.2f}, items=${items_total:.2f}, "
+                  f"gap=${diff:.2f}")
+        else:
+            print(f"  [✓] Delaware Linen invoice total verified: ${invoice_total:.2f}")
+
+    return items, invoice_total
 
 
 # ---------------------------------------------------------------------------
@@ -650,25 +1727,39 @@ def parse_invoice(text: str, vendor: str = None) -> dict:
 
     parsers = {
         "Sysco":                 _parse_sysco,
+        "Exceptional Foods":     _parse_exceptional,
         "Exceptional":           _parse_exceptional,
+        "Farm Art":              _parse_farmart,
         "FarmArt":               _parse_farmart,
+        "Philadelphia Bakery Merchants": _parse_pbm,
         "PBM":                   _parse_pbm,
         "Colonial Meat":         _parse_colonial,
         "Delaware County Linen": _parse_delaware_linen,
     }
 
     parser_fn = parsers.get(vendor, _fallback_parse)
-    items = parser_fn(text)
+    result = parser_fn(text)
+
+    # Parsers that return (items, invoice_total) tuple
+    invoice_total = None
+    if isinstance(result, tuple):
+        items, invoice_total = result
+    else:
+        items = result
 
     if vendor not in parsers:
         for item in items:
             item["needs_review"] = True
 
-    return {
+    parsed = {
         "vendor": vendor,
         "invoice_date": date,
         "items": items,
     }
+    if invoice_total is not None:
+        parsed["invoice_total"] = invoice_total
+
+    return parsed
 
 
 if __name__ == "__main__":

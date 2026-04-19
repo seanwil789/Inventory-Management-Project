@@ -1,0 +1,67 @@
+{% extends "myapp/base.html" %}
+{% block title %}Edit {{ recipe.name }}{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl">
+  <a href="{% url 'recipe_detail' recipe.id %}" class="text-sm text-indigo-600 hover:underline">&larr; Back to recipe</a>
+
+  <div class="mt-4 bg-white rounded shadow-sm p-6">
+    <h1 class="text-xl font-bold mb-4">Edit recipe</h1>
+    <form method="post" class="space-y-6">
+      {% csrf_token %}
+
+      {% for field in form %}
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">{{ field.label }}</label>
+        {{ field }}
+        {% if field.help_text %}<div class="text-xs text-slate-500 mt-1">{{ field.help_text }}</div>{% endif %}
+        {% if field.errors %}<div class="text-sm text-red-600 mt-1">{{ field.errors }}</div>{% endif %}
+      </div>
+      {% endfor %}
+
+      <div>
+        <div class="text-sm font-medium text-slate-700 mb-2">Ingredients</div>
+        {{ formset.management_form }}
+        <div class="border rounded divide-y bg-slate-50">
+          <div class="grid grid-cols-12 gap-2 px-3 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+            <div class="col-span-3">Name</div>
+            <div class="col-span-1">Qty</div>
+            <div class="col-span-1">Unit</div>
+            <div class="col-span-1" title="Edible yield % (overridden by Yield ref if set)">Y%</div>
+            <div class="col-span-3" title="Pick a Book-of-Yields entry; its yield % overrides the typed Y%">Yield ref</div>
+            <div class="col-span-2">Sub-recipe</div>
+            <div class="col-span-1 text-right">Del</div>
+          </div>
+          {% for f in formset %}
+          <div class="grid grid-cols-12 gap-2 px-3 py-2 items-center {% if f.errors %}bg-red-50{% endif %}">
+            {% for hidden in f.hidden_fields %}{{ hidden }}{% endfor %}
+            <div class="col-span-3">{{ f.name_raw }}</div>
+            <div class="col-span-1">{{ f.quantity }}</div>
+            <div class="col-span-1">{{ f.unit }}</div>
+            <div class="col-span-1">{{ f.yield_pct }}</div>
+            <div class="col-span-3">{{ f.yield_ref }}</div>
+            <div class="col-span-2">{{ f.sub_recipe }}</div>
+            <div class="col-span-1 text-right text-xs">{{ f.DELETE }}</div>
+            {% if f.errors %}
+              <div class="col-span-12 text-xs text-red-600">{{ f.errors }}</div>
+            {% endif %}
+          </div>
+          {% endfor %}
+        </div>
+        <p class="text-xs text-slate-500 mt-2">Two blank rows at the bottom are for adding ingredients. Tick "Remove" to delete a row on save.</p>
+      </div>
+
+      {% if form.non_field_errors or formset.non_form_errors %}
+      <div class="bg-red-50 border border-red-200 text-red-700 rounded p-3 text-sm">
+        {{ form.non_field_errors }}{{ formset.non_form_errors }}
+      </div>
+      {% endif %}
+
+      <div class="flex gap-2">
+        <button type="submit" class="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Save</button>
+        <a href="{% url 'recipe_detail' recipe.id %}" class="px-4 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

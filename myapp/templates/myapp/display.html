@@ -1,0 +1,98 @@
+{% load kitchen_filters %}<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta http-equiv="refresh" content="60">
+  <title>Kitchen — {{ as_of|date:"l, M j" }}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    html, body { height: 100%; margin: 0; }
+    body { background: #0f172a; color: #f1f5f9; font-family: ui-sans-serif, system-ui, sans-serif; }
+    .dish-name { font-weight: 700; line-height: 1.1; }
+  </style>
+</head>
+<body class="min-h-screen flex flex-col">
+
+  <header class="px-10 py-6 flex items-start justify-between border-b border-slate-700">
+    <div>
+      <div class="text-slate-400 uppercase tracking-[0.2em] text-sm">Kitchen · Wentworth</div>
+      <h1 class="text-5xl font-bold mt-1">{{ as_of|date:"l" }}</h1>
+      <div class="text-2xl text-slate-300 mt-1">{{ as_of|date:"F j, Y" }}</div>
+    </div>
+    <div class="text-right">
+      {% if census %}
+      <div class="text-slate-400 uppercase tracking-[0.2em] text-xs">Residents</div>
+      <div class="text-5xl font-bold text-emerald-300">{{ census.headcount }}</div>
+      {% endif %}
+    </div>
+  </header>
+
+  <main class="flex-1 px-10 py-8 flex flex-col gap-6">
+
+    {% if has_any_today %}
+    <section>
+      <div class="text-slate-400 uppercase tracking-[0.2em] text-sm mb-4">Today's Menu</div>
+      <div class="grid grid-cols-4 gap-4">
+        {% for row in today_rows %}
+        <div class="bg-slate-800/60 rounded-xl p-5 border border-slate-700 min-h-[180px] flex flex-col">
+          <div class="text-slate-400 uppercase tracking-widest text-xs mb-2">{{ row.label }}</div>
+          {% if row.menu %}
+          <div class="dish-name text-3xl mb-2">{{ row.menu.dish_freetext|default:"—" }}</div>
+          {% if row.menu.additional_recipes.count %}
+          <div class="text-slate-300 text-lg flex-1">
+            {% for r in row.menu.additional_recipes.all %}
+              <div class="mb-0.5">📖 {{ r.name }}</div>
+            {% endfor %}
+          </div>
+          {% endif %}
+          {% if row.menu.assignee %}
+          <div class="mt-auto pt-3">
+            <span class="text-xs uppercase tracking-wider px-2 py-1 rounded
+              {% if row.menu.assignee == 'sean' %}bg-blue-900/60 text-blue-200{% else %}bg-emerald-900/60 text-emerald-200{% endif %}">
+              {{ row.menu.get_assignee_display }}
+            </span>
+          </div>
+          {% endif %}
+          {% else %}
+          <div class="text-slate-500 text-xl italic">—</div>
+          {% endif %}
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% else %}
+    <section class="text-center py-12">
+      <div class="text-4xl text-slate-400 italic">No menu scheduled for {{ as_of|date:"l" }}</div>
+      <div class="text-slate-500 mt-2">Enjoy the break — see upcoming below</div>
+    </section>
+    {% endif %}
+
+    {% if upcoming_days %}
+    <section class="mt-auto">
+      <div class="text-slate-400 uppercase tracking-[0.2em] text-sm mb-3">Coming up this week</div>
+      <div class="grid grid-cols-6 gap-3">
+        {% for day in upcoming_days %}
+        <div class="bg-slate-800/40 rounded-lg p-3 border border-slate-800">
+          <div class="text-slate-300 font-semibold mb-2">{{ day.label }}</div>
+          {% for m in day.menus %}
+            <div class="text-sm mb-1 truncate" title="{{ m.dish_freetext }}">
+              <span class="text-slate-500 uppercase text-[10px] mr-1">{{ m.get_meal_slot_display|slice:":3" }}</span>
+              {{ m.dish_freetext|default:"—" }}
+            </div>
+          {% endfor %}
+        </div>
+        {% endfor %}
+      </div>
+    </section>
+    {% endif %}
+
+  </main>
+
+  <footer class="px-10 py-3 border-t border-slate-800 text-slate-600 text-xs flex justify-between">
+    <span>Auto-refresh every 60s</span>
+    <span>{{ as_of|date:"Y-m-d" }}{% if not is_today %} · preview mode (?as_of={{ as_of|date:"Y-m-d" }}){% endif %}</span>
+  </footer>
+
+</body>
+</html>

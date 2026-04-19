@@ -1,0 +1,72 @@
+{% extends "myapp/base.html" %}
+{% load kitchen_filters %}
+{% block title %}{{ recipe.name }}{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl">
+  <a href="{% url 'calendar_current' %}" class="text-sm text-indigo-600 hover:underline">&larr; Calendar</a>
+
+  <div class="mt-4 bg-white rounded shadow-sm p-6">
+    <div class="flex items-start justify-between">
+      <div>
+        <h1 class="text-2xl font-bold">{{ recipe.name }}</h1>
+        <div class="text-sm text-slate-500 mt-1">
+          Yields {{ recipe.yield_servings }}
+          {% if recipe.source_doc %} · <span class="text-xs text-slate-400">{{ recipe.source_doc }}</span>{% endif %}
+        </div>
+        <div class="mt-2 text-sm inline-flex items-center gap-2 flex-wrap">
+          <span class="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 font-medium">
+            ${{ breakdown.total|floatformat:2 }} total · ${{ breakdown.per_serving|floatformat:3 }}/serving
+          </span>
+          <span class="text-xs text-slate-500">
+            {{ breakdown.priced }}/{{ breakdown.total_count }} ingredients priced
+          </span>
+        </div>
+      </div>
+      <a href="{% url 'recipe_edit' recipe.id %}"
+         class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Edit recipe</a>
+    </div>
+
+    <div class="mt-5">
+      <div class="text-xs uppercase font-semibold text-slate-500 tracking-wide mb-2">Ingredients</div>
+      <ul class="text-sm text-slate-700 divide-y border rounded">
+        {% for line in breakdown.lines %}
+        {% with ing=line.ingredient %}
+        <li class="flex justify-between px-3 py-1.5 gap-2">
+          <span class="flex-1 min-w-0">
+            {% if ing.sub_recipe %}
+              <a href="{% url 'recipe_detail' ing.sub_recipe.id %}" class="text-indigo-600 hover:underline">🔗 {{ ing.sub_recipe.name }}</a>
+            {% else %}
+              {{ ing.name_raw }}
+            {% endif %}
+          </span>
+          <span class="text-slate-500 text-right whitespace-nowrap">
+            {% if ing.quantity %}{{ ing.quantity|pretty_qty }} {{ ing.unit }}{% else %}—{% endif %}
+            {% if ing.effective_yield_pct %}
+              <span class="text-xs text-slate-400 ml-1"
+                    title="AP order: {{ ing.ap_quantity_needed|pretty_qty }} {{ ing.unit }}{% if ing.yield_ref %} (via {{ ing.yield_ref }}){% endif %}">
+                ({{ ing.effective_yield_pct|floatformat:"-2" }}%{% if ing.yield_ref %} 📖{% endif %})
+              </span>
+            {% endif %}
+          </span>
+          <span class="text-right w-20 whitespace-nowrap font-mono {% if line.cost %}text-emerald-700{% else %}text-slate-300{% endif %}"
+                title="{{ line.note }}">
+            {% if line.cost %}${{ line.cost|floatformat:2 }}{% else %}—{% endif %}
+          </span>
+        </li>
+        {% endwith %}
+        {% empty %}
+        <li class="px-3 py-2 text-slate-400 text-sm italic">No ingredients yet.</li>
+        {% endfor %}
+      </ul>
+    </div>
+
+    {% if recipe.notes %}
+    <div class="mt-5">
+      <div class="text-xs uppercase font-semibold text-slate-500 tracking-wide mb-1">Procedure</div>
+      <p class="text-sm text-slate-700 whitespace-pre-wrap">{{ recipe.notes }}</p>
+    </div>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,39 @@
+{% extends "myapp/base.html" %}
+{% block title %}{% if instance %}Edit yield: {{ instance }}{% else %}New yield entry{% endif %}{% endblock %}
+
+{% block content %}
+<div class="max-w-3xl">
+  <a href="{% url 'yield_list' %}" class="text-sm text-indigo-600 hover:underline">&larr; Yield list</a>
+
+  <div class="mt-4 bg-white rounded shadow-sm p-6">
+    <h1 class="text-xl font-bold mb-4">
+      {% if instance %}Edit: {{ instance }}{% else %}New yield entry{% endif %}
+    </h1>
+
+    <form method="post" class="space-y-4">
+      {% csrf_token %}
+      {% for field in form %}
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">{{ field.label }}</label>
+        {{ field }}
+        {% if field.help_text %}<div class="text-xs text-slate-500 mt-1">{{ field.help_text }}</div>{% endif %}
+        {% if field.errors %}<div class="text-sm text-red-600 mt-1">{{ field.errors }}</div>{% endif %}
+      </div>
+      {% endfor %}
+
+      <div class="flex gap-2 pt-2">
+        <button type="submit" class="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Save</button>
+        <a href="{% url 'yield_list' %}" class="px-4 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Cancel</a>
+      </div>
+    </form>
+
+    {% if instance %}
+    <form method="post" action="{% url 'yield_delete' instance.id %}" class="mt-4 pt-4 border-t"
+          onsubmit="return confirm('Delete this yield entry?');">
+      {% csrf_token %}
+      <button type="submit" class="px-4 py-1.5 bg-red-600 text-white text-sm rounded hover:bg-red-700">Delete entry</button>
+    </form>
+    {% endif %}
+  </div>
+</div>
+{% endblock %}

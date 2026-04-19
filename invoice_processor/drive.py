@@ -5,11 +5,14 @@ Hierarchy: Kitchen Invoices / YYYY / MM MonthName YYYY / Vendor / Week N MM.DD -
 """
 import os
 from datetime import datetime, timedelta
+import httplib2
+import google_auth_httplib2
 from googleapiclient.discovery import build
 from google.oauth2 import service_account
 from config import CREDENTIALS_PATH, DRIVE_ROOT_FOLDER_ID
 
 SCOPES = ["https://www.googleapis.com/auth/drive"]
+API_TIMEOUT = 60  # seconds
 
 _folder_cache: dict[tuple, str] = {}   # (name, parent_id) → folder_id
 
@@ -24,7 +27,9 @@ def get_drive_client():
     credentials = service_account.Credentials.from_service_account_file(
         CREDENTIALS_PATH, scopes=SCOPES
     )
-    return build("drive", "v3", credentials=credentials)
+    http = httplib2.Http(timeout=API_TIMEOUT)
+    http = google_auth_httplib2.AuthorizedHttp(credentials, http=http)
+    return build("drive", "v3", http=http)
 
 
 def _find_or_create_folder(drive, name: str, parent_id: str) -> str:
@@ -33,8 +38,9 @@ def _find_or_create_folder(drive, name: str, parent_id: str) -> str:
     if cache_key in _folder_cache:
         return _folder_cache[cache_key]
 
+    escaped_name = name.replace("'", "\\'")
     query = (
-        f"name = '{name}' "
+        f"name = '{escaped_name}' "
         f"and '{parent_id}' in parents "
         f"and mimeType = 'application/vnd.google-apps.folder' "
         f"and trashed = false"

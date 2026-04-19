@@ -1,0 +1,102 @@
+{% extends "myapp/base.html" %}
+{% block title %}Biweekly {{ biweekly_start|date:"M j" }} – {{ biweekly_end|date:"M j" }}{% endblock %}
+
+{% block content %}
+<div class="flex items-center justify-between mb-6 gap-3 flex-wrap">
+  <div>
+    <h1 class="text-xl sm:text-2xl font-bold">Biweekly {{ biweekly_start|date:"M j" }} – {{ biweekly_end|date:"M j, Y" }}</h1>
+    <p class="text-xs sm:text-sm text-slate-500">Today is {{ today|date:"l, F j" }}</p>
+  </div>
+  <div class="flex gap-2 text-xs sm:text-sm">
+    <a href="{% url 'calendar_biweekly' prev_biweekly.isoformat %}"
+       class="px-2 sm:px-3 py-1.5 bg-white border rounded hover:bg-slate-50">&larr;</a>
+    <a href="{% url 'calendar_current' %}"
+       class="px-2 sm:px-3 py-1.5 bg-white border rounded hover:bg-slate-50">Today</a>
+    <a href="{% url 'calendar_biweekly' next_biweekly.isoformat %}"
+       class="px-2 sm:px-3 py-1.5 bg-white border rounded hover:bg-slate-50">&rarr;</a>
+  </div>
+</div>
+
+{% for week in weeks %}
+<section class="mb-6 sm:mb-8">
+  <h2 class="text-xs sm:text-sm font-semibold text-slate-500 uppercase tracking-wide mb-2">
+    Week of {{ week.start|date:"M j" }}
+  </h2>
+
+  {# Desktop / tablet grid (hidden on phones) #}
+  <div class="overflow-x-auto hidden md:block">
+    <table class="w-full border-collapse bg-white shadow-sm rounded">
+      <thead>
+        <tr class="bg-slate-100">
+          <th class="w-28 p-2 text-xs font-semibold text-slate-500 text-left border-b border-r">Meal</th>
+          {% for h in week.day_headers %}
+          <th class="p-2 text-left border-b {% if h.date == today %}bg-amber-50{% endif %}">
+            <div class="text-xs text-slate-500">{{ h.label }}</div>
+            <div class="text-sm font-semibold">{{ h.date|date:"M j" }}</div>
+            {% if h.census %}
+              <div class="text-xs text-slate-500 mt-1">
+                <span class="inline-block bg-slate-200 rounded px-1.5">{{ h.census.headcount }} res</span>
+                {% if h.cost %}
+                <span class="inline-block bg-emerald-100 text-emerald-800 rounded px-1.5 font-mono ml-1" title="Day total (priced portions only)">${{ h.cost|floatformat:0 }}</span>
+                {% endif %}
+              </div>
+            {% endif %}
+          </th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in week.rows %}
+        <tr class="hover:bg-slate-50">
+          <th class="p-2 text-xs font-semibold text-slate-600 text-left border-b border-r bg-slate-50">{{ row.slot_label }}</th>
+          {% for cell in row.cells %}
+          <td class="p-2 border-b align-top {% if cell.date == today %}bg-amber-50/50{% endif %}">
+            {% include "myapp/_cell_content.html" with cell=cell %}
+          </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+      {% if week.week_total %}
+      <tfoot>
+        <tr class="bg-slate-50 border-t-2 border-slate-300">
+          <th class="p-2 text-xs font-semibold text-slate-600 text-right">Week total</th>
+          <td colspan="5" class="p-2 text-sm font-mono text-emerald-700 font-semibold">
+            ${{ week.week_total|floatformat:2 }}
+            <span class="text-xs text-slate-500 ml-2">priced portions only</span>
+          </td>
+        </tr>
+      </tfoot>
+      {% endif %}
+    </table>
+  </div>
+
+  {# Phone: day-stacked cards (hidden at md+) #}
+  <div class="space-y-3 md:hidden">
+    {% for day in week.mobile_days %}
+    <div class="bg-white rounded shadow-sm border {% if day.header.date == today %}border-amber-400 ring-1 ring-amber-200{% endif %}">
+      <div class="px-3 py-2 border-b flex items-center justify-between bg-slate-50 rounded-t">
+        <div>
+          <div class="text-[11px] uppercase tracking-wide text-slate-500">{{ day.header.label }}</div>
+          <div class="text-sm font-semibold">{{ day.header.date|date:"M j" }}</div>
+        </div>
+        {% if day.header.census %}
+        <span class="text-xs bg-slate-200 rounded px-2 py-0.5">{{ day.header.census.headcount }} res</span>
+        {% endif %}
+      </div>
+      <div class="divide-y">
+        {% for slot_label, cell in day.slots %}
+        <div class="px-3 py-2 flex items-start gap-2">
+          <div class="text-[10px] font-semibold text-slate-500 uppercase w-20 flex-shrink-0 pt-1">{{ slot_label }}</div>
+          <div class="flex-1 min-w-0 text-sm">
+            {% include "myapp/_cell_content.html" with cell=cell %}
+          </div>
+        </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endfor %}
+  </div>
+</section>
+{% endfor %}
+{% endblock %}

@@ -1,0 +1,19 @@
+{# Manual-search results, injected into the group card. #}
+{% for p in products %}
+<div class="flex items-center justify-between text-sm border rounded px-3 py-1.5">
+  <div>
+    <span class="font-medium">{{ p.canonical_name }}</span>
+    <span class="text-xs text-slate-400 ml-2">[{{ p.category }}]</span>
+  </div>
+  <button
+    type="button"
+    hx-post="{% url 'bridge_link' %}"
+    hx-vals='{"name_raw": "{{ name_raw|escapejs }}", "product_id": "{{ p.id }}"}'
+    hx-target="closest .bg-white"
+    hx-swap="outerHTML"
+    hx-headers='{"X-CSRFToken": "{{ csrf_token }}"}'
+    class="px-2 py-1 bg-indigo-600 text-white text-xs rounded hover:bg-indigo-700">Apply</button>
+</div>
+{% empty %}
+{% if products is not None %}<div class="text-xs text-slate-400">No products match.</div>{% endif %}
+{% endfor %}

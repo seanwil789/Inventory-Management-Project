@@ -1,4 +1,7 @@
 import os
+import re
+from calendar import month_name
+from datetime import date
 from dotenv import load_dotenv
 
 # Always resolve .env and relative paths from the project root (parent of this file's dir)
@@ -15,8 +18,23 @@ CREDENTIALS_PATH = _resolve(os.getenv("GOOGLE_CREDENTIALS_PATH", "invoice_proces
 # Your Google Sheets spreadsheet ID (from the URL: /spreadsheets/d/<ID>/edit)
 SPREADSHEET_ID = os.getenv("SPREADSHEET_ID", "")
 
-# The tab name for the current month's inventory (update each month)
-ACTIVE_SHEET_TAB = os.getenv("ACTIVE_SHEET_TAB", "Synergy Jan 2026")
+
+def _current_synergy_tab() -> str:
+    """
+    Derive the active Synergy tab name from the current date.
+    Returns e.g. 'Synergy Apr 2026' for April 2026.
+
+    Can be overridden via ACTIVE_SHEET_TAB env var if needed.
+    """
+    override = os.getenv("ACTIVE_SHEET_TAB")
+    if override:
+        return override
+    today = date.today()
+    return f"Synergy {month_name[today.month][:3]} {today.year}"
+
+
+# The tab name for the current month's inventory (auto-detected from date)
+ACTIVE_SHEET_TAB = _current_synergy_tab()
 
 # The tab name for the item mapping table
 MAPPING_TAB = os.getenv("MAPPING_TAB", "Item Mapping")
@@ -33,3 +51,8 @@ COL_PRODUCT      = 2   # B
 COL_VENDOR       = 3   # C
 COL_UNIT_PRICE   = 5   # E
 COL_CASE_SIZE    = 6   # F
+
+# Document AI processor settings
+DOCAI_PROJECT_ID   = os.getenv("DOCAI_PROJECT_ID", "")
+DOCAI_LOCATION     = os.getenv("DOCAI_LOCATION", "us")
+DOCAI_PROCESSOR_ID = os.getenv("DOCAI_PROCESSOR_ID", "")

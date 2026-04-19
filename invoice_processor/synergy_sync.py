@@ -48,40 +48,123 @@ COL_PRICE_PER_LB = 10  # J  — Price per pound
 _SKIP_PRODUCTS = {"product", "sub category", ""}
 
 # Fuzzy threshold for matching canonical names to Synergy product names.
-SYNC_FUZZY_THRESHOLD = 78
+SYNC_FUZZY_THRESHOLD = 90
 
 
 # ── Case size parser ──────────────────────────────────────────────────────────
+
+def _looks_like_date(s: str) -> bool:
+    """Return True if the case size string is actually a date, not a real size."""
+    # "4/11/2026", "3/15/22" — M/D/Y with 3 components is always a date
+    if re.match(r'^\d{1,2}/\d{1,2}/\d{2,4}$', s):
+        return True
+    # M/YYYY — e.g. "3/2022", "3/2026"
+    if re.match(r'^\d{1,2}/\d{4}$', s):
+        return True
+    # Leading-zero month: "09/05", "08/03" — real case sizes never zero-pad
+    if re.match(r'^0\d/', s):
+        return True
+    # MM/DD where the second number is > 12 (can't be a sub-unit size)
+    m = re.match(r'^(\d{1,2})/(\d{1,2})$', s)
+    if m:
+        first, second = int(m.group(1)), int(m.group(2))
+        if first <= 12 and second > 12:
+            return True
+    return False
+
 
 def parse_unit_count(case_size: str) -> int | None:
     """
     Extract the number of individual units per case from a case size string.
 
-    Handles the two most common formats:
-      "N/X..."  — N is the unit count  (e.g. "6/1GAL" → 6, "2/5LB" → 2)
-      "NCT/CS"  — N is the unit count  (e.g. "24CT" → 24, "6CS" → 6)
+    Handles formats:
+      "N/X..."  — N is the unit count  (e.g. "6/1GAL" → 6, "4/1" → 4, "12/2" → 12)
+      "NCT/CS"  — N is the unit count  (e.g. "24CT" → 24, "160CT" → 160)
+      "N"       — bare number (e.g. "20", "80") — the case quantity itself
 
-    Returns None for single-measure strings like "12OZ" or "5LB" where there
-    is no meaningful per-unit subdivision, and for anything unparseable.
+    Returns None for values that look like dates, product specs, or unparseable.
     """
     if not case_size:
         return None
 
     s = case_size.strip().upper()
 
-    # Format 1: N/X  — the number before the slash is always the unit count
-    m = re.match(r'^(\d+)\s*/', s)
+    if _looks_like_date(s):
+        return None
+
+    # Format 1: N/M or N/MUNIT — the number before the slash is the unit count
+    m = re.match(r'^(\d+)\s*/\s*(\d+\.?\d*)\s*(?:LB|OZ|GAL|KG|CT|LTR)?\s*$', s)
     if m:
         n = int(m.group(1))
         return n if n > 0 else None
 
-    # Format 2: NCT, NCS, NEA, NPK, NBG  — N units of that type per case
+    # Format 2: NCT, NCS, NEA, NPK, NBG — N units of that type per case
     m = re.match(r'^(\d+)\s*(?:CT|CS|EA|PK|BG)$', s)
     if m:
         n = int(m.group(1))
         return n if n > 0 else None
 
-    # Bare measure (e.g. "12OZ", "5LB", "1GAL") — single item, no subdivision
+    # Format 3: bare number — the total count or weight per case
+    m = re.match(r'^(\d+)$', s)
+    if m:
+        n = int(m.group(1))
+        return n if n > 0 else None
+
+    # Bare measure with unit (e.g. "12OZ", "5LB", "1GAL") — single item
+    return None
+
+
+def parse_total_weight_lbs(case_size: str) -> float | None:
+    """
+    Extract total weight in pounds from a case size string.
+
+    Handles:
+      "N/MLB"  → N × M lbs  (e.g. "2/5LB" → 10, "4/1LB" → 4)
+      "N/MOZ"  → N × M oz / 16  (e.g. "6/32OZ" → 12)
+      "NLB"    → N lbs  (e.g. "50LB" → 50)
+      "N"      → N lbs when combined with unit="#" (caller decides)
+
+    Returns None if weight cannot be determined.
+    """
+    if not case_size:
+        return None
+
+    s = case_size.strip().upper()
+
+    if _looks_like_date(s):
+        return None
+
+    # N/M LB — e.g. "2/5LB" → 2 × 5 = 10 lbs
+    m = re.match(r'^(\d+)\s*/\s*(\d+\.?\d*)\s*LB\s*$', s)
+    if m:
+        count = int(m.group(1))
+        per_unit = float(m.group(2))
+        return count * per_unit if count > 0 else None
+
+    # N/M OZ — e.g. "6/32OZ" → 6 × 32 / 16 = 12 lbs
+    m = re.match(r'^(\d+)\s*/\s*(\d+\.?\d*)\s*OZ\s*$', s)
+    if m:
+        count = int(m.group(1))
+        per_unit_oz = float(m.group(2))
+        return round(count * per_unit_oz / 16, 4) if count > 0 else None
+
+    # N/M KG — e.g. "2/5KG" → 2 × 5 × 2.205 lbs
+    m = re.match(r'^(\d+)\s*/\s*(\d+\.?\d*)\s*KG\s*$', s)
+    if m:
+        count = int(m.group(1))
+        per_unit_kg = float(m.group(2))
+        return round(count * per_unit_kg * 2.205, 4) if count > 0 else None
+
+    # NLB — e.g. "50LB" → 50 lbs
+    m = re.match(r'^(\d+\.?\d*)\s*LB\s*$', s)
+    if m:
+        return float(m.group(1))
+
+    # NOZ — e.g. "12OZ" → 0.75 lbs
+    m = re.match(r'^(\d+\.?\d*)\s*OZ\s*$', s)
+    if m:
+        return round(float(m.group(1)) / 16, 4)
+
     return None
 
 
@@ -95,6 +178,44 @@ def calc_iup(unit_price: float, case_size: str) -> float | None:
     if count is None or count <= 1:
         return None
     return round(unit_price / count, 4)
+
+
+def calc_price_per_lb(unit_price: float, case_size: str,
+                      unit_col: str = "") -> float | None:
+    """
+    Compute Price per Pound = unit_price / total_weight_in_lbs.
+
+    Uses case size to derive total weight. If case size is a bare number
+    and the unit column is "#" (pounds), treats the number as total pounds.
+
+    Returns None if weight cannot be determined or item isn't sold by weight.
+    """
+    # First try extracting weight from case size string with unit suffix
+    weight = parse_total_weight_lbs(case_size)
+    if weight and weight > 0:
+        return round(unit_price / weight, 4)
+
+    # If case size is a bare number and unit is "#" (pounds),
+    # the bare number IS the total weight
+    if unit_col.strip() == "#" and case_size:
+        s = case_size.strip()
+        if _looks_like_date(s):
+            return None
+        # Bare number
+        m = re.match(r'^(\d+\.?\d*)$', s)
+        if m:
+            lbs = float(m.group(1))
+            if lbs > 0:
+                return round(unit_price / lbs, 4)
+        # N/M with unit=# → N × M total pounds
+        m = re.match(r'^(\d+)\s*/\s*(\d+\.?\d*)$', s)
+        if m:
+            n, per = int(m.group(1)), float(m.group(2))
+            total = n * per
+            if total > 0:
+                return round(unit_price / total, 4)
+
+    return None
 
 # ── Category → Synergy section mapping ───────────────────────────────────────
 # Maps (category, primary_descriptor) pairs to the section sub-category label
@@ -146,13 +267,15 @@ def build_sheet_index(sheet_tab: str) -> tuple[list[dict], list[dict]]:
     current_section = ""
 
     for i, row in enumerate(raw, start=1):
-        # Pad to at least 3 columns
-        while len(row) < 3:
+        # Pad to at least 7 columns
+        while len(row) < 7:
             row.append("")
 
-        sub_cat = row[COL_SUB_CATEGORY - 1].strip()
-        product = row[COL_PRODUCT  - 1].strip()
-        vendor  = row[COL_VENDOR   - 1].strip()
+        sub_cat   = row[COL_SUB_CATEGORY - 1].strip()
+        product   = row[COL_PRODUCT  - 1].strip()
+        vendor    = row[COL_VENDOR   - 1].strip()
+        case_size = row[COL_CASE_SIZE - 1].strip() if len(row) >= COL_CASE_SIZE else ""
+        unit      = row[COL_UNIT - 1].strip() if len(row) >= COL_UNIT else ""
 
         # Row 1 is always the column header row — skip
         if i == 1:
@@ -177,6 +300,8 @@ def build_sheet_index(sheet_tab: str) -> tuple[list[dict], list[dict]]:
             "section": current_section,
             "product": product,
             "vendor":  vendor,
+            "case_size": case_size,
+            "unit":    unit,
         })
 
     # Close last section
@@ -288,6 +413,7 @@ def sync_prices_for_tab(sheet_tab: str = None, dry_run: bool = False) -> dict:
 def sync_prices_from_items(
     mapped_items: list[dict],
     vendor: str = "",
+    invoice_date: str = "",
     sheet_tab: str = None,
     dry_run: bool = False,
 ) -> dict:
@@ -296,7 +422,36 @@ def sync_prices_from_items(
     live batch run).  Items must have 'canonical' and 'unit_price' keys.
     vendor is a single vendor name applied to all items when items lack a
     'vendor_name' key.
+
+    Date guard: if invoice_date is provided, only syncs prices when the invoice
+    month matches the active Synergy tab's month.  This prevents old invoices
+    from overwriting current prices during archive reprocessing.
     """
+    tab = sheet_tab or ACTIVE_SHEET_TAB
+
+    # Date guard — skip sync if invoice is from a different month than the tab
+    if invoice_date:
+        try:
+            tab_year, tab_month = parse_tab_month(tab)
+            inv_parts = invoice_date.split("-")
+            inv_year, inv_month = int(inv_parts[0]), int(inv_parts[1])
+            if (inv_year, inv_month) != (tab_year, tab_month):
+                print(f"   [skip] Invoice {invoice_date} is not in tab month "
+                      f"({tab_year}-{tab_month:02d}) — skipping price sync")
+                return {
+                    "updated": 0, "skipped_no_price": 0,
+                    "skipped_no_match": 0, "failed": 0,
+                    "skipped_wrong_month": len(mapped_items),
+                }
+        except (ValueError, IndexError):
+            # Can't parse date — skip sync rather than risk overwriting with wrong-month data
+            print(f"   [!] Could not parse invoice_date '{invoice_date}' — skipping price sync")
+            return {
+                "updated": 0, "skipped_no_price": 0,
+                "skipped_no_match": 0, "failed": 0,
+                "skipped_wrong_month": len(mapped_items),
+            }
+
     # Normalise to the internal format used by _sync_prices_core
     normalised = []
     for it in mapped_items:
@@ -310,7 +465,7 @@ def sync_prices_from_items(
         })
 
     skipped_no_price = len(mapped_items) - len(normalised)
-    result = _sync_prices_core(normalised, sheet_tab=sheet_tab, dry_run=dry_run)
+    result = _sync_prices_core(normalised, sheet_tab=tab, dry_run=dry_run)
     result["skipped_no_price"] += skipped_no_price
     return result
 
@@ -367,7 +522,7 @@ def _sync_prices_core(
             (name, score) for name, score, _ in all_matches
             if score >= SYNC_FUZZY_THRESHOLD
             and fuzz.token_sort_ratio(canonical, name,
-                                      processor=fuzz_utils.default_process) >= 45
+                                      processor=fuzz_utils.default_process) >= 75
         ]
         if not good_matches:
             summary["skipped_no_match"] += 1
@@ -390,13 +545,13 @@ def _sync_prices_core(
             if name.lower().strip() == canonical_lower
         ]
 
+        variant_names = [name for name, score in good_matches if score == 100]
+
         if exact_names:
             # (a) Exact match — only write to this row, ignore longer variants
             for name in exact_names:
                 for row_entry in [p for p in products if p["product"] == name]:
                     target_rows.append(row_entry)
-        else:
-            variant_names = [name for name, score in good_matches if score == 100]
 
         if not target_rows and len(variant_names) > 1:
             # (b) Multiple 100-score subset matches — all are product variants
@@ -440,6 +595,10 @@ def _sync_prices_core(
         for row_entry in target_rows:
             row_num    = row_entry["row"]
             vendor_col = row_entry["vendor"]
+            sheet_unit = row_entry.get("unit", "")
+
+            # Use invoice case size if available, otherwise keep the sheet's
+            effective_case_size = case_size or row_entry.get("case_size", "")
 
             if dry_run:
                 print(f"   [DRY RUN] row {row_num}: '{canonical}' → '{row_entry['product']}'"
@@ -447,7 +606,8 @@ def _sync_prices_core(
                 summary["updated"] += 1
                 continue
 
-            iup = calc_iup(unit_price, case_size)
+            iup = calc_iup(unit_price, effective_case_size)
+            pplb = calc_price_per_lb(unit_price, effective_case_size, sheet_unit)
 
             batch_data.append({
                 "range": f"'{tab}'!E{row_num}",
@@ -463,12 +623,23 @@ def _sync_prices_core(
                     "range": f"'{tab}'!I{row_num}",
                     "values": [[iup]],
                 })
+            if pplb is not None:
+                batch_data.append({
+                    "range": f"'{tab}'!J{row_num}",
+                    "values": [[pplb]],
+                })
 
-            iup_str = f"  IUP=${iup:.4f}" if iup is not None else ""
+            calc_strs = []
+            if iup is not None:
+                calc_strs.append(f"IUP=${iup:.4f}")
+            if pplb is not None:
+                calc_strs.append(f"P/#=${pplb:.4f}")
+            calc_str = "  " + "  ".join(calc_strs) if calc_strs else ""
+
             print(f"   [✓] row {row_num}: '{canonical}' → '{row_entry['product']}'"
                   f" [{vendor_col}] @ ${unit_price:.2f}"
                   + (f" [{case_size}]" if case_size else "")
-                  + iup_str)
+                  + calc_str)
             summary["updated"] += 1
 
     # Flush all writes in one API call
@@ -483,6 +654,155 @@ def _sync_prices_core(
             summary["failed"] = summary["updated"]
             summary["updated"] = 0
 
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 2b.  Metadata sync (vendor + case size from DB → sheet)
+# ─────────────────────────────────────────────────────────────────────────────
+
+def sync_metadata_to_sheet(sheet_tab: str = None, dry_run: bool = False) -> dict:
+    """
+    Push vendor (col C) and case size (col F) from DB to the Synergy sheet.
+    DB is the source of truth.
+
+    For each product row on the sheet:
+      - Vendor: most frequent vendor from InvoiceLineItem for that product
+      - Case size: most recent invoice's case_size for that product
+
+    Only overwrites blank cells or cells with known-bad data. Does NOT
+    overwrite vendor/case_size that are already filled (to preserve manual edits).
+    Pass overwrite=True to force overwrite all.
+
+    Returns summary dict with counts.
+    """
+    _bootstrap_django()
+    from myapp.models import InvoiceLineItem
+    from django.db.models import Count
+
+    tab = sheet_tab or ACTIVE_SHEET_TAB
+    print(f"   Loading Synergy sheet index from '{tab}'...")
+    products, _ = build_sheet_index(tab)
+
+    client = get_sheets_client()
+    batch_data = []
+    vendors_updated = 0
+    case_sizes_updated = 0
+    skipped = 0
+
+    # Known bad case size values to overwrite on the sheet
+    _BAD_CASE_SIZE_SHEET_RE = re.compile(
+        r'^\d{5,}$'       # 5+ digit numbers (SUPC codes)
+        r'|^0+[A-Z]+$'    # 00EA etc.
+        r'|^\d{2}/\d{2}$' # dates like 04/06
+    )
+
+    # Known bad case size values in the DB (don't push these to the sheet)
+    _BAD_CASE_SIZE_DB_RE = re.compile(
+        r'^90/10$'         # cooking oil blend ratio, not case size
+        r'|^UNIT$'         # generic "unit", not a real case size
+        r'|^CS$'           # just "case" with no count
+        r'|^0+(?:EA|CS)$'  # 00EA, 00CS etc.
+        r'|^0/\d+$'        # 0/31, 0/25 — leading zero
+        r'|^\d{5,}$'       # SUPC codes
+    , re.IGNORECASE)
+
+    for entry in products:
+        product_name = entry["product"]
+        row_num = entry["row"]
+        current_vendor = entry["vendor"]
+        current_case_size = entry["case_size"]
+
+        # --- Vendor sync ---
+        if not current_vendor:
+            # Find most frequent vendor for this product
+            top_vendor = (
+                InvoiceLineItem.objects
+                .filter(
+                    product__canonical_name__iexact=product_name,
+                    vendor__isnull=False,
+                )
+                .values('vendor__name')
+                .annotate(c=Count('id'))
+                .order_by('-c')
+                .first()
+            )
+            if top_vendor:
+                vendor_name = top_vendor['vendor__name']
+                if dry_run:
+                    print(f"   [DRY RUN] row {row_num}: '{product_name}' vendor → {vendor_name}")
+                else:
+                    batch_data.append({
+                        "range": f"'{tab}'!C{row_num}",
+                        "values": [[vendor_name]],
+                    })
+                vendors_updated += 1
+
+        # Normalize existing vendor names
+        _VENDOR_NORMALIZE = {
+            "farmart":       "Farm Art",
+            "exceptional":   "Exceptional Foods",
+        }
+        if current_vendor and current_vendor.lower() in _VENDOR_NORMALIZE:
+            corrected = _VENDOR_NORMALIZE[current_vendor.lower()]
+            if dry_run:
+                print(f"   [DRY RUN] row {row_num}: vendor '{current_vendor}' → '{corrected}'")
+            else:
+                batch_data.append({
+                    "range": f"'{tab}'!C{row_num}",
+                    "values": [[corrected]],
+                })
+            vendors_updated += 1
+
+        # --- Case size sync ---
+        should_update_case = (
+            not current_case_size
+            or _BAD_CASE_SIZE_SHEET_RE.match(current_case_size)
+        )
+        if should_update_case:
+            # Find most recent GOOD case size from DB
+            candidates = (
+                InvoiceLineItem.objects
+                .filter(
+                    product__canonical_name__iexact=product_name,
+                    case_size__isnull=False,
+                )
+                .exclude(case_size='')
+                .order_by('-invoice_date', '-imported_at')
+            )
+            latest = None
+            for candidate in candidates[:10]:
+                if not _BAD_CASE_SIZE_DB_RE.match(candidate.case_size):
+                    latest = candidate
+                    break
+
+            if latest and latest.case_size:
+                if dry_run:
+                    print(f"   [DRY RUN] row {row_num}: '{product_name}' case → {latest.case_size}")
+                else:
+                    batch_data.append({
+                        "range": f"'{tab}'!F{row_num}",
+                        "values": [[latest.case_size]],
+                    })
+                case_sizes_updated += 1
+
+    # Flush writes
+    if batch_data and not dry_run:
+        try:
+            client.values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": batch_data},
+            ).execute()
+        except Exception as e:
+            print(f"   [!] Batch metadata update failed: {e}")
+            return {"vendors_updated": 0, "case_sizes_updated": 0, "failed": True}
+
+    summary = {
+        "vendors_updated": vendors_updated,
+        "case_sizes_updated": case_sizes_updated,
+        "failed": False,
+    }
+    print(f"   [✓] Vendors updated: {vendors_updated}, Case sizes updated: {case_sizes_updated}")
     return summary
 
 
@@ -797,8 +1117,8 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
         },
     ).execute()
 
-    # Clear Unit Price (E), IUP (I), and On Hand (H) — skip row 1 (header)
-    print(f"   Clearing prices, IUP, and on-hand quantities...")
+    # Clear Unit Price (E), On Hand (H), IUP (I), and P/# (J) — skip row 1 (header)
+    print(f"   Clearing prices, IUP, P/#, and on-hand quantities...")
     client.values().batchClear(
         spreadsheetId=SPREADSHEET_ID,
         body={
@@ -806,9 +1126,74 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
                 f"'{new_tab_name}'!E2:E",
                 f"'{new_tab_name}'!H2:H",
                 f"'{new_tab_name}'!I2:I",
+                f"'{new_tab_name}'!J2:J",
             ]
         },
     ).execute()
+
+    # Carry forward last known prices from DB for every product on the sheet
+    print(f"   Carrying forward last known prices from DB...")
+    _bootstrap_django()
+    from myapp.models import InvoiceLineItem
+
+    # Build sheet index to get product names + rows
+    products, _ = build_sheet_index(new_tab_name)
+
+    batch_data = []
+    carried = 0
+    for entry in products:
+        product_name = entry["product"]
+        row_num = entry["row"]
+
+        # Find most recent price for this product from any month
+        latest = (
+            InvoiceLineItem.objects
+            .filter(
+                product__canonical_name__iexact=product_name,
+                unit_price__isnull=False,
+                unit_price__gt=0,
+            )
+            .order_by("-invoice_date", "-imported_at")
+            .first()
+        )
+        if not latest:
+            continue
+
+        unit_price = float(latest.unit_price)
+        case_size = latest.case_size or entry.get("case_size", "")
+        sheet_unit = entry.get("unit", "")
+
+        batch_data.append({
+            "range": f"'{new_tab_name}'!E{row_num}",
+            "values": [[unit_price]],
+        })
+
+        iup = calc_iup(unit_price, case_size)
+        pplb = calc_price_per_lb(unit_price, case_size, sheet_unit)
+
+        if iup is not None:
+            batch_data.append({
+                "range": f"'{new_tab_name}'!I{row_num}",
+                "values": [[iup]],
+            })
+        if pplb is not None:
+            batch_data.append({
+                "range": f"'{new_tab_name}'!J{row_num}",
+                "values": [[pplb]],
+            })
+        carried += 1
+
+    if batch_data:
+        client.values().batchUpdate(
+            spreadsheetId=SPREADSHEET_ID,
+            body={"valueInputOption": "USER_ENTERED", "data": batch_data},
+        ).execute()
+
+    print(f"   [✓] Carried forward prices for {carried} products")
+
+    # Sync vendor + case size metadata from DB
+    print(f"   Syncing vendor and case size metadata from DB...")
+    sync_metadata_to_sheet(sheet_tab=new_tab_name, dry_run=dry_run)
 
     print(f"   [✓] Created '{new_tab_name}'")
     return new_tab_name
@@ -830,11 +1215,23 @@ def main():
                         help="Synergy tab name for --find-new (default: ACTIVE_SHEET_TAB)")
     parser.add_argument("--create-month", nargs=2, metavar=("YEAR", "MONTH"),
                         help="Create a new Synergy tab for YEAR MONTH (e.g. 2026 4)")
+    parser.add_argument("--sync-metadata", metavar="TAB",
+                        help="Sync vendor + case size from DB into this tab "
+                             "(e.g. 'Synergy Apr 2026')")
     parser.add_argument("--find-new", action="store_true",
                         help="List canonical names that have no row in the tab")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview without writing anything")
     args = parser.parse_args()
+
+    if args.sync_metadata:
+        _bootstrap_django()
+        tab = args.sync_metadata
+        print(f"\nSyncing metadata for '{tab}'...")
+        summary = sync_metadata_to_sheet(sheet_tab=tab, dry_run=args.dry_run)
+        print(f"\nDone — Vendors: {summary['vendors_updated']}  |  "
+              f"Case sizes: {summary['case_sizes_updated']}")
+        return
 
     if args.sync_tab:
         _bootstrap_django()

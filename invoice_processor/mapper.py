@@ -19,8 +19,9 @@ from sheets import get_sheet_values
 from config import SPREADSHEET_ID, MAPPING_TAB
 
 MAPPING_CACHE_PATH = "invoice_processor/mappings/item_mappings.json"
-FUZZY_THRESHOLD = 80
-STRIPPED_FUZZY_THRESHOLD = 85
+MAPPING_CACHE_TTL_SECONDS = 3600  # 1 hour
+FUZZY_THRESHOLD = 90
+STRIPPED_FUZZY_THRESHOLD = 90
 
 # Sysco brand/vendor prefix codes that precede the actual product description.
 # Multi-word patterns must come before single-word to avoid partial stripping.
@@ -131,8 +132,14 @@ def load_mappings(force_refresh: bool = False) -> dict:
     cache = {"code_map": {}, "desc_map": {}, "vendor_desc_map": {}, "category_map": {}}
 
     if not force_refresh and os.path.exists(MAPPING_CACHE_PATH):
-        with open(MAPPING_CACHE_PATH) as f:
-            return json.load(f)
+        # Check cache age — refresh if older than TTL
+        import time
+        cache_age = time.time() - os.path.getmtime(MAPPING_CACHE_PATH)
+        if cache_age < MAPPING_CACHE_TTL_SECONDS:
+            with open(MAPPING_CACHE_PATH) as f:
+                return json.load(f)
+        else:
+            print(f"  Mapping cache is {cache_age/60:.0f}m old — refreshing from Sheet...")
 
     try:
         rows = get_sheet_values(SPREADSHEET_ID, f"{MAPPING_TAB}!A:G")
@@ -144,7 +151,7 @@ def load_mappings(force_refresh: bool = False) -> dict:
         while len(row) < 7:
             row.append("")
         vendor     = row[0].strip()          # A: vendor
-        raw_desc   = row[1].strip().upper()  # B: item_description
+        raw_desc   = re.sub(r'\s+', ' ', re.sub(r'[/\\]', ' ', row[1].strip())).upper()  # B: item_description (normalized)
         category   = row[2].strip()          # C: category
         primary    = row[3].strip()          # D: primary_descriptor
         secondary  = row[4].strip()          # E: secondary_descriptor
@@ -202,6 +209,15 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
     vendor_desc_map = mappings.get("vendor_desc_map", {})
     category_map    = mappings.get("category_map", {})
 
+    # Guard: don't attempt fuzzy matching on items with no description.
+    # Without a description, fuzzy matching produces garbage results.
+    # Still allow Sysco item code matches (those are reliable without a description).
+    item_code = item.get("sysco_item_code", "")
+    raw_desc = item.get("raw_description", "").strip()
+    if not raw_desc and not item_code:
+        return {**item, "canonical": None, "confidence": "unmatched", "score": 0,
+                "category": "", "primary_descriptor": "", "secondary_descriptor": ""}
+
     vendor_map = vendor_desc_map.get(vendor.upper(), {}) if vendor else {}
 
     def _attach_category(result: dict) -> dict:
@@ -215,7 +231,6 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
         }
 
     # 1. Sysco item code (most reliable)
-    item_code = item.get("sysco_item_code", "")
     if item_code and item_code in code_map:
         return _attach_category({**item, "canonical": code_map[item_code], "confidence": "code", "score": 100})
 
@@ -269,7 +284,7 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
             )
             if result and result[1] >= STRIPPED_FUZZY_THRESHOLD and \
                     fuzz.token_sort_ratio(stripped, result[0],
-                                         processor=fuzz_utils.default_process) >= 55:
+                                         processor=fuzz_utils.default_process) >= 75:
                 best_canonical, score = result[0], result[1]
                 return _attach_category({
                     **item,
@@ -282,10 +297,80 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
             "category": "", "primary_descriptor": "", "secondary_descriptor": ""}
 
 
+_JUNK_RE = re.compile(
+    r'^\s*$'
+    r'|FUEL\s*SURCHARGE'
+    r'|CREDIT\s*CARD\s*(?:SRCHRG|CHARGE)'
+    r'|REMOTE.?STOCK'
+    r'|GROUP\s*TOTAL'
+    r'|ORDER\s*SUMMARY'
+    r'|MISC\s*CHARGES?'
+    r'|CHARGE\s+FOR'
+    r'|SALES\s*TAX'
+    r'|PA\s+SALES\s+TAX'
+    r'|DELIVERY\s*FEE'
+    r'|ASK\s+YOUR\s+MA'
+    r'|\*{3,}'
+    r'|T/WT='
+    r'|DAIRY\s*\*{2}'
+    r'|OUT/STOCK'
+    r'|PART/ORD'
+    r'|SUBSTITUTE\s*$'
+    r'|^COM$'
+    r'|^FS-\w+$'
+    r'|^\d+$'
+    r'|^REMIT\s+TO'
+    r'|^UNITED\s+STATES'
+    r'|^PRICE\s*$'
+    r'|^TOTAL\s*$'
+    r'|^AMOUNT\s*$'
+    r'|^CLOSE:\s*$'
+    r'|^OPEN:\s*$'
+    r'|^P\.?O\.?\s*BOX'
+    r'|^PHILADELPHIA,?\s+PA'
+    r'|^QTY\s+ADJUSTMENT'
+    r'|^INVOICE\s+ADJUSTMENT'
+    r'|^GROSS\s+WT'
+    r'|^SYSCO\s+(?:NATURAL|PRODUCE\s+CAN)'
+    r'|Alley\.?\s+There\s+is'
+    r'|leave\s+at\s+that\s+door'
+    r'|no\s+longer\s+available'
+    r'|can\s+send\s+\d+'
+    r'|figure\s+something\s+else'
+    r'|day\s+notice'
+    r'|^oneless\s'
+    r'|^\d+oz\s+Bulk\s+Pack'
+    r'|DELIVERY\s+[Ss]ervice\s+fee'
+    r'|NOT\s+AVAILABLE'
+    r'|non-stock\s+item\s+delivered'
+    r'|Our\s+Order\s+Number'
+    r'|^1\.00\s+HALF$'
+    r'|^IMP$'
+    r'|^GAR\d+[A-Z]*$'
+    r'|^B\d{3}[A-Z]+$'
+    r'|^BKB\d+[A-Z]+$'
+    r'|^SYR\d+$'
+    r'|^FL-[A-Z]+-\d+$'
+    r'|^6#10$'
+    r'|CANNED\s*&\s*DRY\s*\*'
+    r'|^[\d\s.,/]+$'
+    r'|CHEMICAL\s+JANITORIAL\s+GROUP',
+    re.IGNORECASE,
+)
+
+
+def _is_junk_item(item: dict) -> bool:
+    """Return True if the item is a non-product line (surcharge, header, etc.)."""
+    desc = item.get("raw_description", "")
+    return bool(_JUNK_RE.search(desc))
+
+
 def map_items(parsed_items: list[dict], force_refresh: bool = False,
               mappings: dict = None, vendor: str = "") -> list[dict]:
     """
     Enrich each parsed line item with its canonical name.
+    Automatically filters out junk lines (surcharges, headers, totals)
+    before mapping.
 
     Args:
         parsed_items:  list of item dicts from parse_invoice()
@@ -296,7 +381,20 @@ def map_items(parsed_items: list[dict], force_refresh: bool = False,
     """
     if mappings is None:
         mappings = load_mappings(force_refresh=force_refresh)
-    results  = [resolve_item(item, mappings, vendor=vendor) for item in parsed_items]
+
+    # Filter junk lines before mapping
+    clean_items = []
+    junk_count = 0
+    for item in parsed_items:
+        if _is_junk_item(item):
+            junk_count += 1
+        else:
+            clean_items.append(item)
+
+    if junk_count:
+        print(f"  Filtered {junk_count} non-product lines (surcharges, headers, etc.)")
+
+    results = [resolve_item(item, mappings, vendor=vendor) for item in clean_items]
 
     unmatched = [r for r in results if r["confidence"] == "unmatched"]
     if unmatched:

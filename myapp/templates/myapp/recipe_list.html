@@ -1,0 +1,47 @@
+{% extends "myapp/base.html" %}
+{% block title %}Recipes{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl">
+  <div class="flex items-center justify-between mb-4">
+    <div>
+      <h1 class="text-2xl font-bold">Recipes</h1>
+      <p class="text-sm text-slate-500">
+        {% if q %}{{ match }} of {% endif %}{{ total }} total in your recipe book
+      </p>
+    </div>
+    <form method="get" class="flex gap-2">
+      <input name="q" value="{{ q }}" placeholder="Search by name…"
+             class="border rounded px-3 py-1.5 text-sm w-64" autofocus />
+      <button type="submit" class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Search</button>
+      {% if q %}<a href="{% url 'recipe_list' %}" class="px-3 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Clear</a>{% endif %}
+    </form>
+  </div>
+
+  {% for cat, recipes in groups %}
+  <section class="mb-6">
+    <h2 class="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-2 flex items-center gap-2">
+      <span>{{ cat }}</span>
+      <span class="text-xs font-normal bg-slate-200 text-slate-600 rounded px-2 py-0.5">{{ recipes|length }}</span>
+    </h2>
+    <div class="bg-white rounded shadow-sm border divide-y">
+      {% for r in recipes %}
+      <div class="flex items-center justify-between px-4 py-2 hover:bg-slate-50">
+        <div class="min-w-0">
+          <a href="{% url 'recipe_detail' r.id %}" class="text-indigo-600 hover:underline font-medium">{{ r.name }}</a>
+          {% if r.is_composed %}<span class="text-xs text-emerald-700 ml-2">• composed</span>{% endif %}
+        </div>
+        <div class="text-xs text-slate-500 ml-4 flex-shrink-0">
+          {{ r.ingredient_count }} ingredient{{ r.ingredient_count|pluralize }}
+        </div>
+      </div>
+      {% endfor %}
+    </div>
+  </section>
+  {% empty %}
+  <div class="bg-white rounded border px-4 py-8 text-center text-slate-400 text-sm italic">
+    No recipes match "{{ q }}". <a href="{% url 'recipe_list' %}" class="text-indigo-600">Clear search</a>.
+  </div>
+  {% endfor %}
+</div>
+{% endblock %}

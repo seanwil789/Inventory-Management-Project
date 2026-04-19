@@ -17,6 +17,35 @@ if not os.environ.get('DJANGO_SETTINGS_MODULE'):
     django.setup()
 
 from myapp.models import Vendor, Product, InvoiceLineItem
+from django.db.models import Avg
+
+
+def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:
+    """
+    Check if a price is anomalous compared to the 90-day historical average
+    for this product+vendor. Returns True if price is >2x or <0.5x the average.
+    """
+    from datetime import timedelta
+    cutoff = datetime.now().date() - timedelta(days=90)
+
+    avg_result = (
+        InvoiceLineItem.objects
+        .filter(
+            product=product,
+            vendor=vendor,
+            unit_price__isnull=False,
+            unit_price__gt=0,
+            invoice_date__gte=cutoff,
+        )
+        .aggregate(avg_price=Avg('unit_price'))
+    )
+
+    avg_price = avg_result.get('avg_price')
+    if avg_price is None or avg_price == 0:
+        return False  # no history — can't flag
+
+    ratio = float(unit_price) / float(avg_price)
+    return ratio > 2.0 or ratio < 0.5
 
 
 def write_invoice_to_db(vendor_name: str, invoice_date: str,
@@ -42,6 +71,15 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
     if invoice_date:
         try:
             parsed_date = datetime.strptime(invoice_date, '%Y-%m-%d').date()
+            # Reject dates more than 18 months old or in the future
+            today = datetime.now().date()
+            from datetime import timedelta
+            if parsed_date > today + timedelta(days=7):
+                print(f"  [!] Rejecting future date {parsed_date} — likely OCR error")
+                parsed_date = None
+            elif parsed_date < today - timedelta(days=548):
+                print(f"  [!] Rejecting old date {parsed_date} — more than 18 months ago")
+                parsed_date = None
         except ValueError:
             pass
 
@@ -50,7 +88,9 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         canonical = item.get('canonical')
         product   = Product.objects.filter(canonical_name=canonical).first() if canonical else None
 
-        raw_desc  = '' if product else (item.get('canonical') or item.get('raw_description', ''))
+        # Always preserve the raw description — it's the original invoice text
+        # and is critical for auditing, even when the item is mapped to a product.
+        raw_desc = item.get('raw_description', '')
 
         unit_price = None
         price_raw  = item.get('unit_price')
@@ -60,9 +100,29 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             except InvalidOperation:
                 pass
 
+        confidence = item.get('confidence', '')
+        score = item.get('score')
+        match_score = int(score) if score is not None else None
+
+        # Price anomaly detection: flag if price is >2x or <0.5x historical avg
+        price_flagged = False
+        if product and unit_price and unit_price > 0:
+            price_flagged = _check_price_anomaly(product, vendor, unit_price)
+
         # Upsert: if a record for the same (vendor, date, product/description)
         # already exists, update it rather than creating a duplicate.
         # This makes re-processing invoices safe — prices get refreshed in place.
+        common_fields = dict(
+            unit_price=unit_price,
+            case_size=item.get('case_size_raw', ''),
+            source_file=source_file,
+            product=product,
+            raw_description=raw_desc,
+            match_confidence=confidence,
+            match_score=match_score,
+            price_flagged=price_flagged,
+        )
+
         if product and parsed_date:
             lookup = dict(vendor=vendor, product=product, invoice_date=parsed_date)
         elif parsed_date:
@@ -71,26 +131,22 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             lookup = None  # no reliable key — fall back to plain create
 
         if lookup:
-            InvoiceLineItem.objects.update_or_create(
-                defaults=dict(
-                    unit_price=unit_price,
-                    case_size=item.get('case_size_raw', ''),
-                    source_file=source_file,
-                    # re-link product in case it was unmatched on the first pass
-                    product=product,
-                    raw_description=raw_desc,
-                ),
-                **lookup,
-            )
+            existing = InvoiceLineItem.objects.filter(**lookup).first()
+            if existing:
+                for field, value in common_fields.items():
+                    setattr(existing, field, value)
+                existing.save()
+            else:
+                InvoiceLineItem.objects.create(
+                    vendor=vendor,
+                    invoice_date=parsed_date,
+                    **common_fields,
+                )
         else:
             InvoiceLineItem.objects.create(
                 vendor=vendor,
-                product=product,
-                raw_description=raw_desc,
-                unit_price=unit_price,
-                case_size=item.get('case_size_raw', ''),
                 invoice_date=parsed_date,
-                source_file=source_file,
+                **common_fields,
             )
         written += 1
 

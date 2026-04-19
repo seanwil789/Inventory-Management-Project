@@ -1,0 +1,131 @@
+{% extends "myapp/base.html" %}
+{% load kitchen_filters %}
+{% block title %}Order Guide · {{ start|date:"M j" }}–{{ end|date:"M j" }}{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl">
+  <div class="flex items-start justify-between mb-4 gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-bold">Order Guide</h1>
+      <p class="text-sm text-slate-500">
+        {{ start|date:"M j" }} – {{ end|date:"M j, Y" }} ·
+        {{ included_count }} menu{{ included_count|pluralize }} included ·
+        default headcount {{ default_headcount }} for days without Census
+      </p>
+    </div>
+    <div class="flex gap-2 text-sm">
+      <a href="?start={{ prev_start|date:'Y-m-d' }}" class="px-3 py-1.5 bg-white border rounded hover:bg-slate-50">&larr; Prev week</a>
+      <a href="?" class="px-3 py-1.5 bg-white border rounded hover:bg-slate-50">This week</a>
+      <a href="?start={{ next_start|date:'Y-m-d' }}" class="px-3 py-1.5 bg-white border rounded hover:bg-slate-50">Next week &rarr;</a>
+    </div>
+  </div>
+
+  <form method="get" class="mb-4 flex items-center gap-2 text-sm">
+    <label>Range:</label>
+    <input type="date" name="start" value="{{ start|date:'Y-m-d' }}" class="border rounded px-2 py-1">
+    <span>→</span>
+    <input type="date" name="end" value="{{ end|date:'Y-m-d' }}" class="border rounded px-2 py-1">
+    <button type="submit" class="px-3 py-1 bg-indigo-600 text-white rounded">Recompute</button>
+  </form>
+
+  {% if unlinked_menus %}
+  <div class="mb-4 bg-amber-50 border border-amber-200 rounded p-3 text-sm">
+    <strong>{{ unlinked_menus|length }} menu{{ unlinked_menus|length|pluralize }} skipped</strong> — no linked recipes, and no freetext components with quantities:
+    <ul class="mt-1 ml-5 list-disc text-slate-700">
+      {% for m in unlinked_menus|slice:":10" %}
+      <li>{{ m.date|date:"D M j" }} {{ m.get_meal_slot_display }}: {{ m.dish_freetext|default:"(no name)" }}</li>
+      {% endfor %}
+      {% if unlinked_menus|length > 10 %}<li class="text-slate-500">+{{ unlinked_menus|length|add:"-10" }} more</li>{% endif %}
+    </ul>
+  </div>
+  {% endif %}
+
+  {% for g in vendor_groups %}
+  <section class="mb-5 bg-white rounded shadow-sm border">
+    <div class="px-4 py-2.5 bg-slate-50 border-b flex items-center justify-between">
+      <div class="font-semibold">{{ g.vendor }}</div>
+      {% if g.has_priced %}
+      <div class="text-sm text-slate-700">${{ g.total|floatformat:2 }}</div>
+      {% endif %}
+    </div>
+    <table class="w-full text-sm">
+      <thead class="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+        <tr>
+          <th class="px-4 py-2 text-left">Product</th>
+          <th class="px-4 py-2 text-right w-24">Qty</th>
+          <th class="px-4 py-2 text-left w-20">Unit</th>
+          <th class="px-4 py-2 text-right w-20">@ Price</th>
+          <th class="px-4 py-2 text-right w-24">Line Total</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y">
+        {% for line in g.lines %}
+        <tr class="hover:bg-slate-50">
+          <td class="px-4 py-2">
+            <div class="font-medium">{{ line.product.canonical_name }}</div>
+            <div class="text-xs text-slate-500">{{ line.product.category }}
+              {% if line.contributors %} · from {{ line.contributors|join:", " }}{% endif %}
+            </div>
+          </td>
+          <td class="px-4 py-2 text-right font-mono">{{ line.qty|floatformat:2 }}</td>
+          <td class="px-4 py-2 text-slate-500">{{ line.unit }}</td>
+          <td class="px-4 py-2 text-right text-slate-500">
+            {% if line.unit_price %}${{ line.unit_price|floatformat:2 }}{% else %}—{% endif %}
+          </td>
+          <td class="px-4 py-2 text-right font-mono">
+            {% if line.line_total %}${{ line.line_total|floatformat:2 }}{% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% empty %}
+  <div class="bg-slate-50 border rounded p-6 text-center text-slate-500 text-sm italic">
+    No recipe-linked ingredients in this range. Author menus with linked recipes to see an order guide.
+  </div>
+  {% endfor %}
+
+  {% if unlinked_names %}
+  <section class="mb-5 bg-white rounded shadow-sm border">
+    <div class="px-4 py-2.5 bg-amber-50 border-b flex items-center justify-between">
+      <div class="font-semibold text-amber-800">Unlinked ingredients (need Product in catalog)</div>
+      <div class="text-xs text-amber-700">{{ unlinked_names|length }} items</div>
+    </div>
+    <table class="w-full text-sm">
+      <tbody class="divide-y">
+        {% for line in unlinked_names %}
+        <tr>
+          <td class="px-4 py-2">{{ line.name_raw }}</td>
+          <td class="px-4 py-2 text-right font-mono w-24">{{ line.qty|floatformat:2 }}</td>
+          <td class="px-4 py-2 text-slate-500 w-20">{{ line.unit }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endif %}
+
+  {% if freetext_list %}
+  <section class="mb-5 bg-white rounded shadow-sm border">
+    <div class="px-4 py-2.5 bg-slate-50 border-b font-semibold text-slate-600">
+      Menu-level freetext components
+      <span class="text-xs font-normal text-slate-500 ml-2">(scaled roughly; no product/vendor)</span>
+    </div>
+    <ul class="text-sm divide-y">
+      {% for f in freetext_list %}
+      <li class="px-4 py-1.5 flex justify-between">
+        <span>
+          <span class="text-slate-500 text-xs mr-2">{{ f.menu_date|date:"D M j" }} {{ f.meal_slot }}</span>
+          {{ f.name }}
+        </span>
+        <span class="text-slate-500">
+          {% if f.qty %}{{ f.qty|floatformat:2 }} {{ f.unit }}{% else %}—{% endif %}
+        </span>
+      </li>
+      {% endfor %}
+    </ul>
+  </section>
+  {% endif %}
+</div>
+{% endblock %}

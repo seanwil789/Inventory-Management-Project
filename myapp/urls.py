@@ -1,0 +1,33 @@
+from django.urls import path
+
+from . import views
+
+urlpatterns = [
+    path('',                                views.calendar_current,    name='calendar_current'),
+    path('biweekly/<str:start_date_str>/',  views.calendar_biweekly,   name='calendar_biweekly'),
+    path('menu/new/',                       views.menu_new,            name='menu_new'),
+    path('menu/component-row/',             views.menu_component_row,    name='menu_component_row'),
+    path('menu/autofill-components/',       views.menu_autofill_components, name='menu_autofill_components'),
+    path('menu/<int:menu_id>/',             views.menu_detail,         name='menu_detail'),
+    path('menu/<int:menu_id>/edit/',        views.menu_edit,           name='menu_edit'),
+    path('menu/<int:menu_id>/delete/',      views.menu_delete,         name='menu_delete'),
+    path('menu/<int:menu_id>/save-prefab/', views.menu_save_prefab,    name='menu_save_prefab'),
+    path('bridge/',                         views.bridge_review,         name='bridge_review'),
+    path('bridge/link/',                    views.bridge_link,           name='bridge_link'),
+    path('bridge/skip/',                    views.bridge_skip,           name='bridge_skip'),
+    path('bridge/search/',                  views.bridge_search_products, name='bridge_search_products'),
+    path('bridge/skipped/',                 views.bridge_skipped,        name='bridge_skipped'),
+    path('bridge/unskip/<int:note_id>/',    views.bridge_unskip,         name='bridge_unskip'),
+    path('prep/',                           views.prep_list,           name='prep_list'),
+    path('prep/<int:task_id>/toggle/',      views.preptask_toggle,     name='preptask_toggle'),
+    path('order-guide/',                    views.order_guide,         name='order_guide'),
+    path('display/',                        views.kitchen_display,     name='kitchen_display'),
+    path('recipes/',                        views.recipe_list,         name='recipe_list'),
+    path('recipe/<int:recipe_id>/',         views.recipe_detail,       name='recipe_detail'),
+    path('recipe/<int:recipe_id>/edit/',    views.recipe_edit,         name='recipe_edit'),
+    path('yields/',                         views.yield_list,          name='yield_list'),
+    path('yields/new/',                     views.yield_edit,          name='yield_new'),
+    path('yields/bridge/',                  views.yield_bridge,        name='yield_bridge'),
+    path('yields/<int:yield_id>/edit/',     views.yield_edit,          name='yield_edit'),
+    path('yields/<int:yield_id>/delete/',   views.yield_delete,        name='yield_delete'),
+]

@@ -1,0 +1,26 @@
+{# Component row — recipe dropdown grouped by protein, or structured freetext. #}
+<div class="component-row flex gap-2 items-center">
+  <select name="component_recipe_id" class="border rounded px-2 py-1 text-sm w-64">
+    <option value="">— pick recipe or use freetext →</option>
+    {% for group_label, group_recipes in recipes_by_protein %}
+    <optgroup label="{{ group_label }}">
+      {% for r in group_recipes %}
+      <option value="{{ r.id }}" {% if row.recipe_id == r.id %}selected{% endif %}>{{ r.name }}{% if r.popularity == 'high' %} 🟢{% elif r.popularity == 'medium' %} 🟡{% elif r.popularity == 'low' %} 🔴{% endif %}{% if r.fat_health %} ({{ r.fat_health }}){% endif %}</option>
+      {% endfor %}
+    </optgroup>
+    {% endfor %}
+  </select>
+  <span class="text-xs text-slate-400">or</span>
+  <input type="text" name="component_freetext_name" value="{{ row.freetext_name }}"
+         placeholder="freetext name (e.g. Shrimp)"
+         class="border rounded px-2 py-1 text-sm flex-1" />
+  <input type="number" name="component_freetext_qty" value="{{ row.freetext_qty }}"
+         step="0.001" placeholder="qty"
+         class="border rounded px-2 py-1 text-sm w-20" />
+  <input type="text" name="component_freetext_unit" value="{{ row.freetext_unit }}"
+         placeholder="unit"
+         class="border rounded px-2 py-1 text-sm w-20" />
+  <button type="button" onclick="this.closest('.component-row').remove()"
+          class="text-red-500 hover:bg-red-50 rounded w-7 h-7 flex items-center justify-center"
+          title="Remove this component">×</button>
+</div>

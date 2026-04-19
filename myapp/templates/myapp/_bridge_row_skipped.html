@@ -1,0 +1,6 @@
+{# HTMX response after Skip — collapsed row with reason shown. #}
+<div class="bg-slate-50 border rounded p-2 text-xs text-slate-600 flex items-center gap-2">
+  <span class="font-semibold">Skipped:</span>
+  <span>{{ name_raw }}</span>
+  {% if reason %}<span class="text-slate-400">— {{ reason }}</span>{% endif %}
+</div>

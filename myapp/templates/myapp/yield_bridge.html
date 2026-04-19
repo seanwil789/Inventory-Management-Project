@@ -1,0 +1,72 @@
+{% extends "myapp/base.html" %}
+{% block title %}Link yields to recipe ingredients{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl">
+  <a href="{% url 'yield_list' %}" class="text-sm text-indigo-600 hover:underline">&larr; Yield list</a>
+
+  <div class="mt-4 bg-white rounded shadow-sm p-6">
+    <h1 class="text-2xl font-bold">Link yields to recipe ingredients</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Ingredients where a Book-of-Yields entry likely applies — pick one from the dropdown,
+      then hit Save at the bottom to link all instances at once.
+    </p>
+    <p class="text-xs text-slate-400 mt-1">
+      Pantry/100%-yield ingredients (salt, flour, sugar, spices, dairy) are filtered out —
+      they don't need BoY refs.
+    </p>
+
+    {% if messages %}
+      {% for m in messages %}
+      <div class="mt-3 px-3 py-2 rounded bg-green-50 text-green-800 text-sm">{{ m }}</div>
+      {% endfor %}
+    {% endif %}
+
+    <form method="post" class="mt-5">
+      {% csrf_token %}
+      <div class="border rounded divide-y bg-slate-50">
+        <div class="grid grid-cols-12 gap-2 px-3 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
+          <div class="col-span-1 text-center">Uses</div>
+          <div class="col-span-4">Ingredient (name_raw)</div>
+          <div class="col-span-7">Pick yield reference</div>
+        </div>
+
+        {% for r in rows %}
+        <div class="grid grid-cols-12 gap-2 px-3 py-2 items-center bg-white">
+          <div class="col-span-1 text-center font-mono text-sm text-slate-700">{{ r.count }}</div>
+          <div class="col-span-4 text-sm font-medium">{{ r.name_lc }}</div>
+          <div class="col-span-7">
+            <select name="ref_for_{{ r.name_lc }}"
+                    class="border rounded px-2 py-1 w-full text-sm">
+              <option value="">— skip —</option>
+              {% for c in r.candidates %}
+              <option value="{{ c.id }}">
+                {{ c.ingredient }}{% if c.prep_state %}, {{ c.prep_state }}{% endif %}
+                {% if c.yield_pct %} · {{ c.yield_pct|floatformat:"-2" }}%{% endif %}
+                · {{ c.get_section_display }} ({{ c.source_ref }})
+              </option>
+              {% endfor %}
+            </select>
+          </div>
+        </div>
+        {% empty %}
+        <div class="px-4 py-8 text-center text-slate-400 text-sm italic">
+          Nothing left to bridge. Every candidate ingredient is already linked (or filtered as pantry).
+        </div>
+        {% endfor %}
+      </div>
+
+      {% if rows %}
+      <div class="mt-4 flex items-center gap-2">
+        <button type="submit" class="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">
+          Save selections
+        </button>
+        <span class="text-xs text-slate-500">
+          Blank dropdowns stay unlinked (you can come back).
+        </span>
+      </div>
+      {% endif %}
+    </form>
+  </div>
+</div>
+{% endblock %}

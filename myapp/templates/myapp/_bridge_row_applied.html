@@ -1,0 +1,8 @@
+{# HTMX response after Apply — replaces the group card with a confirmation. #}
+<div class="bg-emerald-50 border border-emerald-200 rounded p-3 text-sm flex items-center gap-2">
+  <span class="text-emerald-700 font-semibold">✓</span>
+  <span class="text-emerald-800">
+    Linked <strong>{{ name_raw }}</strong> → <strong>{{ product.canonical_name }}</strong>
+    ({{ count }} ingredient{{ count|pluralize }} updated)
+  </span>
+</div>

@@ -1,0 +1,18 @@
+{% extends "myapp/base.html" %}
+{% block title %}Delete {{ menu.dish_freetext }}?{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl">
+  <div class="bg-white rounded shadow-sm p-6">
+    <h1 class="text-xl font-bold mb-2">Delete menu item?</h1>
+    <p class="text-slate-600 mb-4">
+      {{ menu.date|date:"l, F j" }} — {{ menu.get_meal_slot_display }}: <strong>{{ menu.dish_freetext }}</strong>
+    </p>
+    <form method="post" class="flex gap-2">
+      {% csrf_token %}
+      <button type="submit" class="px-4 py-1.5 bg-red-600 text-white text-sm rounded hover:bg-red-700">Delete</button>
+      <a href="{% url 'menu_detail' menu.id %}" class="px-4 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Cancel</a>
+    </form>
+  </div>
+</div>
+{% endblock %}

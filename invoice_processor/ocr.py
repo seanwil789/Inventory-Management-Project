@@ -32,12 +32,27 @@ def extract_text(image_path: str) -> str:
     """
     Run OCR on a local file (image or PDF). Returns the full raw text detected.
     For PDFs, each page is OCR'd and the results are concatenated.
+
+    Results are cached locally by file content hash to avoid repeat API charges.
     """
+    import ocr_cache
+    cached = ocr_cache.get(image_path, "vision_ocr")
+    if cached is not None:
+        print(f"   [Vision] Cache hit — skipping API call")
+        return cached
+
     client = get_vision_client()
 
+    MAX_PDF_PAGES = 30  # safety limit to prevent OOM on huge PDFs
+
     if image_path.lower().endswith(".pdf"):
-        from pdf2image import convert_from_path
-        pages = convert_from_path(image_path, dpi=200)
+        from pdf2image import convert_from_path, pdfinfo_from_path
+        info = pdfinfo_from_path(image_path)
+        total_pages = info.get("Pages", 0)
+        if total_pages > MAX_PDF_PAGES:
+            print(f"  [!] PDF has {total_pages} pages, limiting OCR to first {MAX_PDF_PAGES}")
+        pages = convert_from_path(image_path, dpi=200,
+                                  last_page=min(total_pages, MAX_PDF_PAGES) if total_pages else None)
         texts = []
         for page in pages:
             with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as tmp:
@@ -49,8 +64,12 @@ def extract_text(image_path: str) -> str:
                 texts.append(_ocr_image_bytes(client, content))
             finally:
                 os.remove(tmp_path)
-        return "\n".join(texts)
+        result = "\n".join(texts)
+        ocr_cache.put(image_path, "vision_ocr", result)
+        return result
 
     with open(image_path, "rb") as f:
         content = f.read()
-    return _ocr_image_bytes(client, content)
+    result = _ocr_image_bytes(client, content)
+    ocr_cache.put(image_path, "vision_ocr", result)
+    return result

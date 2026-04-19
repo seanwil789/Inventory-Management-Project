@@ -1,0 +1,46 @@
+{% load static %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Kitchen{% endblock %}</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <script src="https://unpkg.com/htmx.org@1.9.12"></script>
+  <style>
+    [x-cloak] { display: none !important; }
+  </style>
+</head>
+<body class="bg-slate-50 text-slate-800 min-h-screen">
+  <header class="bg-slate-900 text-white px-4 sm:px-6 py-3 flex justify-between items-center gap-3">
+    <div class="flex items-baseline gap-2 sm:gap-4">
+      <a href="{% url 'calendar_current' %}" class="text-base sm:text-lg font-semibold">Kitchen</a>
+      <span class="text-slate-400 text-xs sm:text-sm hidden sm:inline">Wentworth</span>
+    </div>
+    <nav class="text-xs sm:text-sm flex gap-3 sm:gap-4">
+      <a href="{% url 'calendar_current' %}" class="hover:text-slate-200">Calendar</a>
+      <a href="{% url 'prep_list' %}" class="hover:text-slate-200">Prep</a>
+      <a href="{% url 'order_guide' %}" class="hover:text-slate-200">Order</a>
+      <a href="{% url 'recipe_list' %}" class="hover:text-slate-200">Recipes</a>
+      <a href="{% url 'yield_list' %}" class="hover:text-slate-200">Yields</a>
+      <a href="{% url 'bridge_review' %}" class="hover:text-slate-200">Bridge</a>
+      <a href="/admin/" class="hover:text-slate-200">Admin</a>
+    </nav>
+  </header>
+  <main class="max-w-7xl mx-auto p-3 sm:p-6">
+    {% if messages %}
+      <div class="mb-4 space-y-2">
+        {% for m in messages %}
+        <div class="px-4 py-2 rounded text-sm
+          {% if 'error' in m.tags %}bg-red-50 border border-red-200 text-red-700
+          {% elif 'success' in m.tags %}bg-emerald-50 border border-emerald-200 text-emerald-800
+          {% else %}bg-slate-100 text-slate-800{% endif %}">
+          {{ m }}
+        </div>
+        {% endfor %}
+      </div>
+    {% endif %}
+    {% block content %}{% endblock %}
+  </main>
+</body>
+</html>

@@ -1,0 +1,72 @@
+{% extends "myapp/base.html" %}
+{% load kitchen_filters %}
+{% block title %}{{ menu.dish_freetext }} — {{ menu.date }}{% endblock %}
+
+{% block content %}
+<div class="max-w-2xl">
+  <a href="{% url 'calendar_biweekly' menu.date.isoformat %}" class="text-sm text-indigo-600 hover:underline">&larr; Back to calendar</a>
+
+  <div class="mt-4 bg-white rounded shadow-sm p-6">
+    <div class="text-xs uppercase tracking-wide text-slate-500">
+      {{ menu.date|date:"l, F j" }} — {{ menu.get_meal_slot_display }}
+    </div>
+    <h1 class="text-2xl font-bold mt-1">{{ menu.dish_freetext|default:"(no meal name)" }}</h1>
+
+    <div class="mt-2 flex gap-2 items-center flex-wrap">
+      {% if menu.additional_recipes.count %}
+      <span class="text-xs uppercase font-semibold tracking-wide bg-indigo-100 text-indigo-700 rounded px-2 py-0.5">
+        📖 {{ menu.additional_recipes.count }} linked recipe{{ menu.additional_recipes.count|pluralize }}
+      </span>
+      {% endif %}
+      {% if menu.assignee %}
+      <span class="text-xs uppercase font-semibold tracking-wide
+        {% if menu.assignee == 'sean' %}bg-blue-100 text-blue-700{% else %}bg-emerald-100 text-emerald-700{% endif %}
+        rounded px-2 py-0.5">
+        {{ menu.get_assignee_display }}
+      </span>
+      {% endif %}
+    </div>
+
+    {% if menu.additional_recipes.all or menu.freetext_components.all %}
+    <div class="mt-5">
+      <div class="text-xs uppercase font-semibold text-slate-500 tracking-wide mb-2">Components</div>
+      <ul class="text-sm text-slate-700 border rounded divide-y">
+        {% for comp in menu.additional_recipes.all %}
+        <li class="flex justify-between px-3 py-1.5">
+          <a href="{% url 'recipe_detail' comp.id %}" class="text-indigo-600 hover:underline">📖 {{ comp.name }}</a>
+          <span class="text-xs text-slate-500">{{ comp.ingredients.count }} ingredient{{ comp.ingredients.count|pluralize }}</span>
+        </li>
+        {% endfor %}
+        {% for fc in menu.freetext_components.all %}
+        <li class="flex justify-between px-3 py-1.5">
+          <span class="text-slate-700">✏️ {{ fc.name }}</span>
+          <span class="text-xs text-slate-500">
+            {% if fc.quantity %}{{ fc.quantity|pretty_qty }} {{ fc.unit }}{% else %}—{% endif %}
+          </span>
+        </li>
+        {% endfor %}
+      </ul>
+      <form method="post" action="{% url 'menu_save_prefab' menu.id %}" class="mt-3 flex items-center gap-2">
+        {% csrf_token %}
+        <input name="prefab_name" required placeholder="Name this meal (e.g. Cajun Shrimp and Grits)"
+               class="border rounded px-2 py-1 text-sm flex-1" />
+        <button type="submit" class="px-3 py-1.5 bg-emerald-600 text-white text-sm rounded hover:bg-emerald-700"
+                title="Create a reusable recipe from these components and link this slot to it">💾 Save as meal</button>
+      </form>
+    </div>
+    {% endif %}
+
+    <div class="mt-6 flex flex-wrap gap-2">
+      <a href="{% url 'menu_edit' menu.id %}"
+         class="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700"
+         title="Change the meal name, components, date, or assignee">Edit meal</a>
+      <a href="{% url 'menu_delete' menu.id %}"
+         class="px-4 py-1.5 bg-white border border-red-300 text-red-600 text-sm rounded hover:bg-red-50">Delete</a>
+    </div>
+
+    <p class="mt-3 text-xs text-slate-500">
+      To edit a linked recipe's ingredients, click its name in the Components list above.
+    </p>
+  </div>
+</div>
+{% endblock %}
