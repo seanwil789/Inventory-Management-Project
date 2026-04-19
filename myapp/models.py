@@ -369,3 +369,44 @@ class Census(models.Model):
 
     def __str__(self):
         return f"{self.date}: {self.headcount}"
+
+
+class StandardPortionReference(models.Model):
+    """Canonical per-portion sizes from Book of Yields 8e Chapter 15.
+
+    Values stored as strings to preserve source fidelity ('1/4th whole 3 lb
+    fryer', '3 strips', '5 fl. oz.' etc.). App-layer parses when needed.
+    """
+    CATEGORY_CHOICES = [
+        ('soup_salad_bread', 'Soup, Salad, Bread'),
+        ('beef_entrees', 'Beef Entrees'),
+        ('chicken_entrees', 'Chicken Entrees'),
+        ('seafood_entrees', 'Seafood Entrees'),
+        ('pork_entrees', 'Pork Entrees'),
+        ('veal', 'Veal'),
+        ('pasta_entree', 'Pasta Entree'),
+        ('potatoes', 'Potatoes'),
+        ('desserts', 'Desserts'),
+        ('beverages', 'Beverages'),
+        ('breakfast_items', 'Breakfast Items'),
+        ('lunch_items', 'Lunch Items'),
+        ('hors_doeuvre', "Hors d'Oeuvre"),
+    ]
+
+    menu_item        = models.CharField(max_length=120)
+    category         = models.CharField(max_length=32, choices=CATEGORY_CHOICES)
+    average_measure  = models.CharField(max_length=40, blank=True)
+    low_range        = models.CharField(max_length=40, blank=True)
+    high_range       = models.CharField(max_length=40, blank=True)
+    source           = models.CharField(max_length=60, default='Book of Yields 8e Ch 15')
+    source_ref       = models.CharField(max_length=20, blank=True)
+
+    class Meta:
+        ordering = ['category', 'menu_item']
+        indexes = [models.Index(fields=['category', 'menu_item'])]
+        constraints = [
+            models.UniqueConstraint(fields=['category', 'menu_item'], name='uniq_portion_by_category_item'),
+        ]
+
+    def __str__(self):
+        return f"{self.menu_item} ({self.average_measure})"
