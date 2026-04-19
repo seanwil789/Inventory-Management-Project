@@ -4,6 +4,23 @@ __pycache__/
 db.sqlite3
 .env
 staticfiles/
+
+# Credentials & cached mappings
 invoice_processor/credentials/*.json
-invoice_processor/mappings/item_mappings.json
+invoice_processor/mappings/
+invoice_processor/invoice_processor/
+invoice_processor/*_report.json
+invoice_processor/*_report.txt
+
+# Runtime caches & logs
 logs/
+.ocr_cache/
+.invoice_totals/
+
+# Sensitive / proprietary operational data — sync externally
+.kitchen_ops/
+Men's Wentworth Food Budget*.csv
+OneDrive_*.zip
+
+# Reference material (copyrighted published work)
+The-Book-of-Yields*.pdf
