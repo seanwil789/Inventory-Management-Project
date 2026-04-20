@@ -3,7 +3,19 @@ from .models import (
     Vendor, Product, ProductMapping, InvoiceLineItem,
     Recipe, RecipeIngredient, Menu, PrepTask, Census,
     IngredientSkipNote, YieldReference, StandardPortionReference,
+    MealService,
 )
+
+
+@admin.register(MealService)
+class MealServiceAdmin(admin.ModelAdmin):
+    list_display = ('menu', 'prepped_qty', 'post_service_leftover_qty',
+                    'discarded_qty', 'unit', 'updated_at')
+    list_filter = ('menu__meal_slot',)
+    search_fields = ('menu__dish_freetext',)
+    date_hierarchy = 'created_at'
+    autocomplete_fields = ('menu',)
+    readonly_fields = ('created_at', 'updated_at')
 
 
 @admin.register(StandardPortionReference)

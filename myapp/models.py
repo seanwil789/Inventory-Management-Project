@@ -436,6 +436,72 @@ class Census(models.Model):
         return f"{self.date}: {self.headcount}"
 
 
+class MealService(models.Model):
+    """Per-menu-slot service record: how much was prepped, how much leftover,
+    how much discarded (and when). Foundation for the popularity-learning loop
+    per `project_popularity_learning.md`.
+
+    Two-touchpoint capture (not yet UI'd — schema only):
+      - **Cleanup (post-service):** fill prepped_qty + post_service_leftover_qty
+      - **Disposal (at shelf-life end, rare):** fill discarded_qty + discarded_at
+
+    Derived signals (application-layer, not stored):
+      - immediate_eat_rate = (prepped - leftover) / prepped
+      - redemption_rate = (leftover - discarded) / leftover  (when leftover > 0)
+      - total_consumption_rate = (prepped - discarded) / prepped  ← the master signal
+
+    Unit is per-dish and carried on this row (pans, portions, lbs, etc.) — the
+    memory's design decision is to not try to normalize across dishes.
+    """
+    menu = models.ForeignKey(Menu, on_delete=models.CASCADE, related_name='service_records')
+    prepped_qty = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True,
+                                      help_text="Amount prepped for service, in the dish's native unit.")
+    post_service_leftover_qty = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True,
+                                                    help_text="Amount leftover after service; goes to client fridge.")
+    discarded_qty = models.DecimalField(max_digits=8, decimal_places=3, null=True, blank=True,
+                                        help_text="Amount discarded at shelf-life end. Usually 0.")
+    discarded_at = models.DateTimeField(null=True, blank=True,
+                                        help_text="When disposal happened (typically day 5 of leftover shelf life).")
+    unit = models.CharField(max_length=30, blank=True,
+                            help_text="Per-dish convention: pans, portions, lbs, etc.")
+    notes = models.TextField(blank=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        indexes = [
+            models.Index(fields=['menu']),
+            models.Index(fields=['discarded_at']),
+        ]
+        ordering = ['-created_at']
+
+    def __str__(self):
+        return f"MealService {self.menu.date} {self.menu.meal_slot}: prepped={self.prepped_qty} leftover={self.post_service_leftover_qty}"
+
+    @property
+    def immediate_eat_rate(self):
+        """Fraction eaten at service (before leftovers). None if inputs missing."""
+        if not self.prepped_qty or self.post_service_leftover_qty is None:
+            return None
+        from decimal import Decimal
+        if self.prepped_qty == 0:
+            return None
+        return ((self.prepped_qty - self.post_service_leftover_qty)
+                / self.prepped_qty).quantize(Decimal('0.001'))
+
+    @property
+    def total_consumption_rate(self):
+        """Master popularity signal: (prepped - discarded) / prepped.
+        If discarded is null, treat as 0 (no disposal recorded = nothing thrown out)."""
+        if not self.prepped_qty:
+            return None
+        from decimal import Decimal
+        discarded = self.discarded_qty or Decimal('0')
+        if self.prepped_qty == 0:
+            return None
+        return ((self.prepped_qty - discarded) / self.prepped_qty).quantize(Decimal('0.001'))
+
+
 class StandardPortionReference(models.Model):
     """Canonical per-portion sizes from Book of Yields 8e Chapter 15.
 
