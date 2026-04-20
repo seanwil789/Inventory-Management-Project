@@ -163,6 +163,15 @@ class Recipe(models.Model):
                                       help_text="Dietary conflicts this recipe CONTAINS (Big 15 vocab). "
                                                 "Used for client-dietary-safety matching.")
 
+    # Learned popularity (auto-updated by signal on MealService save)
+    learned_consumption_rate = models.DecimalField(
+        max_digits=5, decimal_places=3, null=True, blank=True,
+        help_text="Rolling avg total_consumption_rate from last ~10 services. "
+                  "Null when fewer than 3 samples (fall back to 0.80 baseline).")
+    learned_sample_count = models.IntegerField(
+        default=0,
+        help_text="Number of MealService samples backing learned_consumption_rate.")
+
     # Ontology + versioning (authoring flow)
     level          = models.CharField(max_length=20, choices=LEVEL_CHOICES, default='recipe',
                                       help_text="recipe = ingredients only; composed_dish = has sub_recipes; "

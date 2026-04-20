@@ -2153,15 +2153,31 @@ def _score_candidate(recipe: Recipe, target_date: date, slot: str,
                 reasons.append(f'same F/H as today {other_slot}')
                 break
 
-    # --- Popularity
-    if recipe.popularity == 'high':
-        score += 3
-        reasons.append('popular 👍')
-    elif recipe.popularity == 'medium':
-        score += 1
-    elif recipe.popularity == 'low':
-        score -= 2
-        reasons.append('low popularity')
+    # --- Popularity: prefer learned rate when we have enough samples
+    if recipe.learned_consumption_rate is not None and recipe.learned_sample_count >= 3:
+        rate = float(recipe.learned_consumption_rate)
+        if rate >= 0.92:
+            score += 4
+            reasons.append(f'learned 👍 {rate:.0%} over {recipe.learned_sample_count}x')
+        elif rate >= 0.80:
+            score += 2
+            reasons.append(f'learned OK {rate:.0%} over {recipe.learned_sample_count}x')
+        elif rate >= 0.65:
+            score -= 1
+            reasons.append(f'learned meh {rate:.0%} over {recipe.learned_sample_count}x')
+        else:
+            score -= 3
+            reasons.append(f'learned 👎 {rate:.0%} over {recipe.learned_sample_count}x')
+    else:
+        # Fall back to manual Menu-Guide popularity tag
+        if recipe.popularity == 'high':
+            score += 3
+            reasons.append('popular 👍')
+        elif recipe.popularity == 'medium':
+            score += 1
+        elif recipe.popularity == 'low':
+            score -= 2
+            reasons.append('low popularity')
 
     return score, reasons
 

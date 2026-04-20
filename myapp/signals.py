@@ -61,6 +61,67 @@ def menu_post_save_derive_prep(sender, instance, created, **kwargs):
             'PrepTask auto-derivation failed for menu %s', instance.pk)
 
 
+ROLLING_SAMPLE_SIZE = 10
+MIN_SAMPLES_FOR_LEARNED = 3
+
+
+def _recompute_learned_popularity(recipe) -> bool:
+    """Recompute Recipe.learned_consumption_rate from this recipe's last N
+    MealService records. Returns True if Recipe changed."""
+    from .models import MealService
+    from decimal import Decimal
+
+    # All services where this recipe is linked (direct or via additional_recipes)
+    services = (MealService.objects
+                .filter(menu__recipe=recipe)
+                .order_by('-created_at'))
+    via_m2m = (MealService.objects
+               .filter(menu__additional_recipes=recipe)
+               .order_by('-created_at'))
+    combined = list(services) + [s for s in via_m2m if s.pk not in {x.pk for x in services}]
+    combined.sort(key=lambda s: s.created_at or s.menu.date, reverse=True)
+    combined = combined[:ROLLING_SAMPLE_SIZE]
+
+    rates = [s.total_consumption_rate for s in combined if s.total_consumption_rate is not None]
+
+    old_rate = recipe.learned_consumption_rate
+    old_count = recipe.learned_sample_count
+
+    if len(rates) >= MIN_SAMPLES_FOR_LEARNED:
+        avg = sum(rates) / len(rates)
+        new_rate = avg.quantize(Decimal('0.001'))
+        new_count = len(rates)
+    else:
+        new_rate = None  # falls back to 0.80 baseline at callers
+        new_count = len(rates)
+
+    if new_rate != old_rate or new_count != old_count:
+        recipe.learned_consumption_rate = new_rate
+        recipe.learned_sample_count = new_count
+        recipe.save(update_fields=['learned_consumption_rate', 'learned_sample_count'])
+        return True
+    return False
+
+
+@receiver(post_save, sender='myapp.MealService')
+def mealservice_post_save_update_popularity(sender, instance, **kwargs):
+    """Recompute learned_consumption_rate for each recipe tied to this
+    MealService's menu. Runs on every MealService save (cleanup + disposal)."""
+    try:
+        menu = instance.menu
+        recipes_to_update = set()
+        if menu.recipe_id:
+            recipes_to_update.add(menu.recipe)
+        for r in menu.additional_recipes.all():
+            recipes_to_update.add(r)
+        for recipe in recipes_to_update:
+            _recompute_learned_popularity(recipe)
+    except Exception:
+        import logging
+        logging.getLogger('myapp.signals').exception(
+            'Learned-popularity recompute failed for MealService %s', instance.pk)
+
+
 @receiver(m2m_changed, sender='myapp.Menu_additional_recipes')
 def menu_additional_recipes_changed(sender, instance, action, pk_set, **kwargs):
     """Handle additional_recipes m2m add/remove. post_save on Menu doesn't
