@@ -1,0 +1,111 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Price Alerts{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- Header -->
+  <div class="flex items-baseline justify-between gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Price Alerts</h1>
+      <div class="text-sm text-slate-500">
+        Flagged in the last {{ window_days }} days —
+        {{ total_flagged_window }} product{{ total_flagged_window|pluralize }}
+        with price anomalies
+      </div>
+    </div>
+    <div class="text-sm text-slate-500">
+      Threshold: &gt; 2× or &lt; 0.5× the 90-day average
+    </div>
+  </div>
+
+  <!-- Trend strip -->
+  <div class="rounded-lg bg-white border border-slate-200 p-4">
+    <div class="text-xs text-slate-500 uppercase tracking-wide mb-2">Alert volume by month</div>
+    <div class="flex items-end gap-4">
+      {% for t in trend %}
+        <div class="flex-1 text-center">
+          <div class="text-lg font-semibold text-slate-800">{{ t.n }}</div>
+          <div class="bg-amber-400 rounded-t mx-auto" style="height: {% widthratio t.n trend_max 40 %}px; min-height: 2px; width: 60%;"></div>
+          <div class="text-xs text-slate-500 mt-1">{{ t.label }}</div>
+        </div>
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Recent anomalies -->
+  {% if alerts %}
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-3">Recent Anomalies</h2>
+    <p class="text-sm text-slate-500 mb-3">
+      Sorted by size of deviation. Each row is one (product, vendor) pair —
+      most-recent flagged price within the window.
+    </p>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2">Date</th>
+          <th class="text-left py-2">Product</th>
+          <th class="text-left py-2">Vendor</th>
+          <th class="text-right py-2">Current</th>
+          <th class="text-right py-2">90-day avg</th>
+          <th class="text-right py-2">Δ</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for a in alerts %}
+        <tr class="border-b border-slate-100">
+          <td class="py-2 text-slate-600 text-xs whitespace-nowrap">{{ a.ili.invoice_date|date:"M j" }}</td>
+          <td class="py-2 text-slate-800">{{ a.ili.product.canonical_name }}</td>
+          <td class="py-2 text-slate-600 text-xs">{{ a.ili.vendor.name|default:"—" }}</td>
+          <td class="py-2 text-right font-mono text-slate-900">${{ a.ili.unit_price|floatformat:2 }}</td>
+          <td class="py-2 text-right font-mono text-slate-500">${{ a.avg_price|floatformat:2 }}</td>
+          <td class="py-2 text-right font-mono whitespace-nowrap
+                     {% if a.direction == 'up' %}text-red-700{% else %}text-emerald-700{% endif %}">
+            {% if a.direction == 'up' %}▲{% else %}▼{% endif %}
+            {{ a.delta_pct|floatformat:0 }}%
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <p class="text-slate-500 italic py-6">No price anomalies in the last {{ window_days }} days. 🎉</p>
+  {% endif %}
+
+  <!-- Vendor breakdown -->
+  {% if vendor_counts %}
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-3">By Vendor ({{ window_days }}-day window)</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2">Vendor</th>
+          <th class="text-right py-2">Flagged lines</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for v in vendor_counts %}
+        <tr class="border-b border-slate-100">
+          <td class="py-2 text-slate-800">{{ v.vendor__name|default:"—" }}</td>
+          <td class="py-2 text-right font-mono text-slate-700">{{ v.n }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <!-- Caveat -->
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+    <strong>How this works:</strong> each new invoice line is checked against
+    the 90-day average for the same product+vendor at write-time
+    (<code>invoice_processor/db_write.py</code>). Ratios &gt; 2× or &lt; 0.5×
+    trigger the <code>price_flagged</code> boolean. Outliers go both directions —
+    a drop from $10 to $4.50 is flagged the same as a spike from $10 to $22.
+    First-time buys have no history so they aren't flagged.
+  </div>
+
+</div>
+{% endblock %}

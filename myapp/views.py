@@ -1263,6 +1263,95 @@ def yield_bridge(request):
     return render(request, 'myapp/yield_bridge.html', {'rows': rows})
 
 
+# ---- Price creep alerts ----
+
+def price_alerts(request):
+    """Surface price_flagged InvoiceLineItem rows (>2× or <0.5× 90-day avg).
+    Groups recent flags by (product, vendor) so repeated anomalies don't double-
+    count; shows current price, 90-day avg, delta direction.
+
+    The price_flagged field is set in invoice_processor/db_write.py at write
+    time — no new computation here, just surfacing what's already computed."""
+    from django.db.models import Avg, Count, Max
+    from datetime import timedelta
+    from collections import defaultdict
+
+    today = date.today()
+    window_start = today - timedelta(days=30)
+    history_start = today - timedelta(days=90)
+
+    # Recent flags — group by (product, vendor), keep most-recent per group
+    recent = (InvoiceLineItem.objects
+              .filter(price_flagged=True,
+                      invoice_date__gte=window_start,
+                      product__isnull=False,
+                      unit_price__isnull=False)
+              .select_related('product', 'vendor')
+              .order_by('-invoice_date'))
+
+    grouped: dict = {}  # (product_id, vendor_id) → line
+    for ili in recent:
+        key = (ili.product_id, ili.vendor_id)
+        if key not in grouped:
+            grouped[key] = ili
+
+    # For each group, compute the 90-day average for comparison
+    enriched = []
+    for (pid, vid), ili in grouped.items():
+        avg_price = (InvoiceLineItem.objects
+                     .filter(product_id=pid, vendor_id=vid,
+                             invoice_date__gte=history_start,
+                             invoice_date__lt=ili.invoice_date,
+                             unit_price__isnull=False,
+                             unit_price__gt=0)
+                     .aggregate(a=Avg('unit_price')))['a']
+        if avg_price is None or avg_price == 0:
+            continue
+        delta_pct = (Decimal(ili.unit_price) / Decimal(avg_price) - 1) * 100
+        enriched.append({
+            'ili': ili,
+            'avg_price': Decimal(avg_price).quantize(Decimal('0.01')),
+            'delta_pct': delta_pct.quantize(Decimal('0.1')),
+            'direction': 'up' if delta_pct > 0 else 'down',
+        })
+
+    # Sort by absolute delta magnitude, descending
+    enriched.sort(key=lambda e: abs(e['delta_pct']), reverse=True)
+
+    # Vendor breakdown of flagged counts in window
+    vendor_counts = (InvoiceLineItem.objects
+                     .filter(price_flagged=True, invoice_date__gte=window_start)
+                     .values('vendor__name')
+                     .annotate(n=Count('id'))
+                     .order_by('-n'))
+
+    # Total flag volume over time (last 4 months)
+    from calendar import monthrange
+    trend = []
+    for delta in range(3, -1, -1):
+        y, m = today.year, today.month - delta
+        while m <= 0:
+            y -= 1
+            m += 12
+        start = date(y, m, 1)
+        end = date(y, m, monthrange(y, m)[1])
+        n = InvoiceLineItem.objects.filter(
+            price_flagged=True, invoice_date__gte=start, invoice_date__lte=end,
+        ).count()
+        trend.append({'label': start.strftime('%b %Y'), 'n': n})
+    trend_max = max((t['n'] for t in trend), default=1) or 1
+
+    return render(request, 'myapp/price_alerts.html', {
+        'today': today,
+        'window_days': 30,
+        'alerts': enriched,
+        'total_flagged_window': len(enriched),
+        'vendor_counts': list(vendor_counts),
+        'trend': trend,
+        'trend_max': trend_max,
+    })
+
+
 # ---- Category spend/activity dashboard ----
 
 def category_spend(request):
