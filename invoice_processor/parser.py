@@ -413,9 +413,13 @@ def _parse_sysco(text: str) -> list[dict]:
             current_section = {"name": line, "start_line": i, "end_line": None, "total": None}
         if re.search(r'GROUP\s*TOTAL', line, re.IGNORECASE):
             group_total_lines.add(i)
-            # The group total VALUE appears as standalone numbers within ~5 lines
-            # Mark those lines so they're not used as item prices
-            for j in range(max(0, i - 2), min(len(lines), i + 6)):
+            # The group total VALUE appears as standalone numbers RIGHT near
+            # the "GROUP TOTAL" text — typically within 1-2 lines. Walking
+            # further ahead catches first-item prices of the NEXT section,
+            # which blocks split-anchor pairing and loses items.
+            # Use a tight window (1 before, 2 after) and stop at the first
+            # non-matching line.
+            for j in range(max(0, i - 1), min(len(lines), i + 3)):
                 l = lines[j].strip()
                 if re.match(r'^(\d+\.\d{2})\s*\*?$', l):
                     group_total_lines.add(j)
@@ -449,7 +453,14 @@ def _parse_sysco(text: str) -> list[dict]:
     found_codes = {a[1] for a in anchors}
     # Sysco SUPC codes are 7 digits. Accept 8-digit when OCR has merged a leading
     # digit from an adjacent column (normalize by dropping the leading digit).
+    # Also accept a trailing 7-digit code on a line that begins with a
+    # description/barcode/brand prefix — Sysco OCR often emits lines like
+    # "LE CHIP POTATO SOUR CRM & ON 3800084555 1978309" or "GB100-SYS 5793963"
+    # where the SUPC sits at the end of a mixed-content line.
     _STANDALONE_CODE_RE = re.compile(r'^(?:\d{8,}\s+)?(\d{7,8})\s*$')
+    _TRAILING_CODE_RE = re.compile(
+        r'(?:^|\s)(?:[A-Z0-9\-./]{3,}\s+)?(\d{7})\s*$'
+    )
     _STANDALONE_PRICE_RE = re.compile(r'^(\d+\.\d{2})(?:\s+\d+\.\d{2})?\s*$')
 
     # Load code_map once so we only accept orphan codes that actually resolve
@@ -475,13 +486,20 @@ def _parse_sysco(text: str) -> list[dict]:
             continue
         stripped = line.strip()
         cm = _STANDALONE_CODE_RE.match(stripped)
+        raw_code = None
         if cm:
             raw_code = cm.group(1)
+        else:
+            # Line that ENDS with a 7-digit SUPC (description+code or brand-prefix+code)
+            tcm = _TRAILING_CODE_RE.search(stripped)
+            if tcm and re.search(r'[A-Za-z]', stripped):  # require non-digit content before
+                raw_code = tcm.group(1)
+        if raw_code:
             norm = _normalize_code(raw_code)
             if norm in found_codes:
                 continue
-            # Only accept orphan codes that resolve to a known product —
-            # filters out 7-digit barcode fragments that aren't real SUPCs.
+            # Only accept codes that resolve to a known product — filters out
+            # 7-digit barcode fragments and stray numeric runs in OCR text.
             if _split_code_map and norm not in _split_code_map:
                 continue
             orphan_code_lines.append((i, norm, raw_code))
