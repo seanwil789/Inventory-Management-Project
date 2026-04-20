@@ -9,6 +9,7 @@ from .standard import parse_standard_page
 from .seafood import parse_seafood_page
 from .meats import parse_meats_page
 from .poultry import parse_poultry_page
+from .herbs import parse_herbs_page
 
 
 PARSER_FOR_SECTION = {
@@ -18,9 +19,10 @@ PARSER_FOR_SECTION = {
     'meats':         parse_meats_page,
     # Hierarchical with parent rows (Chicken/Turkey/Duck as parents; Whole/Breast/etc as children)
     'poultry':       parse_poultry_page,
+    # 5-col weight/volume conversions (no trim yield)
+    'herbs_spices':  parse_herbs_page,
+    'fresh_herbs':   parse_herbs_page,
     # Standard 7-col (vegetables, fruit, canned, grains, etc.)
-    'herbs_spices':  parse_standard_page,
-    'fresh_herbs':   parse_standard_page,
     'vegetables':    parse_standard_page,
     'fruit':         parse_standard_page,
     'canned':        parse_standard_page,

@@ -12,7 +12,7 @@ import re
 
 from .base import (
     ParsedRow, page_words, group_lines, is_footer_line, is_notes_line,
-    to_decimal, parse_pct, filter_data_lines,
+    to_decimal, parse_pct, filter_data_lines, ingredient_name_is_plausible,
 )
 
 STANDARD_COLS_RIGHT = [
@@ -117,7 +117,7 @@ def parse_standard_page(page, book_page_num: int) -> list[ParsedRow]:
             cells = _line_right_cells(line, cols, name_boundary)
 
             ingredient, prep_state = _split_ingredient_and_prep(full_name)
-            if not ingredient:
+            if not ingredient or not ingredient_name_is_plausible(ingredient):
                 continue
 
             ap_w = to_decimal(cells.get('ap_weight_raw', ''))

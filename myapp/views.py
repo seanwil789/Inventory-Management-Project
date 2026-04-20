@@ -1152,28 +1152,90 @@ def recipe_new(request):
 
 
 def yield_list(request):
+    """Grouped per-section reference display. Each section gets a header +
+    section-appropriate columns. Collapsed by default unless filtered."""
     q = (request.GET.get('q') or '').strip()
-    section = (request.GET.get('section') or '').strip()
-    refs = YieldReference.objects.all().order_by('section', 'ingredient', 'prep_state')
+    section_filter = (request.GET.get('section') or '').strip()
+
+    # Full queryset with filters
+    qs = YieldReference.objects.all().order_by('section', 'ingredient', 'prep_state')
     if q:
-        refs = refs.filter(models.Q(ingredient__icontains=q) | models.Q(prep_state__icontains=q))
-    if section:
-        refs = refs.filter(section=section)
+        qs = qs.filter(models.Q(ingredient__icontains=q) | models.Q(prep_state__icontains=q))
+    if section_filter:
+        qs = qs.filter(section=section_filter)
+
+    # Group by section
+    from collections import defaultdict
+    by_section: dict = defaultdict(list)
+    for r in qs:
+        by_section[r.section].append(r)
+
+    section_labels = dict(YieldReference.SECTION_CHOICES)
+    # Ordered section list for display
+    section_order = [
+        'meats', 'seafood', 'poultry',               # proteins first
+        'vegetables', 'fruit', 'canned',             # produce
+        'dairy',                                      # dairy
+        'grains', 'pasta', 'dry_legumes', 'nuts_seeds',  # starches
+        'flour', 'sweeteners', 'baking',             # baking
+        'herbs_spices', 'fresh_herbs',                # seasonings
+        'fats_oils', 'condiments', 'liquids', 'beverages',  # liquids
+    ]
+
+    # Row cap per section in the default view. Lifted when filter is active
+    # (a search or explicit section selection).
+    PER_SECTION_CAP = 40 if (q or section_filter) else 25
+
+    sections = []
+    for sect_key in section_order:
+        rows = by_section.get(sect_key, [])
+        if not rows:
+            continue
+        total = len(rows)
+        shown_rows = rows[:PER_SECTION_CAP]
+        sections.append({
+            'key': sect_key,
+            'label': section_labels.get(sect_key, sect_key.title()),
+            'count': total,
+            'shown': len(shown_rows),
+            'rows': shown_rows,
+            'render_as': _section_render_mode(sect_key),
+            # Auto-expand only if filtered
+            'expanded': bool(q or section_filter == sect_key),
+            'has_more': total > len(shown_rows),
+        })
 
     total_count = YieldReference.objects.count()
-    by_section = (
-        YieldReference.objects.values('section').order_by('section')
-        .annotate(n=models.Count('id'))
+    all_sections_for_dropdown = sorted(
+        [(k, section_labels.get(k, k), by_section.get(k, [])) for k in section_order if k in by_section],
+        key=lambda t: t[1].lower()
     )
+
     return render(request, 'myapp/yield_list.html', {
-        'refs': refs[:500],        # cap for pagination sanity
+        'sections': sections,
         'q': q,
-        'selected_section': section,
+        'selected_section': section_filter,
         'total_count': total_count,
-        'by_section': list(by_section),
-        'section_choices': YieldReference.SECTION_CHOICES,
-        'shown_count': min(refs.count(), 500),
+        'filtered_count': qs.count(),
+        'all_sections_for_dropdown': [
+            {'key': k, 'label': label, 'count': len(rows)}
+            for k, label, rows in all_sections_for_dropdown
+        ],
     })
+
+
+def _section_render_mode(section_key: str) -> str:
+    """Map section to render-mode key used by the template.
+    Different sections show different columns based on which data they carry."""
+    if section_key in ('meats',):
+        return 'meats'
+    if section_key == 'seafood':
+        return 'seafood'
+    if section_key == 'poultry':
+        return 'poultry'
+    if section_key in ('herbs_spices', 'fresh_herbs'):
+        return 'herbs'
+    return 'standard'
 
 
 def yield_edit(request, yield_id: int | None = None):

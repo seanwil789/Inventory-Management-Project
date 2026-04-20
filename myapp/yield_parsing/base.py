@@ -144,6 +144,38 @@ def split_name_prep(full_name: str) -> tuple[str, str]:
     return head.strip(), tail.strip()
 
 
+_FOOTNOTE_LEAD_RE = re.compile(r'^\d+\.\s')
+
+
+def looks_like_footnote(text: str) -> bool:
+    """True if text looks like a book footnote (numbered note).
+    Examples: '4. Stemless leaf yield includes the', '1. Finfish:'
+    Applied to the LEFT column to reject footnote lines that got grouped as
+    data rows. Real ingredients never start with 'N. ' (at least in BoY 8e)."""
+    return bool(_FOOTNOTE_LEAD_RE.match((text or '').strip()))
+
+
+def ingredient_name_is_plausible(name: str) -> bool:
+    """Stricter check: reject names that look like wrapped footnote text OR
+    name+value concatenations like 'Bay Leaves 0.6' (the number is data that
+    leaked into the name column due to a missing separator)."""
+    s = (name or '').strip()
+    if not s or len(s) < 2:
+        return False
+    if looks_like_footnote(s):
+        return False
+    # Name+number concatenation: ends with " <number>" (any digits, with or
+    # without decimal). Real ingredient names rarely end in a bare number.
+    # Exceptions: "5-Spice", "B12" — those don't have a leading space.
+    if re.search(r'\s+-?\d+(\.\d+)?\s*$', s):
+        return False
+    # Exceptional: fragment like "2. Crustaceans—Crab" (also handled by footnote
+    # check). "220 to the bushel" — starts with digit, not a name.
+    if re.match(r'^\d', s):
+        return False
+    return True
+
+
 def looks_like_new_entry(text: str) -> bool:
     """Heuristic: no-data lines that start with an uppercase letter or a proper noun
     indicate the start of a new entry (pre-name for the next data row).
