@@ -306,6 +306,19 @@ def _save_components(menu: Menu, post) -> None:
         menu.save(update_fields=['ingredients_raw'])
 
 
+def _recipes_for_slot(slot: str | None):
+    """Recipes valid for a given meal-slot: those whose valid_slots is empty
+    (permissive/any-slot) OR explicitly contains the slot. Falls back to all
+    recipes when slot is None.
+
+    Python-side filter because SQLite's JSONField doesn't support __contains
+    lookups on array elements. With ~80 recipes this is negligible."""
+    qs = Recipe.objects.order_by('name')
+    if not slot:
+        return qs
+    return [r for r in qs if not r.valid_slots or slot in r.valid_slots]
+
+
 def menu_edit(request, menu_id: int):
     menu = get_object_or_404(Menu, pk=menu_id)
     if request.method == 'POST':
@@ -320,7 +333,7 @@ def menu_edit(request, menu_id: int):
         'form':          form,
         'menu':          menu,
         'title':         f"Edit {menu.get_meal_slot_display()} — {menu.date}",
-        'all_recipes':   Recipe.objects.order_by('name'),
+        'all_recipes':   _recipes_for_slot(menu.meal_slot),
         'recipes_by_protein': _recipes_by_protein(),
         'initial_components': _initial_component_rows(menu),
     })
@@ -348,7 +361,7 @@ def menu_new(request):
         'form':          form,
         'menu':          None,
         'title':         "Add meal",
-        'all_recipes':   Recipe.objects.order_by('name'),
+        'all_recipes':   _recipes_for_slot(slot),
         'recipes_by_protein': _recipes_by_protein(),
         'initial_components': [],
     })
@@ -2090,6 +2103,10 @@ def _candidate_recipes_for_slot(slot: str):
     if slot in ('cold_breakfast', 'hot_breakfast'):
         pool = pool.filter(models.Q(id__in=linked_ids) |
                            models.Q(source_doc__icontains='Breakfast/'))
+    # Respect the explicit valid_slots tag when set (permissive when empty).
+    # Python-side filter — SQLite JSONField doesn't support __contains on arrays.
+    if slot:
+        pool = [r for r in pool if not r.valid_slots or slot in r.valid_slots]
     return pool
 
 

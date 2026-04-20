@@ -19,6 +19,22 @@ class ConflictsField(forms.MultipleChoiceField):
         return value
 
 
+class ValidSlotsField(forms.MultipleChoiceField):
+    """Render Recipe.valid_slots (JSONField(default=list)) as checkboxes of
+    the four meal-slot keys. Empty selection = any slot (permissive)."""
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('choices', Menu.MEAL_SLOTS)
+        kwargs.setdefault('widget', forms.CheckboxSelectMultiple(
+            attrs={'class': 'grid grid-cols-2 sm:grid-cols-4 gap-1 text-sm'}))
+        kwargs.setdefault('required', False)
+        super().__init__(*args, **kwargs)
+
+    def prepare_value(self, value):
+        if value is None:
+            return []
+        return value
+
+
 class MenuForm(forms.ModelForm):
     """Meal-name-first menu form. Components (linked recipes + freetext) are handled
     in the view via POST arrays, not on this ModelForm.
@@ -55,10 +71,14 @@ class RecipeForm(forms.ModelForm):
         label='Dietary conflicts',
         help_text='What this recipe CONTAINS — e.g., a gluten-allergy client would avoid any recipe tagged gluten.',
     )
+    valid_slots = ValidSlotsField(
+        label='Menu slots',
+        help_text='Which menu slots this recipe belongs in. Leave all unchecked to allow any slot.',
+    )
 
     class Meta:
         model = Recipe
-        fields = ['name', 'yield_servings', 'notes', 'conflicts']
+        fields = ['name', 'yield_servings', 'notes', 'conflicts', 'valid_slots']
         widgets = {
             'name':           forms.TextInput(attrs={'class': 'border rounded px-2 py-1 w-full'}),
             'yield_servings': forms.NumberInput(attrs={'class': 'border rounded px-2 py-1 w-32'}),

@@ -167,6 +167,10 @@ class Recipe(models.Model):
     conflicts      = models.JSONField(default=list, blank=True,
                                       help_text="Dietary conflicts this recipe CONTAINS (Big 15 vocab). "
                                                 "Used for client-dietary-safety matching.")
+    valid_slots    = models.JSONField(default=list, blank=True,
+                                      help_text="Menu slots where this recipe belongs "
+                                                "(cold_breakfast/hot_breakfast/lunch/dinner). "
+                                                "Empty = appears in any slot.")
 
     # Learned popularity (auto-updated by signal on MealService save)
     learned_consumption_rate = models.DecimalField(
