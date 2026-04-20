@@ -23,7 +23,13 @@ class Command(BaseCommand):
                             help="Fuzzy match similarity cutoff (0..1).")
 
     def handle(self, *args, **opts):
-        recipes = list(Recipe.objects.all())
+        # Only match menu-level recipes — exclude sub-recipes/prep components
+        # to prevent "Pesto" matching "Shrimp Pesto Pasta" (the long-standing
+        # substring bug). composed_dish and meal are the valid match targets.
+        recipes = list(Recipe.objects.filter(
+            level__in=('composed_dish', 'meal'),
+            is_current=True,
+        ))
         by_norm = {_norm(r.name): r for r in recipes}
         norm_keys = list(by_norm.keys())
 

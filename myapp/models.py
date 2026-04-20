@@ -105,6 +105,16 @@ POPULARITY_CHOICES = [
 ]
 
 
+# Recipe ontology — Sean 2026-04-19 per project_recipe_authoring.md.
+# Pre-selected based on content (all-raw → recipe, has sub_recipes → composed_dish,
+# sub_recipes of composed → meal), but ALWAYS prompted, never silent.
+LEVEL_CHOICES = [
+    ('recipe',        'Recipe (ingredients only)'),
+    ('composed_dish', 'Composed Dish (recipes + ingredients)'),
+    ('meal',          'Meal (plate-level menu entry)'),
+]
+
+
 # "Big 15" dietary conflict vocabulary — Sean-approved 2026-04-19 per
 # project_recipe_authoring.md. Applied as NEGATIVE descriptors: Recipe.conflicts
 # lists what the recipe CONTAINS / conflicts with. Downstream (future Client
@@ -152,6 +162,19 @@ class Recipe(models.Model):
     conflicts      = models.JSONField(default=list, blank=True,
                                       help_text="Dietary conflicts this recipe CONTAINS (Big 15 vocab). "
                                                 "Used for client-dietary-safety matching.")
+
+    # Ontology + versioning (authoring flow)
+    level          = models.CharField(max_length=20, choices=LEVEL_CHOICES, default='recipe',
+                                      help_text="recipe = ingredients only; composed_dish = has sub_recipes; "
+                                                "meal = plate-level menu entry.")
+    parent_recipe  = models.ForeignKey('self', null=True, blank=True, on_delete=models.SET_NULL,
+                                       related_name='versions',
+                                       help_text="If this is V2+, points to the prior version (V1).")
+    version_number = models.IntegerField(default=1,
+                                         help_text="1 for trunk, 2+ for later versions of the same lineage.")
+    is_current     = models.BooleanField(default=True,
+                                         help_text="Only one version per lineage is current. Menu links prefer current.")
+    created_at     = models.DateTimeField(auto_now_add=True, null=True)
 
     def __str__(self):
         return self.name
