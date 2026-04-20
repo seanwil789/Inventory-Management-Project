@@ -930,6 +930,71 @@ def _parse_sysco(text: str) -> list[dict]:
 # Exceptional Foods parser (v2 — DocAI OCR column-aware)
 # ---------------------------------------------------------------------------
 
+def _extract_exceptional_freight(lines: list[str]) -> float | None:
+    """Extract the "Freight" delivery fee from Exceptional Foods invoices.
+
+    Exceptional's footer uses two possible layouts:
+
+    Grouped (labels block THEN values block):
+       Sales Amt / Misc Amt / Freight / Sales Tax / Total
+       298.95    / 0.00     / 5.00    / 0.00      / 303.95
+       → Freight is the 3rd label; its value is the 3rd number after the block.
+
+    Interleaved (label/value alternating):
+       Sales Amt / 373.04 / Misc Amt / 0.00 / Freight / 0.00 / ...
+       → Freight value is immediately after the label.
+
+    Detection: interleaved layouts have decimals BETWEEN "Sales Amt" and
+    "Freight"; grouped has only labels in that span.
+    """
+    for i, line in enumerate(lines):
+        if not re.match(r'^\s*Freight\s*$', line, re.IGNORECASE):
+            continue
+        sales_amt_idx = None
+        for j in range(max(0, i - 10), i):
+            if re.match(r'^\s*Sales\s+Amt\s*$', lines[j], re.IGNORECASE):
+                sales_amt_idx = j
+                break
+        if sales_amt_idx is None:
+            continue
+
+        # Check if any numbers appear BETWEEN Sales Amt and Freight labels
+        num_between = False
+        for j in range(sales_amt_idx + 1, i):
+            if re.match(r'^\s*\d+[,\d]*\.\d{2}\s*$', lines[j]):
+                num_between = True
+                break
+
+        if num_between:
+            # Interleaved: freight value is on the next non-label line
+            for j in range(i + 1, min(i + 3, len(lines))):
+                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if m:
+                    val = float(m.group(1).replace(",", ""))
+                    if 0 <= val < 100:  # freight is typically small
+                        return val if val > 0 else None
+        else:
+            # Grouped: values follow the full label block. Freight's value is
+            # the (i - sales_amt_idx)-th number after the last label.
+            offset = i - sales_amt_idx
+            nums = []
+            for j in range(i + 1, min(i + 20, len(lines))):
+                if re.match(r'^\s*Freight|^\s*Sales|^\s*Misc|^\s*Total|^\s*Amount',
+                            lines[j], re.IGNORECASE):
+                    continue
+                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if m:
+                    nums.append(float(m.group(1).replace(",", "")))
+                if len(nums) > offset:
+                    break
+            if len(nums) > offset:
+                val = nums[offset]
+                # Sanity: freight must be small relative to the total
+                if 0 < val < 100:
+                    return val
+    return None
+
+
 def _extract_exceptional_invoice_total(lines: list[str]) -> float | None:
     """Extract invoice total from Exceptional Foods footer.
 
@@ -1180,6 +1245,19 @@ def _parse_exceptional(text: str) -> list[dict]:
     # ── Extract and validate invoice total ────────────────────────────
     all_lines = [l.strip() for l in text.splitlines()]
     invoice_total = _extract_exceptional_invoice_total(all_lines)
+
+    # Exceptional footer includes a "Freight" line (often $5.00) separate
+    # from item lines. Capture it as a synthetic line so item totals
+    # reconcile against invoice_total.
+    freight = _extract_exceptional_freight(all_lines)
+    if freight and freight > 0:
+        items.append({
+            "raw_description": "Freight",
+            "unit_price":      freight,
+            "extended_amount": freight,
+            "case_size_raw":   "",
+        })
+
     items_total = round(sum(it.get("extended_amount", 0) or 0 for it in items), 2)
 
     if invoice_total is not None:
@@ -1488,6 +1566,18 @@ def _parse_pbm(text: str) -> list[dict]:
         unit_price_idx is not None and unit_price_idx > desc_idx + 5
     )
 
+    # "Late header" layout signal: on some PBM digital invoices the
+    # "Description" label is a FOOTER legend printed right before
+    # "Unit Price" / "Amount" (all three consecutive). The actual
+    # descriptions are above, near the U/M tokens. Detecting the exact
+    # adjacent triple avoids false-positives on normal layouts where
+    # "Description" is just a mid-document header.
+    late_header = (
+        unit_price_idx is not None and amount_idx is not None
+        and unit_price_idx == desc_idx + 1
+        and amount_idx == desc_idx + 2
+    )
+
     # ── Extract descriptions ────────────────────────────────────────────────
     # PBM OCR layouts vary — U/M tokens may or may not precede descriptions.
     # Strategy: scan for ALL product-name-like lines after the Description header,
@@ -1528,6 +1618,38 @@ def _parse_pbm(text: str) -> list[dict]:
             clean = re.sub(r'^(DZ|EA|LB|CS|PACK)\s+', '', line, flags=re.IGNORECASE).strip()
             if clean and len(clean) >= 4:
                 descriptions.append(clean)
+
+    # Late-header fallback: primary scan found nothing AND the footer has
+    # the Description/UnitPrice/Amount triple. Rescan the range between the
+    # FIRST U/M token and desc_idx — this skips the invoice header/address
+    # block and focuses on the actual item list.
+    if not descriptions and late_header:
+        first_um = None
+        for i, line in enumerate(lines):
+            if um_pattern.match(line.strip()):
+                first_um = i
+                break
+        if first_um is not None:
+            for i in range(first_um, desc_idx):
+                line = lines[i].strip()
+                if not line or len(line) < 4:
+                    continue
+                if re.match(r'^[\d.]+\s*$', line):
+                    continue
+                if um_pattern.match(line):
+                    continue
+                if re.match(r'^[A-Z]\d{2,}$', line):
+                    continue
+                if re.match(r'^0\d{2,}$', line):
+                    continue
+                if re.match(r'^[A-Z]{1,2}\d+$', line):
+                    continue
+                if skip_desc.match(line):
+                    continue
+                if re.search(r'[A-Za-z]{3,}', line):
+                    clean = re.sub(r'^(DZ|EA|LB|CS|PACK)\s+', '', line, flags=re.IGNORECASE).strip()
+                    if clean and len(clean) >= 4:
+                        descriptions.append(clean)
 
     # ── Collect all standalone prices between Description and Subtotal ────────
     # PBM OCR has varying layouts — prices can be before/after descriptions,
