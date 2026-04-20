@@ -15,6 +15,58 @@ from .base import (
     to_decimal, parse_pct, filter_data_lines, ingredient_name_is_plausible,
 )
 
+
+# --- Per-page column peak detection ---
+#
+# BoY's Part I tables nominally share a 7-data-col layout but column positions
+# and semantics drift between pages (dried-fruit pages shift Yield from x~420
+# to x~345; herbs have a different schema entirely). The old approach used
+# fixed x-ranges and produced garbage on drifted pages.
+#
+# New approach: per page, find N density peaks in right-side data-row x-centers.
+# Map them ordinally to standard columns (peak 1 = ap_unit, peak 2 = ap_weight,
+# ..., peak 5 = yield_pct, etc.). Tolerant of x-shifts and minor schema
+# reorderings — the 5th data column is yield_pct regardless of where it sits.
+
+def _detect_data_peaks(data_lines, right_of_x=150, min_density_frac=0.20):
+    """Find x-positions where data values consistently land across rows.
+    Returns a sorted list of peak x-centers, each wide enough to capture
+    typical decimal-number widths (~35px window centered on peak).
+
+    Filters: bin to 4px, require ≥ min_density_frac × len(data_lines) rows
+    contributing. Merges adjacent high-density bins into single peaks."""
+    from collections import Counter
+    all_xs = []
+    for line in data_lines:
+        for w in line:
+            if w[0] > right_of_x:
+                all_xs.append((w[0] + w[2]) / 2)
+    if not all_xs:
+        return []
+    bins = Counter(round(x / 4) * 4 for x in all_xs)
+    min_density = max(3, int(len(data_lines) * min_density_frac))
+    hot = sorted(b for b, n in bins.items() if n >= min_density)
+    if not hot:
+        return []
+    peaks = [[hot[0]]]
+    for b in hot[1:]:
+        if b - peaks[-1][-1] <= 10:
+            peaks[-1].append(b)
+        else:
+            peaks.append([b])
+    return [sum(p) / len(p) for p in peaks]
+
+
+def _assign_to_peak(w_center, peaks, window=20):
+    """Return the peak index whose center is within `window` of w_center.
+    Returns None if no peak matches."""
+    best_idx, best_dist = None, window + 1
+    for i, p in enumerate(peaks):
+        d = abs(w_center - p)
+        if d < best_dist:
+            best_idx, best_dist = i, d
+    return best_idx
+
 STANDARD_COLS_RIGHT = [
     ('ap_unit',              195, 250),
     ('ap_weight_raw',        250, 300),
@@ -85,22 +137,65 @@ def _split_ingredient_and_prep(full_name: str) -> tuple[str, str]:
     return head.strip(), tail.strip()
 
 
+# Ordinal field mapping for peak-based column detection.
+# 7 peaks → standard 7-col semantics.
+PEAK_TO_FIELD_7 = ['ap_unit', 'ap_weight_raw', 'trimmed_unit',
+                   'trimmed_weight_raw', 'yield_pct_raw',
+                   'measures_per_ap_raw', 'oz_per_cup_raw']
+
+
 def parse_standard_page(page, book_page_num: int) -> list[ParsedRow]:
-    # Note: this function strips BANNER_Y_MAX=100 (via page_words), so column
-    # headers remain. Original parser used 170; rely on banner-line filter instead.
+    """Parse a standard BoY data page via per-page peak detection.
+
+    Strategy:
+      1. Group words into lines; filter banner/notes/footer lines.
+      2. Detect the name-column boundary from the leftmost token x.
+      3. Find data-column peaks across data rows (density histogram).
+      4. Map peaks ordinally to the 7 standard fields. (Semantics mostly
+         consistent across BoY Part I tables; occasional drift handled by
+         falling through to whatever the 5th peak contains.)
+      5. For each data row, assign words to peaks by nearest-center match,
+         then parse values into the right fields.
+      6. Fallback to fixed x-ranges if peak detection produces < 3 peaks
+         (very sparse pages can trip the density threshold)."""
     all_words = page_words(page)
-    # Extra skip-band for the top-of-page title area (Chapter X / section name logo)
+    # Strip top-of-page title band (Chapter logo etc.)
     words = [w for w in all_words if w[1] >= 170]
 
+    # Rough name-column boundary: find the leftmost data word on lines with
+    # numeric content. Most BoY pages have item name starting at x<100 and
+    # first data column starting at x>150. Use x=150 as a pragmatic floor.
     layout = _detect_layout(words)
     if layout == 'left':
-        cols = STANDARD_COLS_LEFT
         name_boundary = NAME_BOUNDARY_LEFT
     else:
-        cols = STANDARD_COLS_RIGHT
         name_boundary = NAME_BOUNDARY_RIGHT
 
     lines = group_lines(words)
+
+    # Candidate data lines (skip banners/notes/footer)
+    candidate_data_lines = []
+    for line in lines:
+        if _is_banner_line(line):
+            continue
+        if is_footer_line(line):
+            break
+        if is_notes_line(line):
+            break
+        if _line_has_data(line, name_boundary):
+            candidate_data_lines.append(line)
+
+    # Detect peaks
+    peaks = _detect_data_peaks(candidate_data_lines, right_of_x=name_boundary - 10)
+    # Limit to 7 peaks max (truncate extras left-to-right by density)
+    peaks = peaks[:7]
+    use_peaks = len(peaks) >= 3
+
+    # Fallback column definition (used when peaks fail)
+    if layout == 'left':
+        fallback_cols = STANDARD_COLS_LEFT
+    else:
+        fallback_cols = STANDARD_COLS_RIGHT
 
     rows: list[ParsedRow] = []
     pending: list[str] = []
@@ -108,20 +203,54 @@ def parse_standard_page(page, book_page_num: int) -> list[ParsedRow]:
     for line in lines:
         if _is_banner_line(line):
             continue
+        if is_footer_line(line) or is_notes_line(line):
+            break
         left_text = _line_left_text(line, name_boundary)
-        if _line_has_data(line, name_boundary):
+        has_right = _line_has_data(line, name_boundary)
+        if has_right:
             name_parts = list(pending)
             if left_text:
                 name_parts.append(left_text)
             full_name = ' '.join(name_parts).strip()
-            cells = _line_right_cells(line, cols, name_boundary)
-
+            pending = []
             ingredient, prep_state = _split_ingredient_and_prep(full_name)
             if not ingredient or not ingredient_name_is_plausible(ingredient):
                 continue
 
-            ap_w = to_decimal(cells.get('ap_weight_raw', ''))
-            trimmed_raw = cells.get('trimmed_weight_raw', '') or ''
+            # Assign right-side words to columns
+            cells: dict[str, list[str]] = {}
+            if use_peaks:
+                for w in line:
+                    if w[0] < name_boundary:
+                        continue
+                    wc = (w[0] + w[2]) / 2
+                    idx = _assign_to_peak(wc, peaks)
+                    if idx is None or idx >= len(PEAK_TO_FIELD_7):
+                        continue
+                    field = PEAK_TO_FIELD_7[idx]
+                    cells.setdefault(field, []).append(w[4])
+            else:
+                cells_raw = _line_right_cells(line, fallback_cols, name_boundary)
+                for k, v in cells_raw.items():
+                    cells.setdefault(k, []).append(v)
+
+            cell_text = {k: ' '.join(v).strip() for k, v in cells.items()}
+
+            # Type-based validation on yield_pct: reject non-percent-looking
+            # values in the yield slot (e.g., "ounce", "pound"). Parse stricter.
+            yield_raw = cell_text.get('yield_pct_raw', '').strip()
+            yield_val = None
+            if yield_raw:
+                # Prefer a %-suffixed value, but accept bare numbers between 0-105.
+                if '%' in yield_raw:
+                    yield_val = parse_pct(yield_raw.replace(' ', ''))
+                else:
+                    v = to_decimal(yield_raw)
+                    if v is not None and 0 < v <= 105:
+                        yield_val = v
+
+            ap_w = to_decimal(cell_text.get('ap_weight_raw', ''))
+            trimmed_raw = cell_text.get('trimmed_weight_raw', '') or ''
             trimmed_w: Decimal | None = None
             trimmed_count: int | None = None
             m = _COUNT_RE.match(trimmed_raw.strip())
@@ -133,18 +262,17 @@ def parse_standard_page(page, book_page_num: int) -> list[ParsedRow]:
             rows.append(ParsedRow(
                 ingredient=ingredient,
                 prep_state=prep_state,
-                ap_unit=cells.get('ap_unit', '').strip(),
+                ap_unit=cell_text.get('ap_unit', '').strip(),
                 ap_weight_oz=ap_w,
-                trimmed_unit=cells.get('trimmed_unit', '').strip(),
+                trimmed_unit=cell_text.get('trimmed_unit', '').strip(),
                 trimmed_weight_oz=trimmed_w,
                 trimmed_count=trimmed_count,
-                yield_pct=parse_pct(cells.get('yield_pct_raw', '')),
-                measures_per_ap=to_decimal(cells.get('measures_per_ap_raw', '')),
-                ounce_weight_per_cup=to_decimal(cells.get('oz_per_cup_raw', '')),
+                yield_pct=yield_val,
+                measures_per_ap=to_decimal(cell_text.get('measures_per_ap_raw', '')),
+                ounce_weight_per_cup=to_decimal(cell_text.get('oz_per_cup_raw', '')),
                 source_ref=f'p.{book_page_num}',
                 extras={},
             ))
-            pending = []
         else:
             if left_text:
                 pending.append(left_text)
