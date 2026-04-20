@@ -254,6 +254,58 @@ class AutoTagConflictsTests(TestCase):
         self.assertNotIn('animal_products', r.conflicts)
 
 
+class PrepTaskAutoDeriveTests(TestCase):
+    """Menu save → PrepTask auto-creation via signal handler."""
+
+    def setUp(self):
+        self.r1 = Recipe.objects.create(name='Auto Prep Test', level='meal',
+                                        yield_servings=40)
+        self.r2 = Recipe.objects.create(name='Auto Prep Side', level='meal',
+                                        yield_servings=40)
+
+    def test_menu_create_derives_preptask(self):
+        from datetime import date as _date, timedelta as _td
+        from myapp.models import PrepTask
+        future = _date.today() + _td(days=180)
+        # Ensure clean state
+        PrepTask.objects.filter(recipe=self.r1).delete()
+
+        m = Menu.objects.create(date=future, meal_slot='lunch',
+                                dish_freetext='x', recipe=self.r1)
+        tasks = PrepTask.objects.filter(recipe=self.r1, date__gte=future - _td(days=4))
+        self.assertEqual(tasks.count(), 1)
+        task = tasks.first()
+        # Prep date: day before, skipping weekends
+        expected = future - _td(days=1)
+        while expected.weekday() >= 5:
+            expected -= _td(days=1)
+        self.assertEqual(task.date, expected)
+        self.assertFalse(task.completed)
+
+    def test_additional_recipe_add_derives_preptask(self):
+        from datetime import date as _date, timedelta as _td
+        from myapp.models import PrepTask
+        future = _date.today() + _td(days=181)
+        m = Menu.objects.create(date=future, meal_slot='dinner',
+                                dish_freetext='x', recipe=self.r1)
+        # Adding additional_recipes → signal → PrepTask for r2
+        m.additional_recipes.add(self.r2)
+        self.assertTrue(PrepTask.objects.filter(recipe=self.r2,
+                                                 date__gte=future - _td(days=4)).exists())
+
+    def test_signal_is_idempotent(self):
+        from datetime import date as _date, timedelta as _td
+        from myapp.models import PrepTask
+        future = _date.today() + _td(days=182)
+        m = Menu.objects.create(date=future, meal_slot='lunch',
+                                dish_freetext='x', recipe=self.r1)
+        # Re-save — should not duplicate PrepTask rows
+        m.save()
+        m.save()
+        tasks = PrepTask.objects.filter(recipe=self.r1, date__gte=future - _td(days=4))
+        self.assertEqual(tasks.count(), 1)
+
+
 class DishSuggestionTests(TestCase):
     """Score recipes against a target (date, slot)."""
 
