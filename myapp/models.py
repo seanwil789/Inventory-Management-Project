@@ -57,6 +57,11 @@ class InvoiceLineItem(models.Model):
     product         = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL)
     raw_description = models.CharField(max_length=500, blank=True)  # fallback if unmatched
     unit_price      = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    extended_amount = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text="Line total (qty × unit_price) as printed on the invoice. "
+                  "For Sysco, typically equals unit_price. For Farm Art and "
+                  "other per-unit priced vendors, this captures the qty multiplier.")
     case_size       = models.CharField(max_length=100, blank=True)
     invoice_date    = models.DateField(null=True, blank=True)
     source_file     = models.CharField(max_length=255, blank=True)  # original filename

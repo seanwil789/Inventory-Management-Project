@@ -100,6 +100,18 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             except InvalidOperation:
                 pass
 
+        extended = None
+        ext_raw = item.get('extended_amount')
+        if ext_raw not in (None, ''):
+            try:
+                extended = Decimal(str(ext_raw))
+            except InvalidOperation:
+                pass
+        # Fall back to unit_price when parser didn't supply extended_amount
+        # (Sysco lines where qty=1 and unit_price == extended_amount)
+        if extended is None and unit_price is not None:
+            extended = unit_price
+
         confidence = item.get('confidence', '')
         score = item.get('score')
         match_score = int(score) if score is not None else None
@@ -114,6 +126,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         # This makes re-processing invoices safe — prices get refreshed in place.
         common_fields = dict(
             unit_price=unit_price,
+            extended_amount=extended,
             case_size=item.get('case_size_raw', ''),
             source_file=source_file,
             product=product,
