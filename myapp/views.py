@@ -2330,21 +2330,25 @@ def cogs_dashboard(request):
         is_current = True
 
     # --- Selected month ---
-    current_spend, current_invoices = _month_spend(year, month)
+    cache_spend, current_invoices = _month_spend(year, month)
     current_census = _default_census_for(year, month)
     current_budget = (current_census * BUDGET_PER_RESIDENT_PER_MONTH).quantize(Decimal('0.01'))
-    current_delta = current_budget - current_spend  # positive = under budget
 
-    # If we have a reconciled budget-sheet total for this month and it's
-    # materially higher than the cache total, the cache is partial OCR
-    # coverage — surface the reconciled figure to avoid a misleading
-    # "under budget" verdict.
+    # When a reconciled budget-sheet total exists and the pipeline cache is
+    # materially short of it (common for months where we have no Sysco OCR),
+    # use the reconciled figure as the headline spend. The vendor breakdown
+    # + invoice list below still come from what the pipeline captured.
     reconciled_total = HISTORICAL_ACTUAL_SPEND.get((year, month))
     partial_cache = (
         reconciled_total is not None
         and current_invoices
-        and current_spend < reconciled_total * Decimal('0.80')
+        and cache_spend < reconciled_total * Decimal('0.80')
     )
+    if partial_cache:
+        current_spend = reconciled_total
+    else:
+        current_spend = cache_spend
+    current_delta = current_budget - current_spend  # positive = under budget
 
     # Pace / days-elapsed only meaningful for the current month; past months
     # use the full month length so $/resident/day is a whole-month average.
@@ -2444,4 +2448,5 @@ def cogs_dashboard(request):
         'budget_per_resident_per_month': BUDGET_PER_RESIDENT_PER_MONTH,
         'reconciled_total': reconciled_total,
         'partial_cache': partial_cache,
+        'cache_spend': cache_spend,
     })

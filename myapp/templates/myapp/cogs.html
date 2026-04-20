@@ -28,12 +28,13 @@
 
   {% if partial_cache %}
   <div class="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm">
-    <strong class="text-amber-900">Partial pipeline coverage:</strong>
+    <strong class="text-amber-900">Headline uses budget-sheet reconciliation:</strong>
     <span class="text-amber-800">
-      Pipeline captured ${{ current_spend|floatformat:2 }} from {{ recent_invoices|length }} invoice{{ recent_invoices|length|pluralize }}
-      for {{ current_label }}, but reconciled budget-sheet total was
-      <strong>${{ reconciled_total|floatformat:2 }}</strong>.
-      The verdict below is based on captured pipeline data only and understates actual spend.
+      Pipeline only captured ${{ cache_spend|floatformat:2 }} from
+      {{ recent_invoices|length }} invoice{{ recent_invoices|length|pluralize }} for {{ current_label }}
+      (no Sysco OCR on early 2026 months). The ${{ current_spend|floatformat:2 }}
+      headline comes from the reconciled budget sheet. Vendor breakdown and
+      recent invoices below reflect only what the pipeline captured.
     </span>
   </div>
   {% endif %}
