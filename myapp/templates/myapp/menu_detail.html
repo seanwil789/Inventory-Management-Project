@@ -68,5 +68,91 @@
       To edit a linked recipe's ingredients, click its name in the Components list above.
     </p>
   </div>
+
+  <!-- Service log (popularity-learning touchpoint) -->
+  <div class="mt-6 bg-white rounded shadow-sm p-6">
+    <h2 class="text-lg font-semibold text-slate-900 mb-1">Service log</h2>
+    <p class="text-xs text-slate-500 mb-4">
+      Log how much was prepped + leftover after service. When leftovers get
+      discarded at day 5, log that too. Data feeds the popularity-learning
+      loop.
+    </p>
+
+    <!-- Existing service records -->
+    {% if services %}
+    <div class="border rounded divide-y mb-5">
+      {% for svc in services %}
+      <div class="p-3">
+        <div class="flex items-baseline justify-between gap-2 flex-wrap">
+          <div class="text-sm text-slate-700">
+            <span class="font-medium">Prepped:</span> {{ svc.prepped_qty }} {{ svc.unit|default:"" }}
+            {% if svc.post_service_leftover_qty is not None %}
+              · <span class="text-slate-600">Leftover:</span> {{ svc.post_service_leftover_qty }} {{ svc.unit|default:"" }}
+            {% endif %}
+            {% if svc.discarded_qty is not None %}
+              · <span class="text-red-700">Discarded:</span> {{ svc.discarded_qty }} {{ svc.unit|default:"" }}
+            {% endif %}
+          </div>
+          <div class="text-xs text-slate-500">
+            {% if svc.immediate_eat_rate is not None %}
+              eat rate {{ svc.immediate_eat_rate|floatformat:"-2" }}
+              {% if svc.total_consumption_rate is not None and svc.total_consumption_rate != svc.immediate_eat_rate %}
+                · total {{ svc.total_consumption_rate|floatformat:"-2" }}
+              {% endif %}
+            {% endif %}
+          </div>
+        </div>
+        {% if svc.notes %}
+          <div class="text-xs text-slate-600 mt-1 italic">{{ svc.notes }}</div>
+        {% endif %}
+
+        {% if svc.discarded_qty is None and svc.post_service_leftover_qty is not None and svc.post_service_leftover_qty > 0 %}
+          <!-- Disposal form: only show if leftovers exist and disposal not yet logged -->
+          <form method="post" action="{% url 'mealservice_log_disposal' svc.id %}" class="mt-2 flex gap-2 items-center">
+            {% csrf_token %}
+            <label class="text-xs text-slate-500">Discarded at day 5:</label>
+            <input type="number" step="0.001" name="discarded_qty" placeholder="qty"
+                   class="border rounded px-2 py-1 text-sm w-24">
+            <span class="text-xs text-slate-500">{{ svc.unit|default:"" }}</span>
+            <button type="submit" class="px-2 py-1 bg-amber-600 text-white text-xs rounded hover:bg-amber-700">Log disposal</button>
+          </form>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+    {% endif %}
+
+    <!-- New service form (cleanup touchpoint) -->
+    <form method="post" action="{% url 'menu_log_service' menu.id %}" class="space-y-2">
+      {% csrf_token %}
+      <div class="grid grid-cols-1 sm:grid-cols-4 gap-2">
+        <div>
+          <label class="block text-xs text-slate-500 mb-0.5">Prepped</label>
+          <input type="number" step="0.001" name="prepped_qty" required
+                 class="border rounded px-2 py-1 w-full text-sm" placeholder="e.g., 40">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-0.5">Leftover (post-service)</label>
+          <input type="number" step="0.001" name="post_service_leftover_qty"
+                 class="border rounded px-2 py-1 w-full text-sm" placeholder="e.g., 8">
+        </div>
+        <div>
+          <label class="block text-xs text-slate-500 mb-0.5">Unit</label>
+          <input type="text" name="unit" maxlength="30"
+                 class="border rounded px-2 py-1 w-full text-sm" placeholder="portions, pans, lbs">
+        </div>
+        <div class="flex items-end">
+          <button type="submit" class="w-full px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">
+            + Log service
+          </button>
+        </div>
+      </div>
+      <div>
+        <label class="block text-xs text-slate-500 mb-0.5">Notes (optional)</label>
+        <input type="text" name="notes"
+               class="border rounded px-2 py-1 w-full text-sm" placeholder="Anything special about this service">
+      </div>
+    </form>
+  </div>
 </div>
 {% endblock %}

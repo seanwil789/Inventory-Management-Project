@@ -183,8 +183,76 @@ def calendar_biweekly(request, start_date_str: str):
 
 
 def menu_detail(request, menu_id: int):
+    from .models import MealService
     menu = get_object_or_404(Menu, pk=menu_id)
-    return render(request, 'myapp/menu_detail.html', {'menu': menu})
+    services = menu.service_records.all().order_by('-created_at')
+    return render(request, 'myapp/menu_detail.html', {
+        'menu': menu,
+        'services': services,
+    })
+
+
+@require_POST
+def menu_log_service(request, menu_id: int):
+    """Create a MealService record for this menu (cleanup touchpoint)."""
+    from .models import MealService
+    from decimal import Decimal, InvalidOperation
+
+    menu = get_object_or_404(Menu, pk=menu_id)
+
+    def _dec(name):
+        v = (request.POST.get(name) or '').strip()
+        if not v:
+            return None
+        try:
+            return Decimal(v)
+        except InvalidOperation:
+            return None
+
+    prepped = _dec('prepped_qty')
+    leftover = _dec('post_service_leftover_qty')
+    unit = (request.POST.get('unit') or '').strip()[:30]
+    notes = (request.POST.get('notes') or '').strip()
+
+    if prepped is None:
+        messages.error(request, "Prepped quantity is required.")
+        return redirect(reverse('menu_detail', args=[menu.id]))
+
+    MealService.objects.create(
+        menu=menu,
+        prepped_qty=prepped,
+        post_service_leftover_qty=leftover,
+        unit=unit,
+        notes=notes,
+    )
+    messages.success(request,
+        f"Logged service: prepped {prepped} {unit}"
+        + (f", leftover {leftover} {unit}" if leftover is not None else ""))
+    return redirect(reverse('menu_detail', args=[menu.id]))
+
+
+@require_POST
+def mealservice_log_disposal(request, service_id: int):
+    """Update a MealService with disposal info (day-5 touchpoint)."""
+    from .models import MealService
+    from datetime import datetime
+    from decimal import Decimal, InvalidOperation
+
+    svc = get_object_or_404(MealService, pk=service_id)
+    raw = (request.POST.get('discarded_qty') or '').strip()
+    try:
+        svc.discarded_qty = Decimal(raw) if raw else None
+    except InvalidOperation:
+        messages.error(request, f"Invalid discarded quantity: {raw}")
+        return redirect(reverse('menu_detail', args=[svc.menu_id]))
+
+    if svc.discarded_qty is not None:
+        svc.discarded_at = datetime.now()
+    svc.save(update_fields=['discarded_qty', 'discarded_at', 'updated_at'])
+    messages.success(request,
+        f"Logged disposal: {svc.discarded_qty} {svc.unit}" if svc.discarded_qty
+        else "Cleared disposal record.")
+    return redirect(reverse('menu_detail', args=[svc.menu_id]))
 
 
 def _save_components(menu: Menu, post) -> None:
