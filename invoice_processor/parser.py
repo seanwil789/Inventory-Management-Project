@@ -1391,7 +1391,11 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
             price_start = i
     if price_start:
         for i in range(price_start + 1, len(lines)):
-            if re.match(r'^(Total|\$)', lines[i], re.IGNORECASE):
+            # Break on "Total: $X" or bare "$X" (total value lines), NOT the
+            # bare "Total" column header that appears before any prices.
+            if re.match(r'^Total\s+\$?\d', lines[i], re.IGNORECASE):
+                break
+            if re.match(r'^\$\d', lines[i]):
                 break
             m = re.match(r'^(\d+\.\d{2})$', lines[i])
             if m:
