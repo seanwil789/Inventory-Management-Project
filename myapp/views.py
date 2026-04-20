@@ -819,6 +819,7 @@ def menu_save_prefab(request, menu_id: int):
 
     meal = Recipe.objects.create(
         name=name,
+        level='meal',  # prefabs saved from a menu are always meal-level
         notes=f"Meal saved from menu {menu.date} {menu.get_meal_slot_display()}.",
     )
     for sub in linked:
@@ -865,13 +866,14 @@ def recipe_edit(request, recipe_id: int):
 def _lineage_recipes(recipe: Recipe) -> list[Recipe]:
     """Return all recipes in the same version lineage (same trunk), including the
     given recipe. Walks parent chain to root, then BFS-collects all descendants."""
-    # Find root
+    # Walk parent chain to root, with cycle guard
     root = recipe
-    seen = {root.pk}
-    while root.parent_recipe_id and root.parent_recipe_id not in seen:
+    walk_seen = {root.pk}
+    while root.parent_recipe_id and root.parent_recipe_id not in walk_seen:
         root = root.parent_recipe
-        seen.add(root.pk)
-    # BFS from root
+        walk_seen.add(root.pk)
+    # BFS all descendants from root (independent seen set so we actually collect them)
+    seen = {root.pk}
     out = [root]
     frontier = [root]
     while frontier:
