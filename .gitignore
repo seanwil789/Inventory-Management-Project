@@ -31,3 +31,4 @@ The-Book-of-Yields*.pdf
 
 # Generated historical stats (from import_production_tracker)
 .historical_stats/
+.archive/
