@@ -788,9 +788,12 @@ def recipe_detail(request, recipe_id: int):
         pk=recipe_id,
     )
     breakdown = recipe.estimated_cost_breakdown()
+    # Version lineage (empty list if this is a solo v1)
+    lineage = _lineage_recipes(recipe) if recipe.parent_recipe_id or recipe.versions.exists() else []
     return render(request, 'myapp/recipe_detail.html', {
         'recipe': recipe,
         'breakdown': breakdown,
+        'lineage': lineage,
     })
 
 
@@ -857,6 +860,84 @@ def recipe_edit(request, recipe_id: int):
     return render(request, 'myapp/recipe_form.html', {
         'recipe': recipe, 'form': form, 'formset': formset,
     })
+
+
+def _lineage_recipes(recipe: Recipe) -> list[Recipe]:
+    """Return all recipes in the same version lineage (same trunk), including the
+    given recipe. Walks parent chain to root, then BFS-collects all descendants."""
+    # Find root
+    root = recipe
+    seen = {root.pk}
+    while root.parent_recipe_id and root.parent_recipe_id not in seen:
+        root = root.parent_recipe
+        seen.add(root.pk)
+    # BFS from root
+    out = [root]
+    frontier = [root]
+    while frontier:
+        next_frontier = []
+        for r in frontier:
+            for child in r.versions.all():
+                if child.pk not in seen:
+                    seen.add(child.pk)
+                    out.append(child)
+                    next_frontier.append(child)
+        frontier = next_frontier
+    return sorted(out, key=lambda r: r.version_number)
+
+
+@require_POST
+def recipe_new_version(request, recipe_id: int):
+    """Create Recipe V{n+1} from an existing recipe. Copies fields + ingredients,
+    points parent_recipe back, marks old as is_current=False."""
+    current = get_object_or_404(Recipe, pk=recipe_id)
+
+    lineage = _lineage_recipes(current)
+    max_v = max(r.version_number for r in lineage)
+    new_v = max_v + 1
+
+    # Name: strip any trailing " V<digits>" then append new version
+    import re as _re
+    base_name = _re.sub(r'\s+V\d+\s*$', '', current.name).strip()
+    new_name = f'{base_name} V{new_v}'
+
+    # Safety: if somehow the new name collides, bump further
+    while Recipe.objects.filter(name__iexact=new_name).exists():
+        new_v += 1
+        new_name = f'{base_name} V{new_v}'
+
+    new = Recipe.objects.create(
+        name=new_name,
+        level=current.level,
+        yield_servings=current.yield_servings,
+        source_doc=current.source_doc,
+        notes=current.notes,
+        protein=current.protein,
+        fat_health=current.fat_health,
+        popularity='',  # fresh popularity tracking per version (per design memo)
+        conflicts=list(current.conflicts or []),
+        parent_recipe=current,
+        version_number=new_v,
+        is_current=True,
+    )
+    for ing in current.ingredients.all():
+        RecipeIngredient.objects.create(
+            recipe=new,
+            name_raw=ing.name_raw,
+            quantity=ing.quantity,
+            unit=ing.unit,
+            yield_pct=ing.yield_pct,
+            yield_ref=ing.yield_ref,
+            product=ing.product,
+            sub_recipe=ing.sub_recipe,
+        )
+    # Flip all other lineage members to is_current=False; only `new` is current.
+    Recipe.objects.filter(pk__in=[r.pk for r in lineage]).update(is_current=False)
+
+    messages.success(request,
+        f'Created {new_name} — {new.ingredients.count()} ingredients copied. '
+        f'Edit below; previous version remains available in the history.')
+    return redirect(reverse('recipe_edit', args=[new.id]))
 
 
 def recipe_new(request):

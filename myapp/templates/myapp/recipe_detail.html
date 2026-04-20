@@ -34,8 +34,20 @@
         {% endif %}
         {% endwith %}
       </div>
-      <a href="{% url 'recipe_edit' recipe.id %}"
-         class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Edit recipe</a>
+      <div class="flex gap-2">
+        <a href="{% url 'recipe_edit' recipe.id %}"
+           class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Edit recipe</a>
+        {% if recipe.is_current %}
+        <form method="post" action="{% url 'recipe_new_version' recipe.id %}" class="inline"
+              onsubmit="return confirm('Create V{{ recipe.version_number|add:1 }} as a new editable copy? Current version will be preserved in history.');">
+          {% csrf_token %}
+          <button type="submit" class="px-3 py-1.5 bg-white border border-indigo-300 text-indigo-700 text-sm rounded hover:bg-indigo-50"
+                  title="Duplicate this recipe + ingredients into a new version. Tweak safely without losing the original.">
+            + V{{ recipe.version_number|add:1 }}
+          </button>
+        </form>
+        {% endif %}
+      </div>
     </div>
 
     <div class="mt-5">
@@ -76,6 +88,31 @@
     <div class="mt-5">
       <div class="text-xs uppercase font-semibold text-slate-500 tracking-wide mb-1">Procedure</div>
       <p class="text-sm text-slate-700 whitespace-pre-wrap">{{ recipe.notes }}</p>
+    </div>
+    {% endif %}
+
+    {% if lineage %}
+    <div class="mt-5 pt-4 border-t">
+      <div class="text-xs uppercase font-semibold text-slate-500 tracking-wide mb-2">Version history</div>
+      <ul class="text-sm space-y-1">
+        {% for v in lineage %}
+          <li class="flex items-center gap-2">
+            <span class="text-xs font-mono text-slate-400 w-10">V{{ v.version_number }}</span>
+            {% if v.id == recipe.id %}
+              <span class="font-medium text-slate-900">{{ v.name }}</span>
+              <span class="text-xs rounded bg-indigo-100 text-indigo-700 px-1.5 py-0.5">viewing</span>
+            {% else %}
+              <a href="{% url 'recipe_detail' v.id %}" class="text-indigo-600 hover:underline">{{ v.name }}</a>
+            {% endif %}
+            {% if v.is_current %}
+              <span class="text-xs rounded bg-emerald-100 text-emerald-700 px-1.5 py-0.5">current</span>
+            {% endif %}
+            {% if v.created_at %}
+              <span class="text-xs text-slate-400 ml-auto">{{ v.created_at|date:"M j, Y" }}</span>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
     </div>
     {% endif %}
   </div>
