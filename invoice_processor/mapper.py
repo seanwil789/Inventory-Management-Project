@@ -197,8 +197,9 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
 
     Returns the item dict enriched with:
       canonical             — resolved name or None
-      confidence            — "code" | "vendor-exact" | "vendor-fuzzy" |
-                              "exact" | "fuzzy" | "stripped-fuzzy" | "unmatched"
+      confidence            — "code" | "vendor_exact" | "vendor_fuzzy" |
+                              "exact" | "fuzzy" | "stripped_fuzzy" |
+                              "keyword_batch" | "manual_review" | "unmatched"
       score                 — 0-100
       category              — top-level category (e.g. "Produce") or ""
       primary_descriptor    — mid-level grouping (e.g. "Leaf") or ""
@@ -240,7 +241,7 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
     # 2. Vendor-scoped exact match
     if vendor_map and normalized in vendor_map:
         return _attach_category({**item, "canonical": vendor_map[normalized],
-                                 "confidence": "vendor-exact", "score": 100})
+                                 "confidence": "vendor_exact", "score": 100})
 
     # 3. Vendor-scoped fuzzy match
     if vendor_map and normalized:
@@ -251,7 +252,7 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
         )
         if score >= FUZZY_THRESHOLD:
             return _attach_category({**item, "canonical": vendor_map[best_match],
-                                     "confidence": "vendor-fuzzy", "score": score})
+                                     "confidence": "vendor_fuzzy", "score": score})
 
     # 4. Global exact match
     if normalized in desc_map:
@@ -289,7 +290,7 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
                 return _attach_category({
                     **item,
                     "canonical":  best_canonical,
-                    "confidence": "stripped-fuzzy",
+                    "confidence": "stripped_fuzzy",
                     "score":      score,
                 })
 

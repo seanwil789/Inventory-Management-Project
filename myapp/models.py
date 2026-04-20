@@ -46,9 +46,10 @@ class InvoiceLineItem(models.Model):
         ('exact', 'Exact Description Match'),
         ('vendor_exact', 'Vendor-Scoped Exact'),
         ('vendor_fuzzy', 'Vendor-Scoped Fuzzy'),
-        ('global_exact', 'Global Exact'),
-        ('global_fuzzy', 'Global Fuzzy'),
-        ('stripped-fuzzy', 'Stripped Prefix Fuzzy'),
+        ('fuzzy', 'Fuzzy Match'),
+        ('stripped_fuzzy', 'Stripped Prefix Fuzzy'),
+        ('keyword_batch', 'Keyword Batch (Human)'),
+        ('manual_review', 'Manual Review (Human)'),
         ('unmatched', 'Unmatched'),
     ]
 

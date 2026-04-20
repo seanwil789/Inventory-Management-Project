@@ -2,8 +2,16 @@ from django.contrib import admin
 from .models import (
     Vendor, Product, ProductMapping, InvoiceLineItem,
     Recipe, RecipeIngredient, Menu, PrepTask, Census,
-    IngredientSkipNote, YieldReference,
+    IngredientSkipNote, YieldReference, StandardPortionReference,
 )
+
+
+@admin.register(StandardPortionReference)
+class StandardPortionReferenceAdmin(admin.ModelAdmin):
+    list_display   = ('menu_item', 'category', 'average_measure', 'low_range', 'high_range', 'source_ref')
+    list_filter    = ('category', 'source')
+    search_fields  = ('menu_item',)
+    ordering       = ('category', 'menu_item')
 
 
 @admin.register(YieldReference)

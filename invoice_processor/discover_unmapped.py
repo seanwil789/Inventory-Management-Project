@@ -717,7 +717,7 @@ def run_audit():
     suspect = (InvoiceLineItem.objects
         .filter(
             product__isnull=False,
-            match_confidence__in=["vendor_fuzzy", "global_fuzzy", "stripped-fuzzy"],
+            match_confidence__in=["vendor_fuzzy", "fuzzy", "stripped_fuzzy"],
             match_score__isnull=False,
         )
         .select_related("product", "vendor")

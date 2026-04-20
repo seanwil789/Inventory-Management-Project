@@ -24,3 +24,7 @@ OneDrive_*.zip
 
 # Reference material (copyrighted published work)
 The-Book-of-Yields*.pdf
+
+# Claude Code personal workspace (hook scripts + per-session snapshot)
+.claude/session_snapshot.md
+.claude/session_start_scour.py
