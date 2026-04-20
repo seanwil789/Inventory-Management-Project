@@ -22,6 +22,15 @@
       <span class="text-[10px] font-mono bg-emerald-50 text-emerald-800 rounded px-1.5 py-0.5"
             title="Scaled by census headcount">${{ cell.cost|floatformat:0 }}</span>
       {% endif %}
+      {# Dietary conflict badges — union across all linked recipes on this menu #}
+      {% with conflict_set=cell.menu_conflicts %}
+      {% if conflict_set %}
+        {% for k, label, icon in conflict_set %}
+          <span class="text-[10px] rounded-full bg-amber-50 border border-amber-200 text-amber-800 px-1"
+                title="Contains {{ label }}">{{ icon }}</span>
+        {% endfor %}
+      {% endif %}
+      {% endwith %}
     </div>
   </a>
 {% else %}

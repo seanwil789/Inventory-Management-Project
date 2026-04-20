@@ -105,6 +105,39 @@ POPULARITY_CHOICES = [
 ]
 
 
+# "Big 15" dietary conflict vocabulary — Sean-approved 2026-04-19 per
+# project_recipe_authoring.md. Applied as NEGATIVE descriptors: Recipe.conflicts
+# lists what the recipe CONTAINS / conflicts with. Downstream (future Client
+# model): match when set(client.avoid) & set(recipe.conflicts) == empty.
+CONFLICT_CHOICES = [
+    ('gluten',          'Gluten'),
+    ('dairy',           'Dairy'),
+    ('egg',             'Egg'),
+    ('peanut',          'Peanut'),
+    ('tree_nut',        'Tree nuts'),
+    ('fish',            'Fish'),
+    ('shellfish',       'Shellfish'),
+    ('soy',             'Soy'),
+    ('sesame',          'Sesame'),
+    ('meat',            'Contains meat'),
+    ('animal_products', 'Contains animal products'),
+    ('high_sugar',      'High sugar'),
+    ('high_sodium',     'High sodium'),
+    ('not_kosher',      'Not kosher'),
+    ('not_halal',       'Not halal'),
+    ('other',           'Other'),
+]
+CONFLICT_LABELS = dict(CONFLICT_CHOICES)
+# Short emoji icons for compact rendering on calendar cells
+CONFLICT_ICONS = {
+    'gluten': '🌾', 'dairy': '🥛', 'egg': '🥚', 'peanut': '🥜',
+    'tree_nut': '🌰', 'fish': '🐟', 'shellfish': '🦐', 'soy': '🫘',
+    'sesame': '·', 'meat': '🍖', 'animal_products': '🐄',
+    'high_sugar': 'S+', 'high_sodium': 'Na+', 'not_kosher': 'K✗',
+    'not_halal': 'H✗', 'other': '?',
+}
+
+
 class Recipe(models.Model):
     name           = models.CharField(max_length=200, unique=True)
     yield_servings = models.IntegerField(default=40)
@@ -116,9 +149,17 @@ class Recipe(models.Model):
                                       help_text="Sean's (F)=Fatty / (H)=Healthy oscillation tag.")
     popularity     = models.CharField(max_length=10, blank=True, choices=POPULARITY_CHOICES,
                                       help_text="Popularity among residents (from Menu Guide highlight color).")
+    conflicts      = models.JSONField(default=list, blank=True,
+                                      help_text="Dietary conflicts this recipe CONTAINS (Big 15 vocab). "
+                                                "Used for client-dietary-safety matching.")
 
     def __str__(self):
         return self.name
+
+    def conflict_labels(self):
+        """Return list of (key, label, icon) tuples for rendering badges."""
+        return [(k, CONFLICT_LABELS.get(k, k), CONFLICT_ICONS.get(k, '?'))
+                for k in (self.conflicts or [])]
 
     def estimated_cost_breakdown(self):
         """Return dict: total Decimal, per_serving Decimal, priced count, total count, lines list."""

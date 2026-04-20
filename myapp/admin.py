@@ -72,7 +72,9 @@ class RecipeIngredientInline(admin.TabularInline):
 
 @admin.register(Recipe)
 class RecipeAdmin(admin.ModelAdmin):
-    list_display  = ('name', 'yield_servings', 'ingredient_count', 'is_composed', 'source_doc')
+    list_display  = ('name', 'yield_servings', 'ingredient_count', 'is_composed',
+                     'conflicts_summary', 'source_doc')
+    list_filter   = ('protein', 'fat_health', 'popularity')
     search_fields = ('name',)
     inlines       = [RecipeIngredientInline]
 
@@ -82,6 +84,12 @@ class RecipeAdmin(admin.ModelAdmin):
     def is_composed(self, obj):
         return obj.ingredients.filter(sub_recipe__isnull=False).exists()
     is_composed.boolean = True
+
+    def conflicts_summary(self, obj):
+        if not obj.conflicts:
+            return '—'
+        return ', '.join(obj.conflicts)
+    conflicts_summary.short_description = 'Conflicts'
 
 
 @admin.register(Menu)

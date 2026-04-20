@@ -1,6 +1,22 @@
 from django import forms
 from django.forms import inlineformset_factory
-from .models import Menu, Recipe, RecipeIngredient, YieldReference
+from .models import Menu, Recipe, RecipeIngredient, YieldReference, CONFLICT_CHOICES
+
+
+class ConflictsField(forms.MultipleChoiceField):
+    """Render Recipe.conflicts (JSONField(default=list)) as a multi-select of
+    Big-15 checkboxes. Stores as a list of string keys."""
+    def __init__(self, *args, **kwargs):
+        kwargs.setdefault('choices', CONFLICT_CHOICES)
+        kwargs.setdefault('widget', forms.CheckboxSelectMultiple(
+            attrs={'class': 'grid grid-cols-2 sm:grid-cols-3 gap-1 text-sm'}))
+        kwargs.setdefault('required', False)
+        super().__init__(*args, **kwargs)
+
+    def prepare_value(self, value):
+        if value is None:
+            return []
+        return value
 
 
 class MenuForm(forms.ModelForm):
@@ -35,9 +51,14 @@ class MenuForm(forms.ModelForm):
 
 
 class RecipeForm(forms.ModelForm):
+    conflicts = ConflictsField(
+        label='Dietary conflicts',
+        help_text='What this recipe CONTAINS — e.g., a gluten-allergy client would avoid any recipe tagged gluten.',
+    )
+
     class Meta:
         model = Recipe
-        fields = ['name', 'yield_servings', 'notes']
+        fields = ['name', 'yield_servings', 'notes', 'conflicts']
         widgets = {
             'name':           forms.TextInput(attrs={'class': 'border rounded px-2 py-1 w-full'}),
             'yield_servings': forms.NumberInput(attrs={'class': 'border rounded px-2 py-1 w-32'}),

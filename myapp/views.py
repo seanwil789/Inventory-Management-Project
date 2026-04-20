@@ -17,6 +17,7 @@ from .forms import MenuForm, RecipeForm, RecipeIngredientFormSet, YieldReference
 from .models import (
     Census, IngredientSkipNote, Menu, MenuFreetextComponent, PrepTask, Product,
     Recipe, RecipeIngredient, YieldReference, PROTEIN_CHOICES,
+    CONFLICT_LABELS, CONFLICT_ICONS,
 )
 
 
@@ -53,6 +54,19 @@ def _dominant_protein(menu) -> str:
     return Counter(proteins).most_common(1)[0][0]
 
 
+def _menu_conflict_set(menu: Menu) -> list[tuple[str, str, str]]:
+    """Union of dietary conflict flags across menu.recipe + additional_recipes.
+    Returns sorted [(key, label, icon), ...] for template rendering."""
+    keys: set[str] = set()
+    if menu.recipe and menu.recipe.conflicts:
+        keys.update(menu.recipe.conflicts)
+    for r in menu.additional_recipes.all():
+        if r.conflicts:
+            keys.update(r.conflicts)
+    return [(k, CONFLICT_LABELS.get(k, k), CONFLICT_ICONS.get(k, '?'))
+            for k in sorted(keys)]
+
+
 def _menu_cost(menu: Menu, headcount: int | None) -> Decimal | None:
     """Sum cost of main + additional recipes × headcount. None if no priced data."""
     if not menu or not headcount:
@@ -84,7 +98,9 @@ def _build_week(start: date, menu_map, census_map, protein_map):
             census = census_map.get(day)
             headcount = census.headcount if census else None
             cost = _menu_cost(menu, headcount) if menu else None
-            cell = {'date': day, 'slot': slot_key, 'menu': menu, 'warnings': [], 'cost': cost}
+            conflicts = _menu_conflict_set(menu) if menu else []
+            cell = {'date': day, 'slot': slot_key, 'menu': menu, 'warnings': [],
+                    'cost': cost, 'menu_conflicts': conflicts}
             if menu:
                 mine = protein_map.get((day, slot_key), '')
                 if mine:

@@ -22,6 +22,17 @@
             {{ breakdown.priced }}/{{ breakdown.total_count }} ingredients priced
           </span>
         </div>
+        {% with flags=recipe.conflict_labels %}
+        {% if flags %}
+        <div class="mt-2 flex gap-1 flex-wrap">
+          <span class="text-xs text-slate-500 mr-1 self-center">Contains:</span>
+          {% for k, label, icon in flags %}
+            <span class="px-2 py-0.5 text-xs rounded-full bg-amber-50 border border-amber-200 text-amber-900"
+                  title="{{ label }}">{{ icon }} {{ label }}</span>
+          {% endfor %}
+        </div>
+        {% endif %}
+        {% endwith %}
       </div>
       <a href="{% url 'recipe_edit' recipe.id %}"
          class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Edit recipe</a>
