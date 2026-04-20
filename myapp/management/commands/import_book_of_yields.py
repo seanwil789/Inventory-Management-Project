@@ -28,13 +28,13 @@ SECTION_PAGE_RANGES = {
     'herbs_spices':  (33, 37),
     'fresh_herbs':   (38, 38),
     # Chapter 2 — Produce.
-    # Fruit chapter starts at book p.38 (PDF index 61); verified against the PDF
-    # header "Chapter 2 Produce — Fruit". Previously vegetables overshot by 1
-    # page, putting fruit rows (Apricots, Bananas, Berries) into the vegetables
-    # section. Fixed 2026-04-19.
+    # Fruit chapter starts at book p.38 (PDF 61). Canned goods start at book
+    # p.45 (PDF 68), not p.47 as originally configured — the last two fruit-
+    # section pages (p.45/46) were actually canned-foods data (carrots in
+    # water, onions canned, apricots in syrup). Fixed 2026-04-19.
     'vegetables':    (48, 60),
-    'fruit':         (61, 69),
-    'canned':        (70, 73),
+    'fruit':         (61, 67),
+    'canned':        (68, 73),
     # Chapter 3 — Starchy
     'dry_legumes':   (80, 80),
     'grains':        (81, 82),
