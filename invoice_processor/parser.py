@@ -1551,7 +1551,15 @@ def _parse_pbm(text: str) -> list[dict]:
     )
 
     raw_amounts = []
-    search_start = desc_idx + 1
+    # When PBM's explicit "Unit Price" header was detected well after the
+    # Description header, the price column is separated from the item list.
+    # Use the header position as the price-search anchor — otherwise the
+    # row-by-row extractor mistakes QTY column values (0.50 DZ, 1.00 DZ)
+    # for prices and produces nonsense totals.
+    if unit_price_idx is not None and unit_price_idx > desc_idx + 5:
+        search_start = unit_price_idx + 1
+    else:
+        search_start = desc_idx + 1
     if used_fallback:
         # Column format: prices are after Subtotal, up to Invoice Total
         for i in range(search_start, len(lines)):
