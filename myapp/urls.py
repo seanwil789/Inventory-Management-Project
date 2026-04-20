@@ -37,5 +37,7 @@ urlpatterns = [
     path('cogs/',                           views.cogs_dashboard,      name='cogs_dashboard'),
     path('categories/',                     views.category_spend,      name='category_spend'),
     path('alerts/',                         views.price_alerts,        name='price_alerts'),
+    path('demo/ready/',                     views.demo_ready,          name='demo_ready'),
+    path('historical/',                     views.historical_dishes,   name='historical_dishes'),
     path('suggestions/',                    views.menu_suggestions,    name='menu_suggestions'),
 ]

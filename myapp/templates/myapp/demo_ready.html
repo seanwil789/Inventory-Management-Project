@@ -1,0 +1,75 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Demo Readiness — {{ today }}{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl space-y-5">
+
+  <!-- Header + rollup -->
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Demo Readiness</h1>
+    <div class="text-sm text-slate-600 mt-1">
+      Morning-of checklist. Click links to fix. Goal: zero red, few yellow.
+    </div>
+  </div>
+
+  <div class="flex gap-3 flex-wrap">
+    <div class="flex-1 rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-center">
+      <div class="text-3xl font-bold text-emerald-700">{{ green_count }}</div>
+      <div class="text-xs text-emerald-800 uppercase tracking-wide">green</div>
+    </div>
+    <div class="flex-1 rounded-lg border border-amber-200 bg-amber-50 p-3 text-center">
+      <div class="text-3xl font-bold text-amber-700">{{ yellow_count }}</div>
+      <div class="text-xs text-amber-800 uppercase tracking-wide">yellow</div>
+    </div>
+    <div class="flex-1 rounded-lg border border-red-200 bg-red-50 p-3 text-center">
+      <div class="text-3xl font-bold text-red-700">{{ red_count }}</div>
+      <div class="text-xs text-red-800 uppercase tracking-wide">red</div>
+    </div>
+  </div>
+
+  <!-- Sections -->
+  {% for section_name, rows in sections %}
+    <div class="rounded-lg bg-white border border-slate-200 p-4">
+      <h2 class="text-sm font-semibold uppercase tracking-wider text-slate-700 mb-3">{{ section_name }}</h2>
+      <ul class="space-y-2">
+        {% for row in rows %}
+        <li class="flex items-start gap-3">
+          <!-- Status dot -->
+          <span class="mt-1 w-3 h-3 rounded-full flex-shrink-0
+            {% if row.status == 'green' %}bg-emerald-500
+            {% elif row.status == 'yellow' %}bg-amber-500
+            {% else %}bg-red-500{% endif %}"></span>
+          <!-- Content -->
+          <div class="flex-1 min-w-0">
+            <div class="text-sm font-medium text-slate-900">{{ row.label }}</div>
+            {% if row.detail %}
+              <div class="text-xs text-slate-600 mt-0.5">{{ row.detail }}</div>
+            {% endif %}
+          </div>
+          {% if row.link %}
+          <a href="{{ row.link }}"
+             class="text-xs px-2 py-1 rounded
+                    {% if row.status == 'red' %}bg-red-50 border border-red-200 text-red-800 hover:bg-red-100
+                    {% elif row.status == 'yellow' %}bg-amber-50 border border-amber-200 text-amber-800 hover:bg-amber-100
+                    {% else %}bg-slate-50 border border-slate-200 text-slate-700 hover:bg-slate-100{% endif %}
+                    whitespace-nowrap">
+            {{ row.link_label }} →
+          </a>
+          {% endif %}
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+  {% endfor %}
+
+  <!-- Footer guidance -->
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+    <strong>How to read this:</strong>
+    <span class="text-emerald-700">Green</span> = ready. Keep as-is.
+    <span class="text-amber-700">Yellow</span> = partial; a single action fixes.
+    <span class="text-red-700">Red</span> = demo-risk; address before the meeting or plan around it.
+    This page re-evaluates on every load — fix something, refresh, see the status change.
+  </div>
+
+</div>
+{% endblock %}

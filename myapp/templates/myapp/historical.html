@@ -1,0 +1,139 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Historical Dish Performance{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl space-y-5">
+
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Historical Dish Performance</h1>
+    <p class="text-sm text-slate-600 mt-1">
+      Jan 2026 Production Tracker data — what Sean was already measuring by hand.
+      Waste ratio = (wasted ÷ prepped) within a service.
+    </p>
+  </div>
+
+  {% if stats %}
+    <!-- Rollup -->
+    <div class="rounded-lg bg-white border border-slate-200 p-4 grid grid-cols-2 sm:grid-cols-3 gap-4">
+      <div>
+        <div class="text-xs text-slate-500 uppercase tracking-wide">Services</div>
+        <div class="text-2xl font-semibold">{{ stats.total_services }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-slate-500 uppercase tracking-wide">Unique dishes</div>
+        <div class="text-2xl font-semibold">{{ stats.unique_dishes }}</div>
+      </div>
+      <div>
+        <div class="text-xs text-slate-500 uppercase tracking-wide">With 2+ services</div>
+        <div class="text-2xl font-semibold">{{ stats.total_multi_service }}</div>
+      </div>
+    </div>
+
+    <!-- Top waste (high-waste = unpopular) -->
+    {% if stats.top_waste %}
+    <div class="rounded-lg bg-white border border-slate-200 p-5">
+      <h2 class="text-lg font-semibold text-slate-900 mb-1">Highest Waste (Multi-Service Dishes)</h2>
+      <p class="text-xs text-slate-500 mb-3">
+        Dishes that consistently get thrown out. Signals to prep less next time, or drop the dish.
+      </p>
+      <table class="w-full text-sm">
+        <thead class="text-xs uppercase text-slate-500 tracking-wide">
+          <tr class="border-b border-slate-200">
+            <th class="text-left py-2">Dish</th>
+            <th class="text-right py-2">Services</th>
+            <th class="text-right py-2">Avg waste</th>
+            <th class="text-left py-2 pl-4">Waste bar</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in stats.top_waste %}
+          <tr class="border-b border-slate-100">
+            <td class="py-2 text-slate-800">{{ d.display_name }}</td>
+            <td class="py-2 text-right text-slate-600">{{ d.n_services }}</td>
+            <td class="py-2 text-right font-mono text-red-700">{{ d.avg_waste_ratio|floatformat:1 }}%</td>
+            <td class="py-2 pl-4 w-48">
+              <div class="w-full bg-slate-100 rounded h-2.5 relative">
+                <div class="bg-red-400 h-2.5 rounded" style="width: {% widthratio d.avg_waste_ratio 1 100 %}%"></div>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    <!-- Top consumed (low-waste = popular) -->
+    {% if stats.top_consumed %}
+    <div class="rounded-lg bg-white border border-slate-200 p-5">
+      <h2 class="text-lg font-semibold text-slate-900 mb-1">Highest Consumption (Multi-Service Dishes)</h2>
+      <p class="text-xs text-slate-500 mb-3">
+        Dishes that consistently get eaten. Signals to prep more, or repeat the dish.
+      </p>
+      <table class="w-full text-sm">
+        <thead class="text-xs uppercase text-slate-500 tracking-wide">
+          <tr class="border-b border-slate-200">
+            <th class="text-left py-2">Dish</th>
+            <th class="text-right py-2">Services</th>
+            <th class="text-right py-2">Consumed</th>
+            <th class="text-left py-2 pl-4">Consumption bar</th>
+          </tr>
+        </thead>
+        <tbody>
+          {% for d in stats.top_consumed %}
+          <tr class="border-b border-slate-100">
+            <td class="py-2 text-slate-800">{{ d.display_name }}</td>
+            <td class="py-2 text-right text-slate-600">{{ d.n_services }}</td>
+            <td class="py-2 text-right font-mono text-emerald-700">{{ d.avg_consumption_rate|floatformat:1 }}%</td>
+            <td class="py-2 pl-4 w-48">
+              <div class="w-full bg-slate-100 rounded h-2.5 relative">
+                <div class="bg-emerald-400 h-2.5 rounded" style="width: {% widthratio d.avg_consumption_rate 1 100 %}%"></div>
+              </div>
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+    <!-- Single-service outliers -->
+    {% if stats.interesting_singles %}
+    <div class="rounded-lg bg-white border border-slate-200 p-5">
+      <h2 class="text-lg font-semibold text-slate-900 mb-1">Single-Service High-Waste Outliers</h2>
+      <p class="text-xs text-slate-500 mb-3">
+        One-off observations. Need a second service to confirm a pattern, but each of these is flagged for follow-up.
+      </p>
+      <ul class="text-sm space-y-1">
+        {% for d in stats.interesting_singles %}
+          <li class="flex justify-between gap-4">
+            <span class="text-slate-800">{{ d.display_name }}</span>
+            <span class="font-mono text-red-700">{{ d.avg_waste_ratio|floatformat:1 }}% waste</span>
+          </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% endif %}
+
+    <!-- Caveat -->
+    <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+      <strong>Data quality note:</strong> The Production Tracker xlsx has 150+ row entries, but only
+      {{ stats.total_services }} have cleanly-parseable prep + waste values (numeric or number-plus-unit
+      where prep and waste share the same unit). Text-only entries like "1 Hotel Pan"
+      prep with "Client Fridge" usage are skipped — the app's
+      new MealService schema captures structured data going forward; this page
+      is a historical read of Sean's manual tracking.
+      Generated {{ stats.generated_at|slice:":16" }}.
+    </div>
+  {% else %}
+    <div class="rounded-lg bg-white border border-slate-200 p-5">
+      <p class="text-slate-500 italic">
+        No historical stats yet. Run:
+        <code class="bg-slate-100 px-2 py-0.5 rounded">python manage.py import_production_tracker --apply</code>
+        to parse the Jan 2026 Production Tracker.xlsx into demo-ready stats.
+      </p>
+    </div>
+  {% endif %}
+
+</div>
+{% endblock %}

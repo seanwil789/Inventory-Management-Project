@@ -1295,6 +1295,302 @@ def yield_bridge(request):
     return render(request, 'myapp/yield_bridge.html', {'rows': rows})
 
 
+
+# ---- Historical dish performance (Production Tracker) ----
+
+def historical_dishes(request):
+    """Display Jan 2026 Production Tracker data — historical waste ratios
+    and consumption rates. Demo prop for the 'we have real data' narrative.
+
+    JSON source: .historical_stats/production_tracker.json, produced by the
+    import_production_tracker management command. If the file is missing,
+    the view shows an empty-state prompt."""
+    import json
+    from pathlib import Path
+    from django.conf import settings as _settings
+
+    json_path = _settings.BASE_DIR / '.historical_stats' / 'production_tracker.json'
+    if not json_path.exists():
+        return render(request, 'myapp/historical.html', {'stats': None})
+
+    try:
+        data = json.loads(json_path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return render(request, 'myapp/historical.html', {'stats': None})
+
+    dishes = data.get('dishes', [])
+    # Sort buckets
+    multi_service = [d for d in dishes if d['n_services'] >= 2]
+    single_service = [d for d in dishes if d['n_services'] == 1]
+
+    top_waste = sorted(multi_service, key=lambda d: -d['avg_waste_ratio'])[:10]
+    top_consumed = sorted(multi_service, key=lambda d: d['avg_waste_ratio'])[:10]
+    interesting_singles = sorted(single_service, key=lambda d: -d['avg_waste_ratio'])[:6]
+
+    return render(request, 'myapp/historical.html', {
+        'stats': {
+            'generated_at': data.get('generated_at', ''),
+            'total_services': data.get('total_services', 0),
+            'unique_dishes': data.get('unique_dishes', 0),
+            'top_waste': top_waste,
+            'top_consumed': top_consumed,
+            'interesting_singles': interesting_singles,
+            'total_multi_service': len(multi_service),
+        },
+    })
+
+
+# ---- Demo readiness page ----
+
+def demo_ready(request):
+    """Morning-of demo checklist. Groups status by demo scene + data quality +
+    external blockers. Each row is one actionable status with a fix link."""
+    from datetime import timedelta
+    from django.db.models import Count, Q
+    from pathlib import Path
+    import os
+
+    today = date.today()
+
+    checks: list[dict] = []
+
+    def add(section: str, status: str, label: str, detail: str = '', link: str = '', link_label: str = ''):
+        checks.append({
+            'section': section,
+            'status': status,  # 'green' | 'yellow' | 'red'
+            'label': label,
+            'detail': detail,
+            'link': link,
+            'link_label': link_label,
+        })
+
+    # --- Scene 1: Ambient / wall display ---
+    today_menus = Menu.objects.filter(date=today).count()
+    if today_menus >= 3:
+        add('Scene 1 — Ambient (wall display)', 'green',
+            f"Today's menu populated ({today_menus} slots)",
+            '/display/ will have dishes to show',
+            reverse('kitchen_display'), 'open display')
+    elif today_menus:
+        add('Scene 1 — Ambient (wall display)', 'yellow',
+            f"Today's menu partial ({today_menus} slots)",
+            'Display will show some dishes; others blank',
+            reverse('kitchen_display'), 'open display')
+    else:
+        add('Scene 1 — Ambient (wall display)', 'red',
+            "Today has no menu",
+            "Wall display will show 'No menu scheduled'. Use ?as_of= to preview a populated day.",
+            reverse('kitchen_display') + f'?as_of=2026-04-27', 'preview 4/27')
+
+    # --- Scene 2: Albert authors a cell ---
+    # Need: empty cells to demo against, and the "+ New Recipe" + order-guide paths to look good.
+    upcoming_end = today + timedelta(days=14)
+    upcoming_total = Menu.objects.filter(date__gte=today, date__lte=upcoming_end).count()
+    upcoming_linked = Menu.objects.filter(
+        date__gte=today, date__lte=upcoming_end, recipe__isnull=False
+    ).count()
+    linked_pct = int(100 * upcoming_linked / upcoming_total) if upcoming_total else 0
+    if linked_pct >= 50:
+        add('Scene 2 — Albert authors', 'green',
+            f"Next 14 days: {upcoming_linked}/{upcoming_total} menus linked ({linked_pct}%)",
+            'Cost badges will be visible throughout the demo calendar',
+            reverse('calendar_current'), 'open calendar')
+    elif linked_pct >= 20:
+        add('Scene 2 — Albert authors', 'yellow',
+            f"Next 14 days: {upcoming_linked}/{upcoming_total} menus linked ({linked_pct}%)",
+            'Some cells will show cost badges; most will be freetext-only',
+            reverse('menu_bulk_link'), 'run bulk-link')
+    else:
+        add('Scene 2 — Albert authors', 'red',
+            f"Next 14 days: {upcoming_linked}/{upcoming_total} menus linked ({linked_pct}%)",
+            'Most calendar cells will have no cost badges — the story is thin. Bulk-link is the fix.',
+            reverse('menu_bulk_link'), 'run bulk-link')
+
+    # Cost coverage for linked menus
+    linked_menus = (Menu.objects
+                    .filter(date__gte=today, date__lte=upcoming_end, recipe__isnull=False)
+                    .select_related('recipe')
+                    .prefetch_related('recipe__ingredients'))
+    priced = 0
+    for m in linked_menus:
+        bd = m.recipe.estimated_cost_breakdown()
+        if bd['coverage'] >= 0.5:
+            priced += 1
+    if linked_menus and priced / len(list(linked_menus)) >= 0.7 if linked_menus else False:
+        add('Scene 2 — Albert authors', 'green',
+            f"Linked menus with ≥50% cost coverage: {priced}/{len(list(linked_menus))}",
+            'Cost badges will show real numbers')
+    elif linked_menus:
+        add('Scene 2 — Albert authors', 'yellow',
+            f"Linked menus with ≥50% cost coverage: {priced}/{len(list(linked_menus))}",
+            'Many linked menus have null ingredient quantities. Fix to light up badges.',
+            reverse('recipe_missing_quantities'), 'fill quantities')
+
+    # --- Scene 3: Management / COGs ---
+    cache_dir = Path('.invoice_totals')
+    current_month_cache = cache_dir / f'{today.year:04d}-{today.month:02d}.json'
+    if current_month_cache.exists():
+        import json
+        entries = json.loads(current_month_cache.read_text())
+        total = sum(e.get('total', 0) for e in entries)
+        if total > 5000:
+            add('Scene 3 — Management (COGs)', 'green',
+                f"{len(entries)} invoices cached, ${total:,.2f}",
+                'COGs dashboard will have substance')
+        elif total > 0:
+            add('Scene 3 — Management (COGs)', 'yellow',
+                f"{len(entries)} invoices cached, only ${total:,.2f}",
+                'COGs shows near-empty April. Run invoice batch or verify Drive inbox.',
+                reverse('cogs_dashboard'), 'open cogs')
+        else:
+            add('Scene 3 — Management (COGs)', 'red',
+                "No April invoices cached",
+                'COGs will show $0 spent. Run invoice batch.',
+                reverse('cogs_dashboard'), 'open cogs')
+    else:
+        add('Scene 3 — Management (COGs)', 'red',
+            "No invoice-totals cache file for current month",
+            f"Expected: .invoice_totals/{current_month_cache.name}")
+
+    # Dietary tags visible
+    tagged = Recipe.objects.exclude(conflicts=[]).count()
+    total_recipes = Recipe.objects.count()
+    if tagged >= total_recipes * 0.5:
+        add('Scene 3 — Management (dietary story)', 'green',
+            f"{tagged}/{total_recipes} recipes have dietary conflicts tagged",
+            'Management scene can show "here\'s what flags for a gluten allergy"')
+    else:
+        add('Scene 3 — Management (dietary story)', 'yellow',
+            f"Only {tagged}/{total_recipes} recipes tagged",
+            'Run auto_tag_conflicts or tag manually via /recipes/.')
+
+    # --- Scene 4: IT ask ---
+    it_doc = Path('docs/it-access-request.md')
+    if it_doc.exists():
+        size = it_doc.stat().st_size
+        add('Scene 4 — IT ask handout', 'green',
+            f"docs/it-access-request.md present ({size} bytes)",
+            'Print or email to IT admin before the meeting')
+    else:
+        add('Scene 4 — IT ask handout', 'red',
+            "docs/it-access-request.md missing",
+            'The 1-pager isn\'t in the repo. Check git log.')
+
+    # --- Data quality ---
+    null_qty = RecipeIngredient.objects.filter(quantity__isnull=True, sub_recipe__isnull=True).count()
+    if null_qty == 0:
+        add('Data quality', 'green', 'All recipe ingredients have quantities')
+    elif null_qty < 50:
+        add('Data quality', 'yellow',
+            f'{null_qty} RecipeIngredients have null quantity',
+            'Blocks cost calc on those ingredients',
+            reverse('recipe_missing_quantities'), 'fill quantities')
+    else:
+        add('Data quality', 'red',
+            f'{null_qty} RecipeIngredients have null quantity',
+            'Biggest single cost-coverage unlock',
+            reverse('recipe_missing_quantities'), 'fill quantities')
+
+    proteinless = Recipe.objects.filter(protein='').count()
+    if proteinless == 0:
+        add('Data quality', 'green', 'All recipes have a protein label')
+    elif proteinless < 20:
+        add('Data quality', 'yellow',
+            f'{proteinless} recipes have no protein label',
+            'Dish-suggestion protein-rotation rules silently skip these')
+    else:
+        add('Data quality', 'red',
+            f'{proteinless} recipes have no protein label',
+            'Run auto_tag_protein or set manually')
+
+    # --- Pipeline health ---
+    logs_dir = Path('logs')
+    recent_logs = []
+    if logs_dir.exists():
+        recent_logs = sorted(logs_dir.glob('invoice_batch_*.log'))[-5:]
+    if recent_logs:
+        any_error = False
+        for log in recent_logs:
+            try:
+                content = log.read_text()
+                if 'Traceback' in content or 'ERROR' in content:
+                    any_error = True
+                    break
+            except OSError:
+                pass
+        if not any_error:
+            add('Pipeline health', 'green',
+                f'Last 5 invoice batch runs clean (through {recent_logs[-1].name})')
+        else:
+            add('Pipeline health', 'red',
+                'Error found in recent batch logs',
+                f'Check {recent_logs[-1].name}')
+    else:
+        add('Pipeline health', 'yellow',
+            'No recent invoice batch logs',
+            'Pipeline may be idle or stopped')
+
+    recent_alerts = InvoiceLineItem.objects.filter(
+        price_flagged=True, invoice_date__gte=today - timedelta(days=7),
+    ).count()
+    add('Pipeline health', 'green' if recent_alerts else 'yellow',
+        f'{recent_alerts} price alerts in last 7 days',
+        'Fresh anomalies = demo has "we catch things" story' if recent_alerts else 'No recent alerts — weak "we watch prices" demo beat',
+        reverse('price_alerts'), 'open alerts')
+
+    # --- External blockers ---
+    april_census = Census.objects.filter(date__year=today.year, date__month=today.month).count()
+    if april_census >= 15:
+        add('External blockers', 'green',
+            f'Current-month census populated ({april_census} days)')
+    elif april_census > 0:
+        add('External blockers', 'yellow',
+            f'Current-month census partial ({april_census} days)',
+            'Program director still updating — chase via Google Tasks')
+    else:
+        add('External blockers', 'red',
+            'Current-month census empty',
+            'Blocks headcount scaling throughout. Chase program director.')
+
+    add('External blockers', 'red',
+        'Kitchen display hardware not deployed',
+        'Apolosign ordered? Mount? Network? The wall display is the ambient-anchor for scene 1.')
+
+    add('External blockers', 'yellow',
+        'Rehearsal: not tracked',
+        'Memory: "rehearse at least twice before demo day, Albert once." Both uncertain here.')
+
+    # --- Organize by section ---
+    from collections import defaultdict
+    by_section: dict = defaultdict(list)
+    for c in checks:
+        by_section[c['section']].append(c)
+    section_order = [
+        'Scene 1 — Ambient (wall display)',
+        'Scene 2 — Albert authors',
+        'Scene 3 — Management (COGs)',
+        'Scene 3 — Management (dietary story)',
+        'Scene 4 — IT ask handout',
+        'Data quality',
+        'Pipeline health',
+        'External blockers',
+    ]
+    sections = [(s, by_section[s]) for s in section_order if s in by_section]
+
+    # Rollup: count by status
+    red = sum(1 for c in checks if c['status'] == 'red')
+    yellow = sum(1 for c in checks if c['status'] == 'yellow')
+    green = sum(1 for c in checks if c['status'] == 'green')
+
+    return render(request, 'myapp/demo_ready.html', {
+        'today': today,
+        'sections': sections,
+        'red_count': red,
+        'yellow_count': yellow,
+        'green_count': green,
+    })
+
+
 # ---- Price creep alerts ----
 
 def price_alerts(request):
