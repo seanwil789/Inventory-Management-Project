@@ -859,6 +859,81 @@ def recipe_edit(request, recipe_id: int):
     })
 
 
+def recipe_new(request):
+    """Minimum-viable inline recipe creation. Fields: name, level, yield, notes.
+    On save: redirect to recipe_edit so ingredients can be added.
+
+    Supports ?prefill_name=... (used when linking from menu form) and
+    ?link_menu=<id> (re-links that menu to the new recipe after save)."""
+    from .models import LEVEL_CHOICES
+
+    prefill_name = (request.GET.get('prefill_name') or '').strip()
+    link_menu_id = request.GET.get('link_menu')
+
+    if request.method == 'POST':
+        name = (request.POST.get('name') or '').strip()
+        level = request.POST.get('level') or 'meal'
+        try:
+            yield_servings = int(request.POST.get('yield_servings') or 40)
+        except ValueError:
+            yield_servings = 40
+        notes = (request.POST.get('notes') or '').strip()
+        post_link_menu_id = request.POST.get('link_menu') or link_menu_id
+
+        errors = {}
+        if not name:
+            errors['name'] = 'Name is required.'
+        elif Recipe.objects.filter(name__iexact=name).exists():
+            errors['name'] = f'A recipe named "{name}" already exists — pick a different name.'
+        if level not in dict(LEVEL_CHOICES):
+            errors['level'] = 'Pick a valid level.'
+
+        if errors:
+            return render(request, 'myapp/recipe_new.html', {
+                'prefill_name': name, 'level': level,
+                'yield_servings': yield_servings, 'notes': notes,
+                'link_menu_id': post_link_menu_id,
+                'levels': LEVEL_CHOICES,
+                'errors': errors,
+            })
+
+        recipe = Recipe.objects.create(
+            name=name, level=level,
+            yield_servings=yield_servings, notes=notes,
+        )
+
+        # Link back to a menu if requested
+        if post_link_menu_id:
+            try:
+                menu = Menu.objects.get(pk=int(post_link_menu_id))
+                menu.recipe = recipe
+                menu.save(update_fields=['recipe'])
+                messages.success(request, f'Created "{name}" and linked to {menu.date} {menu.get_meal_slot_display()}. Add ingredients below.')
+            except (Menu.DoesNotExist, ValueError):
+                messages.success(request, f'Created "{name}". Add ingredients below.')
+        else:
+            messages.success(request, f'Created "{name}". Add ingredients below.')
+
+        return redirect(reverse('recipe_edit', args=[recipe.id]))
+
+    # GET: render empty form
+    # Pre-select level: if prefill_name looks like a meal-level name (has "with" or multi-word),
+    # suggest 'meal'. Otherwise 'recipe'. Never silent — user confirms.
+    suggested_level = 'meal' if (
+        prefill_name and (' with ' in prefill_name.lower() or len(prefill_name.split()) >= 3)
+    ) else 'recipe'
+
+    return render(request, 'myapp/recipe_new.html', {
+        'prefill_name': prefill_name,
+        'level': suggested_level,
+        'yield_servings': 40,
+        'notes': '',
+        'link_menu_id': link_menu_id,
+        'levels': LEVEL_CHOICES,
+        'errors': {},
+    })
+
+
 def yield_list(request):
     q = (request.GET.get('q') or '').strip()
     section = (request.GET.get('section') or '').strip()

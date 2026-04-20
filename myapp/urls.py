@@ -23,6 +23,7 @@ urlpatterns = [
     path('order-guide/',                    views.order_guide,         name='order_guide'),
     path('display/',                        views.kitchen_display,     name='kitchen_display'),
     path('recipes/',                        views.recipe_list,         name='recipe_list'),
+    path('recipe/new/',                     views.recipe_new,          name='recipe_new'),
     path('recipe/<int:recipe_id>/',         views.recipe_detail,       name='recipe_detail'),
     path('recipe/<int:recipe_id>/edit/',    views.recipe_edit,         name='recipe_edit'),
     path('yields/',                         views.yield_list,          name='yield_list'),

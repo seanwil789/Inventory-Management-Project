@@ -1,0 +1,82 @@
+{% extends 'myapp/base.html' %}
+{% block title %}New Recipe{% endblock %}
+
+{% block content %}
+<div class="max-w-xl">
+  <a href="{% url 'recipe_list' %}" class="text-sm text-indigo-600 hover:underline">&larr; Back</a>
+
+  <div class="mt-4 bg-white rounded shadow-sm p-6">
+    <h1 class="text-xl font-bold mb-1">New Recipe</h1>
+    <p class="text-sm text-slate-500 mb-4">
+      Minimum info to create the recipe shell — add ingredients on the next step.
+    </p>
+
+    <form method="post" class="space-y-4">
+      {% csrf_token %}
+      {% if link_menu_id %}
+        <input type="hidden" name="link_menu" value="{{ link_menu_id }}">
+      {% endif %}
+
+      <!-- Name -->
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">Name</label>
+        <input type="text" name="name" value="{{ prefill_name }}" autofocus required
+               class="border rounded px-2 py-1 w-full text-lg"
+               placeholder="e.g., Honey Glazed Salmon">
+        {% if errors.name %}<div class="text-sm text-red-600 mt-1">{{ errors.name }}</div>{% endif %}
+      </div>
+
+      <!-- Level (ontology) -->
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">What kind of thing is this?</label>
+        <div class="space-y-1">
+          {% for key, label in levels %}
+            <label class="flex items-start gap-2 cursor-pointer hover:bg-slate-50 rounded p-1">
+              <input type="radio" name="level" value="{{ key }}"
+                     {% if level == key %}checked{% endif %}
+                     class="mt-1">
+              <div class="text-sm">
+                <div class="font-medium text-slate-800">{{ label }}</div>
+                <div class="text-xs text-slate-500">
+                  {% if key == 'recipe' %}
+                    A single cookable item made from raw ingredients (e.g., Biscuits, Marinara, Pesto).
+                  {% elif key == 'composed_dish' %}
+                    A dish built from other recipes + maybe ingredients (e.g., Taco Lasagna, Beef Bolognese).
+                  {% else %}
+                    A plate-level menu entry combining multiple items (e.g., Shrimp &amp; Grits with Poached Eggs).
+                  {% endif %}
+                </div>
+              </div>
+            </label>
+          {% endfor %}
+        </div>
+        {% if errors.level %}<div class="text-sm text-red-600 mt-1">{{ errors.level }}</div>{% endif %}
+        <p class="text-xs text-slate-500 mt-1">
+          You can change this later. Sub-recipes (level = <em>recipe</em>) won't appear as menu candidates.
+        </p>
+      </div>
+
+      <!-- Yield -->
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">Yield (servings)</label>
+        <input type="number" name="yield_servings" value="{{ yield_servings }}"
+               min="1" class="border rounded px-2 py-1 w-32">
+        <p class="text-xs text-slate-500 mt-1">Default 40 — adjust once you know how many this recipe portions out to.</p>
+      </div>
+
+      <!-- Notes -->
+      <div>
+        <label class="block text-sm font-medium text-slate-700 mb-1">Notes (optional)</label>
+        <textarea name="notes" rows="3"
+                  class="border rounded px-2 py-1 w-full font-mono text-sm"
+                  placeholder="Procedure, reheating instructions, or a sketch of ingredients to flesh out later.">{{ notes }}</textarea>
+      </div>
+
+      <div class="flex gap-2 pt-2">
+        <button type="submit" class="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Create &amp; add ingredients</button>
+        <a href="{% url 'calendar_current' %}" class="px-4 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Cancel</a>
+      </div>
+    </form>
+  </div>
+</div>
+{% endblock %}

@@ -20,18 +20,27 @@
         <datalist id="meal-names">
           {% for r in all_recipes %}<option value="{{ r.name }}"></option>{% endfor %}
         </datalist>
-        <input type="text" name="dish_freetext" id="id_dish_freetext"
-               value="{{ form.dish_freetext.value|default:'' }}"
-               list="meal-names"
-               autofocus required
-               placeholder="Search existing meals or type a new name"
-               class="border rounded px-2 py-1 w-full text-lg"
-               hx-get="{% url 'menu_autofill_components' %}"
-               hx-trigger="change"
-               hx-target="#components-list"
-               hx-include="[name='dish_freetext']" />
+        <div class="flex gap-2">
+          <input type="text" name="dish_freetext" id="id_dish_freetext"
+                 value="{{ form.dish_freetext.value|default:'' }}"
+                 list="meal-names"
+                 autofocus required
+                 placeholder="Search existing meals or type a new name"
+                 class="border rounded px-2 py-1 flex-1 text-lg"
+                 hx-get="{% url 'menu_autofill_components' %}"
+                 hx-trigger="change"
+                 hx-target="#components-list"
+                 hx-include="[name='dish_freetext']" />
+          <a href="{% url 'recipe_new' %}{% if menu %}?link_menu={{ menu.id }}{% endif %}"
+             class="px-3 py-1 bg-indigo-50 border border-indigo-200 text-indigo-700 text-sm rounded hover:bg-indigo-100 whitespace-nowrap self-center"
+             title="Create a new saved recipe from this dish"
+             onclick="var n = document.getElementById('id_dish_freetext').value.trim(); if (n) this.href += (this.href.indexOf('?')>-1?'&':'?') + 'prefill_name=' + encodeURIComponent(n);">
+            + New Recipe
+          </a>
+        </div>
         <div class="text-xs text-slate-500 mt-1">
           Start typing to find a saved meal — pick one and its components auto-fill below. Or type a fresh name and build components from scratch.
+          Click <strong>+ New Recipe</strong> to save this dish as a reusable recipe before filling in components.
         </div>
         {% if form.dish_freetext.errors %}
           <div class="text-sm text-red-600 mt-1">{{ form.dish_freetext.errors }}</div>
