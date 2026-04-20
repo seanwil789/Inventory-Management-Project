@@ -708,6 +708,8 @@ def order_guide(request):
 def kitchen_display(request):
     """Read-only, big-text kitchen display — designed for a wall-mounted tablet.
     Optional ?as_of=YYYY-MM-DD to preview any date (demo-friendly)."""
+    from datetime import datetime
+
     as_of_str = request.GET.get('as_of')
     try:
         as_of = date.fromisoformat(as_of_str) if as_of_str else date.today()
@@ -717,23 +719,45 @@ def kitchen_display(request):
     # Today's meals (if any)
     today_menus = list(Menu.objects
                        .filter(date=as_of)
+                       .select_related('recipe')
                        .prefetch_related('additional_recipes', 'freetext_components')
                        .order_by('meal_slot'))
-    # Build a slot-keyed map for guaranteed ordering
     slot_order = ['cold_breakfast', 'hot_breakfast', 'lunch', 'dinner']
     slot_labels = dict(Menu.MEAL_SLOTS)
     today_by_slot = {m.meal_slot: m for m in today_menus}
-    today_rows = [
-        {'slot': s, 'label': slot_labels.get(s, s.title()), 'menu': today_by_slot.get(s)}
-        for s in slot_order
-    ]
+
+    # Current-slot computation: which meal is "active right now"?
+    # Approx windows: 6-10 cold, 10-12 hot, 12-17 lunch, 17-20 dinner, else none.
+    now = datetime.now()
+    hour = now.hour
+    current_slot = None
+    if as_of == date.today():
+        if 6 <= hour < 10:
+            current_slot = 'cold_breakfast'
+        elif 10 <= hour < 12:
+            current_slot = 'hot_breakfast'
+        elif 12 <= hour < 17:
+            current_slot = 'lunch'
+        elif 17 <= hour < 21:
+            current_slot = 'dinner'
+
+    today_rows = []
+    for s in slot_order:
+        menu = today_by_slot.get(s)
+        conflicts = _menu_conflict_set(menu) if menu else []
+        today_rows.append({
+            'slot': s,
+            'label': slot_labels.get(s, s.title()),
+            'menu': menu,
+            'conflicts': conflicts,
+            'is_current': s == current_slot,
+        })
 
     # Next 6 days' highlights for the "coming up" strip
     upcoming_menus = (Menu.objects
                       .filter(date__gt=as_of, date__lte=as_of + timedelta(days=6))
                       .prefetch_related('additional_recipes')
                       .order_by('date', 'meal_slot'))
-    # Group upcoming by date
     from collections import defaultdict
     upcoming_by_date = defaultdict(list)
     for m in upcoming_menus:
@@ -746,6 +770,10 @@ def kitchen_display(request):
 
     census = Census.objects.filter(date=as_of).first()
 
+    # Prep task summary for today
+    prep_total = PrepTask.objects.filter(date=as_of).count()
+    prep_done = PrepTask.objects.filter(date=as_of, completed=True).count()
+
     return render(request, 'myapp/display.html', {
         'as_of':         as_of,
         'is_today':      as_of == date.today(),
@@ -753,6 +781,10 @@ def kitchen_display(request):
         'upcoming_days': upcoming_days,
         'census':        census,
         'has_any_today': bool(today_menus),
+        'current_slot':  current_slot,
+        'prep_total':    prep_total,
+        'prep_done':     prep_done,
+        'clock_time':    now.strftime('%-I:%M %p') if as_of == date.today() else None,
     })
 
 
