@@ -1,0 +1,181 @@
+{% extends 'myapp/base.html' %}
+{% block title %}COGs — {{ current_label }}{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- Header -->
+  <div class="flex items-baseline justify-between">
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Food Spend — {{ current_label }}</h1>
+    <div class="text-sm text-slate-500">
+      Day {{ days_elapsed }} of {{ days_in_month }} ({{ elapsed_pct }}%)
+    </div>
+  </div>
+
+  <!-- Primary verdict card -->
+  {% if current_delta >= 0 %}
+    <div class="rounded-lg border border-emerald-200 bg-emerald-50 p-5">
+      <div class="flex items-baseline justify-between gap-4 flex-wrap">
+        <div>
+          <div class="text-sm text-emerald-700 uppercase tracking-wide">Under budget</div>
+          <div class="text-3xl sm:text-4xl font-bold text-emerald-900 mt-1">
+            ${{ current_spend|floatformat:2 }} <span class="text-xl text-emerald-700">of ${{ current_budget|floatformat:2 }}</span>
+          </div>
+          <div class="text-sm text-emerald-800 mt-1">${{ current_delta|floatformat:2 }} remaining for the month</div>
+        </div>
+        <div class="text-right">
+          <div class="text-sm text-emerald-700">Census</div>
+          <div class="text-2xl font-semibold text-emerald-900">{{ current_census }}</div>
+          <div class="text-xs text-emerald-700">at ${{ budget_per_resident_per_month }}/mo each</div>
+        </div>
+      </div>
+    </div>
+  {% else %}
+    <div class="rounded-lg border border-red-200 bg-red-50 p-5">
+      <div class="flex items-baseline justify-between gap-4 flex-wrap">
+        <div>
+          <div class="text-sm text-red-700 uppercase tracking-wide">OVER budget</div>
+          <div class="text-3xl sm:text-4xl font-bold text-red-900 mt-1">
+            ${{ current_spend|floatformat:2 }} <span class="text-xl text-red-700">of ${{ current_budget|floatformat:2 }}</span>
+          </div>
+          <div class="text-sm text-red-800 mt-1">Over by ${{ current_delta|floatformat:2|cut:"-" }}</div>
+        </div>
+        <div class="text-right">
+          <div class="text-sm text-red-700">Census</div>
+          <div class="text-2xl font-semibold text-red-900">{{ current_census }}</div>
+          <div class="text-xs text-red-700">at ${{ budget_per_resident_per_month }}/mo each</div>
+        </div>
+      </div>
+    </div>
+  {% endif %}
+
+  <!-- Secondary metrics row -->
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
+    <!-- Pace vs budget -->
+    <div class="rounded-lg bg-white border border-slate-200 p-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Pace vs linear budget</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-900">
+        ${{ current_spend|floatformat:2 }}
+      </div>
+      <div class="text-sm text-slate-600">
+        {% if pace_delta >= 0 %}
+          <span class="text-emerald-700">${{ pace_delta|floatformat:2 }} under</span> day-{{ days_elapsed }} pace (${{ budget_pace|floatformat:2 }})
+        {% else %}
+          <span class="text-red-700">${{ pace_delta|floatformat:2|cut:"-" }} over</span> day-{{ days_elapsed }} pace (${{ budget_pace|floatformat:2 }})
+        {% endif %}
+      </div>
+    </div>
+
+    <!-- Per-resident-per-day actual -->
+    <div class="rounded-lg bg-white border border-slate-200 p-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Actual $ / resident / day</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-900">
+        ${{ actual_per_res_per_day|floatformat:2 }}
+      </div>
+      <div class="text-sm text-slate-600">
+        Target ${{ target_per_res_per_day|floatformat:2 }}/day
+      </div>
+    </div>
+
+    <!-- Month progress -->
+    <div class="rounded-lg bg-white border border-slate-200 p-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Month progress</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-900">
+        {{ elapsed_pct }}%
+      </div>
+      <div class="text-sm text-slate-600">
+        Day {{ days_elapsed }} of {{ days_in_month }}
+      </div>
+      <div class="mt-2 w-full bg-slate-200 rounded-full h-1.5">
+        <div class="bg-slate-500 h-1.5 rounded-full" style="width: {{ elapsed_pct }}%"></div>
+      </div>
+    </div>
+  </div>
+
+  <!-- 4-month trend -->
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-4">Monthly Trend</h2>
+    <div class="space-y-4">
+      {% for row in trend_rows %}
+        <div>
+          <div class="flex justify-between items-baseline text-sm mb-1">
+            <span class="font-medium {% if row.is_current %}text-slate-900{% else %}text-slate-700{% endif %}">
+              {{ row.label }}{% if row.is_current %} <span class="text-xs text-slate-500">(in progress)</span>{% endif %}
+            </span>
+            <span class="text-slate-600">
+              ${{ row.spend|floatformat:2 }}
+              <span class="text-slate-400">/ ${{ row.budget|floatformat:2 }}</span>
+              {% if row.delta >= 0 %}
+                <span class="text-emerald-700 ml-2">under ${{ row.delta|floatformat:2 }}</span>
+              {% else %}
+                <span class="text-red-700 ml-2">over ${{ row.delta|floatformat:2|cut:"-" }}</span>
+              {% endif %}
+            </span>
+          </div>
+          <div class="relative h-8 bg-slate-100 rounded">
+            <!-- Budget marker (gray outline) -->
+            <div class="absolute inset-y-0 border-r-2 border-slate-400"
+                 style="width: {% widthratio row.budget max_trend 100 %}%"></div>
+            <!-- Actual spend (colored fill) -->
+            <div class="absolute inset-y-0 left-0 rounded {% if row.delta >= 0 %}bg-emerald-400{% else %}bg-red-400{% endif %}"
+                 style="width: {% widthratio row.spend max_trend 100 %}%"></div>
+          </div>
+        </div>
+      {% endfor %}
+    </div>
+    <div class="text-xs text-slate-500 mt-4">
+      Gray line = budget (census × ${{ budget_per_resident_per_month }}/resident). Green/red bar = actual spend.
+    </div>
+  </div>
+
+  <!-- Vendor breakdown & invoices -->
+  <div class="grid grid-cols-1 lg:grid-cols-2 gap-4">
+
+    {% if vendor_rows %}
+    <div class="rounded-lg bg-white border border-slate-200 p-5">
+      <h2 class="text-lg font-semibold text-slate-900 mb-3">Spend by Vendor ({{ current_label }})</h2>
+      <div class="space-y-2">
+        {% for v in vendor_rows %}
+          <div>
+            <div class="flex justify-between text-sm mb-0.5">
+              <span class="text-slate-800">{{ v.vendor }}</span>
+              <span class="text-slate-600">${{ v.total|floatformat:2 }} <span class="text-slate-400 text-xs">({{ v.pct }}%)</span></span>
+            </div>
+            <div class="w-full bg-slate-100 rounded h-2">
+              <div class="bg-slate-500 h-2 rounded" style="width: {{ v.pct }}%"></div>
+            </div>
+          </div>
+        {% endfor %}
+      </div>
+    </div>
+    {% endif %}
+
+    {% if recent_invoices %}
+    <div class="rounded-lg bg-white border border-slate-200 p-5">
+      <h2 class="text-lg font-semibold text-slate-900 mb-3">Recent Invoices ({{ current_label }})</h2>
+      <table class="w-full text-sm">
+        <thead class="text-slate-500 text-xs uppercase tracking-wide">
+          <tr><th class="text-left py-1">Date</th><th class="text-left py-1">Vendor</th><th class="text-right py-1">Amount</th></tr>
+        </thead>
+        <tbody>
+          {% for inv in recent_invoices %}
+          <tr class="border-t border-slate-100">
+            <td class="py-1 text-slate-700">{{ inv.date }}</td>
+            <td class="py-1 text-slate-800">{{ inv.vendor }}</td>
+            <td class="py-1 text-right text-slate-900 font-mono">${{ inv.total|floatformat:2 }}</td>
+          </tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+    {% endif %}
+
+  </div>
+
+  <!-- Caveat footer -->
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+    <strong>Note:</strong> This dashboard reflects invoice-pipeline spend only. Historical reconciliation shows the pipeline captures roughly 58–85% of the budget-sheet total — the rest is non-invoice purchases (restaurants, catering). The budget-sheet total is the authoritative figure for overall spend. April has only recent cached invoices; Jan–Feb–Mar use budget-sheet reconciliation figures.
+  </div>
+
+</div>
+{% endblock %}

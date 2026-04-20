@@ -985,3 +985,160 @@ def yield_bridge(request):
             break
 
     return render(request, 'myapp/yield_bridge.html', {'rows': rows})
+
+
+# ---- COGs / Budget Dashboard ----
+
+BUDGET_PER_RESIDENT_PER_MONTH = Decimal('346.67')
+INVOICE_TOTALS_DIR = 'invoice_totals'  # at project root, under ".invoice_totals/"
+
+
+def _load_invoice_totals_for_month(year: int, month: int) -> list[dict]:
+    """Read .invoice_totals/YYYY-MM.json; return [] if file absent."""
+    import json
+    from django.conf import settings as _settings
+    base = _settings.BASE_DIR / '.invoice_totals'
+    path = base / f'{year:04d}-{month:02d}.json'
+    if not path.exists():
+        return []
+    try:
+        with open(path) as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return []
+
+
+# Historical monthly totals known from the budget CSV / reconciliation.
+# Sourced from Men's Wentworth Food Budget 2026(Mar).csv + memory's
+# reconciliation figures. Used until full monthly caches exist.
+HISTORICAL_ACTUAL_SPEND = {
+    (2026, 1): Decimal('13431.00'),   # from project_budget_sheet.md
+    (2026, 2): Decimal('8191.00'),    # from project_budget_sheet.md
+    (2026, 3): Decimal('12870.38'),   # from budget CSV
+}
+HISTORICAL_CENSUS = {
+    (2026, 1): Decimal('26'),
+    (2026, 2): Decimal('23'),
+    (2026, 3): Decimal('30.38'),
+}
+
+
+def _month_spend(year: int, month: int) -> tuple[Decimal, list[dict]]:
+    """Return (total_dollars, invoice_list) for a given month.
+    Prefers .invoice_totals/ cache; falls back to HISTORICAL_ACTUAL_SPEND if cache is empty."""
+    entries = _load_invoice_totals_for_month(year, month)
+    if entries:
+        total = sum(Decimal(str(e.get('total', 0))) for e in entries)
+        return total.quantize(Decimal('0.01')), entries
+    historical = HISTORICAL_ACTUAL_SPEND.get((year, month))
+    if historical is not None:
+        return historical, []
+    return Decimal('0.00'), []
+
+
+def _default_census_for(year: int, month: int) -> Decimal:
+    """Average headcount for the month. Uses Census table if populated,
+    else HISTORICAL_CENSUS, else most-recent Census row."""
+    from calendar import monthrange
+    start = date(year, month, 1)
+    end = date(year, month, monthrange(year, month)[1])
+    rows = Census.objects.filter(date__gte=start, date__lte=end)
+    if rows.exists():
+        vals = [r.headcount for r in rows]
+        return Decimal(sum(vals)) / Decimal(len(vals))
+    historical = HISTORICAL_CENSUS.get((year, month))
+    if historical is not None:
+        return historical
+    latest = Census.objects.order_by('-date').first()
+    return Decimal(latest.headcount) if latest else Decimal('30')
+
+
+def cogs_dashboard(request):
+    """Food-spend vs budget dashboard. Current-month status + 4-month trend."""
+    today = date.today()
+    year, month = today.year, today.month
+
+    # --- Current month ---
+    current_spend, current_invoices = _month_spend(year, month)
+    current_census = _default_census_for(year, month)
+    current_budget = (current_census * BUDGET_PER_RESIDENT_PER_MONTH).quantize(Decimal('0.01'))
+    current_delta = current_budget - current_spend  # positive = under budget
+
+    # Days elapsed vs month length
+    from calendar import monthrange
+    days_in_month = monthrange(year, month)[1]
+    days_elapsed = today.day
+    elapsed_pct = Decimal(days_elapsed) / Decimal(days_in_month)
+    budget_pace = (current_budget * elapsed_pct).quantize(Decimal('0.01'))
+    pace_delta = budget_pace - current_spend  # positive = spending slower than linear pace
+
+    # Per-resident-per-day metrics
+    target_per_res_per_day = BUDGET_PER_RESIDENT_PER_MONTH / Decimal('30')
+    actual_per_res_per_day = (
+        (current_spend / current_census / Decimal(days_elapsed)).quantize(Decimal('0.01'))
+        if current_census and days_elapsed else Decimal('0.00')
+    )
+
+    # Vendor breakdown for current month
+    from collections import Counter
+    vendor_totals = Counter()
+    for inv in current_invoices:
+        vendor_totals[inv.get('vendor', 'Unknown')] += Decimal(str(inv.get('total', 0)))
+    vendor_rows = [
+        {'vendor': v, 'total': t.quantize(Decimal('0.01')),
+         'pct': (t / current_spend * 100).quantize(Decimal('0.1')) if current_spend else Decimal('0')}
+        for v, t in sorted(vendor_totals.items(), key=lambda x: -x[1])
+    ]
+
+    # --- Trend: last 4 months (current + 3 back) ---
+    trend_rows = []
+    for delta in range(3, -1, -1):
+        y, m = year, month - delta
+        while m <= 0:
+            y -= 1
+            m += 12
+        spend, _ = _month_spend(y, m)
+        census = _default_census_for(y, m)
+        budget = (census * BUDGET_PER_RESIDENT_PER_MONTH).quantize(Decimal('0.01'))
+        trend_rows.append({
+            'year': y, 'month': m,
+            'label': date(y, m, 1).strftime('%b %Y'),
+            'spend': spend,
+            'budget': budget,
+            'census': census.quantize(Decimal('0.01')),
+            'delta': (budget - spend).quantize(Decimal('0.01')),
+            'is_current': (y == year and m == month),
+            'spend_pct_of_budget': (spend / budget * 100).quantize(Decimal('0.1')) if budget else Decimal('0'),
+        })
+
+    # Max spend in trend for bar scaling
+    max_trend = max([r['spend'] for r in trend_rows] + [r['budget'] for r in trend_rows],
+                    default=Decimal('1'))
+
+    # Recent invoices (current month, descending by date)
+    recent_invoices = sorted(
+        current_invoices,
+        key=lambda x: x.get('date', ''),
+        reverse=True,
+    )[:15]
+
+    return render(request, 'myapp/cogs.html', {
+        'today': today,
+        'current_label': today.strftime('%B %Y'),
+        'current_spend': current_spend,
+        'current_budget': current_budget,
+        'current_delta': current_delta,
+        'current_census': current_census.quantize(Decimal('0.01')),
+        'days_elapsed': days_elapsed,
+        'days_in_month': days_in_month,
+        'elapsed_pct': (elapsed_pct * 100).quantize(Decimal('0.1')),
+        'budget_pace': budget_pace,
+        'pace_delta': pace_delta,
+        'target_per_res_per_day': target_per_res_per_day.quantize(Decimal('0.01')),
+        'actual_per_res_per_day': actual_per_res_per_day,
+        'vendor_rows': vendor_rows,
+        'trend_rows': trend_rows,
+        'max_trend': max_trend,
+        'recent_invoices': recent_invoices,
+        'budget_per_resident_per_month': BUDGET_PER_RESIDENT_PER_MONTH,
+    })
