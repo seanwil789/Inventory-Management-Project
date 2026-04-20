@@ -3,19 +3,26 @@
 
 {% block content %}
 <div class="max-w-4xl">
-  <div class="flex items-center justify-between mb-4">
+  <div class="flex items-center justify-between mb-4 flex-wrap gap-2">
     <div>
       <h1 class="text-2xl font-bold">Recipes</h1>
       <p class="text-sm text-slate-500">
         {% if q %}{{ match }} of {% endif %}{{ total }} total in your recipe book
       </p>
     </div>
-    <form method="get" class="flex gap-2">
-      <input name="q" value="{{ q }}" placeholder="Search by name…"
-             class="border rounded px-3 py-1.5 text-sm w-64" autofocus />
-      <button type="submit" class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Search</button>
-      {% if q %}<a href="{% url 'recipe_list' %}" class="px-3 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Clear</a>{% endif %}
-    </form>
+    <div class="flex gap-2 items-center">
+      <form method="get" class="flex gap-2">
+        <input name="q" value="{{ q }}" placeholder="Search by name…"
+               class="border rounded px-3 py-1.5 text-sm w-64" autofocus />
+        <button type="submit" class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Search</button>
+        {% if q %}<a href="{% url 'recipe_list' %}" class="px-3 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Clear</a>{% endif %}
+      </form>
+      <a href="{% url 'recipe_new' %}"
+         class="px-3 py-1.5 bg-emerald-600 text-white text-sm rounded hover:bg-emerald-700 flex items-center gap-1"
+         title="Create a new recipe">
+        <span class="text-base leading-none">+</span> New Recipe
+      </a>
+    </div>
   </div>
 
   {% for cat, recipes in groups %}
