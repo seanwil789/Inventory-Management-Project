@@ -6,6 +6,17 @@ from django import template
 register = template.Library()
 
 
+@register.filter(name='get_item')
+def get_item(dictionary, key):
+    """{{ mydict|get_item:key }} — access dict values by dynamic key in template."""
+    if not dictionary:
+        return None
+    try:
+        return dictionary.get(key)
+    except AttributeError:
+        return None
+
+
 # Common cooking fractions: (Fraction value, display string).
 COMMON_FRACTIONS = [
     (Fraction(1, 8), '1/8'),

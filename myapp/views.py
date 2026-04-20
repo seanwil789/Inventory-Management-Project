@@ -15,9 +15,9 @@ from collections import defaultdict
 
 from .forms import MenuForm, RecipeForm, RecipeIngredientFormSet, YieldReferenceForm
 from .models import (
-    Census, IngredientSkipNote, Menu, MenuFreetextComponent, PrepTask, Product,
-    Recipe, RecipeIngredient, YieldReference, PROTEIN_CHOICES,
-    CONFLICT_LABELS, CONFLICT_ICONS,
+    Census, IngredientSkipNote, InvoiceLineItem, Menu, MenuFreetextComponent,
+    PrepTask, Product, Recipe, RecipeIngredient, YieldReference,
+    PROTEIN_CHOICES, CONFLICT_LABELS, CONFLICT_ICONS,
 )
 
 
@@ -1261,6 +1261,119 @@ def yield_bridge(request):
             break
 
     return render(request, 'myapp/yield_bridge.html', {'rows': rows})
+
+
+# ---- Category spend/activity dashboard ----
+
+def category_spend(request):
+    """Line-item activity + estimated spend by Product.category, with a 4-month
+    trend. Companion to /cogs/ — that view shows authoritative invoice totals;
+    this view shows category-level distribution.
+
+    Estimated spend is Σ(unit_price) per category — NOT authoritative dollars
+    (case-count per line isn't stored). Directional only; trends and ratios
+    between categories are reliable."""
+    from django.db.models import Count, Sum
+    from django.db.models.functions import TruncMonth
+    from calendar import monthrange
+    from collections import defaultdict
+
+    today = date.today()
+    year, month = today.year, today.month
+
+    # --- Current month breakdown ---
+    mo_start = date(year, month, 1)
+    mo_end = date(year, month, monthrange(year, month)[1])
+
+    current = list(InvoiceLineItem.objects
+                   .filter(product__isnull=False,
+                           invoice_date__gte=mo_start, invoice_date__lte=mo_end)
+                   .values('product__category')
+                   .annotate(
+                       line_count=Count('id'),
+                       est_spend=Sum('unit_price'),
+                       unique_products=Count('product', distinct=True),
+                   )
+                   .order_by('-line_count'))
+
+    # Normalize missing-category
+    for row in current:
+        row['category'] = row['product__category'] or '(uncategorized)'
+        row['est_spend'] = row['est_spend'] or Decimal('0')
+
+    total_lines = sum(r['line_count'] for r in current) or 1
+    total_est_spend = sum(r['est_spend'] for r in current)
+
+    for row in current:
+        row['pct_of_lines'] = (Decimal(row['line_count']) / Decimal(total_lines) * 100).quantize(Decimal('0.1'))
+        row['pct_of_est_spend'] = ((row['est_spend'] / total_est_spend * 100).quantize(Decimal('0.1'))
+                                   if total_est_spend else Decimal('0'))
+
+    # --- Top products per category (current month) ---
+    top_products: dict = {}
+    for row in current:
+        cat = row['product__category']
+        if not cat:
+            continue
+        tops = (InvoiceLineItem.objects
+                .filter(product__category=cat,
+                        invoice_date__gte=mo_start, invoice_date__lte=mo_end)
+                .values('product__canonical_name')
+                .annotate(n=Count('id'), spend=Sum('unit_price'))
+                .order_by('-n')[:3])
+        top_products[cat] = [
+            {'name': t['product__canonical_name'],
+             'n': t['n'],
+             'spend': (t['spend'] or Decimal('0')).quantize(Decimal('0.01'))}
+            for t in tops
+        ]
+
+    # --- 4-month trend: lines per category over last 4 months ---
+    trend_months = []
+    for delta in range(3, -1, -1):
+        y, m = year, month - delta
+        while m <= 0:
+            y -= 1
+            m += 12
+        start = date(y, m, 1)
+        end = date(y, m, monthrange(y, m)[1])
+        trend_months.append({'year': y, 'month': m, 'label': start.strftime('%b %Y'),
+                             'start': start, 'end': end})
+
+    # For trend: pick top 6 categories from current month (or overall recent period)
+    recent_cats = [r['product__category'] for r in current[:6] if r['product__category']]
+    # If current month has few rows, fall back to all-time top
+    if len(recent_cats) < 4:
+        fallback = (InvoiceLineItem.objects
+                    .filter(product__isnull=False, invoice_date__gte=trend_months[0]['start'])
+                    .values('product__category')
+                    .annotate(n=Count('id'))
+                    .order_by('-n')[:6])
+        recent_cats = [r['product__category'] for r in fallback if r['product__category']]
+
+    trend_rows = []
+    max_val = 0
+    for cat in recent_cats:
+        cells = []
+        for tm in trend_months:
+            n = (InvoiceLineItem.objects
+                 .filter(product__category=cat,
+                         invoice_date__gte=tm['start'], invoice_date__lte=tm['end'])
+                 .count())
+            cells.append({'label': tm['label'], 'n': n})
+            max_val = max(max_val, n)
+        trend_rows.append({'category': cat, 'cells': cells})
+
+    return render(request, 'myapp/category_spend.html', {
+        'current_label': today.strftime('%B %Y'),
+        'current': current,
+        'top_products': top_products,
+        'trend_months': trend_months,
+        'trend_rows': trend_rows,
+        'trend_max': max_val or 1,
+        'total_lines': total_lines,
+        'total_est_spend': total_est_spend.quantize(Decimal('0.01')),
+    })
 
 
 # ---- Dish suggestions ----

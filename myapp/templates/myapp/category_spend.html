@@ -1,0 +1,139 @@
+{% extends 'myapp/base.html' %}
+{% load kitchen_filters %}
+{% block title %}Category Activity — {{ current_label }}{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <!-- Header + tab to COGs -->
+  <div class="flex items-baseline justify-between gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Category Activity</h1>
+      <div class="text-sm text-slate-500">{{ current_label }} — {{ total_lines }} invoice line{{ total_lines|pluralize }} across {{ current|length }} categor{{ current|pluralize:"y,ies" }}</div>
+    </div>
+    <nav class="flex gap-2 text-sm">
+      <a href="{% url 'cogs_dashboard' %}" class="px-3 py-1 rounded border border-slate-300 hover:bg-slate-50 text-slate-700">COGs / Budget</a>
+      <span class="px-3 py-1 rounded bg-slate-900 text-white">Categories</span>
+    </nav>
+  </div>
+
+  <!-- Current month breakdown -->
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-4">Current-Month Breakdown</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2">Category</th>
+          <th class="text-right py-2">Lines</th>
+          <th class="text-right py-2">Unique products</th>
+          <th class="text-right py-2">Est. spend</th>
+          <th class="text-left py-2 pl-4">Share (lines)</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in current %}
+        <tr class="border-b border-slate-100">
+          <td class="py-2">
+            <a class="font-medium text-slate-900 hover:text-indigo-700"
+               href="{% url 'category_spend' %}#cat-{{ row.category|slugify }}">{{ row.category }}</a>
+            {% if top_products|dictsort:"0"|length and row.product__category %}
+              {% with tops=top_products|default_if_none:"" %}
+                {% with list=tops|get_item:row.product__category %}
+                {% endwith %}
+              {% endwith %}
+            {% endif %}
+          </td>
+          <td class="py-2 text-right text-slate-700">{{ row.line_count }}</td>
+          <td class="py-2 text-right text-slate-700">{{ row.unique_products }}</td>
+          <td class="py-2 text-right font-mono text-slate-700">${{ row.est_spend|floatformat:2 }}</td>
+          <td class="py-2 pl-4 w-64">
+            <div class="w-full bg-slate-100 rounded h-2">
+              <div class="bg-indigo-500 h-2 rounded" style="width: {{ row.pct_of_lines }}%"></div>
+            </div>
+            <div class="text-xs text-slate-500 mt-0.5">{{ row.pct_of_lines }}%</div>
+          </td>
+        </tr>
+        {% endfor %}
+        <tr class="text-xs text-slate-500 font-mono">
+          <td class="py-2">Total</td>
+          <td class="py-2 text-right">{{ total_lines }}</td>
+          <td></td>
+          <td class="py-2 text-right">${{ total_est_spend|floatformat:2 }}</td>
+          <td></td>
+        </tr>
+      </tbody>
+    </table>
+  </div>
+
+  <!-- 4-month trend -->
+  {% if trend_rows %}
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-4">4-Month Trend (line count)</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2 pr-4">Category</th>
+          {% for tm in trend_months %}
+            <th class="text-right py-2 px-3">{{ tm.label }}</th>
+          {% endfor %}
+        </tr>
+      </thead>
+      <tbody>
+        {% for tr in trend_rows %}
+        <tr class="border-b border-slate-100">
+          <td class="py-2 pr-4 text-slate-800 whitespace-nowrap">{{ tr.category }}</td>
+          {% for c in tr.cells %}
+            <td class="py-2 px-3 text-right">
+              <div class="text-xs font-mono text-slate-700">{{ c.n }}</div>
+              <div class="inline-block w-16 bg-slate-100 rounded h-1.5 mt-0.5">
+                <div class="bg-slate-500 h-1.5 rounded"
+                     style="width: {% widthratio c.n trend_max 100 %}%"></div>
+              </div>
+            </td>
+          {% endfor %}
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    <div class="text-xs text-slate-500 mt-3">
+      Top categories by recent activity. Bar widths scaled to the max across all cells.
+    </div>
+  </div>
+  {% endif %}
+
+  <!-- Top products per category -->
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-4">Top Products Per Category ({{ current_label }})</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-3 gap-4">
+      {% for row in current %}
+        {% if row.product__category %}
+          {% with tops=top_products|get_item:row.product__category %}
+            {% if tops %}
+            <div id="cat-{{ row.category|slugify }}" class="border border-slate-200 rounded p-3">
+              <div class="text-sm font-medium text-slate-800 mb-2">{{ row.category }}</div>
+              <ol class="text-xs space-y-1">
+                {% for p in tops %}
+                <li class="flex justify-between gap-2">
+                  <span class="text-slate-700 truncate">{{ p.name }}</span>
+                  <span class="text-slate-500 whitespace-nowrap">{{ p.n }}× · ${{ p.spend|floatformat:2 }}</span>
+                </li>
+                {% endfor %}
+              </ol>
+            </div>
+            {% endif %}
+          {% endwith %}
+        {% endif %}
+      {% endfor %}
+    </div>
+  </div>
+
+  <!-- Caveat -->
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+    <strong>Note on "Est. spend":</strong> InvoiceLineItem stores <em>unit_price</em> (per case) but not quantity-per-line.
+    Σ(unit_price) per category is a directional estimate — it assumes roughly one case per invoice line and will
+    under-represent real spend where multiple cases were ordered. Use <a class="text-indigo-600 hover:underline" href="{% url 'cogs_dashboard' %}">/cogs/</a>
+    for authoritative monthly totals (which aggregate invoice-level totals, not line-level). Line counts, unique-product counts, and month-over-month trends are all accurate from the pipeline data.
+  </div>
+
+</div>
+{% endblock %}
