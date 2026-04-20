@@ -1,0 +1,67 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Recipes missing quantities{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl space-y-4">
+
+  <div class="flex items-baseline justify-between gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-semibold text-slate-900">Missing quantities</h1>
+      <p class="text-sm text-slate-600">
+        {{ total_null }} ingredient{{ total_null|pluralize }} across
+        {{ total_recipes_affected }} recipe{{ total_recipes_affected|pluralize }}
+        need{{ total_recipes_affected|pluralize:"s," }} a quantity filled in.
+        Fixing these is the biggest cost-calculation unlock — typically pushes
+        coverage from ~27% to 70%+.
+      </p>
+    </div>
+    <a href="{% url 'recipe_list' %}" class="text-sm text-indigo-600 hover:underline">All recipes →</a>
+  </div>
+
+  {% if rows %}
+    <div class="space-y-2">
+      {% for row in rows %}
+        <div class="rounded border border-slate-200 bg-white p-3 flex items-start gap-3 flex-wrap">
+          <!-- Count badge -->
+          <div class="w-14 text-center">
+            <div class="text-xl font-bold {% if row.null_qty >= 5 %}text-red-700{% else %}text-amber-700{% endif %}">
+              {{ row.null_qty }}
+            </div>
+            <div class="text-[10px] uppercase tracking-wide text-slate-500">missing</div>
+          </div>
+          <!-- Name + samples -->
+          <div class="flex-1 min-w-0">
+            <div class="flex items-baseline gap-2 flex-wrap">
+              <a href="{% url 'recipe_detail' row.recipe.id %}"
+                 class="font-medium text-slate-900 hover:text-indigo-700">{{ row.recipe.name }}</a>
+              <span class="text-xs text-slate-500">({{ row.null_qty }}/{{ row.total_ings }} ingredients)</span>
+            </div>
+            {% if row.samples %}
+              <div class="text-xs text-slate-600 mt-1">
+                Sample:
+                {% for s in row.samples %}
+                  <span class="text-slate-700">{{ s }}</span>{% if not forloop.last %},{% endif %}
+                {% endfor %}
+              </div>
+            {% endif %}
+          </div>
+          <a href="{% url 'recipe_edit' row.recipe.id %}"
+             class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700 whitespace-nowrap">
+            Fill in →
+          </a>
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="text-slate-500 italic py-8">All recipes have quantities — nothing to fix! 🎉</p>
+  {% endif %}
+
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3 mt-6">
+    <strong>Why this matters:</strong> cost calculations require quantity × unit_price.
+    Recipes with missing quantities produce "—" in the cost column, silently
+    under-represent per-meal and per-serving cost, and break headcount scaling
+    in the order guide.
+  </div>
+
+</div>
+{% endblock %}

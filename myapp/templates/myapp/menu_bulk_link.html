@@ -1,0 +1,79 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Link menus to recipes{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl space-y-4">
+
+  <div class="flex items-baseline justify-between gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl font-semibold text-slate-900">Link menus → recipes</h1>
+      <p class="text-sm text-slate-600">
+        {{ total_unlinked }} menu{{ total_unlinked|pluralize }} still freetext.
+        Pick a matching recipe below, or create a new one. Matcher pool:
+        {{ total_recipes }} recipe{{ total_recipes|pluralize }} at level
+        <em>composed_dish</em> / <em>meal</em>.
+      </p>
+    </div>
+    <a href="{% url 'calendar_current' %}" class="text-sm text-indigo-600 hover:underline">Calendar →</a>
+  </div>
+
+  {% if rows %}
+    <div class="space-y-2">
+      {% for row in rows %}
+        <div class="rounded border border-slate-200 bg-white p-3">
+          <!-- Menu header -->
+          <div class="flex items-baseline justify-between gap-2 flex-wrap mb-2">
+            <div>
+              <span class="text-xs font-mono text-slate-500 mr-2">
+                {{ row.menu.date|date:"D M j" }} · {{ row.menu.get_meal_slot_display }}
+              </span>
+              <span class="font-medium text-slate-900">{{ row.menu.dish_freetext }}</span>
+            </div>
+            <a href="{{ row.create_url }}"
+               class="text-xs px-2 py-1 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded hover:bg-emerald-100">
+              + Create new recipe
+            </a>
+          </div>
+
+          {% if row.candidates %}
+            <!-- Candidate links -->
+            <div class="flex gap-1 flex-wrap pl-2">
+              {% for c in row.candidates %}
+                <form method="post" class="inline">
+                  {% csrf_token %}
+                  <input type="hidden" name="menu_id" value="{{ row.menu.id }}">
+                  <input type="hidden" name="recipe_id" value="{{ c.recipe.id }}">
+                  <button type="submit"
+                          class="text-xs px-2 py-1 rounded border
+                                 {% if c.score >= 85 %}bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100
+                                 {% elif c.score >= 70 %}bg-indigo-50 border-indigo-200 text-indigo-700 hover:bg-indigo-100
+                                 {% else %}bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100{% endif %}">
+                    → {{ c.recipe.name }}
+                    <span class="text-[10px] opacity-75">({{ c.score }})</span>
+                  </button>
+                </form>
+              {% endfor %}
+            </div>
+          {% else %}
+            <p class="text-xs text-slate-500 italic pl-2">No existing recipes match — create new.</p>
+          {% endif %}
+        </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <p class="text-slate-500 italic py-8">
+      All menus are linked to recipes! Calendar is fully populated. 🎉
+    </p>
+  {% endif %}
+
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3 mt-6">
+    <strong>Color scale:</strong>
+    <span class="text-emerald-700">green</span> = confident match (≥85),
+    <span class="text-indigo-700">blue</span> = probable (70–84),
+    <span class="text-slate-600">gray</span> = possible (50–69).
+    Click to link, or use <span class="text-emerald-800">+ Create new recipe</span>
+    if none fit.
+  </div>
+
+</div>
+{% endblock %}

@@ -756,6 +756,108 @@ def kitchen_display(request):
     })
 
 
+def recipe_missing_quantities(request):
+    """Focused work surface: lists recipes with the most null-quantity ingredients.
+    Each row has a direct "Edit" link so Sean can knock them out in order."""
+    from django.db.models import Count, Q
+
+    # Per-recipe null-quantity count (excluding sub_recipe rows — those don't need qty)
+    rows = (Recipe.objects
+            .annotate(
+                null_qty=Count('ingredients',
+                               filter=Q(ingredients__quantity__isnull=True,
+                                        ingredients__sub_recipe__isnull=True)),
+                total_ings=Count('ingredients'),
+            )
+            .filter(null_qty__gt=0)
+            .order_by('-null_qty', 'name'))
+
+    total_null = sum(r.null_qty for r in rows)
+    total_recipes_affected = rows.count()
+
+    # For each recipe, list a few sample null-ingredient names for context
+    enriched = []
+    for r in rows[:80]:
+        samples = list(r.ingredients.filter(quantity__isnull=True,
+                                            sub_recipe__isnull=True)
+                                    .values_list('name_raw', flat=True)[:5])
+        enriched.append({
+            'recipe': r,
+            'null_qty': r.null_qty,
+            'total_ings': r.total_ings,
+            'samples': samples,
+        })
+
+    return render(request, 'myapp/recipe_missing_quantities.html', {
+        'rows': enriched,
+        'total_null': total_null,
+        'total_recipes_affected': total_recipes_affected,
+    })
+
+
+def menu_bulk_link(request):
+    """Walks each unlinked Menu row with fuzzy-matched recipe candidates.
+    Actions per row:
+      - Link to a candidate (POST)
+      - Create new recipe (routes through /recipe/new/ with prefill + link_menu)
+      - Skip (no-op, just stays unlinked)"""
+    from rapidfuzz import fuzz as _fuzz, process as _process
+    from .management.commands.link_menus_to_recipes import _norm as _link_norm
+
+    if request.method == 'POST':
+        menu_id = request.POST.get('menu_id')
+        recipe_id = request.POST.get('recipe_id')
+        if menu_id and recipe_id:
+            try:
+                m = Menu.objects.get(pk=int(menu_id))
+                r = Recipe.objects.get(pk=int(recipe_id))
+                m.recipe = r
+                m.save(update_fields=['recipe'])
+                messages.success(request, f'Linked "{m.dish_freetext}" → {r.name}')
+            except (Menu.DoesNotExist, Recipe.DoesNotExist, ValueError):
+                messages.error(request, 'Invalid menu or recipe.')
+        return redirect(reverse('menu_bulk_link'))
+
+    # Pool of linkable recipes: composed_dish or meal, current, preloaded
+    recipes = list(Recipe.objects.filter(
+        level__in=('composed_dish', 'meal'), is_current=True
+    ).order_by('name'))
+    recipe_names_norm = {_link_norm(r.name): r for r in recipes}
+    norm_keys = list(recipe_names_norm.keys())
+
+    unlinked = (Menu.objects
+                .filter(recipe__isnull=True)
+                .exclude(dish_freetext='')
+                .order_by('date', 'meal_slot'))
+
+    rows = []
+    for m in unlinked:
+        candidates = []
+        if norm_keys:
+            matches = _process.extract(
+                _link_norm(m.dish_freetext), norm_keys,
+                scorer=_fuzz.token_set_ratio, limit=5,
+            )
+            for name_norm, score, idx in matches:
+                if score >= 50:  # generous floor; user picks
+                    candidates.append({
+                        'recipe': recipe_names_norm[name_norm],
+                        'score': int(score),
+                    })
+        rows.append({
+            'menu': m,
+            'candidates': candidates,
+            'create_url': (reverse('recipe_new')
+                           + f'?prefill_name={m.dish_freetext}&link_menu={m.id}'),
+        })
+
+    return render(request, 'myapp/menu_bulk_link.html', {
+        'rows': rows,
+        'total_unlinked': len(rows),
+        'total_recipes': len(recipes),
+    })
+
+
 def recipe_list(request):
     """Browse / search / categorized view of all recipes."""
     from collections import defaultdict
