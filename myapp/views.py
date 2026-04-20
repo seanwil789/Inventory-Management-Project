@@ -1003,6 +1003,171 @@ def yield_bridge(request):
     return render(request, 'myapp/yield_bridge.html', {'rows': rows})
 
 
+# ---- Dish suggestions ----
+
+MEAL_FOLDER_HEURISTIC = ('Proteins/', 'Composed Meals/', 'Breakfast/', 'Side Dishes/', 'Events/')
+
+
+def _candidate_recipes_for_slot(slot: str):
+    """Candidate pool: recipes that are 'meal-level' by either having been linked
+    to a Menu row in history, or living under a meal-appropriate folder.
+    Sub-recipes (Prep Components, Baking components) are excluded."""
+    linked_ids = set(Menu.objects.filter(recipe__isnull=False)
+                                 .values_list('recipe_id', flat=True))
+    through_m2m = set(Menu.objects.values_list('additional_recipes__id', flat=True)
+                                  .exclude(additional_recipes__isnull=True))
+    linked_ids |= through_m2m
+
+    import re as _re
+    folder_q = models.Q()
+    for folder in MEAL_FOLDER_HEURISTIC:
+        folder_q |= models.Q(source_doc__icontains=folder)
+    pool = (Recipe.objects.filter(models.Q(id__in=linked_ids) | folder_q)
+                          .distinct()
+                          .prefetch_related('ingredients'))
+    # Slot-specific filter: breakfasts favor Breakfast/ folder.
+    if slot in ('cold_breakfast', 'hot_breakfast'):
+        pool = pool.filter(models.Q(id__in=linked_ids) |
+                           models.Q(source_doc__icontains='Breakfast/'))
+    return pool
+
+
+def _score_candidate(recipe: Recipe, target_date: date, slot: str,
+                     neighbor_proteins: dict, recent_dates: dict) -> tuple[int, list[str]]:
+    """Return (score, [reasons_for_display]).
+    neighbor_proteins: {(date, slot): protein_str} for nearby menu slots
+    recent_dates: {recipe_id: most_recent_menu_date}  (None if never served)"""
+    score = 0
+    reasons = []
+
+    # --- Recency
+    last = recent_dates.get(recipe.id)
+    if last is None:
+        score += 4
+        reasons.append('never served')
+    else:
+        days_since = (target_date - last).days
+        if days_since >= 30:
+            score += 4
+            reasons.append(f'not in {days_since}d')
+        elif days_since >= 14:
+            score += 3
+            reasons.append(f'not in {days_since}d')
+        elif days_since >= 7:
+            score += 1
+            reasons.append(f'last {days_since}d ago')
+        else:
+            score -= 3
+            reasons.append(f'served {days_since}d ago')
+
+    # --- Protein diversity (vs yesterday's dinner, today's lunch, today's other slots)
+    my_p = recipe.protein or ''
+    if my_p:
+        # Yesterday's dinner
+        yest_p = neighbor_proteins.get((target_date - timedelta(days=1), 'dinner'), '')
+        if yest_p and yest_p == my_p:
+            score -= 4
+            reasons.append(f'same protein as yesterday dinner')
+        # Today's other slots
+        for other_slot in ('cold_breakfast', 'hot_breakfast', 'lunch', 'dinner'):
+            if other_slot == slot:
+                continue
+            other_p = neighbor_proteins.get((target_date, other_slot), '')
+            if other_p and other_p == my_p:
+                score -= 2
+                reasons.append(f'same protein as today {other_slot.replace("_", " ")}')
+                break
+
+    # --- Fat/health alternation
+    my_fh = recipe.fat_health
+    if my_fh:
+        # Check the previous day's dinner's fat/health
+        for other_slot in ('lunch', 'dinner'):
+            if other_slot == slot:
+                continue
+            menu_other = Menu.objects.filter(date=target_date, meal_slot=other_slot,
+                                             recipe__isnull=False).select_related('recipe').first()
+            if menu_other and menu_other.recipe.fat_health == my_fh:
+                score -= 1
+                reasons.append(f'same F/H as today {other_slot}')
+                break
+
+    # --- Popularity
+    if recipe.popularity == 'high':
+        score += 3
+        reasons.append('popular 👍')
+    elif recipe.popularity == 'medium':
+        score += 1
+    elif recipe.popularity == 'low':
+        score -= 2
+        reasons.append('low popularity')
+
+    return score, reasons
+
+
+def menu_suggestions(request):
+    """List dish suggestions ranked for a given (date, slot).
+    Query params: ?date=YYYY-MM-DD&slot=lunch  (defaults: today, dinner)."""
+    try:
+        target = (date.fromisoformat(request.GET['date'])
+                  if request.GET.get('date') else date.today())
+    except ValueError:
+        target = date.today()
+    slot = request.GET.get('slot') or 'dinner'
+    if slot not in dict(Menu.MEAL_SLOTS):
+        slot = 'dinner'
+
+    # Neighbor proteins: 3 days around target
+    neighbor_menus = (Menu.objects
+                      .filter(date__gte=target - timedelta(days=3),
+                              date__lte=target + timedelta(days=1))
+                      .select_related('recipe')
+                      .prefetch_related('additional_recipes'))
+    neighbor_proteins: dict = {}
+    for m in neighbor_menus:
+        if m.recipe and m.recipe.protein:
+            neighbor_proteins[(m.date, m.meal_slot)] = m.recipe.protein
+        else:
+            for r in m.additional_recipes.all():
+                if r.protein:
+                    neighbor_proteins[(m.date, m.meal_slot)] = r.protein
+                    break
+
+    # Recent dates per recipe_id
+    recent_dates: dict = {}
+    for m in Menu.objects.filter(date__lte=target,
+                                 date__gte=target - timedelta(days=90)):
+        ids = []
+        if m.recipe_id:
+            ids.append(m.recipe_id)
+        ids.extend(m.additional_recipes.values_list('id', flat=True))
+        for rid in ids:
+            prev = recent_dates.get(rid)
+            if prev is None or m.date > prev:
+                recent_dates[rid] = m.date
+
+    candidates = list(_candidate_recipes_for_slot(slot))
+    scored = []
+    for r in candidates:
+        score, reasons = _score_candidate(r, target, slot, neighbor_proteins, recent_dates)
+        scored.append({
+            'recipe': r,
+            'score': score,
+            'reasons': reasons,
+            'last_served': recent_dates.get(r.id),
+            'has_conflicts': bool(r.conflicts),
+        })
+    scored.sort(key=lambda s: (-s['score'], s['recipe'].name.lower()))
+
+    return render(request, 'myapp/suggestions.html', {
+        'target_date': target,
+        'slot': slot,
+        'slot_label': dict(Menu.MEAL_SLOTS).get(slot, slot.title()),
+        'suggestions': scored[:20],
+        'total_candidates': len(candidates),
+    })
+
+
 # ---- COGs / Budget Dashboard ----
 
 BUDGET_PER_RESIDENT_PER_MONTH = Decimal('346.67')

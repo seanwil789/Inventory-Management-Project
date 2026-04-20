@@ -31,4 +31,5 @@ urlpatterns = [
     path('yields/<int:yield_id>/edit/',     views.yield_edit,          name='yield_edit'),
     path('yields/<int:yield_id>/delete/',   views.yield_delete,        name='yield_delete'),
     path('cogs/',                           views.cogs_dashboard,      name='cogs_dashboard'),
+    path('suggestions/',                    views.menu_suggestions,    name='menu_suggestions'),
 ]
