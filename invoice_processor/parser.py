@@ -48,7 +48,8 @@ def extract_date(text: str) -> str:
 # ---------------------------------------------------------------------------
 
 # Sysco item codes are 6-7 digit numbers. Prices end in .XX (two decimal places).
-_PRICE_ANCHOR = re.compile(r'(\d{6,7})\s+(\d+\.\d{2})\s*$')
+# Accept an optional trailing pack_price: "CODE UNIT_PRICE" or "CODE UNIT_PRICE PACK_PRICE".
+_PRICE_ANCHOR = re.compile(r'(\d{6,7})\s+(\d+\.\d{2})(?:\s+\d+\.\d{2})?\s*$')
 
 # Lines that look like product descriptions (contain 3+ consecutive letters
 # and are not section headers or pure-number lines).
@@ -440,30 +441,90 @@ def _parse_sysco(text: str) -> list[dict]:
             anchors.append((i, m.group(1), float(m.group(2)), prefix))
             anchor_lines.add(i)
 
-    # Now find split anchors: standalone 7-digit code followed by price on next line
+    # Now find split anchors: standalone item-code line paired with a nearby price.
+    # Codes may be 6-8 digits (OCR sometimes merges a leading digit with the code,
+    # e.g. "12273758" is really item 2273758). A price must be a line whose only
+    # content is a decimal number; inline "CODE PRICE" lines don't count as prices
+    # for this purpose (they're their own anchor).
     found_codes = {a[1] for a in anchors}
+    # Sysco SUPC codes are 7 digits. Accept 8-digit when OCR has merged a leading
+    # digit from an adjacent column (normalize by dropping the leading digit).
+    _STANDALONE_CODE_RE = re.compile(r'^(?:\d{8,}\s+)?(\d{7,8})\s*$')
+    _STANDALONE_PRICE_RE = re.compile(r'^(\d+\.\d{2})(?:\s+\d+\.\d{2})?\s*$')
+
+    # Load code_map once so we only accept orphan codes that actually resolve
+    # to a real product. This filters out barcode fragments like 401490 / 911123
+    # that happen to be 7 digits alone.
+    try:
+        from mapper import load_mappings as _load_for_split_anchor
+        _split_code_map = _load_for_split_anchor().get("code_map", {})
+    except Exception:
+        _split_code_map = {}
+
+    def _normalize_code(raw_code: str) -> str:
+        """Trim OCR-merged leading digit from 8-digit codes (Sysco codes are 7)."""
+        if len(raw_code) == 8 and raw_code[0] in '12':
+            return raw_code[1:]
+        return raw_code
+
+    # Phase 1: collect orphan standalone-code lines and standalone-price lines.
+    orphan_code_lines = []   # (line_idx, normalized_code, raw_code)
+    standalone_price_lines = []  # (line_idx, price)
     for i, line in enumerate(lines):
-        if i in anchor_lines or i in group_total_lines:
+        if i in anchor_lines or i in group_total_lines or i in used_as_split_price:
             continue
-        # Standalone 7-digit code (possibly preceded by barcode)
-        m = re.match(r'^(?:\d{8,}\s+)?(\d{7})\s*$', line)
-        if not m:
-            m = re.match(r'^(\d{7})\s*$', line)
-        if not m:
+        stripped = line.strip()
+        cm = _STANDALONE_CODE_RE.match(stripped)
+        if cm:
+            raw_code = cm.group(1)
+            norm = _normalize_code(raw_code)
+            if norm in found_codes:
+                continue
+            # Only accept orphan codes that resolve to a known product —
+            # filters out 7-digit barcode fragments that aren't real SUPCs.
+            if _split_code_map and norm not in _split_code_map:
+                continue
+            orphan_code_lines.append((i, norm, raw_code))
             continue
-        code = m.group(1)
-        if code in found_codes:
-            continue  # already detected
-        # Check next line for a price (skip group total lines)
-        if i + 1 < len(lines) and i + 1 not in group_total_lines:
-            price_m = re.match(r'^(\d+\.\d{2})\b', lines[i + 1].strip())
-            if price_m:
-                price = float(price_m.group(1))
-                if 1.0 <= price <= 500:  # reasonable price range
-                    anchors.append((i, code, price, ""))
-                    anchor_lines.add(i)
-                    used_as_split_price.add(i + 1)
-                    found_codes.add(code)
+        pm = _STANDALONE_PRICE_RE.match(stripped)
+        if pm:
+            price = float(pm.group(1))
+            if 1.0 <= price <= 1000:
+                standalone_price_lines.append((i, price))
+
+    # Phase 2: pair orphan codes with standalone prices.
+    # For each code, find the nearest standalone price AFTER it (within 6 lines)
+    # that hasn't been claimed. If that fails, accept the nearest standalone
+    # price overall (within 6 lines, forward or back). This handles both the
+    # column-dump layout (codes-column then prices-column) and the single-orphan
+    # case where a price lives 2–3 lines after the code.
+    used_prices = set()
+    for i, norm_code, raw_code in orphan_code_lines:
+        best = None
+        # Prefer forward direction
+        for pi, (pline, price) in enumerate(standalone_price_lines):
+            if pi in used_prices:
+                continue
+            if pline > i and pline - i <= 6:
+                best = pi
+                break
+        # Fall back to any nearby (within 6 lines), backward or forward
+        if best is None:
+            best_dist = 999
+            for pi, (pline, price) in enumerate(standalone_price_lines):
+                if pi in used_prices:
+                    continue
+                dist = abs(pline - i)
+                if dist <= 6 and dist < best_dist:
+                    best_dist = dist
+                    best = pi
+        if best is not None:
+            pline, price = standalone_price_lines[best]
+            anchors.append((i, norm_code, price, ""))
+            anchor_lines.add(i)
+            used_as_split_price.add(pline)
+            used_prices.add(best)
+            found_codes.add(norm_code)
 
     # Sort anchors by line position
     anchors.sort(key=lambda a: a[0])
@@ -615,10 +676,74 @@ def _parse_sysco(text: str) -> list[dict]:
             if item_code in line:
                 code_positions.setdefault(item_code, []).append(i)
 
+    # ── Step A0: anchor-run ordered pairing ───────────────────────────────
+    # Sysco OCR often reads a column of descriptions top-to-bottom, then a
+    # column of codes+prices. The result is a RUN of consecutive anchor lines
+    # with no descriptions interleaved, preceded by a block of descriptions.
+    # Per-anchor proximity matching fails here (every anchor grabs the last
+    # desc in the block) and shifts case_sizes by one position.
+    #
+    # Strategy: detect anchor-runs (2+ consecutive anchors with no descs
+    # between them), then pair the run with the N preceding descs in the
+    # same section, in line order.
+    def _section_of(line_idx: int) -> str:
+        for sec in sections:
+            end = sec["end_line"] or len(lines)
+            if sec["start_line"] <= line_idx <= end:
+                return sec["name"]
+        return ""
+
+    sorted_known_ais = sorted(
+        [ai for ai, (_, code, _, _) in enumerate(anchors) if code in _code_map],
+        key=lambda a: anchors[a][0],
+    )
+
+    runs: list[list[int]] = []
+    current_run: list[int] = []
+    prev_line = -10
+    for ai in sorted_known_ais:
+        line = anchors[ai][0]
+        desc_between = any(prev_line < de["line"] < line for de in desc_entries)
+        if current_run and not desc_between and line - prev_line <= 6:
+            current_run.append(ai)
+        else:
+            if len(current_run) >= 2:
+                runs.append(current_run)
+            current_run = [ai]
+        prev_line = line
+    if len(current_run) >= 2:
+        runs.append(current_run)
+
+    for run in runs:
+        first_anchor_line = anchors[run[0]][0]
+        sec_name = _section_of(first_anchor_line)
+        preceding = sorted(
+            [di for di, de in enumerate(desc_entries)
+             if _section_of(de["line"]) == sec_name
+             and de["line"] < first_anchor_line
+             and di not in used_descs],
+            key=lambda d: desc_entries[d]["line"],
+        )
+        if len(preceding) < len(run):
+            continue
+        # Take the last N descs before the run — these are the tightest match
+        matching = preceding[-len(run):]
+        for idx, ai in enumerate(run):
+            di = matching[idx]
+            if di in used_descs:
+                continue
+            used_descs.add(di)
+            known_anchor_indices.add(ai)
+            de = desc_entries[di]
+            canonical = _code_map.get(anchors[ai][1])
+            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
+
     for ai, (line_idx, item_code, price, prefix) in enumerate(anchors):
         canonical = _code_map.get(item_code)
         if not canonical:
             continue  # unknown code — handle in step B
+        if ai in known_anchor_indices:
+            continue  # handled in Step A0
 
         known_anchor_indices.add(ai)
 

@@ -4,13 +4,39 @@
 {% block content %}
 <div class="space-y-6">
 
-  <!-- Header -->
-  <div class="flex items-baseline justify-between">
+  <!-- Header + month nav -->
+  <div class="flex items-baseline justify-between flex-wrap gap-2">
     <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Food Spend — {{ current_label }}</h1>
-    <div class="text-sm text-slate-500">
-      Day {{ days_elapsed }} of {{ days_in_month }} ({{ elapsed_pct }}%)
+    <div class="flex items-center gap-3 text-sm">
+      <a href="?year={{ prev_year }}&month={{ prev_month }}"
+         class="text-slate-600 hover:text-slate-900">← Prev</a>
+      {% if not is_current_month %}
+        <a href="{% url 'cogs_dashboard' %}"
+           class="text-slate-600 hover:text-slate-900">Today</a>
+      {% endif %}
+      {% if has_next %}
+        <a href="?year={{ next_year }}&month={{ next_month }}"
+           class="text-slate-600 hover:text-slate-900">Next →</a>
+      {% endif %}
+      {% if is_current_month %}
+        <span class="text-slate-500 ml-2">Day {{ days_elapsed }} of {{ days_in_month }} ({{ elapsed_pct }}%)</span>
+      {% else %}
+        <span class="text-slate-500 ml-2">Historical ({{ days_in_month }} days)</span>
+      {% endif %}
     </div>
   </div>
+
+  {% if partial_cache %}
+  <div class="rounded-lg border border-amber-300 bg-amber-50 p-4 text-sm">
+    <strong class="text-amber-900">Partial pipeline coverage:</strong>
+    <span class="text-amber-800">
+      Pipeline captured ${{ current_spend|floatformat:2 }} from {{ recent_invoices|length }} invoice{{ recent_invoices|length|pluralize }}
+      for {{ current_label }}, but reconciled budget-sheet total was
+      <strong>${{ reconciled_total|floatformat:2 }}</strong>.
+      The verdict below is based on captured pipeline data only and understates actual spend.
+    </span>
+  </div>
+  {% endif %}
 
   <!-- Primary verdict card -->
   {% if current_delta >= 0 %}
@@ -51,7 +77,8 @@
 
   <!-- Secondary metrics row -->
   <div class="grid grid-cols-1 sm:grid-cols-3 gap-4">
-    <!-- Pace vs budget -->
+    {% if is_current_month %}
+    <!-- Pace vs budget (current month only) -->
     <div class="rounded-lg bg-white border border-slate-200 p-4">
       <div class="text-xs text-slate-500 uppercase tracking-wide">Pace vs linear budget</div>
       <div class="mt-1 text-2xl font-semibold text-slate-900">
@@ -65,10 +92,24 @@
         {% endif %}
       </div>
     </div>
+    {% else %}
+    <!-- Final % of budget (historical) -->
+    <div class="rounded-lg bg-white border border-slate-200 p-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Spend vs Budget</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-900">
+        ${{ current_spend|floatformat:2 }}
+      </div>
+      <div class="text-sm text-slate-600">
+        of ${{ current_budget|floatformat:2 }} budget
+      </div>
+    </div>
+    {% endif %}
 
     <!-- Per-resident-per-day actual -->
     <div class="rounded-lg bg-white border border-slate-200 p-4">
-      <div class="text-xs text-slate-500 uppercase tracking-wide">Actual $ / resident / day</div>
+      <div class="text-xs text-slate-500 uppercase tracking-wide">
+        {% if is_current_month %}Actual $ / resident / day{% else %}Avg $ / resident / day{% endif %}
+      </div>
       <div class="mt-1 text-2xl font-semibold text-slate-900">
         ${{ actual_per_res_per_day|floatformat:2 }}
       </div>
@@ -77,6 +118,7 @@
       </div>
     </div>
 
+    {% if is_current_month %}
     <!-- Month progress -->
     <div class="rounded-lg bg-white border border-slate-200 p-4">
       <div class="text-xs text-slate-500 uppercase tracking-wide">Month progress</div>
@@ -90,6 +132,14 @@
         <div class="bg-slate-500 h-1.5 rounded-full" style="width: {{ elapsed_pct }}%"></div>
       </div>
     </div>
+    {% else %}
+    <!-- Invoice count (historical) -->
+    <div class="rounded-lg bg-white border border-slate-200 p-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Invoices this month</div>
+      <div class="mt-1 text-2xl font-semibold text-slate-900">{{ recent_invoices|length }}</div>
+      <div class="text-sm text-slate-600">across {{ vendor_rows|length }} vendor{{ vendor_rows|length|pluralize }}</div>
+    </div>
+    {% endif %}
   </div>
 
   <!-- 4-month trend -->
@@ -97,10 +147,10 @@
     <h2 class="text-lg font-semibold text-slate-900 mb-4">Monthly Trend</h2>
     <div class="space-y-4">
       {% for row in trend_rows %}
-        <div>
+        <a href="?year={{ row.year }}&month={{ row.month }}" class="block hover:bg-slate-50 rounded p-1 -m-1">
           <div class="flex justify-between items-baseline text-sm mb-1">
-            <span class="font-medium {% if row.is_current %}text-slate-900{% else %}text-slate-700{% endif %}">
-              {{ row.label }}{% if row.is_current %} <span class="text-xs text-slate-500">(in progress)</span>{% endif %}
+            <span class="font-medium {% if row.is_selected %}text-slate-900 underline{% else %}text-slate-700{% endif %}">
+              {{ row.label }}{% if row.is_today_month %} <span class="text-xs text-slate-500">(in progress)</span>{% endif %}
             </span>
             <span class="text-slate-600">
               ${{ row.spend|floatformat:2 }}
@@ -120,7 +170,7 @@
             <div class="absolute inset-y-0 left-0 rounded {% if row.delta >= 0 %}bg-emerald-400{% else %}bg-red-400{% endif %}"
                  style="width: {% widthratio row.spend max_trend 100 %}%"></div>
           </div>
-        </div>
+        </a>
       {% endfor %}
     </div>
     <div class="text-xs text-slate-500 mt-4">

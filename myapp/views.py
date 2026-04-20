@@ -2312,20 +2312,48 @@ def _default_census_for(year: int, month: int) -> Decimal:
 
 
 def cogs_dashboard(request):
-    """Food-spend vs budget dashboard. Current-month status + 4-month trend."""
+    """Food-spend vs budget dashboard. Current-month status + 4-month trend.
+    Query params ?year=YYYY&month=MM let you view a past month; defaults to today.
+    """
     today = date.today()
-    year, month = today.year, today.month
+    try:
+        year = int(request.GET.get('year', today.year))
+        month = int(request.GET.get('month', today.month))
+    except (TypeError, ValueError):
+        year, month = today.year, today.month
+    if not (1 <= month <= 12):
+        year, month = today.year, today.month
+    is_current = (year == today.year and month == today.month)
+    is_future = (year, month) > (today.year, today.month)
+    if is_future:
+        year, month = today.year, today.month
+        is_current = True
 
-    # --- Current month ---
+    # --- Selected month ---
     current_spend, current_invoices = _month_spend(year, month)
     current_census = _default_census_for(year, month)
     current_budget = (current_census * BUDGET_PER_RESIDENT_PER_MONTH).quantize(Decimal('0.01'))
     current_delta = current_budget - current_spend  # positive = under budget
 
-    # Days elapsed vs month length
+    # If we have a reconciled budget-sheet total for this month and it's
+    # materially higher than the cache total, the cache is partial OCR
+    # coverage — surface the reconciled figure to avoid a misleading
+    # "under budget" verdict.
+    reconciled_total = HISTORICAL_ACTUAL_SPEND.get((year, month))
+    partial_cache = (
+        reconciled_total is not None
+        and current_invoices
+        and current_spend < reconciled_total * Decimal('0.80')
+    )
+
+    # Pace / days-elapsed only meaningful for the current month; past months
+    # use the full month length so $/resident/day is a whole-month average.
     from calendar import monthrange
     days_in_month = monthrange(year, month)[1]
-    days_elapsed = today.day
+    if is_current:
+        days_elapsed = today.day
+    else:
+        days_elapsed = days_in_month
     elapsed_pct = Decimal(days_elapsed) / Decimal(days_in_month)
     budget_pace = (current_budget * elapsed_pct).quantize(Decimal('0.01'))
     pace_delta = budget_pace - current_spend  # positive = spending slower than linear pace
@@ -2348,7 +2376,7 @@ def cogs_dashboard(request):
         for v, t in sorted(vendor_totals.items(), key=lambda x: -x[1])
     ]
 
-    # --- Trend: last 4 months (current + 3 back) ---
+    # --- Trend: last 4 months (selected month + 3 back) ---
     trend_rows = []
     for delta in range(3, -1, -1):
         y, m = year, month - delta
@@ -2365,9 +2393,16 @@ def cogs_dashboard(request):
             'budget': budget,
             'census': census.quantize(Decimal('0.01')),
             'delta': (budget - spend).quantize(Decimal('0.01')),
-            'is_current': (y == year and m == month),
+            'is_selected': (y == year and m == month),
+            'is_today_month': (y == today.year and m == today.month),
             'spend_pct_of_budget': (spend / budget * 100).quantize(Decimal('0.1')) if budget else Decimal('0'),
         })
+
+    # Prev / next month for nav links
+    prev_y, prev_m = (year, month - 1) if month > 1 else (year - 1, 12)
+    next_y, next_m = (year, month + 1) if month < 12 else (year + 1, 1)
+    # Don't offer "next" past the current month
+    has_next = (next_y, next_m) <= (today.year, today.month)
 
     # Max spend in trend for bar scaling
     max_trend = max([r['spend'] for r in trend_rows] + [r['budget'] for r in trend_rows],
@@ -2382,7 +2417,15 @@ def cogs_dashboard(request):
 
     return render(request, 'myapp/cogs.html', {
         'today': today,
-        'current_label': today.strftime('%B %Y'),
+        'current_label': date(year, month, 1).strftime('%B %Y'),
+        'is_current_month': is_current,
+        'year': year,
+        'month': month,
+        'prev_year': prev_y,
+        'prev_month': prev_m,
+        'next_year': next_y,
+        'next_month': next_m,
+        'has_next': has_next,
         'current_spend': current_spend,
         'current_budget': current_budget,
         'current_delta': current_delta,
@@ -2399,4 +2442,6 @@ def cogs_dashboard(request):
         'max_trend': max_trend,
         'recent_invoices': recent_invoices,
         'budget_per_resident_per_month': BUDGET_PER_RESIDENT_PER_MONTH,
+        'reconciled_total': reconciled_total,
+        'partial_cache': partial_cache,
     })
