@@ -1,0 +1,145 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Popularity{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl space-y-5">
+
+  <div class="flex items-baseline justify-between gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Popularity</h1>
+      <p class="text-sm text-slate-600 mt-1">
+        Aggregated from MealService records — what you've been logging
+        via the service-log forms on menu pages. Distinct from
+        <a href="{% url 'historical_dishes' %}" class="text-indigo-600 hover:underline">historical Jan 2026 data</a>.
+      </p>
+    </div>
+    <div class="text-right text-sm text-slate-500">
+      <div>{{ total_services }} service{{ total_services|pluralize }} logged</div>
+      <div>{{ total_dishes }} dish{{ total_dishes|pluralize:",es" }} with data</div>
+    </div>
+  </div>
+
+  {% if total_services == 0 %}
+    <div class="rounded-lg border border-amber-200 bg-amber-50 p-5">
+      <div class="text-sm text-amber-900 font-semibold mb-1">No service data yet</div>
+      <p class="text-xs text-amber-800">
+        Open a past menu (e.g., from
+        <a href="{% url 'calendar_current' %}" class="text-indigo-600 hover:underline">the calendar</a>)
+        and fill in the "Service log" section at the bottom of the menu-detail page
+        with prepped + leftover quantities. Once you've logged a few services across
+        multiple dates, this page will show consumption rates and popularity rankings.
+      </p>
+    </div>
+  {% endif %}
+
+  {% if top_popular %}
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-2">Most Consumed</h2>
+    <p class="text-xs text-slate-500 mb-3">Dishes whose prepared quantity most reliably gets eaten (at service + as leftovers).</p>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2">Dish</th>
+          <th class="text-right py-2">Services</th>
+          <th class="text-right py-2">Avg consumed</th>
+          <th class="text-right py-2">Avg eat rate</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in top_popular %}
+        <tr class="border-b border-slate-100">
+          <td class="py-2"><a href="{% url 'recipe_detail' row.recipe.id %}" class="text-slate-900 hover:text-indigo-700">{{ row.recipe.name }}</a></td>
+          <td class="py-2 text-right text-slate-600">{{ row.n_services }}</td>
+          <td class="py-2 text-right font-mono text-emerald-700">{{ row.avg_consumption_rate|floatformat:"-2" }}</td>
+          <td class="py-2 text-right font-mono text-slate-600">{{ row.avg_eat_rate|default_if_none:"—"|floatformat:"-2" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if bottom_popular %}
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-2">Least Consumed</h2>
+    <p class="text-xs text-slate-500 mb-3">Dishes with the highest disposal rate. Candidates to prep less, revisit recipe, or retire.</p>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2">Dish</th>
+          <th class="text-right py-2">Services</th>
+          <th class="text-right py-2">Avg consumed</th>
+          <th class="text-right py-2">Avg eat rate</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in bottom_popular %}
+        <tr class="border-b border-slate-100">
+          <td class="py-2"><a href="{% url 'recipe_detail' row.recipe.id %}" class="text-slate-900 hover:text-indigo-700">{{ row.recipe.name }}</a></td>
+          <td class="py-2 text-right text-slate-600">{{ row.n_services }}</td>
+          <td class="py-2 text-right font-mono text-red-700">{{ row.avg_consumption_rate|floatformat:"-2" }}</td>
+          <td class="py-2 text-right font-mono text-slate-600">{{ row.avg_eat_rate|default_if_none:"—"|floatformat:"-2" }}</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if rows_by_name %}
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-2">All Tracked Dishes (A–Z)</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2">Dish</th>
+          <th class="text-right py-2">Services</th>
+          <th class="text-right py-2">Avg prepped</th>
+          <th class="text-right py-2">Eat rate</th>
+          <th class="text-right py-2">Total consumption</th>
+          <th class="text-right py-2"></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows_by_name %}
+        <tr class="border-b border-slate-100">
+          <td class="py-2"><a href="{% url 'recipe_detail' row.recipe.id %}" class="text-slate-900 hover:text-indigo-700">{{ row.recipe.name }}</a></td>
+          <td class="py-2 text-right text-slate-600">{{ row.n_services }}</td>
+          <td class="py-2 text-right font-mono text-slate-700">{{ row.avg_prepped|floatformat:"-2" }}</td>
+          <td class="py-2 text-right font-mono text-slate-600">{{ row.avg_eat_rate|default_if_none:"—"|floatformat:"-2" }}</td>
+          <td class="py-2 text-right font-mono
+                     {% if row.avg_consumption_rate >= 0.9 %}text-emerald-700
+                     {% elif row.avg_consumption_rate is None or row.avg_consumption_rate >= 0.7 %}text-slate-700
+                     {% else %}text-red-700{% endif %}">
+            {{ row.avg_consumption_rate|default_if_none:"—"|floatformat:"-2" }}
+          </td>
+          <td class="py-2 text-right text-xs">
+            {% if row.has_disposal_data %}
+              <span class="text-slate-500" title="Has day-5 disposal data">🗑️</span>
+            {% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  {% if unlinked_services %}
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+    <strong>Note:</strong> {{ unlinked_services }} MealService record{{ unlinked_services|pluralize }}
+    {% if unlinked_services > 1 %}are{% else %}is{% endif %} logged against
+    menus with no linked Recipe. Those can't be aggregated by dish — link the menu to a recipe
+    via <a href="{% url 'menu_bulk_link' %}" class="text-indigo-600 hover:underline">Link</a> to include them.
+  </div>
+  {% endif %}
+
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+    <strong>Metric definitions:</strong>
+    <em>eat rate</em> = (prepped − leftover) ÷ prepped (how much got eaten at service);
+    <em>total consumption rate</em> = (prepped − discarded) ÷ prepped (master popularity signal;
+    closer to 1.0 = more popular). Falls back to eat rate when no disposal data.
+  </div>
+
+</div>
+{% endblock %}

@@ -1426,6 +1426,76 @@ def yield_bridge(request):
 
 
 
+# ---- Popularity analytics (current MealService data) ----
+
+def popularity_dashboard(request):
+    """Aggregate MealService records by recipe. Shows current-era popularity
+    data — distinct from /historical/ which shows the Jan 2026 Production
+    Tracker parse. Populates as Sean logs service records via /menu/<id>/."""
+    from .models import MealService
+    from decimal import Decimal
+    from collections import defaultdict
+
+    # Group services by recipe (via menu.recipe or menu.additional_recipes)
+    by_recipe: dict = defaultdict(list)
+    unlinked: list = []
+    for svc in (MealService.objects
+                .select_related('menu', 'menu__recipe')
+                .prefetch_related('menu__additional_recipes')):
+        recipes = list(svc.menu.additional_recipes.all())
+        if svc.menu.recipe_id and svc.menu.recipe not in recipes:
+            recipes.append(svc.menu.recipe)
+        if not recipes:
+            unlinked.append(svc)
+            continue
+        for r in recipes:
+            by_recipe[r.id].append(svc)
+
+    # Build per-recipe rollups
+    rows = []
+    for recipe_id, services in by_recipe.items():
+        from .models import Recipe
+        recipe = Recipe.objects.filter(pk=recipe_id).first()
+        if not recipe:
+            continue
+        # Only include services with numeric prep_qty for averaging
+        prepped_vals = [s.prepped_qty for s in services if s.prepped_qty is not None]
+        if not prepped_vals:
+            continue
+
+        eat_rates = [s.immediate_eat_rate for s in services if s.immediate_eat_rate is not None]
+        consume_rates = [s.total_consumption_rate for s in services if s.total_consumption_rate is not None]
+
+        avg_eat = sum(eat_rates) / len(eat_rates) if eat_rates else None
+        avg_consume = sum(consume_rates) / len(consume_rates) if consume_rates else None
+
+        rows.append({
+            'recipe': recipe,
+            'n_services': len(services),
+            'avg_prepped': sum(prepped_vals) / len(prepped_vals),
+            'avg_eat_rate': avg_eat,
+            'avg_consumption_rate': avg_consume,
+            'services': services[:5],  # sample for drill-down hint
+            'has_disposal_data': any(s.discarded_qty is not None for s in services),
+        })
+
+    # Rank
+    with_consumption = [r for r in rows if r['avg_consumption_rate'] is not None]
+    top_popular = sorted(with_consumption, key=lambda r: -r['avg_consumption_rate'])[:10]
+    bottom_popular = sorted(with_consumption, key=lambda r: r['avg_consumption_rate'])[:10]
+
+    total_services = sum(r['n_services'] for r in rows)
+
+    return render(request, 'myapp/popularity.html', {
+        'rows_by_name': sorted(rows, key=lambda r: r['recipe'].name.lower()),
+        'top_popular': top_popular,
+        'bottom_popular': bottom_popular,
+        'total_services': total_services,
+        'total_dishes': len(rows),
+        'unlinked_services': len(unlinked),
+    })
+
+
 # ---- Historical dish performance (Production Tracker) ----
 
 def historical_dishes(request):
