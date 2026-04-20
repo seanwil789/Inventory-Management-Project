@@ -1,0 +1,120 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Leftovers — Fridge Rotation{% endblock %}
+
+{% block content %}
+<div class="max-w-4xl space-y-5">
+
+  <div class="flex items-baseline justify-between gap-3 flex-wrap">
+    <div>
+      <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Leftovers</h1>
+      <p class="text-sm text-slate-600 mt-1">
+        Client-fridge contents aging through the 5-day shelf window.
+        Check what's in the walk-in, discard what's past it, rotate what's good.
+      </p>
+    </div>
+    <div class="text-right text-sm text-slate-500">
+      <div>{{ total }} active leftover{{ total|pluralize }}</div>
+      <div>As of {{ today|date:"D, M j" }}</div>
+    </div>
+  </div>
+
+  {% if total %}
+  <div class="grid grid-cols-3 gap-3">
+    <div class="rounded-lg border border-emerald-200 bg-emerald-50 p-3 text-center">
+      <div class="text-2xl font-bold text-emerald-700">{{ green_count }}</div>
+      <div class="text-xs text-emerald-800 uppercase tracking-wide">fresh (day 0–2)</div>
+    </div>
+    <div class="rounded-lg border border-amber-200 bg-amber-50 p-3 text-center">
+      <div class="text-2xl font-bold text-amber-700">{{ amber_count }}</div>
+      <div class="text-xs text-amber-800 uppercase tracking-wide">check soon (day 3–4)</div>
+    </div>
+    <div class="rounded-lg border border-red-200 bg-red-50 p-3 text-center">
+      <div class="text-2xl font-bold text-red-700">{{ red_count }}</div>
+      <div class="text-xs text-red-800 uppercase tracking-wide">day 5+ — act now</div>
+    </div>
+  </div>
+  {% endif %}
+
+  {% if rows %}
+    <div class="space-y-3">
+      {% for row in rows %}
+      <div class="rounded-lg border
+        {% if row.urgency == 'red' %}border-red-300 bg-red-50
+        {% elif row.urgency == 'amber' %}border-amber-300 bg-amber-50
+        {% else %}border-emerald-200 bg-white{% endif %} p-4">
+        <div class="flex items-baseline justify-between gap-3 flex-wrap">
+          <div>
+            <div class="text-sm font-medium text-slate-900">
+              {% if row.service.menu.recipe %}
+                <a href="{% url 'recipe_detail' row.service.menu.recipe.id %}" class="hover:text-indigo-700">{{ row.service.menu.recipe.name }}</a>
+              {% else %}
+                {{ row.service.menu.dish_freetext|default:"(unnamed)" }}
+              {% endif %}
+            </div>
+            <div class="text-xs text-slate-500 mt-0.5">
+              Served {{ row.service.menu.date|date:"D, M j" }} {{ row.service.menu.get_meal_slot_display }}
+              · <a href="{% url 'menu_detail' row.service.menu.id %}" class="text-indigo-600 hover:underline">menu detail →</a>
+            </div>
+          </div>
+          <div class="text-right">
+            <div class="text-xs uppercase tracking-wide
+              {% if row.urgency == 'red' %}text-red-700 font-bold
+              {% elif row.urgency == 'amber' %}text-amber-700
+              {% else %}text-emerald-700{% endif %}">
+              {{ row.banner }}
+            </div>
+            <div class="text-xs text-slate-500 mt-0.5">
+              Prepped {{ row.service.prepped_qty }} {{ row.service.unit|default:"" }}
+              · Leftover {{ row.service.post_service_leftover_qty }} {{ row.service.unit|default:"" }}
+            </div>
+          </div>
+        </div>
+
+        <!-- Actions -->
+        <div class="mt-3 flex flex-wrap gap-2">
+          <!-- Mark as fully consumed (no waste) -->
+          <form method="post" action="{% url 'mealservice_mark_consumed' row.service.id %}" class="inline">
+            {% csrf_token %}
+            <button type="submit" class="px-3 py-1 bg-emerald-600 text-white text-xs rounded hover:bg-emerald-700"
+                    title="Leftover was fully consumed — no waste">
+              ✓ Fully consumed
+            </button>
+          </form>
+
+          <!-- Log partial disposal -->
+          <form method="post" action="{% url 'mealservice_log_disposal' row.service.id %}"
+                class="inline-flex items-center gap-1">
+            {% csrf_token %}
+            <input type="number" step="0.001" name="discarded_qty" placeholder="qty discarded"
+                   class="border rounded px-2 py-1 text-xs w-24">
+            <span class="text-xs text-slate-500">{{ row.service.unit|default:"" }}</span>
+            <button type="submit" class="px-3 py-1 bg-red-600 text-white text-xs rounded hover:bg-red-700"
+                    title="Some or all got thrown out">
+              🗑️ Log disposal
+            </button>
+          </form>
+        </div>
+
+        {% if row.service.notes %}
+          <div class="text-xs text-slate-600 mt-2 italic">{{ row.service.notes }}</div>
+        {% endif %}
+      </div>
+      {% endfor %}
+    </div>
+  {% else %}
+    <div class="rounded-lg border border-slate-200 bg-white p-8 text-center text-slate-500 italic">
+      No active leftovers in the fridge. Kitchen's caught up. 🎉
+    </div>
+  {% endif %}
+
+  <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
+    <strong>How this works:</strong> when you log a service with leftovers
+    on the menu-detail page, it shows up here. Each day it ages one more
+    day. At day 5 it's at shelf-life end — check the fridge and either
+    mark it <em>fully consumed</em> (leftover got eaten, no waste) or
+    <em>log disposal</em> (thrown out, feeds the popularity loop as a
+    low-signal dish).
+  </div>
+
+</div>
+{% endblock %}

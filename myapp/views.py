@@ -1426,6 +1426,77 @@ def yield_bridge(request):
 
 
 
+# ---- Leftover aging / fridge-rotation view ----
+
+def leftovers_view(request):
+    """List active leftovers (service logged with leftover_qty > 0, no disposal
+    logged yet). Color-coded by age. Supports inline log-disposal + "consumed"
+    (marks leftover as 0 discarded = fully eaten)."""
+    from .models import MealService
+    from datetime import timedelta
+    from decimal import Decimal
+
+    today = date.today()
+    active = (MealService.objects
+              .filter(post_service_leftover_qty__gt=0, discarded_qty__isnull=True)
+              .select_related('menu', 'menu__recipe')
+              .order_by('menu__date'))
+
+    rows = []
+    for svc in active:
+        age_days = (today - svc.menu.date).days
+        if age_days < 0:
+            continue
+        if age_days >= 5:
+            urgency = 'red'
+            banner = 'DAY 5 — check now'
+        elif age_days >= 3:
+            urgency = 'amber'
+            banner = f'Day {age_days} — check soon'
+        else:
+            urgency = 'green'
+            banner = f'Day {age_days} — fresh'
+        rows.append({
+            'service': svc,
+            'age_days': age_days,
+            'urgency': urgency,
+            'banner': banner,
+        })
+
+    # Sort: most urgent (highest age) first
+    rows.sort(key=lambda r: -r['age_days'])
+
+    # Counts for summary
+    red_count = sum(1 for r in rows if r['urgency'] == 'red')
+    amber_count = sum(1 for r in rows if r['urgency'] == 'amber')
+    green_count = sum(1 for r in rows if r['urgency'] == 'green')
+
+    return render(request, 'myapp/leftovers.html', {
+        'today': today,
+        'rows': rows,
+        'red_count': red_count,
+        'amber_count': amber_count,
+        'green_count': green_count,
+        'total': len(rows),
+    })
+
+
+@require_POST
+def mealservice_mark_consumed(request, service_id: int):
+    """Mark a leftover as fully consumed (discarded_qty=0). Different from
+    log-disposal which records actual thrown-out quantity."""
+    from .models import MealService
+    from datetime import datetime
+    from decimal import Decimal
+    svc = get_object_or_404(MealService, pk=service_id)
+    svc.discarded_qty = Decimal('0')
+    svc.discarded_at = datetime.now()
+    svc.save(update_fields=['discarded_qty', 'discarded_at', 'updated_at'])
+    messages.success(request,
+        f"Marked leftover for {svc.menu.recipe.name if svc.menu.recipe else svc.menu.dish_freetext} as fully consumed.")
+    return redirect(reverse('leftovers_view'))
+
+
 # ---- Popularity analytics (current MealService data) ----
 
 def popularity_dashboard(request):
