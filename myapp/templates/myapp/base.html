@@ -17,24 +17,71 @@
       <a href="{% url 'calendar_current' %}" class="text-base sm:text-lg font-semibold">Kitchen</a>
       <span class="text-slate-400 text-xs sm:text-sm hidden sm:inline">Wentworth</span>
     </div>
-    <nav class="text-xs sm:text-sm flex gap-3 sm:gap-4">
+    <nav class="text-xs sm:text-sm flex items-center gap-3 sm:gap-5 relative">
       <a href="{% url 'calendar_current' %}" class="hover:text-slate-200">Calendar</a>
       <a href="{% url 'prep_list' %}" class="hover:text-slate-200">Prep</a>
       <a href="{% url 'order_guide' %}" class="hover:text-slate-200">Order</a>
-      <a href="{% url 'cogs_dashboard' %}" class="hover:text-slate-200">COGs</a>
-      <a href="{% url 'category_spend' %}" class="hover:text-slate-200">Categories</a>
-      <a href="{% url 'price_alerts' %}" class="hover:text-slate-200">Alerts</a>
-      <a href="{% url 'popularity_dashboard' %}" class="hover:text-slate-200" title="Aggregated MealService popularity stats">Popularity</a>
-      <a href="{% url 'leftovers_view' %}" class="hover:text-slate-200" title="Aging leftovers in the fridge">Leftovers</a>
-      <a href="{% url 'demo_ready' %}" class="hover:text-slate-200 text-indigo-300" title="Demo-day readiness checklist">Demo</a>
-      <a href="{% url 'pipeline_health' %}" class="hover:text-slate-200 text-slate-300" title="Invoice pipeline + recipe linkage + cache health">Health</a>
-      <a href="{% url 'menu_bulk_link' %}" class="hover:text-slate-200" title="Link freetext menus to recipes">Link</a>
-      <a href="{% url 'recipe_list' %}" class="hover:text-slate-200">Recipes</a>
-      <a href="{% url 'yield_list' %}" class="hover:text-slate-200">Yields</a>
-      <a href="{% url 'bridge_review' %}" class="hover:text-slate-200">Bridge</a>
-      <a href="/admin/" class="hover:text-slate-200">Admin</a>
+
+      <details class="relative group">
+        <summary class="cursor-pointer list-none hover:text-slate-200 flex items-center gap-0.5">
+          Recipes <span class="text-slate-500 text-xs">▾</span>
+        </summary>
+        <div class="absolute top-full left-0 mt-1 bg-slate-800 border border-slate-700 rounded shadow-lg py-1 min-w-[180px] z-20">
+          <a href="{% url 'recipe_list' %}" class="block px-3 py-1.5 hover:bg-slate-700">All recipes</a>
+          <a href="{% url 'recipe_new' %}" class="block px-3 py-1.5 hover:bg-slate-700">+ New recipe</a>
+          <a href="{% url 'recipe_missing_quantities' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Fill recipe qty/unit gaps">Missing quantities</a>
+          <a href="{% url 'menu_suggestions' %}" class="block px-3 py-1.5 hover:bg-slate-700">Dish suggestions</a>
+          <a href="{% url 'historical_dishes' %}" class="block px-3 py-1.5 hover:bg-slate-700">Historical dishes</a>
+          <a href="{% url 'menu_bulk_link' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Link freetext menus to recipes">Bulk-link menus</a>
+        </div>
+      </details>
+
+      <details class="relative group">
+        <summary class="cursor-pointer list-none hover:text-slate-200 flex items-center gap-0.5">
+          Analytics <span class="text-slate-500 text-xs">▾</span>
+        </summary>
+        <div class="absolute top-full left-0 mt-1 bg-slate-800 border border-slate-700 rounded shadow-lg py-1 min-w-[180px] z-20">
+          <a href="{% url 'cogs_dashboard' %}" class="block px-3 py-1.5 hover:bg-slate-700">COGs</a>
+          <a href="{% url 'category_spend' %}" class="block px-3 py-1.5 hover:bg-slate-700">Category spend</a>
+          <a href="{% url 'price_alerts' %}" class="block px-3 py-1.5 hover:bg-slate-700">Price alerts</a>
+          <a href="{% url 'popularity_dashboard' %}" class="block px-3 py-1.5 hover:bg-slate-700">Popularity</a>
+          <a href="{% url 'leftovers_view' %}" class="block px-3 py-1.5 hover:bg-slate-700">Leftovers</a>
+        </div>
+      </details>
+
+      <details class="relative group">
+        <summary class="cursor-pointer list-none hover:text-slate-200 flex items-center gap-0.5">
+          Data <span class="text-slate-500 text-xs">▾</span>
+        </summary>
+        <div class="absolute top-full left-0 mt-1 bg-slate-800 border border-slate-700 rounded shadow-lg py-1 min-w-[180px] z-20">
+          <a href="{% url 'yield_list' %}" class="block px-3 py-1.5 hover:bg-slate-700">Yield references</a>
+          <a href="{% url 'yield_bridge' %}" class="block px-3 py-1.5 hover:bg-slate-700">Yield bridge</a>
+          <a href="{% url 'bridge_review' %}" class="block px-3 py-1.5 hover:bg-slate-700">Ingredient bridge</a>
+          <a href="{% url 'bridge_skipped' %}" class="block px-3 py-1.5 hover:bg-slate-700">Skipped ingredients</a>
+        </div>
+      </details>
+
+      <details class="relative group">
+        <summary class="cursor-pointer list-none hover:text-slate-200 flex items-center gap-0.5 text-slate-300">
+          Ops <span class="text-slate-500 text-xs">▾</span>
+        </summary>
+        <div class="absolute top-full right-0 mt-1 bg-slate-800 border border-slate-700 rounded shadow-lg py-1 min-w-[180px] z-20">
+          <a href="{% url 'demo_ready' %}" class="block px-3 py-1.5 hover:bg-slate-700 text-indigo-300" title="Demo-day readiness checklist">Demo readiness</a>
+          <a href="{% url 'pipeline_health' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Invoice pipeline + recipe linkage + cache health">Pipeline health</a>
+          <a href="{% url 'kitchen_display' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Wall-mount tablet display">Kitchen display</a>
+          <a href="/admin/" class="block px-3 py-1.5 hover:bg-slate-700">Django admin</a>
+        </div>
+      </details>
     </nav>
   </header>
+  <script>
+    // Close nav <details> dropdowns when clicking outside them.
+    document.addEventListener('click', function (e) {
+      document.querySelectorAll('nav details[open]').forEach(function (d) {
+        if (!d.contains(e.target)) d.open = false;
+      });
+    });
+  </script>
   <main class="max-w-7xl mx-auto p-3 sm:p-6">
     {% if messages %}
       <div class="mb-4 space-y-2">
