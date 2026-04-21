@@ -890,35 +890,65 @@ def _parse_sysco(text: str) -> list[dict]:
 
     # ── Extract invoice total ────────────────────────────────────────────
     # Sysco multi-page invoices: the LAST PAGE has the invoice total.
-    # Pattern: "LAST PAGE" followed by subtotal, tax, invoice total
-    # (the last standalone number is the invoice total).
-    # Single-page or non-last pages: fall back to GROUP TOTAL sums.
+    # Extraction order:
+    #   1. "INVOICE TOTAL" label pattern — dedicated labeled total, most
+    #      reliable. Handles both "INVOICE TOTAL" on one line and "INVOICE"
+    #      / "TOTAL" stacked on adjacent lines.
+    #   2. "LAST PAGE" marker — take largest decimal in ±10 line window.
+    #   3. GROUP TOTAL sum — for pages without either marker.
     invoice_total = None
 
-    # Method 1: Look for "LAST PAGE" indicator (definitive total)
-    # Numbers may appear BEFORE or AFTER "LAST PAGE" depending on OCR layout.
-    # Search both directions, filter out dates, take the largest number.
+    # Method 1: "INVOICE TOTAL" label — LAST occurrence in the page.
+    # Sysco OCR often stacks multiple label pairs (TAX TOTAL, INVOICE
+    # TOTAL) followed by a block of values. The value ordering matches
+    # the label ordering, so "INVOICE TOTAL" (2nd label pair) pairs with
+    # the 2nd value — which is the LARGEST value since invoice total
+    # exceeds tax total. Take the largest decimal in the 8-line window
+    # after the label to get the right one regardless of the number of
+    # preceding stacked labels (TAX TOTAL, DISCOUNT TOTAL, etc.).
+    label_positions = []
     for i, line in enumerate(lines):
-        if re.match(r'^\s*LAST PAGE\s*$', line, re.IGNORECASE):
-            nums = []
-            # Look backwards (up to 10 lines before LAST PAGE)
-            for j in range(max(0, i - 10), i):
-                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
-                if m:
-                    val = float(m.group(1).replace(",", ""))
-                    if val > 1.0:  # skip tiny numbers like fuel surcharges
-                        nums.append(val)
-            # Look forwards (up to 10 lines after LAST PAGE)
-            for j in range(i + 1, min(i + 10, len(lines))):
-                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
-                if m:
-                    val = float(m.group(1).replace(",", ""))
-                    if val > 1.0:
-                        nums.append(val)
-            if nums:
-                invoice_total = max(nums)  # largest number = invoice total
-                print(f"  [✓] Sysco invoice total from LAST PAGE: ${invoice_total:.2f}")
-            break
+        stripped = line.strip().upper()
+        if re.match(r'^INVOICE\s+TOTAL\s*$', stripped):
+            label_positions.append((i, i))
+        elif stripped == 'INVOICE' and i + 1 < len(lines) and \
+                lines[i + 1].strip().upper() == 'TOTAL':
+            label_positions.append((i, i + 1))
+    if label_positions:
+        _, search_after = label_positions[-1]
+        nums = []
+        for j in range(search_after + 1, min(search_after + 9, len(lines))):
+            m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+            if m:
+                val = float(m.group(1).replace(",", ""))
+                if val > 1.0:
+                    nums.append(val)
+        if nums:
+            invoice_total = max(nums)
+            print(f"  [✓] Sysco invoice total from INVOICE TOTAL label: ${invoice_total:.2f}")
+
+    # Method 2: "LAST PAGE" fallback. Numbers may appear before or after
+    # the marker; search both directions, take the largest.
+    if invoice_total is None:
+        for i, line in enumerate(lines):
+            if re.match(r'^\s*LAST PAGE\s*$', line, re.IGNORECASE):
+                nums = []
+                for j in range(max(0, i - 10), i):
+                    m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                    if m:
+                        val = float(m.group(1).replace(",", ""))
+                        if val > 1.0:
+                            nums.append(val)
+                for j in range(i + 1, min(i + 10, len(lines))):
+                    m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                    if m:
+                        val = float(m.group(1).replace(",", ""))
+                        if val > 1.0:
+                            nums.append(val)
+                if nums:
+                    invoice_total = max(nums)
+                    print(f"  [✓] Sysco invoice total from LAST PAGE: ${invoice_total:.2f}")
+                break
 
     # Method 2: Fall back to GROUP TOTAL sums (partial pages)
     if invoice_total is None:
