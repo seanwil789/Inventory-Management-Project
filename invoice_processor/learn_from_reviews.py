@@ -35,19 +35,23 @@ LEARNED_RULES_PATH = os.path.join(os.path.dirname(__file__), "mappings", "learne
 
 
 def load_review_history() -> tuple[list[dict], list[dict]]:
-    """Load all Y and N decisions from the Mapping Review tab."""
-    raw = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!A:E")
+    """Load all Y and N decisions from the Mapping Review tab.
+
+    Real sheet schema: A=Vendor, B=Raw Description, C=Suggested Product,
+    D=Score, E=Count, F=Approve? (Y/N), G=Avg Price, H=Times Seen, I=Notes.
+    """
+    raw = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!A:I")
 
     approvals = []
     rejections = []
 
     for row in raw[1:]:
-        while len(row) < 5:
+        while len(row) < 9:
             row.append("")
-        status = row[0].strip().upper()
-        vendor = row[1].strip()
-        desc = row[3].strip()
-        canonical = row[4].strip()
+        vendor    = row[0].strip()       # A
+        desc      = row[1].strip()       # B
+        canonical = row[2].strip()       # C
+        status    = row[5].strip().upper()  # F
 
         if not desc or not canonical:
             continue

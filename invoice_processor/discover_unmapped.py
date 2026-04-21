@@ -107,6 +107,10 @@ def suggest_canonical(desc: str, vendor: str,
     """
     Suggest a canonical name for an unmapped description by fuzzy matching
     against existing Product names and Synergy sheet names.
+
+    When the top score is in the borderline band (75-89), returns alternates
+    so the review UX can surface all plausible candidates — the user picks
+    from three instead of accepting/rejecting a single guess.
     """
     cleaned = clean_description(desc)
     if len(cleaned) < 3:
@@ -129,12 +133,19 @@ def suggest_canonical(desc: str, vendor: str,
                     cat = prod.category or ""
             except Exception:
                 pass
+            # Surface alternates only when top score is borderline (<90).
+            # At >= 90, top-1 is confident enough to stand alone.
+            alternates = []
+            if matches[0][1] < 90:
+                alternates = [{"name": m[0], "score": int(m[1])}
+                              for m in matches[1:3] if m[1] >= 70]
             return {
                 "suggested": matches[0][0],
                 "score": matches[0][1],
                 "source": "product_db",
                 "cleaned": cleaned,
                 "category": cat,
+                "alternates": alternates,
             }
 
     # Try matching against Synergy sheet product names
@@ -152,12 +163,17 @@ def suggest_canonical(desc: str, vendor: str,
                 if sp["product"] == matches[0][0]:
                     cat = sp.get("section", "")
                     break
+            alternates = []
+            if matches[0][1] < 90:
+                alternates = [{"name": m[0], "score": int(m[1])}
+                              for m in matches[1:3] if m[1] >= 70]
             return {
                 "suggested": matches[0][0],
                 "score": matches[0][1],
                 "source": "synergy_sheet",
                 "cleaned": cleaned,
                 "category": cat,
+                "alternates": alternates,
             }
 
     return None
@@ -198,20 +214,52 @@ AUTO_APPROVE_THRESHOLD = 90  # Score >= this gets auto-approved
 NEGATIVE_MATCH_PATH = os.path.join(os.path.dirname(__file__), "mappings", "negative_matches.json")
 
 
-def _load_negative_matches() -> set[tuple[str, str]]:
-    """Load rejected (vendor, description) pairs so they aren't re-suggested."""
-    if os.path.exists(NEGATIVE_MATCH_PATH):
-        with open(NEGATIVE_MATCH_PATH) as f:
-            data = json.load(f)
-        return set(tuple(pair) for pair in data)
-    return set()
+def _load_negative_matches() -> set[tuple[str, str, str]]:
+    """Load rejected (vendor, raw_description, suggested_canonical) triples.
+
+    Legacy format was 2-tuples (vendor, raw_desc) meaning "block any
+    suggestion for this pair." On load, legacy entries are migrated to
+    3-tuples with empty suggested = wildcard (preserves old behavior).
+    Re-save after load converts the file to the new format.
+    """
+    if not os.path.exists(NEGATIVE_MATCH_PATH):
+        return set()
+    with open(NEGATIVE_MATCH_PATH) as f:
+        data = json.load(f)
+    result = set()
+    for entry in data:
+        if len(entry) == 2:
+            # Legacy: wildcard (blocks any canonical for this pair)
+            result.add((entry[0], entry[1], ""))
+        elif len(entry) >= 3:
+            result.add((entry[0], entry[1], entry[2]))
+    return result
 
 
-def _save_negative_matches(negatives: set[tuple[str, str]]):
-    """Save rejected pairs to disk."""
+def _save_negative_matches(negatives: set[tuple[str, str, str]]):
+    """Save rejected triples to disk as 3-element arrays."""
     os.makedirs(os.path.dirname(NEGATIVE_MATCH_PATH), exist_ok=True)
     with open(NEGATIVE_MATCH_PATH, "w") as f:
         json.dump(sorted(negatives), f, indent=2)
+
+
+def _is_negated(vendor: str, raw_desc: str, suggested: str,
+                negatives: set[tuple[str, str, str]]) -> bool:
+    """True if (vendor, raw_desc, suggested) is blocked — either by a
+    specific triple match or by a wildcard (empty-suggested) entry."""
+    if (vendor, raw_desc, suggested) in negatives:
+        return True
+    if (vendor, raw_desc, "") in negatives:
+        return True
+    return False
+
+
+def _is_wildcard_negated(vendor: str, raw_desc: str,
+                         negatives: set[tuple[str, str, str]]) -> bool:
+    """True only if a wildcard (empty-suggested) entry blocks any
+    suggestion for (vendor, raw_desc). Used by audit-suspect corrections
+    so that specific-canonical rejections don't block corrections."""
+    return (vendor, raw_desc, "") in negatives
 
 
 def _is_known_mismatch(desc: str, suggested: str) -> bool:
@@ -256,14 +304,16 @@ def _format_review_tab(client):
     if sheet_id is None:
         return
 
-    # Write header
+    # Write header — matches the schema Sean established manually on the tab.
+    # Col A=Vendor, B=Raw Description, C=Suggested Product, D=Score, E=Count,
+    # F=Approve (Y/N dropdown), G=Avg Price, H=Times Seen, I=Notes.
     client.values().update(
         spreadsheetId=SPREADSHEET_ID,
         range=f"'{REVIEW_TAB}'!A1:I1",
         valueInputOption="USER_ENTERED",
         body={"values": [[
-            "Status", "Vendor", "Category", "Raw Description",
-            "Suggested Canonical", "Score", "Avg Price", "Times Seen", "Notes",
+            "Vendor", "Raw Description", "Suggested Product", "Score", "Count",
+            "Approve? (Y/N)", "Avg Price", "Times Seen", "Notes",
         ]]},
     ).execute()
 
@@ -283,36 +333,36 @@ def _format_review_tab(client):
             }},
             "fields": "userEnteredFormat(textFormat,backgroundColor)",
         }},
-        # Column widths
+        # Column widths — match real schema
         {"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 0, "endIndex": 1},  # A: Status
-            "properties": {"pixelSize": 90}, "fields": "pixelSize",
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 1, "endIndex": 2},  # B: Vendor
+                      "startIndex": 0, "endIndex": 1},  # A: Vendor
             "properties": {"pixelSize": 120}, "fields": "pixelSize",
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 2, "endIndex": 3},  # C: Category
-            "properties": {"pixelSize": 100}, "fields": "pixelSize",
-        }},
-        {"updateDimensionProperties": {
-            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 3, "endIndex": 4},  # D: Raw Description
+                      "startIndex": 1, "endIndex": 2},  # B: Raw Description
             "properties": {"pixelSize": 320}, "fields": "pixelSize",
         }},
         {"updateDimensionProperties": {
             "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
-                      "startIndex": 4, "endIndex": 5},  # E: Suggested Canonical
+                      "startIndex": 2, "endIndex": 3},  # C: Suggested Product
             "properties": {"pixelSize": 200}, "fields": "pixelSize",
         }},
-        # Status dropdown validation (A2:A1000) — Y/N
+        {"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                      "startIndex": 3, "endIndex": 5},  # D: Score, E: Count
+            "properties": {"pixelSize": 60}, "fields": "pixelSize",
+        }},
+        {"updateDimensionProperties": {
+            "range": {"sheetId": sheet_id, "dimension": "COLUMNS",
+                      "startIndex": 5, "endIndex": 6},  # F: Approve? (Y/N)
+            "properties": {"pixelSize": 90}, "fields": "pixelSize",
+        }},
+        # Approve-status dropdown validation (F2:F1000) — Y/N
         {"setDataValidation": {
             "range": {"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1000,
-                      "startColumnIndex": 0, "endColumnIndex": 1},
+                      "startColumnIndex": 5, "endColumnIndex": 6},
             "rule": {
                 "condition": {"type": "ONE_OF_LIST",
                               "values": [{"userEnteredValue": "Y"},
@@ -327,7 +377,7 @@ def _format_review_tab(client):
                 "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1000}],
                 "booleanRule": {
                     "condition": {"type": "CUSTOM_FORMULA",
-                                  "values": [{"userEnteredValue": '=$A2="Y"'}]},
+                                  "values": [{"userEnteredValue": '=$F2="Y"'}]},
                     "format": {"backgroundColor": {"red": 0.85, "green": 0.95, "blue": 0.85}},
                 },
             },
@@ -339,7 +389,7 @@ def _format_review_tab(client):
                 "ranges": [{"sheetId": sheet_id, "startRowIndex": 1, "endRowIndex": 1000}],
                 "booleanRule": {
                     "condition": {"type": "CUSTOM_FORMULA",
-                                  "values": [{"userEnteredValue": '=$A2="N"'}]},
+                                  "values": [{"userEnteredValue": '=$F2="N"'}]},
                     "format": {"backgroundColor": {"red": 0.95, "green": 0.85, "blue": 0.85}},
                 },
             },
@@ -361,31 +411,33 @@ def write_suggestions_to_review(suggestions: list[dict]):
 
     Features:
       - Filters out known mismatches (tortilla→Corn, pickle→Dill, etc.)
+      - Filters previously-rejected triples + wildcard-blocked pairs
       - Auto-approves suggestions scoring >= 90%
       - Sorted by vendor then frequency (most seen first)
-      - Includes category column for context
-      - Dropdown for Status, conditional formatting for APPROVE/REJECT/DONE
 
-    Columns:
-      A: Status              — APPROVE (auto for 90%+), blank for review, dropdown
-      B: Vendor
-      C: Category            — product category for context
-      D: Raw Description     — what DocAI extracted
-      E: Suggested Canonical — editable, what it will map to
-      F: Score               — fuzzy match confidence
-      G: Avg Price           — average price seen across invoices
-      H: Times Seen          — how many invoices this description appeared on
-      I: Notes               — free-form
+    Real sheet schema (matches how Sean set up the tab):
+      A: Vendor
+      B: Raw Description     — what OCR/parser extracted
+      C: Suggested Product   — editable, the canonical to apply
+      D: Score               — fuzzy match confidence
+      E: Count               — times seen across invoices
+      F: Approve? (Y/N)      — dropdown, drives auto-apply
+      G: Avg Price
+      H: Times Seen          — historically blank (E covers count)
+      I: Notes               — free-form; "Row N" pattern triggers in-place
+                                col-F rewrite on Item Mapping when approved
     """
     client = get_sheets_client()
     _ensure_review_tab_exists(client)
 
-    # Check for existing rows to avoid duplicates (check cols C:D now)
-    existing = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!B:D")
+    # Check for existing rows to avoid duplicates. Real schema: col A=Vendor,
+    # col B=Raw Description — dedup key is (vendor, raw_desc).
+    existing = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!A:B")
     existing_keys = set()
     for row in existing[1:]:
-        if len(row) >= 3:
-            existing_keys.add((row[0].strip(), row[2].strip()))
+        while len(row) < 2:
+            row.append('')
+        existing_keys.add((row[0].strip(), row[1].strip()))
 
     # Load negative matches to avoid re-suggesting rejected pairs
     negatives = _load_negative_matches()
@@ -406,8 +458,12 @@ def write_suggestions_to_review(suggestions: list[dict]):
             skipped_dupes += 1
             continue
 
-        # Skip previously rejected suggestions
-        if key in negatives:
+        # Skip previously rejected triples. Triple semantics: a rejection
+        # blocks only the specific (vendor, raw_desc, suggested) combo —
+        # future suggestions with different canonicals still surface.
+        # Legacy pairs get migrated to wildcard triples on load and block
+        # any suggestion for that (vendor, raw_desc).
+        if _is_negated(s["vendor"], s["raw_description"], s["suggested"], negatives):
             skipped_negatives += 1
             continue
 
@@ -419,16 +475,26 @@ def write_suggestions_to_review(suggestions: list[dict]):
         # Auto-approve high confidence
         status = "Y" if s["score"] >= AUTO_APPROVE_THRESHOLD else ""
 
+        # Build notes: category (if present) + alternates (when borderline)
+        note_parts = []
+        if s.get("category"):
+            note_parts.append(s["category"])
+        if s.get("alternates"):
+            alts = " · ".join(f"{a['name']} ({a['score']})"
+                              for a in s["alternates"])
+            note_parts.append(f"Alts: {alts}")
+        notes = " | ".join(note_parts)
+
         rows.append([
-            status,                            # A: Status
-            s["vendor"],                       # B: Vendor
-            s.get("category", ""),             # C: Category
-            s["raw_description"],              # D: Raw Description
-            s["suggested"],                    # E: Suggested Canonical
-            round(s["score"], 1),              # F: Score
+            s["vendor"],                       # A: Vendor
+            s["raw_description"],              # B: Raw Description
+            s["suggested"],                    # C: Suggested Product
+            round(s["score"], 1),              # D: Score
+            s["count"],                        # E: Count
+            status,                            # F: Approve? (Y/N) — "Y" auto, "" manual
             f"${s['avg_price']:.2f}" if s.get("avg_price") else "",  # G: Avg Price
-            s["count"],                        # H: Times Seen
-            "",                                # I: Notes
+            "",                                # H: Times Seen (historically blank)
+            notes,                             # I: Notes — category + alternates
         ])
 
     if not rows:
@@ -439,15 +505,19 @@ def write_suggestions_to_review(suggestions: list[dict]):
             print(f"  ({filtered_mismatches} known mismatches filtered)")
         return
 
-    # Clear old DONE rows first
+    # Clear old DONE rows first. Status is in col F (index 5) per the
+    # sheet's real schema.
     existing_data = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!A:I")
-    done_count = sum(1 for row in existing_data[1:] if row and row[0].strip().upper() == "DONE")
+    done_count = sum(
+        1 for row in existing_data[1:]
+        if len(row) > 5 and row[5].strip().upper() == "DONE"
+    )
 
     if done_count > 0:
         # Delete DONE rows by rewriting the sheet (keep header + non-DONE rows)
         keep_rows = [existing_data[0]]  # header
         for row in existing_data[1:]:
-            if row and row[0].strip().upper() != "DONE":
+            if not (len(row) > 5 and row[5].strip().upper() == "DONE"):
                 keep_rows.append(row)
 
         # Clear and rewrite
@@ -494,14 +564,27 @@ def write_suggestions_to_review(suggestions: list[dict]):
     print(f"  4. Run: python discover_unmapped.py --apply-approved")
 
 
+MAX_REJECTIONS_PER_RUN = 25  # Cap on rejection-triples persisted per cron
+                              # run. Keeps historic backlogs from surprise
+                              # bulk-adds; remaining rejections drain on
+                              # subsequent runs. Triples mean rejection
+                              # blocks only the specific (vendor, raw_desc,
+                              # suggested) — not the whole pair — so future
+                              # better canonicals can still be suggested.
+
+
 def apply_approved():
     """
-    Read APPROVE rows from the Mapping Review tab and move them
-    to the Item Mapping tab, then mark them as DONE in the review tab.
+    Read approved/rejected rows from the Mapping Review tab and act:
+      - Y-approved → write to Item Mapping (append or in-place col-F rewrite
+        when Notes contains "Row N"), mark DONE.
+      - N-rejected → save (vendor, raw_desc) to negative_matches.json so
+        future discover_unmapped runs skip them. Capped at
+        MAX_REJECTIONS_PER_RUN per run to prevent surprise bulk effects
+        from historic backlogs — remaining rejections process on next cron.
 
-    Uses new column layout:
-      A: Status, B: Vendor, C: Category, D: Raw Description,
-      E: Suggested Canonical, F: Score, G: Avg Price, H: Times Seen, I: Notes
+    Real sheet schema: A=Vendor, B=Raw Description, C=Suggested Product,
+    D=Score, E=Count, F=Approve? (Y/N), G=Avg Price, H=Times Seen, I=Notes.
     """
     client = get_sheets_client()
     raw = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!A:I")
@@ -517,24 +600,60 @@ def apply_approved():
     for i, row in enumerate(raw[1:], start=2):  # skip header, 1-indexed
         while len(row) < 9:
             row.append("")
-        status = row[0].strip().upper()
+        vendor    = row[0].strip()       # A: Vendor
+        raw_desc  = row[1].strip()       # B: Raw Description
+        suggested = row[2].strip()       # C: Suggested Product
+        status    = row[5].strip().upper()  # F: Approve? (Y/N)
+        notes     = row[8].strip()       # I: Notes
 
         if status in ("N", "REJECT"):
-            rejected_pairs.append((row[1].strip(), row[3].strip()))
+            # Triple: block only this specific raw→canonical mapping.
+            # Future suggestions with different canonicals still surface.
+            rejected_pairs.append((vendor, raw_desc, suggested))
 
         if status in ("Y", "APPROVE"):
             approved.append({
-                "vendor": row[1].strip(),
-                "category": row[2].strip(),
-                "raw_description": row[3].strip(),
-                "canonical": row[4].strip(),
-                "notes": row[8].strip(),
+                "vendor": vendor,
+                "raw_description": raw_desc,
+                "canonical": suggested,
+                "notes": notes,
                 "row_num": i,
             })
             approved_row_nums.append(i)
 
+    if not approved and not rejected_pairs:
+        print("No approved (Y) or rejected (N) rows found in col F. "
+              "Mark rows in the Approve? column first.")
+        return
+
+    # Process rejections first — does not require any approvals.
+    # Triples (vendor, raw_desc, suggested); capped per run so a large
+    # backlog drains over multiple cron passes without silent surprises.
+    if rejected_pairs:
+        negatives = _load_negative_matches()
+        fresh = [t for t in rejected_pairs if tuple(t) not in negatives]
+        total_fresh = len(fresh)
+
+        if total_fresh > MAX_REJECTIONS_PER_RUN:
+            print(f"  [gate] {total_fresh} pending rejections exceeds per-run cap "
+                  f"({MAX_REJECTIONS_PER_RUN}). Processing {MAX_REJECTIONS_PER_RUN} "
+                  f"this run; remaining {total_fresh - MAX_REJECTIONS_PER_RUN} "
+                  f"will process on the next cron pass.")
+            fresh = fresh[:MAX_REJECTIONS_PER_RUN]
+
+        if fresh:
+            new_negatives = set(tuple(t) for t in fresh)
+            negatives.update(new_negatives)
+            _save_negative_matches(negatives)
+            print(f"  [OK] Saved {len(new_negatives)} rejection triples to "
+                  f"negative_matches.json ({len(negatives)} total)")
+            for vendor, raw_desc, suggested in fresh:
+                print(f"    + ({vendor or '-'}) {raw_desc[:50]} → NOT {suggested[:25]}")
+        else:
+            print(f"  (no new rejections — all {len(rejected_pairs)} already in negative_matches.json)")
+
     if not approved:
-        print("No approved rows found. Mark rows as Y in the Status column first.")
+        print("No approved (Y) rows this run.")
         return
 
     print(f"Found {len(approved)} approved mappings. Writing to Item Mapping...")
@@ -545,19 +664,22 @@ def apply_approved():
 
     for a in approved:
         notes = a.get("notes", "")
-        category = a.get("category", "")
 
-        # If category starts with "SUPC:" and notes has "Row N", this is a
-        # SUPC code update — write canonical to column F of the existing row
-        if category.startswith("SUPC:") and "Row " in notes:
-            try:
-                target_row = int(notes.replace("Row ", "").strip())
-                supc_updates.append({
-                    "canonical": a["canonical"],
-                    "target_row": target_row,
-                })
-            except ValueError:
-                new_appends.append(a)
+        # In-place col-F rewrites on Item Mapping: triggered purely by
+        # presence of "Row N" in Notes. Used by SUPC code updates (from
+        # build_sysco_codes) and CORRECTION rows (from audit_suspect_mappings
+        # --write-to-review). Additional fields in Notes like "WAS:" and
+        # "Candidates:" are tolerated.
+        m = re.search(r'Row\s+(\d+)', notes)
+        if m:
+            if not a["canonical"]:
+                print(f"  [skip] '{a['raw_description']}': blank canonical "
+                      f"on row-referenced suggestion — fill col C before approving")
+                continue
+            supc_updates.append({
+                "canonical": a["canonical"],
+                "target_row": int(m.group(1)),
+            })
         else:
             new_appends.append(a)
 
@@ -575,16 +697,17 @@ def apply_approved():
                 spreadsheetId=SPREADSHEET_ID,
                 body={"valueInputOption": "USER_ENTERED", "data": chunk},
             ).execute()
-        print(f"  [OK] {len(supc_updates)} SUPC canonical names updated in Item Mapping.")
+        print(f"  [OK] {len(supc_updates)} in-place canonical updates applied to Item Mapping.")
 
-    # Append new mapping rows
+    # Append new mapping rows to Item Mapping. Note: Item Mapping schema is
+    # different from the Mapping Review schema — here col F is the canonical.
     if new_appends:
         mapping_rows = []
         for a in new_appends:
             mapping_rows.append([
                 a["vendor"],           # A: Vendor
                 a["raw_description"],  # B: Raw Description
-                a["category"],         # C: Category
+                "",                    # C: Category (manual)
                 "",                    # D: Primary descriptor
                 "",                    # E: Secondary descriptor
                 a["canonical"],        # F: Canonical name
@@ -600,11 +723,11 @@ def apply_approved():
         ).execute()
         print(f"  [OK] {len(mapping_rows)} new rows added to Item Mapping.")
 
-    # Mark as DONE in review tab
+    # Mark as DONE in review tab — status lives in col F (real schema)
     batch_data = []
     for row_num in approved_row_nums:
         batch_data.append({
-            "range": f"'{REVIEW_TAB}'!A{row_num}",
+            "range": f"'{REVIEW_TAB}'!F{row_num}",
             "values": [["DONE"]],
         })
 
@@ -615,15 +738,6 @@ def apply_approved():
         ).execute()
 
     print(f"  [OK] Marked {len(approved_row_nums)} rows as DONE in '{REVIEW_TAB}'.")
-
-    # Save rejections to negative match memory
-    if rejected_pairs:
-        negatives = _load_negative_matches()
-        new_negatives = set(tuple(p) for p in rejected_pairs) - negatives
-        if new_negatives:
-            negatives.update(new_negatives)
-            _save_negative_matches(negatives)
-            print(f"  [OK] Saved {len(new_negatives)} rejections to negative match memory ({len(negatives)} total)")
 
     # Count remaining
     remaining = sum(1 for row in raw[1:] if len(row) > 0 and row[0].strip().upper() not in ("Y", "N", "APPROVE", "REJECT", "DONE"))

@@ -70,6 +70,13 @@ class Command(BaseCommand):
                             help='Restrict to one vendor')
         parser.add_argument('--json', type=str, default=None,
                             help='Write full report as JSON to this path')
+        parser.add_argument('--write-to-review', action='store_true',
+                            help='Push correction rows to the Mapping Review tab with '
+                                 'top-3 candidate canonicals in notes. Auto-apply picks '
+                                 'them up on the next cron pass once you set status=Y '
+                                 'and fill in the chosen canonical in col E.')
+        parser.add_argument('--dry-run', action='store_true',
+                            help='With --write-to-review: preview the rows without writing.')
 
     def handle(self, *args, **opts):
         qs = (InvoiceLineItem.objects
@@ -165,3 +172,160 @@ class Command(BaseCommand):
             'tab and correct the canonical (column F). Then `python invoice_processor/\n'
             'cleanup_mappings.py --apply` + `python manage.py reprocess_invoices` to\n'
             'pick up corrections.'))
+
+        if opts['write_to_review']:
+            self._write_corrections_to_review(filtered, dry_run=opts['dry_run'])
+
+    def _write_corrections_to_review(self, filtered, dry_run: bool = False):
+        """Push each flagged suspect pair to the Mapping Review tab as a
+        correction row. Notes carries 'Row N · WAS: X · Candidates: ...' —
+        apply_approved reads the row number and rewrites col F of the
+        Item Mapping sheet when the user sets status=Y and fills col E."""
+        import sys
+        from django.conf import settings
+        ip_path = str(settings.BASE_DIR / 'invoice_processor')
+        if ip_path not in sys.path:
+            sys.path.insert(0, ip_path)
+        from rapidfuzz import process, fuzz, utils as fuzz_utils
+        from sheets import get_sheets_client, get_sheet_values
+        from config import SPREADSHEET_ID, MAPPING_TAB
+        from discover_unmapped import (REVIEW_TAB, _ensure_review_tab_exists,
+                                        _load_negative_matches, _is_wildcard_negated)
+        from mapper import _strip_sysco_prefix
+        from myapp.models import Product
+
+        client = get_sheets_client()
+        canonical_list = list(Product.objects.values_list('canonical_name', flat=True))
+        self.stdout.write(f'\n=== Writing corrections to "{REVIEW_TAB}" ===')
+        self.stdout.write(f'  {len(canonical_list)} canonicals in DB (candidate pool)')
+
+        # Build (vendor_upper, desc_upper) -> Item Mapping row number lookup
+        mapping_rows = get_sheet_values(SPREADSHEET_ID, f'{MAPPING_TAB}!A:G')
+        row_lookup = {}
+        for i, row in enumerate(mapping_rows[1:], start=2):
+            while len(row) < 7:
+                row.append('')
+            v = row[0].strip().upper()
+            d = row[1].strip().upper()
+            if d:
+                row_lookup[(v, d)] = i
+        self.stdout.write(f'  {len(row_lookup)} rows indexed in Item Mapping')
+
+        if not dry_run:
+            _ensure_review_tab_exists(client)
+
+        # Dedupe against existing Mapping Review rows. Real schema:
+        # col A=Vendor, col B=Raw Description — dedup key is (A, B).
+        existing = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!A:B")
+        existing_keys = set()
+        for row in existing[1:]:
+            while len(row) < 2:
+                row.append('')
+            existing_keys.add((row[0].strip(), row[1].strip()))
+
+        # Skip pairs that have a WILDCARD negative entry only. Specific
+        # (vendor, raw, suggested) triples don't block corrections — they
+        # mean "this specific canonical was wrong," which is exactly the
+        # situation corrections are here to fix.
+        negatives = _load_negative_matches()
+
+        new_rows = []
+        skipped_no_row = 0
+        skipped_dupes = 0
+        skipped_negatives = 0
+
+        for (pid, _), g in filtered:
+            vendor = sorted(g['vendors'])[0] if g['vendors'] else ''
+            raw_desc = g['raw_desc']
+            wrong_canonical = g['canonical']
+
+            if (vendor, raw_desc) in existing_keys:
+                skipped_dupes += 1
+                continue
+            if _is_wildcard_negated(vendor, raw_desc, negatives):
+                skipped_negatives += 1
+                continue
+
+            key = (vendor.upper(), raw_desc.upper())
+            row_num = row_lookup.get(key)
+            if row_num is None:
+                skipped_no_row += 1
+                continue
+
+            # Top-3 candidates excluding the wrong canonical. Strip Sysco
+            # brand prefix first so the search sees the product name, not
+            # "WHLFCLS" / "SYS IMP" / etc. noise. Matches the mapper's
+            # stripped_fuzzy tier behavior.
+            search_key = _strip_sysco_prefix(raw_desc)
+            pool = [c for c in canonical_list if c != wrong_canonical]
+            top3 = process.extract(
+                search_key, pool,
+                scorer=fuzz.token_set_ratio,
+                processor=fuzz_utils.default_process,
+                limit=3,
+            )
+            cand_str = ' · '.join(f'{name} ({int(score)})' for name, score, _ in top3) \
+                if top3 else '(no candidates)'
+            notes = f'Row {row_num} · WAS: {wrong_canonical} · Candidates: {cand_str}'
+
+            new_rows.append([
+                vendor,                # A: Vendor
+                raw_desc,              # B: Raw Description
+                '',                    # C: Suggested Product — blank for Sean to fill
+                '',                    # D: Score
+                g['count'],            # E: Count
+                '',                    # F: Approve? (Y/N) — blank, manual review
+                '',                    # G: Avg Price
+                '',                    # H: Times Seen
+                notes,                 # I: Notes — "Row N · WAS: X · Candidates: ..."
+                                        # apply_approved reads "Row N" from here
+                                        # and rewrites col F of Item Mapping row N.
+            ])
+
+        if not new_rows:
+            self.stdout.write(self.style.WARNING('  No new correction rows to write.'))
+            if skipped_dupes:
+                self.stdout.write(f'  Skipped {skipped_dupes} already in review tab')
+            if skipped_negatives:
+                self.stdout.write(f'  Skipped {skipped_negatives} previously rejected')
+            if skipped_no_row:
+                self.stdout.write(f'  Skipped {skipped_no_row} without a matching Item Mapping row')
+            return
+
+        if dry_run:
+            self.stdout.write(self.style.HTTP_INFO(
+                f'\n[DRY RUN] Would write {len(new_rows)} correction row(s):'))
+            for r in new_rows:
+                self.stdout.write(f'    [{r[1]}] {r[3][:50]:<50}')
+                self.stdout.write(f'      {r[8]}')
+            self.stdout.write(f'\n  Skipped — dupes: {skipped_dupes} · negatives: {skipped_negatives} · no-row: {skipped_no_row}')
+            return
+
+        client.values().append(
+            spreadsheetId=SPREADSHEET_ID,
+            range=f"'{REVIEW_TAB}'!A:I",
+            valueInputOption='USER_ENTERED',
+            insertDataOption='INSERT_ROWS',
+            body={'values': new_rows},
+        ).execute()
+
+        self.stdout.write(self.style.SUCCESS(
+            f'\n✔ Wrote {len(new_rows)} correction row(s) to "{REVIEW_TAB}"'))
+        if skipped_dupes:
+            self.stdout.write(f'  Skipped {skipped_dupes} already in review tab')
+        if skipped_negatives:
+            self.stdout.write(f'  Skipped {skipped_negatives} previously rejected (in negative_matches.json)')
+        if skipped_no_row:
+            self.stdout.write(f'  Skipped {skipped_no_row} without a matching Item Mapping row')
+        self.stdout.write(self.style.WARNING(
+            '\nNext steps:\n'
+            '  1. Open the sheet → "Mapping Review" tab.\n'
+            '  2. For each correction row, paste the chosen canonical into\n'
+            '     col C (Suggested Product). Candidates live in col I (Notes).\n'
+            '     If none fit, type a new canonical.\n'
+            '  3. Set col F (Approve? Y/N) to "Y".\n'
+            '  4. The 6-hour cron (run_mapping_review_apply.sh) will auto-apply\n'
+            '     on the next pass, rewriting col F of the Item Mapping row\n'
+            '     (referenced in col I Notes as "Row N").\n'
+            '  5. Set col F to "N" to reject — adds (vendor, raw_desc) to\n'
+            '     negative_matches.json so future audits skip it.'))
