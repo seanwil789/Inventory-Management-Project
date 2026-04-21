@@ -763,6 +763,238 @@ class AuditSuspectMappingsTests(TestCase):
                               "'egg'/'eggs' stem should overlap between canonical and desc")
 
 
+class ParserSyscoIntegrationTests(TestCase):
+    """Sysco parser is parser.py's largest + most complex format: 5-pass
+    anchor/description matching, catch-weight handling, pack-size extraction,
+    section tagging, GROUP TOTAL exclusion, LAST PAGE total extraction.
+    These tests cover the major paths via minimal synthetic OCR.
+
+    Uses a stub mapper.load_mappings so tests are deterministic regardless
+    of the live invoice_processor/mappings/item_mappings.json cache state."""
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        import mapper
+        return p, mapper
+
+    def _stub_mappings(self, code_map=None):
+        """Context manager: patch mapper.load_mappings to return controlled
+        code_map (other fields empty). Needed because Sysco parser consults
+        mapper.load_mappings internally for known-code-first matching."""
+        from unittest.mock import patch
+        _, mapper = self._import_parser()
+        return patch.object(mapper, 'load_mappings', return_value={
+            'code_map': code_map or {},
+            'desc_map': {}, 'vendor_desc_map': {}, 'category_map': {},
+        })
+
+    def test_basic_two_items_unknown_codes(self):
+        """Codes unknown → fall back to ordered OCR-description pairing.
+        First desc pairs with first anchor in read order."""
+        parser_mod, _ = self._import_parser()
+        raw = """SYSCO PHILADELPHIA
+Invoice Number
+775800001
+DELV. DATE
+4/15/26
+**** DAIRY ****
+MILK WHOLE GAL
+YOGURT PLAIN TUB
+1234567 15.00
+2345678 22.00
+GROUP TOTAL
+37.00
+LAST PAGE
+Subtotal
+37.00
+Total
+37.00
+"""
+        with self._stub_mappings(code_map={}):
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        self.assertEqual(result['vendor'], 'Sysco')
+        items = result['items']
+        self.assertEqual(len(items), 2)
+        # Both items have unit_price set
+        prices = sorted(it['unit_price'] for it in items)
+        self.assertEqual(prices, [15.00, 22.00])
+        # Item codes captured
+        codes = sorted(it['sysco_item_code'] for it in items)
+        self.assertEqual(codes, ['1234567', '2345678'])
+
+    def test_known_code_uses_canonical_as_description(self):
+        """When code is in code_map, raw_description becomes the canonical
+        name (more reliable than OCR text). Sysco parser design choice."""
+        parser_mod, _ = self._import_parser()
+        raw = """**** DAIRY ****
+MILK WHOLE GAL
+1234567 15.00
+GROUP TOTAL
+15.00
+LAST PAGE
+Subtotal
+15.00
+Total
+15.00
+"""
+        with self._stub_mappings(code_map={'1234567': 'Milk, Whole Gallon'}):
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        items = result['items']
+        self.assertEqual(len(items), 1)
+        # Known canonical preferred over OCR desc
+        self.assertEqual(items[0]['raw_description'], 'Milk, Whole Gallon')
+
+    def test_group_total_not_treated_as_item(self):
+        """GROUP TOTAL + its amount must NOT show up as an extra line item."""
+        parser_mod, _ = self._import_parser()
+        raw = """**** PRODUCE ****
+ROMAINE HEARTS FRESH
+CARROTS BABY CUT
+1111111 10.00
+2222222 8.00
+GROUP TOTAL
+18.00
+LAST PAGE
+Subtotal
+18.00
+Total
+18.00
+"""
+        with self._stub_mappings():
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        # Should be 2 items (not 3 — GROUP TOTAL amount must not pair)
+        self.assertEqual(len(result['items']), 2)
+        # No item has $18.00 (that's the group total, not a line)
+        self.assertNotIn(18.00, [it['unit_price'] for it in result['items']])
+
+    def test_section_tagging(self):
+        """Each item tagged with its section name (DAIRY, PRODUCE, etc.)
+        from the nearest preceding section header."""
+        parser_mod, _ = self._import_parser()
+        raw = """**** DAIRY ****
+MILK WHOLE GAL
+1111111 15.00
+GROUP TOTAL
+15.00
+**** PRODUCE ****
+ROMAINE HEARTS FRESH
+2222222 10.00
+GROUP TOTAL
+10.00
+LAST PAGE
+Subtotal
+25.00
+Total
+25.00
+"""
+        with self._stub_mappings():
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        items = result['items']
+        self.assertEqual(len(items), 2)
+        # Match items to their sections by unit_price
+        by_price = {it['unit_price']: it for it in items}
+        self.assertIn('DAIRY', by_price[15.00]['section'].upper())
+        self.assertIn('PRODUCE', by_price[10.00]['section'].upper())
+
+    def test_last_page_invoice_total(self):
+        """Invoice total extracted as the max decimal near 'LAST PAGE'.
+        This is the canonical path for multi-page Sysco invoices."""
+        parser_mod, _ = self._import_parser()
+        raw = """**** DAIRY ****
+MILK WHOLE GAL
+YOGURT PLAIN TUB
+1111111 15.00
+2222222 22.00
+GROUP TOTAL
+37.00
+LAST PAGE
+Subtotal
+37.00
+Tax
+0.00
+Invoice Total
+37.00
+"""
+        with self._stub_mappings():
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        self.assertEqual(result.get('invoice_total'), 37.00)
+
+    def test_catch_weight_protein_section(self):
+        """MEATS section: catch-weight line ('42.5 LB CHICKEN BREAST')
+        gets weight extracted and computed into per-lb pricing."""
+        parser_mod, _ = self._import_parser()
+        raw = """**** MEATS ****
+42.5 LB CHICKEN BREAST FRESH
+1111111 200.00
+GROUP TOTAL
+200.00
+LAST PAGE
+Subtotal
+200.00
+Total
+200.00
+"""
+        with self._stub_mappings():
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        items = result['items']
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        # Catch-weight items get price_per_unit = total / weight_lbs
+        # and unit_of_measure='LB'
+        self.assertEqual(item.get('unit_of_measure'), 'LB')
+        # 200 / 42.5 = 4.7058... → round to 4 decimals
+        self.assertAlmostEqual(item.get('price_per_unit'), 4.7058823529, places=3)
+
+    def test_catch_weight_not_applied_in_canned_section(self):
+        """Catch-weight only triggers in MEAT/POULTRY/SEAFOOD sections.
+        CANNED & DRY section should not extract weight from what looks
+        like a catch-weight line."""
+        parser_mod, _ = self._import_parser()
+        raw = """**** CANNED & DRY ****
+42.5 LB FLOUR ALL PURPOSE
+1111111 200.00
+GROUP TOTAL
+200.00
+LAST PAGE
+Subtotal
+200.00
+Total
+200.00
+"""
+        with self._stub_mappings():
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        items = result['items']
+        self.assertEqual(len(items), 1)
+        # No catch-weight extraction outside protein sections
+        self.assertNotIn('price_per_unit', items[0])
+        self.assertNotEqual(items[0].get('unit_of_measure'), 'LB')
+
+    def test_date_extracted_from_delv_date(self):
+        """Sysco's canonical date field is 'DELV. DATE', which
+        `extract_date` must pull via its generic regex."""
+        parser_mod, _ = self._import_parser()
+        raw = """SYSCO PHILADELPHIA
+DELV. DATE
+4/15/2026
+**** DAIRY ****
+MILK WHOLE GAL
+1111111 15.00
+GROUP TOTAL
+15.00
+LAST PAGE
+Total
+15.00
+"""
+        with self._stub_mappings():
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        self.assertEqual(result['invoice_date'], '2026-04-15')
+
+
 class ParserPipelineIntegrationTest(TestCase):
     """T4: full parse → map → write_invoice_to_db round-trip. Verifies the
     three layers cooperate — parser finds items, mapper links canonical
