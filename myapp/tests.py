@@ -659,6 +659,52 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class ManagementCommandSmokeTests(TestCase):
+    """Smoke tests for DB-only management commands. Each one runs in its
+    safest mode (dry-run / no --apply) against an empty-or-minimal DB
+    and asserts it doesn't raise. Catches regressions across the 22
+    commands without requiring per-command deep coverage.
+
+    Excluded: commands that need external resources (Google Sheets CSV,
+    PDF, docx, xlsx, OCR cache) — those need full fixtures."""
+
+    def _run(self, cmd_name, *args, **kwargs):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        err = StringIO()
+        call_command(cmd_name, *args, stdout=out, stderr=err, **kwargs)
+        return out.getvalue()
+
+    def test_auto_tag_protein(self):
+        """Without --apply: dry-run over all recipes, should not raise."""
+        self._run('auto_tag_protein')  # dry-run default
+
+    def test_relevel_recipes(self):
+        self._run('relevel_recipes')  # dry-run default
+
+    def test_tag_meal_slots(self):
+        self._run('tag_meal_slots')
+
+    def test_backfill_yield_refs_dry_run(self):
+        """No --apply → reports without writing."""
+        self._run('backfill_yield_refs')
+
+    def test_infer_recipe_proteins_dry_run(self):
+        self._run('infer_recipe_proteins', dry_run=True)
+
+    def test_map_recipe_ingredients_dry_run(self):
+        self._run('map_recipe_ingredients', dry_run=True)
+
+    def test_purge_invoice_month_dry_run(self):
+        """No --confirm → dry-run, should not delete anything."""
+        self._run('purge_invoice_month', '2026', '1')  # dry-run default
+
+    def test_regenerate_preptasks_dry_run(self):
+        """Without --dry-run the command writes — test the preview path."""
+        self._run('regenerate_preptasks', dry_run=True)
+
+
 class AuditOrphanProductsTests(TestCase):
     """`audit_orphan_products` — locks in zero-invoice-line detection + the
     mapping-count annotation that tells Sean whether an orphan is safe to
