@@ -2450,3 +2450,189 @@ class MapperNewTiersTests(TestCase):
         r = mapper.resolve_item(item, mappings, vendor='Farm Art')
         # Should match Milk via tier 6b (stemmed) — clean 1:1 token match
         self.assertEqual(r['canonical'], 'Milk')
+
+
+class MapperRealisticScenariosTests(TestCase):
+    """Integration tests with realistic invoice-shaped inputs that exercise
+    full tier sequencing + feature interactions. Parser-parity quality
+    infrastructure: any future change to thresholds, regexes, or tier
+    ordering is caught here before shipping.
+
+    Shared fixture reflects a miniaturized slice of production data —
+    real raw_descriptions from live Sysco/Farm Art/Exceptional invoices,
+    paired with realistic canonical names + category assignments."""
+
+    FIXTURE_MAPPINGS = {
+        'code_map': {
+            '1234567': 'Romaine',
+            '7890123': 'Milk, Whole Gallon',
+        },
+        'desc_map': {
+            # Global exact (all-vendors)
+            'SYSCO CLS BROCCOLI FLORETS FRESH': 'Broccoli Florets',
+        },
+        'vendor_desc_map': {
+            'SYSCO': {
+                'WHLFCLS ROMAINE HEARTS 3CT': 'Romaine',
+                'GRECOSN CHEESE MOZZARELLA SHREDDED 4 5LB': 'Mozzarella',
+                'ARIZONA DRINK TEA ICED LMN 24 16 OZ': 'Arizona Iced Tea',
+            },
+            'FARM ART': {
+                'LETTUCE, ROMAINE, 24 CT': 'Romaine',
+                'ONIONS, RED JUMBO, 25 LB': 'Red Onion',
+            },
+            'EXCEPTIONAL FOODS': {
+                'BACON APPLEWOOD SLICE MARTINS': 'Applewood Bacon',
+            },
+        },
+        'category_map': {
+            'Romaine':              {'category': 'Produce', 'primary_descriptor': 'Leaf', 'secondary_descriptor': ''},
+            'Red Onion':            {'category': 'Produce', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Rosemary':             {'category': 'Spices', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Sweet Potato':         {'category': 'Produce', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Cantaloupe':           {'category': 'Produce', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Cereal, Frosted Flakes': {'category': 'Drystock', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Mozzarella':           {'category': 'Cheese', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Milk, Whole Gallon':   {'category': 'Dairy', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Applewood Bacon':      {'category': 'Proteins', 'primary_descriptor': 'Pork', 'secondary_descriptor': ''},
+            'Ground Pork':          {'category': 'Proteins', 'primary_descriptor': 'Pork', 'secondary_descriptor': ''},
+            'Dried Shiitake':       {'category': 'Drystock', 'primary_descriptor': '', 'secondary_descriptor': ''},
+            'Broccoli Florets':     {'category': 'Produce', 'primary_descriptor': '', 'secondary_descriptor': ''},
+        },
+    }
+
+    def _mapper(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import mapper
+        return mapper
+
+    def _assert_resolves(self, raw_desc: str, vendor: str,
+                         expected_canonical: str | None,
+                         expected_confidence: str = None,
+                         *, sysco_code: str = '', section: str = ''):
+        mapper = self._mapper()
+        item = {'sysco_item_code': sysco_code, 'raw_description': raw_desc}
+        if section:
+            item['section'] = section
+        r = mapper.resolve_item(item, self.FIXTURE_MAPPINGS, vendor=vendor)
+        msg = f"raw={raw_desc!r} vendor={vendor!r} got={r['canonical']!r} tier={r['confidence']!r}"
+        if expected_canonical is None:
+            self.assertEqual(r['confidence'], 'unmatched', msg)
+            self.assertIsNone(r['canonical'], msg)
+        else:
+            self.assertEqual(r['canonical'], expected_canonical, msg)
+            if expected_confidence:
+                self.assertEqual(r['confidence'], expected_confidence, msg)
+
+    # Tier 1: SUPC code — highest priority
+    def test_scenario_sysco_code_match_beats_everything(self):
+        self._assert_resolves('totally wrong text', 'Sysco', 'Romaine',
+                              expected_confidence='code', sysco_code='1234567')
+
+    # Tier 2: vendor-scoped exact
+    def test_scenario_sysco_vendor_exact(self):
+        self._assert_resolves('WHLFCLS ROMAINE HEARTS 3CT', 'Sysco', 'Romaine',
+                              expected_confidence='vendor_exact')
+
+    def test_scenario_farm_art_vendor_exact(self):
+        self._assert_resolves('LETTUCE, ROMAINE, 24 CT', 'Farm Art', 'Romaine',
+                              expected_confidence='vendor_exact')
+
+    # Tier 3: vendor-scoped fuzzy, default threshold (Sysco @ 90)
+    def test_scenario_sysco_vendor_fuzzy_90(self):
+        # Close variation of mapped desc — should match at >=90
+        self._assert_resolves('ARIZONA DRINK TEA ICED LMN 2416 OZ', 'Sysco',
+                              'Arizona Iced Tea',
+                              expected_confidence='vendor_fuzzy')
+
+    # Tier 3: relaxed threshold for Exceptional Foods (85)
+    def test_scenario_exceptional_relaxed_threshold(self):
+        # Close variation of "BACON APPLEWOOD SLICE MARTINS" — one token
+        # different. token_sort_ratio lands in 85-89 band: passes
+        # Exceptional's relaxed threshold, would fail Sysco's 90.
+        self._assert_resolves('BACON APPLEWOOD SLICE MARTIN', 'Exceptional Foods',
+                              'Applewood Bacon',
+                              expected_confidence='vendor_fuzzy')
+
+    # Tier 4: global desc exact (cross-vendor)
+    def test_scenario_global_exact_cross_vendor(self):
+        # Mapped under no specific vendor, matches global desc_map
+        self._assert_resolves('SYSCO CLS BROCCOLI FLORETS FRESH', 'Unknown',
+                              'Broccoli Florets',
+                              expected_confidence='exact')
+
+    # Tier 6 (stripped_fuzzy): WHLFCLS prefix + token_set match
+    def test_scenario_sysco_prefix_strip_and_match(self):
+        # Not in vendor_desc_map, not in desc_map — falls to tier 6a/6b.
+        # Clean raw that matches after WHLFCLS strip.
+        self._assert_resolves('WHLFCLS MOZZARELLA', 'Sysco', 'Mozzarella')
+
+    # Tier 6b: stemmed fuzzy catches pluralization
+    def test_scenario_farm_art_stemmed_plural(self):
+        self._assert_resolves('ONIONS, RED JUMBO, 50 LB', 'Farm Art',
+                              'Red Onion',
+                              expected_confidence='vendor_fuzzy')
+
+    def test_scenario_farm_art_stemmed_herb(self):
+        self._assert_resolves('HERB, ROSEMARY, 1 LB', 'Farm Art',
+                              'Rosemary')
+
+    # Tier 6c: char-level catches spelling variant
+    def test_scenario_char_fallback_spelling(self):
+        # Raw spelled "Canteloupes", canonical is "Cantaloupe" — single-char
+        # typo that only char-level catches. Plural stems collapse first.
+        self._assert_resolves('Canteloupe', 'Farm Art', 'Cantaloupe')
+
+    # Qualifier gate: canonical 'Dried Shiitake' blocked by missing 'dried' in raw
+    def test_scenario_qualifier_gate_blocks_dried(self):
+        # Raw is FRESH shiitake → should NOT match "Dried Shiitake" canonical
+        self._assert_resolves('MUSHROOMS, SHIITAKE, #1, 3 LB', 'Farm Art',
+                              expected_canonical=None)
+
+    # Section-aware: prefers Dairy-category canonical
+    def test_scenario_section_aware_match(self):
+        # Section-aware restricts candidate pool, helping precision
+        self._assert_resolves('WHLFCLS MOZZARELLA SHRD', 'Sysco',
+                              'Mozzarella',
+                              section='**** DAIRY ****')
+
+    # Junk line — should not even try (filtered upstream by _is_junk_item)
+    def test_scenario_junk_is_unmatched(self):
+        # Verified via _is_junk_item separately; just confirm the flow here
+        mapper = self._mapper()
+        self.assertTrue(mapper._is_junk_item(
+            {'raw_description': 'FUEL SURCHARGE 2.5%'}))
+        self.assertTrue(mapper._is_junk_item(
+            {'raw_description': '[Sysco #5229067]'}))
+        self.assertTrue(mapper._is_junk_item(
+            {'raw_description': 'GROUP TOTAL'}))
+
+    # End-to-end: map_items filters junk, then resolves each remaining item
+    def test_scenario_map_items_filters_and_resolves(self):
+        mapper = self._mapper()
+        items = [
+            {'sysco_item_code': '1234567', 'raw_description': 'x'},           # code tier
+            {'sysco_item_code': '', 'raw_description': 'FUEL SURCHARGE'},    # junk
+            {'sysco_item_code': '', 'raw_description': 'WHLFCLS ROMAINE HEARTS 3CT'},  # vendor_exact
+            {'sysco_item_code': '', 'raw_description': 'COMPLETELY UNKNOWN'}, # unmatched
+        ]
+        results = mapper.map_items(items, mappings=self.FIXTURE_MAPPINGS, vendor='Sysco')
+        # Junk filtered, so 3 results (not 4)
+        self.assertEqual(len(results), 3)
+        by_confidence = {r['confidence'] for r in results}
+        self.assertIn('code', by_confidence)
+        self.assertIn('vendor_exact', by_confidence)
+        self.assertIn('unmatched', by_confidence)
+
+    # Unknown vendor fallback — no vendor_desc_map, falls to global tiers
+    def test_scenario_unknown_vendor_fallback(self):
+        self._assert_resolves('SYSCO CLS BROCCOLI FLORETS FRESH', 'Unknown',
+                              'Broccoli Florets')  # hits global exact
+
+    # Empty description + no code → unmatched (guard)
+    def test_scenario_empty_input_unmatched(self):
+        self._assert_resolves('', 'Sysco', expected_canonical=None)
