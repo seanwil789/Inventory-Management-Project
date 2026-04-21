@@ -695,6 +695,100 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class MenuFormTests(TestCase):
+    """MenuForm — dish_freetext is required (whitespace stripped)."""
+
+    def test_valid_menu(self):
+        from myapp.forms import MenuForm
+        form = MenuForm(data={
+            'dish_freetext': 'Test Dish',
+            'date': '2026-04-20',
+            'meal_slot': 'lunch',
+            'assignee': 'sean',
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_dish_freetext_required(self):
+        from myapp.forms import MenuForm
+        form = MenuForm(data={
+            'dish_freetext': '',
+            'date': '2026-04-20',
+            'meal_slot': 'lunch',
+        })
+        self.assertFalse(form.is_valid())
+        self.assertIn('dish_freetext', form.errors)
+
+    def test_dish_freetext_whitespace_only_rejected(self):
+        """'   ' should be treated as empty after strip."""
+        from myapp.forms import MenuForm
+        form = MenuForm(data={
+            'dish_freetext': '   ',
+            'date': '2026-04-20',
+            'meal_slot': 'lunch',
+        })
+        self.assertFalse(form.is_valid())
+
+    def test_invalid_meal_slot_rejected(self):
+        from myapp.forms import MenuForm
+        form = MenuForm(data={
+            'dish_freetext': 'Test',
+            'date': '2026-04-20',
+            'meal_slot': 'brunch',  # not in choices
+        })
+        self.assertFalse(form.is_valid())
+
+
+class RecipeFormTests(TestCase):
+    """RecipeForm — ConflictsField + ValidSlotsField multi-select storage."""
+
+    def test_valid_recipe(self):
+        from myapp.forms import RecipeForm
+        form = RecipeForm(data={
+            'name': 'Test Recipe',
+            'yield_servings': '40',
+            'notes': 'Some notes',
+            'conflicts': ['gluten', 'dairy'],
+            'valid_slots': ['lunch', 'dinner'],
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_empty_conflicts_valid(self):
+        """Empty conflicts list is valid (means no dietary restrictions)."""
+        from myapp.forms import RecipeForm
+        form = RecipeForm(data={
+            'name': 'Test',
+            'yield_servings': '30',
+            'notes': '',
+            'conflicts': [],
+            'valid_slots': [],
+        })
+        self.assertTrue(form.is_valid(), form.errors)
+
+    def test_invalid_conflict_choice_rejected(self):
+        """Values outside the Big-15 vocab should fail validation."""
+        from myapp.forms import RecipeForm
+        form = RecipeForm(data={
+            'name': 'Test',
+            'yield_servings': '40',
+            'notes': '',
+            'conflicts': ['not_a_real_conflict'],
+            'valid_slots': [],
+        })
+        self.assertFalse(form.is_valid())
+
+    def test_invalid_valid_slot_rejected(self):
+        """Meal-slot values outside MEAL_SLOTS vocab should fail."""
+        from myapp.forms import RecipeForm
+        form = RecipeForm(data={
+            'name': 'Test',
+            'yield_servings': '40',
+            'notes': '',
+            'conflicts': [],
+            'valid_slots': ['midnight_snack'],
+        })
+        self.assertFalse(form.is_valid())
+
+
 class CalendarUtilsTests(TestCase):
     """`calendar_utils.biweekly_start_for` — returns the Monday that begins
     the biweekly cycle containing a given date. Anchor is 2026-01-05 (Mon)."""
