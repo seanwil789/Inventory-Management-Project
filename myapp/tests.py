@@ -194,20 +194,100 @@ class RecipeVersioningTests(AuthedTestCase):
 
 
 class LinkMenusToRecipesTests(AuthedTestCase):
-    """Matcher respects Recipe.level filtering (fixes Pesto→Shrimp Pesto Pasta bug)."""
+    """Covers the matcher's exact/substring/fuzzy tiers + the level filter that
+    fixes the Pesto→Shrimp Pesto Pasta class of false-positives."""
+
+    def _run_matcher(self):
+        from django.core.management import call_command
+        from io import StringIO
+        call_command('link_menus_to_recipes', stdout=StringIO())
 
     def test_component_recipes_excluded_from_match_pool(self):
-        # level='recipe' (component) should NOT match
+        """level='recipe' (component/sub-recipe) should NOT match a longer menu
+        name that happens to contain it. The 2026-04 known bug was 'Pesto'
+        mapping to 'Shrimp Pesto Pasta'."""
         Recipe.objects.create(name='Pesto', level='recipe',
                               source_doc='Recipe Book/Prep Components/Sauces/')
         Menu.objects.create(date=date.today(), meal_slot='dinner',
                             dish_freetext='Shrimp Pesto Pasta')
-        from django.core.management import call_command
-        from io import StringIO
-        out = StringIO()
-        call_command('link_menus_to_recipes', stdout=out)
+        self._run_matcher()
         menu = Menu.objects.first()
-        self.assertIsNone(menu.recipe)  # should NOT have matched Pesto
+        self.assertIsNone(menu.recipe)  # Pesto (level=recipe) must stay excluded
+
+    def test_exact_match_links(self):
+        """Normalized exact-name match always wins."""
+        recipe = Recipe.objects.create(name='Cajun Shrimp and Grits', level='meal')
+        Menu.objects.create(date=date.today(), meal_slot='dinner',
+                            dish_freetext='Cajun Shrimp and Grits')
+        self._run_matcher()
+        menu = Menu.objects.first()
+        self.assertEqual(menu.recipe, recipe)
+
+    def test_substring_match_on_composed_dish(self):
+        """Multi-word composed_dish name contained in a longer menu string
+        should still link via substring tier."""
+        recipe = Recipe.objects.create(name='Beef Bolognese', level='composed_dish')
+        Menu.objects.create(date=date.today(), meal_slot='dinner',
+                            dish_freetext='Beef Bolognese with garlic bread')
+        self._run_matcher()
+        menu = Menu.objects.first()
+        self.assertEqual(menu.recipe, recipe)
+
+    def test_with_clipping(self):
+        """'X with Y' should match against X only. The 'with' clip prevents
+        'Biscuits and gravy with eggs' from matching a sub-recipe named 'eggs'."""
+        main = Recipe.objects.create(name='Biscuits and Gravy', level='meal')
+        Recipe.objects.create(name='Scrambled Eggs', level='recipe')  # should NOT win
+        Menu.objects.create(date=date.today(), meal_slot='hot_breakfast',
+                            dish_freetext='Biscuits and Gravy with Scrambled Eggs')
+        self._run_matcher()
+        menu = Menu.objects.first()
+        self.assertEqual(menu.recipe, main)
+
+    def test_empty_dish_freetext_skipped(self):
+        """Menus with no dish_freetext aren't considered — matcher should not
+        crash or link them to anything."""
+        Recipe.objects.create(name='Anything', level='meal')
+        menu = Menu.objects.create(date=date.today(), meal_slot='lunch',
+                                    dish_freetext='')
+        self._run_matcher()
+        menu.refresh_from_db()
+        self.assertIsNone(menu.recipe)
+
+    def test_already_linked_menu_not_retouched(self):
+        """Menus with recipe already set should be left alone — the matcher
+        only fills blanks."""
+        original = Recipe.objects.create(name='Original', level='meal')
+        decoy = Recipe.objects.create(name='Decoy', level='meal')
+        menu = Menu.objects.create(date=date.today(), meal_slot='dinner',
+                                    dish_freetext='Decoy', recipe=original)
+        self._run_matcher()
+        menu.refresh_from_db()
+        self.assertEqual(menu.recipe, original)  # NOT re-linked to Decoy
+
+    def test_non_current_versions_excluded(self):
+        """is_current=False recipes should not match, even when name is
+        a perfect normalized match. Locks in the version-filtering clause."""
+        # V1 has the exact name the menu contains — but is_current=False,
+        # so matcher must exclude it. V2's name differs by suffix so it
+        # doesn't auto-match. Net: menu stays unlinked (V1 excluded is
+        # what we're verifying).
+        v1 = Recipe.objects.create(name='Salmon Teriyaki', level='meal',
+                                    version_number=1, is_current=False)
+        v2 = Recipe.objects.create(name='Salmon Teriyaki V2', level='meal',
+                                    parent_recipe=v1, version_number=2,
+                                    is_current=True)
+        Menu.objects.create(date=date.today(), meal_slot='dinner',
+                            dish_freetext='Salmon Teriyaki')
+        self._run_matcher()
+        menu = Menu.objects.first()
+        # Critical: menu.recipe must NOT be v1. Either None (expected with
+        # current matcher — V-suffix discrepancy) or v2 would be acceptable.
+        # What MUST fail is linking to the non-current V1.
+        self.assertNotEqual(menu.recipe, v1)
+        # Known limitation: V-suffix means V2 doesn't substring-match a
+        # menu that uses the trunk name. Documented separately; see
+        # project_recipe_authoring.md for how authoring flow handles this.
 
 
 @override_settings(ALLOWED_HOSTS=['testserver'])
@@ -319,6 +399,278 @@ class PrepTaskAutoDeriveTests(AuthedTestCase):
         m.save()
         tasks = PrepTask.objects.filter(recipe=self.r1, date__gte=future - _td(days=4))
         self.assertEqual(tasks.count(), 1)
+
+
+class CostUtilsParseCaseSizeTests(TestCase):
+    """Pure-function tests on `cost_utils.parse_case_size` — no DB, no auth.
+    Adds regression coverage to the crown-jewel-parallel math layer."""
+
+    def test_none_and_empty(self):
+        from myapp.cost_utils import parse_case_size
+        self.assertIsNone(parse_case_size(None))
+        self.assertIsNone(parse_case_size(""))
+        self.assertIsNone(parse_case_size("   "))
+
+    def test_bare_numbers_reject(self):
+        """No unit = can't determine packing; all bare numbers → None."""
+        from myapp.cost_utils import parse_case_size
+        for s in ("1", "2", "3", "4", "5", "10", "12"):
+            self.assertIsNone(parse_case_size(s),
+                              f"bare number {s!r} parsed when it shouldn't have")
+
+    def test_slash_format(self):
+        """'12/32OZ' → 12 packs of 32 oz each."""
+        from myapp.cost_utils import parse_case_size
+        info = parse_case_size("12/32OZ")
+        self.assertEqual(info.pack_count, 12)
+        self.assertEqual(info.pack_size, Decimal("32"))
+        self.assertEqual(info.pack_unit, 'oz')
+
+    def test_simple_format(self):
+        """'24CT' → 1 pack of 24 ct."""
+        from myapp.cost_utils import parse_case_size
+        info = parse_case_size("24CT")
+        self.assertEqual(info.pack_count, 1)
+        self.assertEqual(info.pack_size, Decimal("24"))
+        self.assertEqual(info.pack_unit, 'ct')
+
+    def test_pound_only(self):
+        from myapp.cost_utils import parse_case_size
+        info = parse_case_size("50LB")
+        self.assertEqual(info.pack_count, 1)
+        self.assertEqual(info.pack_size, Decimal("50"))
+        self.assertEqual(info.pack_unit, 'lb')
+
+    def test_unit_aliasing(self):
+        """EA → ct, EACH → ct, FLOZ → fl_oz."""
+        from myapp.cost_utils import parse_case_size
+        self.assertEqual(parse_case_size("5EA").pack_unit, 'ct')
+        self.assertEqual(parse_case_size("5EACH").pack_unit, 'ct')
+        self.assertEqual(parse_case_size("5FLOZ").pack_unit, 'fl_oz')
+
+    def test_dates_dont_match(self):
+        """'4/11/2026' has no valid unit suffix → shouldn't parse as 4×11."""
+        from myapp.cost_utils import parse_case_size
+        self.assertIsNone(parse_case_size("4/11/2026"))
+        self.assertIsNone(parse_case_size("3/15/22"))
+
+    def test_junk_returns_none(self):
+        from myapp.cost_utils import parse_case_size
+        for s in ("abc", "??", "null", "1GAL/extra"):
+            self.assertIsNone(parse_case_size(s))
+
+    def test_total_in_base_unit(self):
+        """12 packs × 32 oz = 384 total oz."""
+        from myapp.cost_utils import parse_case_size
+        info = parse_case_size("12/32OZ")
+        self.assertEqual(info.total_in_base_unit, Decimal("384"))
+
+
+class CostUtilsUnitKindTests(TestCase):
+    """`unit_kind` classification — weight / volume / count / unknown."""
+
+    def test_weight_units(self):
+        from myapp.cost_utils import unit_kind
+        for u in ("lb", "oz", "g", "kg", "pound", "ounce", "gram"):
+            self.assertEqual(unit_kind(u), 'weight', f"{u!r} should be weight")
+
+    def test_volume_units(self):
+        from myapp.cost_utils import unit_kind
+        for u in ("cup", "tbsp", "gal", "fl_oz", "qt", "pt", "ml", "liter"):
+            self.assertEqual(unit_kind(u), 'volume', f"{u!r} should be volume")
+
+    def test_count_units(self):
+        from myapp.cost_utils import unit_kind
+        for u in ("ct", "each", "ea", "bag", "bottle", "head"):
+            self.assertEqual(unit_kind(u), 'count', f"{u!r} should be count")
+
+    def test_unknown_units(self):
+        from myapp.cost_utils import unit_kind
+        self.assertEqual(unit_kind(""), 'unknown')
+        self.assertEqual(unit_kind("foobar"), 'unknown')
+
+    def test_punctuation_normalized(self):
+        """'Tbsp.' → 'tbsp' → volume. '  LB  ' → 'lb' → weight."""
+        from myapp.cost_utils import unit_kind
+        self.assertEqual(unit_kind("Tbsp."), 'volume')
+        self.assertEqual(unit_kind("  LB  "), 'weight')
+
+
+class CostUtilsToBaseUnitTests(TestCase):
+    """`to_base_unit` conversion math."""
+
+    def test_weight_to_oz(self):
+        """1 lb → 16 oz."""
+        from myapp.cost_utils import to_base_unit
+        qty, unit = to_base_unit(Decimal("1"), "lb")
+        self.assertEqual(qty, Decimal("16"))
+        self.assertEqual(unit, 'oz')
+
+    def test_volume_to_floz(self):
+        """1 gal → 128 fl_oz."""
+        from myapp.cost_utils import to_base_unit
+        qty, unit = to_base_unit(Decimal("1"), "gal")
+        self.assertEqual(qty, Decimal("128"))
+        self.assertEqual(unit, 'fl_oz')
+
+    def test_cup_to_floz(self):
+        from myapp.cost_utils import to_base_unit
+        qty, unit = to_base_unit(Decimal("2"), "cup")
+        self.assertEqual(qty, Decimal("16"))
+        self.assertEqual(unit, 'fl_oz')
+
+    def test_count_unchanged(self):
+        """'ct' stays as-is — count doesn't convert."""
+        from myapp.cost_utils import to_base_unit
+        qty, unit = to_base_unit(Decimal("24"), "ct")
+        self.assertEqual(qty, Decimal("24"))
+        self.assertEqual(unit, 'ct')
+
+    def test_unknown_returns_none(self):
+        from myapp.cost_utils import to_base_unit
+        self.assertIsNone(to_base_unit(Decimal("1"), "foobar"))
+
+
+class CostUtilsDensityTests(TestCase):
+    """Fallback density lookup — `cup_weight_oz_for`."""
+
+    def test_common_ingredients(self):
+        from myapp.cost_utils import cup_weight_oz_for
+        self.assertEqual(cup_weight_oz_for("flour"), Decimal("4.25"))
+        self.assertEqual(cup_weight_oz_for("butter"), Decimal("8"))
+        self.assertEqual(cup_weight_oz_for("sugar"), Decimal("7"))
+        self.assertEqual(cup_weight_oz_for("honey"), Decimal("12"))
+
+    def test_normalized_variants(self):
+        """'All-Purpose Flour' and 'ap_flour' both resolve to flour density."""
+        from myapp.cost_utils import cup_weight_oz_for
+        self.assertEqual(cup_weight_oz_for("all-purpose flour"), Decimal("4.25"))
+        self.assertEqual(cup_weight_oz_for("ap_flour"), Decimal("4.25"))
+
+    def test_fallback_by_last_token(self):
+        """'white sugar' → falls back to 'sugar' match."""
+        from myapp.cost_utils import cup_weight_oz_for
+        self.assertEqual(cup_weight_oz_for("white sugar"), Decimal("7"))
+
+    def test_unknown_returns_none(self):
+        from myapp.cost_utils import cup_weight_oz_for
+        self.assertIsNone(cup_weight_oz_for("foobar"))
+        self.assertIsNone(cup_weight_oz_for(""))
+
+
+class IngredientCostTests(TestCase):
+    """End-to-end `ingredient_cost` — covers all unit-domain paths.
+    These numbers anchor the cost badges shown on the calendar; if this
+    math drifts, every recipe cost drifts with it."""
+
+    def test_none_quantity_returns_reason(self):
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            None, 'lb', 'flour', Decimal("50"), "25LB",
+        )
+        self.assertIsNone(cost)
+        self.assertIn('no quantity', note)
+
+    def test_none_case_price_returns_reason(self):
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            Decimal("1"), 'lb', 'flour', None, "25LB",
+        )
+        self.assertIsNone(cost)
+        self.assertIn('no recent invoice price', note)
+
+    def test_unparseable_case_size_returns_reason(self):
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            Decimal("1"), 'lb', 'flour', Decimal("50"), "abc",
+        )
+        self.assertIsNone(cost)
+        self.assertIn('unparseable', note.lower())
+
+    def test_weight_to_weight_simple(self):
+        """4 lb out of a 25-lb case at $50 → $8.00."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal("4"), recipe_unit='lb',
+            ingredient_name='flour',
+            case_price=Decimal("50"), case_size_str="25LB",
+        )
+        self.assertEqual(cost, Decimal("8.00"))
+        self.assertIn('weight', note)
+
+    def test_volume_to_volume(self):
+        """2 cups out of a 4×1-gal case at $40 → $1.25."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal("2"), recipe_unit='cup',
+            ingredient_name='oil',
+            case_price=Decimal("40"), case_size_str="4/1GAL",
+        )
+        self.assertEqual(cost, Decimal("1.25"))
+        self.assertIn('volume', note)
+
+    def test_volume_to_weight_via_density(self):
+        """2 cups flour (density 4.25 oz/cup) out of a 50-lb case at $30 → $0.32.
+
+        Math: 2 cups × 4.25 oz/cup = 8.5 oz; 50 lb × 16 oz = 800 oz;
+        $30 × 8.5/800 = $0.31875 → quantize to $0.32."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal("2"), recipe_unit='cup',
+            ingredient_name='flour',
+            case_price=Decimal("30"), case_size_str="50LB",
+        )
+        self.assertEqual(cost, Decimal("0.32"))
+        self.assertIn('density', note)
+
+    def test_count_to_count(self):
+        """2 'ea' out of a 24-CT case at $5 → $0.42."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal("2"), recipe_unit='ea',
+            ingredient_name='eggs',
+            case_price=Decimal("5"), case_size_str="24CT",
+        )
+        self.assertEqual(cost, Decimal("0.42"))
+        self.assertIn('count', note)
+
+    def test_yield_pct_scales_ap(self):
+        """1 lb edible onion at 90% yield → AP = 1.111 lb. 50-lb case at $20 → $0.44.
+
+        Math: AP oz = 1/0.9 × 16 ≈ 17.78; $20 × 17.78/800 ≈ $0.4444 → $0.44."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal("1"), recipe_unit='lb',
+            ingredient_name='onion',
+            case_price=Decimal("20"), case_size_str="50LB",
+            yield_pct=Decimal("90"),
+        )
+        self.assertEqual(cost, Decimal("0.44"))
+
+    def test_no_density_returns_none(self):
+        """Unknown ingredient + volume→weight cross-domain = no density lookup
+        possible = (None, 'no density for volume→weight ...')."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal("1"), recipe_unit='cup',
+            ingredient_name='unknown_exotic_spice',
+            case_price=Decimal("10"), case_size_str="5LB",
+        )
+        self.assertIsNone(cost)
+        self.assertIn('no density', note.lower())
+
+    def test_supplied_density_overrides_fallback(self):
+        """If caller passes `ounce_weight_per_cup`, it overrides the fallback
+        table. This is what YieldReference linkage provides."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal("2"), recipe_unit='cup',
+            ingredient_name='flour',  # fallback says 4.25
+            case_price=Decimal("30"), case_size_str="50LB",
+            ounce_weight_per_cup=Decimal("5.0"),  # override
+        )
+        # With 5.0 oz/cup: 2 × 5.0 = 10 oz; 30 × 10/800 = 0.375 → 0.38
+        self.assertEqual(cost, Decimal("0.38"))
 
 
 class DishSuggestionTests(AuthedTestCase):
