@@ -11,6 +11,7 @@ from __future__ import annotations
 from datetime import date, timedelta
 from decimal import Decimal
 
+from django.contrib.auth.models import User
 from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 
@@ -19,8 +20,20 @@ from myapp.models import (
 )
 
 
+class AuthedTestCase(TestCase):
+    """Base class: auto-logs-in a throwaway user so `LoginRequiredMiddleware`
+    doesn't 302 every request. All app tests inherit from this — only
+    `kitchen_display` is `@login_not_required`."""
+    def setUp(self):
+        super().setUp()
+        user = User.objects.create_user(
+            username=f'tester_{id(self)}', password='pw',
+        )
+        self.client.force_login(user)
+
+
 @override_settings(ALLOWED_HOSTS=['testserver', 'localhost', '127.0.0.1'])
-class SmokeTests(TestCase):
+class SmokeTests(AuthedTestCase):
     """HTTP 200 on every GET route added in the April 2026 push."""
 
     @classmethod
@@ -85,7 +98,7 @@ class SmokeTests(TestCase):
 
 
 @override_settings(ALLOWED_HOSTS=['testserver'])
-class RecipeCreationTests(TestCase):
+class RecipeCreationTests(AuthedTestCase):
     """POST /recipe/new/ end-to-end."""
 
     def test_create_recipe_via_form(self):
@@ -137,10 +150,11 @@ class RecipeCreationTests(TestCase):
 
 
 @override_settings(ALLOWED_HOSTS=['testserver'])
-class RecipeVersioningTests(TestCase):
+class RecipeVersioningTests(AuthedTestCase):
     """POST /recipe/<id>/new-version/ duplicates + marks old non-current."""
 
     def setUp(self):
+        super().setUp()
         self.r1 = Recipe.objects.create(name='Versioned Dish', level='meal',
                                         yield_servings=40)
         RecipeIngredient.objects.create(recipe=self.r1, name_raw='flour',
@@ -179,7 +193,7 @@ class RecipeVersioningTests(TestCase):
         self.assertFalse(v2.is_current)
 
 
-class LinkMenusToRecipesTests(TestCase):
+class LinkMenusToRecipesTests(AuthedTestCase):
     """Matcher respects Recipe.level filtering (fixes Pesto→Shrimp Pesto Pasta bug)."""
 
     def test_component_recipes_excluded_from_match_pool(self):
@@ -197,7 +211,7 @@ class LinkMenusToRecipesTests(TestCase):
 
 
 @override_settings(ALLOWED_HOSTS=['testserver'])
-class CogsDashboardMathTests(TestCase):
+class CogsDashboardMathTests(AuthedTestCase):
     """Budget math: census × 346.67 per month; spend vs budget verdict."""
 
     def test_cogs_renders_with_no_data(self):
@@ -213,7 +227,7 @@ class CogsDashboardMathTests(TestCase):
         self.assertContains(resp, date.today().strftime('%b %Y'))
 
 
-class AutoTagConflictsTests(TestCase):
+class AutoTagConflictsTests(AuthedTestCase):
     """Keyword-based conflict auto-tagging."""
 
     def test_pork_recipe_tagged_not_kosher_and_not_halal(self):
@@ -254,10 +268,11 @@ class AutoTagConflictsTests(TestCase):
         self.assertNotIn('animal_products', r.conflicts)
 
 
-class PrepTaskAutoDeriveTests(TestCase):
+class PrepTaskAutoDeriveTests(AuthedTestCase):
     """Menu save → PrepTask auto-creation via signal handler."""
 
     def setUp(self):
+        super().setUp()
         self.r1 = Recipe.objects.create(name='Auto Prep Test', level='meal',
                                         yield_servings=40)
         self.r2 = Recipe.objects.create(name='Auto Prep Side', level='meal',
@@ -306,7 +321,7 @@ class PrepTaskAutoDeriveTests(TestCase):
         self.assertEqual(tasks.count(), 1)
 
 
-class DishSuggestionTests(TestCase):
+class DishSuggestionTests(AuthedTestCase):
     """Score recipes against a target (date, slot)."""
 
     def test_suggestions_endpoint_returns_candidates(self):

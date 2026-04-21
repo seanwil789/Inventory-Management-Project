@@ -2,6 +2,7 @@ from datetime import date, timedelta
 from decimal import Decimal
 
 from django.contrib import messages
+from django.contrib.auth.decorators import login_not_required
 from django.db import models
 from django.http import Http404, HttpResponseBadRequest
 from django.shortcuts import get_object_or_404, redirect, render
@@ -786,9 +787,13 @@ def order_guide(request):
     })
 
 
+@login_not_required
 def kitchen_display(request):
     """Read-only, big-text kitchen display — designed for a wall-mounted tablet.
-    Optional ?as_of=YYYY-MM-DD to preview any date (demo-friendly)."""
+    Optional ?as_of=YYYY-MM-DD to preview any date (demo-friendly).
+
+    Exempt from login via @login_not_required — the wall display has no user
+    to authenticate and must render for anyone on the tailnet."""
     from datetime import datetime
 
     as_of_str = request.GET.get('as_of')
