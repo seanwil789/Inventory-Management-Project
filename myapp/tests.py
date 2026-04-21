@@ -763,6 +763,118 @@ class AuditSuspectMappingsTests(TestCase):
                               "'egg'/'eggs' stem should overlap between canonical and desc")
 
 
+class ParserDelawareLinenIntegrationTests(TestCase):
+    """Delaware County Linen parser — OCR reads columns top-to-bottom.
+    After the 'Amount' header, skip pure numbers + all-caps item codes;
+    each description line gets paired with the next two prices
+    (unit_price, amount)."""
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        return p
+
+    def test_basic_parse(self):
+        """After 'Amount' header: skip qty integers, skip all-caps item codes,
+        pair each description with the next two decimal prices."""
+        parser_mod = self._import_parser()
+        # Format mimics real Delaware Linen OCR — qtys and codes in one column,
+        # then descriptions interleaved with unit_price + amount.
+        raw = """Delaware County Linen
+4/15/2026
+Qty
+Item Code
+Description
+Unit Price
+Amount
+300
+25
+MOPS
+BAPSWTW
+Bar Mops
+0.22
+66.00
+Bib Aprons White
+0.50
+12.50
+Total Due
+78.50
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Delaware County Linen')
+        self.assertEqual(result['vendor'], 'Delaware County Linen')
+        items = result['items']
+        self.assertEqual(len(items), 2)
+        descs = {it['raw_description'] for it in items}
+        self.assertIn('Bar Mops', descs)
+        self.assertIn('Bib Aprons White', descs)
+
+    def test_total_due_extraction(self):
+        """'Total Due' marker → next standalone decimal is invoice_total."""
+        parser_mod = self._import_parser()
+        raw = """Delaware County Linen
+Qty
+Amount
+300
+MOPS
+Bar Mops
+0.22
+66.00
+Total Due
+66.00
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Delaware County Linen')
+        self.assertEqual(result.get('invoice_total'), 66.00)
+
+
+class ParserColonialAndFallbackTests(TestCase):
+    """Colonial Meat (handwritten — all items flagged needs_review) +
+    generic fallback parser for unknown vendors."""
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        return p
+
+    def test_colonial_flags_everything_for_review(self):
+        """Colonial Meat invoices are handwritten — OCR accuracy is low,
+        so the parser captures what it can and flags every item."""
+        parser_mod = self._import_parser()
+        raw = """Colonial Village Meat Markets
+Some handwritten line 25.50
+Another product 18.00
+Total 43.50
+"""
+        result = parser_mod.parse_invoice(raw)
+        self.assertEqual(result['vendor'], 'Colonial Village Meat Markets')
+        for item in result['items']:
+            self.assertTrue(item.get('needs_review', False),
+                            f"{item!r} should be flagged for manual review")
+
+    def test_fallback_parser_on_unknown_vendor(self):
+        """Unknown vendor → generic line-at-end-of-line-price parser. Every
+        item gets needs_review=True as well."""
+        parser_mod = self._import_parser()
+        raw = """Random Supplier Corp
+Invoice 4/15/2026
+Widget Product A                  12.50
+Widget Product B                  8.75
+Widget Product C                  15.00
+"""
+        result = parser_mod.parse_invoice(raw)
+        self.assertEqual(result['vendor'], 'Unknown')
+        self.assertGreaterEqual(len(result['items']), 1)
+        for item in result['items']:
+            self.assertTrue(item.get('needs_review', False))
+
+
 class ParserFarmArtIntegrationTests(TestCase):
     """FarmArt parser — two-pass extraction with proximity matching.
     Descriptions + price-pairs (unit_price, extended_amount) scanned
