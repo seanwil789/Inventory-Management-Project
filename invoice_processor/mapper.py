@@ -88,6 +88,62 @@ def _stem_text(text: str) -> str:
         tokens.append(low)
     return ' '.join(tokens)
 
+
+# Sysco section header → Product.category candidates. When the Sysco
+# parser tags an item with a section (DAIRY, PRODUCE, MEATS, etc.),
+# we can narrow fuzzy-match candidate pool to canonicals whose Product
+# category aligns. Two-pass: if nothing matches in the restricted pool,
+# fall back to unrestricted (preserves recall when Product.category is
+# wrong or empty in the DB).
+#
+# Sections map to MULTIPLE categories where ambiguous (DAIRY covers both
+# Dairy and Cheese; BEVERAGES covers Beverages and Coffee/Concessions).
+# Keys are substring-matched against the section header UPPERcased, so
+# "**** CANNED & DRY ****" matches both "CANNED" and "DRY" — union of
+# both target sets is used.
+_SYSCO_SECTION_TO_CATEGORIES = {
+    'DAIRY':      ['Dairy', 'Cheese'],
+    'PRODUCE':    ['Produce'],
+    'MEATS':      ['Proteins'],
+    'MEAT':       ['Proteins'],
+    'POULTRY':    ['Proteins'],
+    'SEAFOOD':    ['Proteins'],
+    'CANNED':     ['Drystock', 'Condiments/Sauces'],
+    'DRY':        ['Drystock', 'Spices'],
+    'PAPER':      ['Paper/Disposable'],
+    'DISPOSABLE': ['Paper/Disposable'],
+    'JANITORIAL': ['Chemicals'],
+    'CHEMICAL':   ['Chemicals'],
+    'BEVERAGE':   ['Beverages', 'Coffee/Concessions'],
+    'BAKERY':     ['Bakery'],
+    'DELI':       ['Proteins', 'Cheese'],
+    'SPICES':     ['Spices'],
+    'GROCERY':    ['Drystock'],
+    # FROZEN intentionally excluded — too ambiguous (frozen meat / frozen
+    # produce / frozen bakery all plausible). No filter applied.
+}
+
+
+def _candidates_for_section(section: str, category_map: dict) -> list[str]:
+    """Return canonical names restricted to categories matching the
+    Sysco section. Empty list when section is unknown/empty or when
+    the filter would leave an untenable pool (<3 candidates — fall
+    through to full pool in that case)."""
+    if not section:
+        return []
+    section_upper = section.upper()
+    target_categories: set[str] = set()
+    for key, cats in _SYSCO_SECTION_TO_CATEGORIES.items():
+        if key in section_upper:
+            target_categories.update(cats)
+    if not target_categories:
+        return []
+    restricted = [c for c, info in category_map.items()
+                  if info.get('category') in target_categories]
+    # If the restricted pool is too small, fuzzy will be noisy. Signal
+    # "no useful filter" so caller falls back to unrestricted.
+    return restricted if len(restricted) >= 3 else []
+
 # Sysco brand/vendor prefix codes that precede the actual product description.
 # Multi-word patterns must come before single-word to avoid partial stripping.
 # Leading noise patterns that appear before the actual brand prefix or description.
@@ -339,72 +395,82 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
     # 6. Strip Sysco brand prefix and fuzzy match against canonical names directly.
     #    Sysco descriptions like "WHLFCLS ROMAINE HEARTS 3CT" → "ROMAINE HEARTS 3CT"
     #    which can then match the canonical "Romaine" at a lower threshold.
+    #
+    # Two-pass when the Sysco parser tagged a section: first try against
+    # canonicals in matching Product categories (higher precision), then
+    # fall back to full pool if no match found. Preserves recall when
+    # Product.category is empty/wrong in the DB.
     if category_map and normalized:
-        canonical_names = list(category_map.keys())
-        stripped = _strip_sysco_prefix(normalized)
-        if stripped != normalized:
-            result = process.extractOne(
-                stripped,
-                canonical_names,
-                scorer=fuzz.token_set_ratio,
-                processor=fuzz_utils.default_process,
-            )
-            if result and result[1] >= STRIPPED_FUZZY_THRESHOLD and \
-                    fuzz.token_sort_ratio(stripped, result[0],
-                                         processor=fuzz_utils.default_process) >= 75:
-                best_canonical, score = result[0], result[1]
-                return _attach_category({
-                    **item,
-                    "canonical":  best_canonical,
-                    "confidence": "stripped_fuzzy",
-                    "score":      score,
-                })
+        canonical_names_full = list(category_map.keys())
+        section_pool = _candidates_for_section(item.get('section', ''),
+                                               category_map)
+        # Pools to try in order. Section-filtered first when available.
+        pools_to_try = []
+        if section_pool:
+            pools_to_try.append(section_pool)
+        pools_to_try.append(canonical_names_full)
 
-        # 6b. Stemmed fuzzy — catches pluralization mismatches that the
-        #     stripped_fuzzy path missed (e.g. "PINEAPPLES" vs "Pineapple").
-        #     Stems both sides before token_set_ratio compare. Gated by
-        #     qualifier-word check so "SHIITAKE" doesn't match "Dried Shiitake".
+        stripped = _strip_sysco_prefix(normalized)
         stripped_for_stem = stripped if stripped != normalized else normalized
         stemmed_desc = _stem_text(stripped_for_stem)
-        if stemmed_desc:
-            stemmed_canonicals = {_stem_text(c): c for c in canonical_names if c}
-            stem_result = process.extractOne(
-                stemmed_desc,
-                list(stemmed_canonicals.keys()),
-                scorer=fuzz.token_set_ratio,
-            )
-            if stem_result and stem_result[1] >= STRIPPED_FUZZY_THRESHOLD and \
-                    fuzz.token_sort_ratio(stemmed_desc, stem_result[0]) >= 75 and \
-                    not _has_missing_qualifier(stemmed_desc, stem_result[0]):
-                best_canonical = stemmed_canonicals[stem_result[0]]
-                return _attach_category({
-                    **item,
-                    "canonical":  best_canonical,
-                    "confidence": "stripped_fuzzy",
-                    "score":      stem_result[1],
-                })
 
-        # 6c. Char-level fallback — catches single-char spelling variants
-        #     (e.g. "Canteloupe" vs "Cantaloupe"). Uses fuzz.ratio which
-        #     is character-based Levenshtein. Threshold 95 + token_sort_ratio
-        #     >= 60 + qualifier gate to minimize short-string false positives.
-        char_result = process.extractOne(
-            stripped_for_stem,
-            canonical_names,
-            scorer=fuzz.ratio,
-            processor=fuzz_utils.default_process,
-        )
-        if char_result and char_result[1] >= CHAR_RATIO_THRESHOLD:
-            canon = char_result[0]
-            if fuzz.token_sort_ratio(stripped_for_stem, canon,
-                                     processor=fuzz_utils.default_process) >= 60 and \
-                    not _has_missing_qualifier(_stem_text(stripped_for_stem), _stem_text(canon)):
-                return _attach_category({
-                    **item,
-                    "canonical":  canon,
-                    "confidence": "stripped_fuzzy",
-                    "score":      char_result[1],
-                })
+        for canonical_names in pools_to_try:
+            # 6a. Stripped prefix + token_set_ratio (existing behavior)
+            if stripped != normalized:
+                result = process.extractOne(
+                    stripped,
+                    canonical_names,
+                    scorer=fuzz.token_set_ratio,
+                    processor=fuzz_utils.default_process,
+                )
+                if result and result[1] >= STRIPPED_FUZZY_THRESHOLD and \
+                        fuzz.token_sort_ratio(stripped, result[0],
+                                             processor=fuzz_utils.default_process) >= 75:
+                    return _attach_category({
+                        **item,
+                        "canonical":  result[0],
+                        "confidence": "stripped_fuzzy",
+                        "score":      result[1],
+                    })
+
+            # 6b. Stemmed fuzzy with qualifier gate
+            if stemmed_desc:
+                stemmed_canonicals = {_stem_text(c): c for c in canonical_names if c}
+                stem_result = process.extractOne(
+                    stemmed_desc,
+                    list(stemmed_canonicals.keys()),
+                    scorer=fuzz.token_set_ratio,
+                )
+                if stem_result and stem_result[1] >= STRIPPED_FUZZY_THRESHOLD and \
+                        fuzz.token_sort_ratio(stemmed_desc, stem_result[0]) >= 75 and \
+                        not _has_missing_qualifier(stemmed_desc, stem_result[0]):
+                    best_canonical = stemmed_canonicals[stem_result[0]]
+                    return _attach_category({
+                        **item,
+                        "canonical":  best_canonical,
+                        "confidence": "stripped_fuzzy",
+                        "score":      stem_result[1],
+                    })
+
+            # 6c. Char-level fallback with qualifier gate
+            char_result = process.extractOne(
+                stripped_for_stem,
+                canonical_names,
+                scorer=fuzz.ratio,
+                processor=fuzz_utils.default_process,
+            )
+            if char_result and char_result[1] >= CHAR_RATIO_THRESHOLD:
+                canon = char_result[0]
+                if fuzz.token_sort_ratio(stripped_for_stem, canon,
+                                         processor=fuzz_utils.default_process) >= 60 and \
+                        not _has_missing_qualifier(_stem_text(stripped_for_stem),
+                                                   _stem_text(canon)):
+                    return _attach_category({
+                        **item,
+                        "canonical":  canon,
+                        "confidence": "stripped_fuzzy",
+                        "score":      char_result[1],
+                    })
 
     return {**item, "canonical": None, "confidence": "unmatched", "score": 0,
             "category": "", "primary_descriptor": "", "secondary_descriptor": ""}
