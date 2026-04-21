@@ -1299,24 +1299,33 @@ def _parse_exceptional(text: str) -> list[dict]:
 # ---------------------------------------------------------------------------
 
 def _extract_farmart_invoice_total(lines: list[str]) -> float | None:
-    """Extract the invoice total from a Farm Art invoice OCR text."""
+    """Extract the invoice total from a Farm Art invoice OCR text.
+
+    Farm Art footers vary: sometimes label + adjacent value, sometimes
+    label-block then value-block (Taxable Subtotal / Tax / Invoice Total /
+    Invoice Balance stacked, then all their values stacked below). The
+    label may be up to 5 lines from its value.
+    """
     for i, line in enumerate(lines):
-        # Look for "Nontaxable" or "Invoice Total" followed by a number
-        if re.match(r'^Nontaxable\s*$', line, re.IGNORECASE):
-            # Number is on the same line or next line
-            for j in range(i, min(i + 2, len(lines))):
-                m = re.search(r'(\d+[,\d]*\.\d{2})', lines[j])
-                if m and lines[j].strip() != line.strip():
-                    return float(m.group(1).replace(",", ""))
-        if re.match(r'^Invoice Total\s*$', line, re.IGNORECASE):
-            for j in range(i, min(i + 2, len(lines))):
-                m = re.search(r'(\d+[,\d]*\.\d{2})', lines[j])
-                if m and lines[j].strip() != line.strip():
-                    return float(m.group(1).replace(",", ""))
-        # Also catch inline: "Nontaxable 222.07"
-        m = re.match(r'^(?:Nontaxable|Invoice Total)\s+(\d+[,\d]*\.\d{2})', line, re.IGNORECASE)
+        # Inline: "Nontaxable 222.07" or "Invoice Total 316.90"
+        m = re.match(r'^(?:Nontaxable|Invoice Total)\s+(\d+[,\d]*\.\d{2})',
+                     line, re.IGNORECASE)
         if m:
             return float(m.group(1).replace(",", ""))
+
+        # Label-on-own-line: search forward for the first bare decimal.
+        # Farm Art footer blocks put the value 2-5 lines after the label.
+        if re.match(r'^Nontaxable\s*$', line, re.IGNORECASE) or \
+                re.match(r'^Invoice Total\s*$', line, re.IGNORECASE):
+            for j in range(i + 1, min(i + 6, len(lines))):
+                # Accept only bare decimal-on-own-line (avoids matching
+                # prices embedded in items/tax notices)
+                bm = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if bm:
+                    val = float(bm.group(1).replace(",", ""))
+                    # Sanity: totals are usually $1+ (skip rogue $0.00 tax lines)
+                    if val >= 1.0:
+                        return val
     return None
 
 
