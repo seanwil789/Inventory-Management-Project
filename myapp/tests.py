@@ -659,6 +659,45 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class AuditOrphanProductsTests(TestCase):
+    """`audit_orphan_products` — locks in zero-invoice-line detection + the
+    mapping-count annotation that tells Sean whether an orphan is safe to
+    retire ('no mappings either') or waiting on an invoice."""
+
+    def test_orphan_flagged(self):
+        from myapp.models import Product
+        from django.core.management import call_command
+        from io import StringIO
+
+        Product.objects.create(canonical_name='Unused Bagel',
+                                category='Bakery')
+        out = StringIO()
+        call_command('audit_orphan_products', stdout=out)
+        output = out.getvalue()
+        self.assertIn('Unused Bagel', output)
+        self.assertIn('no mappings either', output)
+
+    def test_non_orphan_not_flagged(self):
+        """A product with at least one invoice line should not appear in
+        the orphan report."""
+        from myapp.models import Product, Vendor, InvoiceLineItem
+        from django.core.management import call_command
+        from io import StringIO
+
+        v = Vendor.objects.create(name='V')
+        p = Product.objects.create(canonical_name='Used Product',
+                                    category='Produce')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='raw',
+            unit_price=Decimal('5.00'),
+            invoice_date=date.today(),
+        )
+        out = StringIO()
+        call_command('audit_orphan_products', stdout=out)
+        self.assertNotIn('Used Product', out.getvalue())
+
+
 class AuditSuspectMappingsTests(TestCase):
     """`audit_suspect_mappings` — locks in the zero-token-overlap detector
     and the plural-stem fix (Canteloupe ← CANTALOUPES shouldn't false-positive)."""
