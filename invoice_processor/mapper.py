@@ -22,6 +22,71 @@ MAPPING_CACHE_PATH = "invoice_processor/mappings/item_mappings.json"
 MAPPING_CACHE_TTL_SECONDS = 3600  # 1 hour
 FUZZY_THRESHOLD = 90
 STRIPPED_FUZZY_THRESHOLD = 90
+CHAR_RATIO_THRESHOLD = 95  # tighter than token because char-level is more
+                           # sensitive to short strings and noise
+
+
+# Discriminator tokens: if a canonical name contains any of these AND the
+# raw description doesn't, the match is rejected. Prevents the stemmed and
+# char tiers from collapsing semantically distinct forms (fresh vs dried
+# shiitake, raw vs cooked beef, etc.) that happen to share most tokens.
+_CANONICAL_QUALIFIERS = {
+    'dried', 'frozen', 'canned', 'cooked', 'raw',
+    'powdered', 'powder', 'smoked', 'pickled', 'jarred',
+    'bottled', 'concentrated', 'condensed', 'decaf', 'instant',
+    'whole', 'ground', 'minced', 'shredded', 'grated',
+    'sliced', 'diced', 'chopped', 'crushed', 'pureed',
+    'roasted', 'toasted', 'baked', 'fried', 'steamed',
+    'fresh',  # only catches "fresh X" canonical vs generic raw, not the reverse
+}
+
+
+def _has_missing_qualifier(raw_stemmed: str, canonical_stemmed: str) -> bool:
+    """Return True if the canonical has a qualifier token that the raw
+    description doesn't. When True, the match should be rejected — the
+    canonical is semantically more specific and the raw probably means
+    something different."""
+    raw_tokens = set(raw_stemmed.lower().split())
+    canon_tokens = set(canonical_stemmed.lower().split())
+    missing = (canon_tokens & _CANONICAL_QUALIFIERS) - raw_tokens
+    return bool(missing)
+
+
+# Per-vendor threshold overrides for the vendor_fuzzy tier.
+# Exceptional Foods has catch-weight descriptions that lose tokens faster
+# than typical vendors (e.g. "1.00 CS Bacon Applewood Slice Martins 30530"
+# has vendor codes + item numbers that reduce fuzzy scores). Loosening to
+# 85 catches legitimate matches without materially increasing false positives.
+_VENDOR_FUZZY_THRESHOLDS = {
+    'EXCEPTIONAL FOODS': 85,
+    'DELAWARE COUNTY LINEN': 85,  # low-volume, high variability
+    'COLONIAL VILLAGE MEAT MARKETS': 85,  # handwritten OCR
+}
+
+
+def _fuzzy_threshold_for(vendor: str) -> int:
+    """Return the fuzzy-match threshold for a vendor, falling back to the
+    global default. Case-insensitive lookup."""
+    return _VENDOR_FUZZY_THRESHOLDS.get(vendor.upper(), FUZZY_THRESHOLD)
+
+
+# Token stemmer: lowercases, strips punctuation, and crudely removes
+# trailing 's' for simple plurals (4+ char words, not ending in 'ss').
+# Matches what audit_suspect_mappings does — brings those semantics into
+# the mapper so pluralization no longer depends on token_set_ratio luck.
+_STEM_TOKEN_RE = re.compile(r'[A-Za-z]{3,}')
+
+
+def _stem_text(text: str) -> str:
+    """Lowercase + strip punctuation + stem plural tokens. Returns a
+    space-joined string of stemmed tokens, suitable for fuzzy comparison."""
+    tokens = []
+    for t in _STEM_TOKEN_RE.findall(text or ''):
+        low = t.lower()
+        if len(low) >= 4 and low.endswith('s') and not low.endswith('ss'):
+            low = low[:-1]
+        tokens.append(low)
+    return ' '.join(tokens)
 
 # Sysco brand/vendor prefix codes that precede the actual product description.
 # Multi-word patterns must come before single-word to avoid partial stripping.
@@ -243,14 +308,15 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
         return _attach_category({**item, "canonical": vendor_map[normalized],
                                  "confidence": "vendor_exact", "score": 100})
 
-    # 3. Vendor-scoped fuzzy match
+    # 3. Vendor-scoped fuzzy match (with per-vendor threshold)
     if vendor_map and normalized:
+        vendor_threshold = _fuzzy_threshold_for(vendor)
         best_match, score, _ = process.extractOne(
             normalized,
             vendor_map.keys(),
             scorer=fuzz.token_sort_ratio,
         )
-        if score >= FUZZY_THRESHOLD:
+        if score >= vendor_threshold:
             return _attach_category({**item, "canonical": vendor_map[best_match],
                                      "confidence": "vendor_fuzzy", "score": score})
 
@@ -274,9 +340,9 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
     #    Sysco descriptions like "WHLFCLS ROMAINE HEARTS 3CT" → "ROMAINE HEARTS 3CT"
     #    which can then match the canonical "Romaine" at a lower threshold.
     if category_map and normalized:
+        canonical_names = list(category_map.keys())
         stripped = _strip_sysco_prefix(normalized)
         if stripped != normalized:
-            canonical_names = list(category_map.keys())
             result = process.extractOne(
                 stripped,
                 canonical_names,
@@ -292,6 +358,52 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
                     "canonical":  best_canonical,
                     "confidence": "stripped_fuzzy",
                     "score":      score,
+                })
+
+        # 6b. Stemmed fuzzy — catches pluralization mismatches that the
+        #     stripped_fuzzy path missed (e.g. "PINEAPPLES" vs "Pineapple").
+        #     Stems both sides before token_set_ratio compare. Gated by
+        #     qualifier-word check so "SHIITAKE" doesn't match "Dried Shiitake".
+        stripped_for_stem = stripped if stripped != normalized else normalized
+        stemmed_desc = _stem_text(stripped_for_stem)
+        if stemmed_desc:
+            stemmed_canonicals = {_stem_text(c): c for c in canonical_names if c}
+            stem_result = process.extractOne(
+                stemmed_desc,
+                list(stemmed_canonicals.keys()),
+                scorer=fuzz.token_set_ratio,
+            )
+            if stem_result and stem_result[1] >= STRIPPED_FUZZY_THRESHOLD and \
+                    fuzz.token_sort_ratio(stemmed_desc, stem_result[0]) >= 75 and \
+                    not _has_missing_qualifier(stemmed_desc, stem_result[0]):
+                best_canonical = stemmed_canonicals[stem_result[0]]
+                return _attach_category({
+                    **item,
+                    "canonical":  best_canonical,
+                    "confidence": "stripped_fuzzy",
+                    "score":      stem_result[1],
+                })
+
+        # 6c. Char-level fallback — catches single-char spelling variants
+        #     (e.g. "Canteloupe" vs "Cantaloupe"). Uses fuzz.ratio which
+        #     is character-based Levenshtein. Threshold 95 + token_sort_ratio
+        #     >= 60 + qualifier gate to minimize short-string false positives.
+        char_result = process.extractOne(
+            stripped_for_stem,
+            canonical_names,
+            scorer=fuzz.ratio,
+            processor=fuzz_utils.default_process,
+        )
+        if char_result and char_result[1] >= CHAR_RATIO_THRESHOLD:
+            canon = char_result[0]
+            if fuzz.token_sort_ratio(stripped_for_stem, canon,
+                                     processor=fuzz_utils.default_process) >= 60 and \
+                    not _has_missing_qualifier(_stem_text(stripped_for_stem), _stem_text(canon)):
+                return _attach_category({
+                    **item,
+                    "canonical":  canon,
+                    "confidence": "stripped_fuzzy",
+                    "score":      char_result[1],
                 })
 
     return {**item, "canonical": None, "confidence": "unmatched", "score": 0,
