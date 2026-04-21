@@ -401,6 +401,282 @@ class PrepTaskAutoDeriveTests(AuthedTestCase):
         self.assertEqual(tasks.count(), 1)
 
 
+def _import_parser():
+    """Import parser from invoice_processor/ — adds its dir to sys.path."""
+    import sys
+    from django.conf import settings
+    path = str(settings.BASE_DIR / 'invoice_processor')
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import parser as invoice_parser
+    return invoice_parser
+
+
+class ParserDetectVendorTests(TestCase):
+    """`detect_vendor` — keyword-based vendor detection. First-match-wins."""
+
+    def test_sysco(self):
+        p = _import_parser()
+        self.assertEqual(p.detect_vendor("SYSCO PHILADELPHIA INVOICE"), "Sysco")
+        self.assertEqual(p.detect_vendor("sysco corp"), "Sysco")  # case-insensitive
+
+    def test_exceptional(self):
+        p = _import_parser()
+        self.assertEqual(p.detect_vendor("EXCEPTIONAL FOODS"), "Exceptional Foods")
+
+    def test_farmart_both_spellings(self):
+        p = _import_parser()
+        self.assertEqual(p.detect_vendor("FARMART INC"), "Farm Art")
+        self.assertEqual(p.detect_vendor("FARM ART DELIVERY"), "Farm Art")
+
+    def test_pbm_all_aliases(self):
+        p = _import_parser()
+        self.assertEqual(p.detect_vendor("PBM"), "Philadelphia Bakery Merchants")
+        self.assertEqual(p.detect_vendor("PHILADELPHIA BAKERY MERCHANTS"),
+                         "Philadelphia Bakery Merchants")
+        self.assertEqual(p.detect_vendor("philabakery llc"),
+                         "Philadelphia Bakery Merchants")
+
+    def test_delaware_linen(self):
+        p = _import_parser()
+        self.assertEqual(p.detect_vendor("DELAWARE COUNTY LINEN CO"),
+                         "Delaware County Linen")
+
+    def test_colonial_or_volonial_ocr_artifact(self):
+        """OCR sometimes misreads COLONIAL as VOLONIAL — both should detect."""
+        p = _import_parser()
+        self.assertEqual(p.detect_vendor("COLONIAL VILLAGE"),
+                         "Colonial Village Meat Markets")
+        self.assertEqual(p.detect_vendor("VOLONIAL VILLAGE"),
+                         "Colonial Village Meat Markets")
+
+    def test_unknown_fallback(self):
+        p = _import_parser()
+        self.assertEqual(p.detect_vendor("RANDOM VENDOR CORP"), "Unknown")
+        self.assertEqual(p.detect_vendor(""), "Unknown")
+
+
+class ParserExtractDateTests(TestCase):
+    """`extract_date` — returns ISO YYYY-MM-DD from varied invoice date formats."""
+
+    def test_slash_4digit_year(self):
+        p = _import_parser()
+        self.assertEqual(p.extract_date("Invoice date: 4/15/2026"), "2026-04-15")
+
+    def test_slash_2digit_year(self):
+        p = _import_parser()
+        self.assertEqual(p.extract_date("Delivery 4/15/26"), "2026-04-15")
+
+    def test_dash_format(self):
+        p = _import_parser()
+        self.assertEqual(p.extract_date("Date 4-15-2026"), "2026-04-15")
+
+    def test_no_date_returns_empty(self):
+        p = _import_parser()
+        self.assertEqual(p.extract_date("no date here"), "")
+        self.assertEqual(p.extract_date(""), "")
+
+    def test_first_valid_date_wins(self):
+        """Earlier valid date in text is returned, not the last one."""
+        p = _import_parser()
+        self.assertEqual(p.extract_date("ordered 4/1/2026 shipped 4/5/2026"),
+                         "2026-04-01")
+
+
+class ParserCaseSizeExtractTests(TestCase):
+    """`_extract_case_size` and `_normalize_pack_size` — OCR pack-size handling."""
+
+    def test_case_size_standard(self):
+        p = _import_parser()
+        self.assertEqual(p._extract_case_size("ROMAINE HEARTS 3CT"), "3CT")
+        self.assertEqual(p._extract_case_size("MAYO 4/1GAL"), "4/1GAL")
+        self.assertEqual(p._extract_case_size("CHICKEN BREAST 2/5LB"), "2/5LB")
+
+    def test_case_size_none_when_absent(self):
+        p = _import_parser()
+        self.assertEqual(p._extract_case_size("NO SIZE IN THIS DESCRIPTION"), "")
+        self.assertEqual(p._extract_case_size(""), "")
+
+    def test_normalize_pack_size_merged_oz(self):
+        """'124 OZ' → '12/4OZ' (12 packs × 4 oz each — common Sysco format)."""
+        p = _import_parser()
+        self.assertEqual(p._normalize_pack_size("124 OZ"), "12/4OZ")
+        self.assertEqual(p._normalize_pack_size("2416 OZ"), "24/16OZ")
+
+    def test_normalize_pack_size_merged_lb(self):
+        """'120 LB' → '1/20LB' (1 case × 20 lbs — e.g. black beans)."""
+        p = _import_parser()
+        self.assertEqual(p._normalize_pack_size("120 LB"), "1/20LB")
+        self.assertEqual(p._normalize_pack_size("210 LB"), "2/10LB")
+
+    def test_normalize_pack_size_ocr_0z_artifact(self):
+        """'1240Z' (OCR misread OZ as 0Z, no space) → '124OZ' → '12/4OZ'."""
+        p = _import_parser()
+        self.assertEqual(p._normalize_pack_size("1240Z"), "12/4OZ")
+
+    def test_normalize_pack_size_passthrough(self):
+        """Already-well-formed pack sizes shouldn't be mangled."""
+        p = _import_parser()
+        self.assertEqual(p._normalize_pack_size("50LB"), "50LB")  # <=50 → no split
+        self.assertEqual(p._normalize_pack_size(""), "")
+
+
+class ParserCatchWeightTests(TestCase):
+    """`_extract_catch_weight` — Sysco protein per-pound weight patterns."""
+
+    def test_direct_weight_space(self):
+        """'42.5 LB CHICKEN BREAST' → 42.5 lbs shipped."""
+        p = _import_parser()
+        r = p._extract_catch_weight("42.5 LB CHICKEN BREAST")
+        self.assertIsNotNone(r)
+        self.assertEqual(r['weight_lbs'], 42.5)
+        self.assertTrue(r['is_catch_weight'])
+
+    def test_avg_pattern(self):
+        """'110#AVGPORTPRD SALMON' → 1 piece × 10# avg = 10 lbs."""
+        p = _import_parser()
+        r = p._extract_catch_weight("110#AVGPORTPRD SALMON")
+        self.assertIsNotNone(r)
+        self.assertEqual(r['weight_lbs'], 10)
+
+    def test_range_avg_pattern(self):
+        """'86-9#AV PORK BUTT' → 8 pieces × (6+9)/2 avg = 60 lbs."""
+        p = _import_parser()
+        r = p._extract_catch_weight("86-9#AVBCH PORK BUTT")
+        self.assertIsNotNone(r)
+        self.assertEqual(r['weight_lbs'], 60)
+
+    def test_merged_digit_weight(self):
+        """'115LB' (no space) → 1 case × 15 lbs = 15 lbs."""
+        p = _import_parser()
+        r = p._extract_catch_weight("115LB CHICKEN FRYER")
+        self.assertIsNotNone(r)
+        self.assertEqual(r['weight_lbs'], 15)
+
+    def test_no_catch_weight_returns_none(self):
+        p = _import_parser()
+        self.assertIsNone(p._extract_catch_weight("REGULAR PRODUCT DESCRIPTION"))
+        self.assertIsNone(p._extract_catch_weight(""))
+
+
+class ParserCleanDescriptionTests(TestCase):
+    """`_clean_description` — strip leading qty/unit and trailing codes."""
+
+    def test_strips_leading_qty_unit(self):
+        p = _import_parser()
+        self.assertEqual(p._clean_description("1 CS CHICKEN BREAST"),
+                         "CHICKEN BREAST")
+        self.assertEqual(p._clean_description("2 BG FLOUR 50LB"),
+                         "FLOUR 50LB")
+
+    def test_strips_trailing_barcode(self):
+        """Trailing 12+ digit barcodes removed."""
+        p = _import_parser()
+        result = p._clean_description("PRODUCT NAME 123456789012")
+        self.assertEqual(result, "PRODUCT NAME")
+
+    def test_preserves_meaningful_text(self):
+        """Descriptions without noise come through intact."""
+        p = _import_parser()
+        original = "CHICKEN BREAST BONELESS SKINLESS"
+        self.assertEqual(p._clean_description(original), original)
+
+
+class ParserIsDescriptionTests(TestCase):
+    """`_is_description` — gatekeeper for what counts as a product-line OCR row."""
+
+    def test_accepts_product_text(self):
+        p = _import_parser()
+        self.assertTrue(p._is_description("CHICKEN BREAST BONELESS"))
+        self.assertTrue(p._is_description("ROMAINE HEARTS 3CT"))
+
+    def test_rejects_section_headers(self):
+        p = _import_parser()
+        self.assertFalse(p._is_description("**** DAIRY ****"))
+
+    def test_rejects_pure_numbers(self):
+        p = _import_parser()
+        self.assertFalse(p._is_description("12345"))
+        self.assertFalse(p._is_description("  123.45  "))
+
+    def test_rejects_too_short(self):
+        p = _import_parser()
+        self.assertFalse(p._is_description("AB"))
+        self.assertFalse(p._is_description(""))
+
+    def test_rejects_single_word(self):
+        """Single-word brand fragments rejected (LAYS, KIND, KONTOS)."""
+        p = _import_parser()
+        self.assertFalse(p._is_description("KONTOS"))
+
+    def test_rejects_known_footer_text(self):
+        p = _import_parser()
+        self.assertFalse(p._is_description("GROUP TOTAL"))
+        self.assertFalse(p._is_description("REMIT TO PO BOX"))
+
+
+class ParserPbmFormat1IntegrationTest(TestCase):
+    """End-to-end: synthetic PBM-format-1 invoice → parse_invoice →
+    verify items + total extracted correctly. Integration-level coverage
+    for the parser's simplest vendor path."""
+
+    def test_basic_two_item_parse(self):
+        p = _import_parser()
+        # Synthetic PBM-format-1 OCR. Items need "N code/abbrev... Product Name"
+        # and a Price Each / Amount block followed by a $total line.
+        raw = """ABC Bakery Invoice
+Invoice #12345
+4/15/2026
+Description
+2 0290/AsstDo... Assorted Donuts
+3 0100/Bagels... Plain Bagels
+Price Each
+Amount
+1.50
+3.00
+0.75
+2.25
+Total
+$5.25
+"""
+        result = p.parse_invoice(raw, vendor='PBM')
+        self.assertEqual(result['vendor'], 'PBM')
+        self.assertEqual(result['invoice_date'], '2026-04-15')
+
+        items = result['items']
+        self.assertEqual(len(items), 2)
+
+        # Items pair with prices in order: (unit, ext) alternating
+        descs = {it['raw_description'] for it in items}
+        self.assertIn('Assorted Donuts', descs)
+        self.assertIn('Plain Bagels', descs)
+
+        # Invoice total should be extracted from "$5.25" line
+        self.assertEqual(result.get('invoice_total'), 5.25)
+
+        # Sum of extended_amounts should match invoice_total (parser validates this)
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 5.25, places=2)
+
+
+class ParserUnknownVendorFallbackTest(TestCase):
+    """Unknown vendor → falls through to generic parser + flags needs_review."""
+
+    def test_unknown_vendor_generic_parse(self):
+        p = _import_parser()
+        raw = """Unknown Vendor Co
+Invoice 4/15/2026
+Some Product Name           12.50
+Another Thing               8.75
+"""
+        result = p.parse_invoice(raw)
+        self.assertEqual(result['vendor'], 'Unknown')
+        # Generic parser marks every item needs_review=True
+        for item in result['items']:
+            self.assertTrue(item.get('needs_review', False),
+                            f"{item} should be flagged for review")
+
+
 def _import_mapper():
     """Import the mapper module (lives in invoice_processor/, not in myapp).
     Inserting its dir on sys.path so `import mapper` works in tests."""
