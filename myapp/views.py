@@ -1652,6 +1652,10 @@ def leftovers_view(request):
     amber_count = sum(1 for r in rows if r['urgency'] == 'amber')
     green_count = sum(1 for r in rows if r['urgency'] == 'green')
 
+    # Distinguish "caught up" (has logged services, all handled) from
+    # "never logged" (no MealService records exist) — different empty states.
+    ever_logged = MealService.objects.exists()
+
     return render(request, 'myapp/leftovers.html', {
         'today': today,
         'rows': rows,
@@ -1659,6 +1663,7 @@ def leftovers_view(request):
         'amber_count': amber_count,
         'green_count': green_count,
         'total': len(rows),
+        'ever_logged': ever_logged,
     })
 
 

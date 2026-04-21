@@ -102,9 +102,23 @@
       {% endfor %}
     </div>
   {% else %}
+    {% if ever_logged %}
     <div class="rounded-lg border border-slate-200 bg-white p-8 text-center text-slate-500 italic">
       No active leftovers in the fridge. Kitchen's caught up. 🎉
     </div>
+    {% else %}
+    <div class="rounded-lg border border-amber-200 bg-amber-50 p-5">
+      <div class="text-sm text-amber-900 font-semibold mb-1">No service data yet</div>
+      <p class="text-xs text-amber-800">
+        This page tracks leftovers from meals after they've been served. To start
+        populating it, open a past menu (e.g., from
+        <a href="{% url 'calendar_current' %}" class="text-indigo-600 hover:underline">the calendar</a>)
+        and fill in the "Service log" section at the bottom of the menu-detail page
+        with prepped + leftover quantities. Leftovers with <code class="text-xs bg-amber-100 px-1 rounded">qty &gt; 0</code>
+        and no disposal logged will show up here, aging through the 5-day window.
+      </p>
+    </div>
+    {% endif %}
   {% endif %}
 
   <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
