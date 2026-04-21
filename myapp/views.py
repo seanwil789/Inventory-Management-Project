@@ -915,25 +915,48 @@ def recipe_missing_quantities(request):
 
 def menu_bulk_link(request):
     """Walks each unlinked Menu row with fuzzy-matched recipe candidates.
+
+    Rows are grouped logically by normalized dish_freetext so duplicates
+    appear together; sort puts the most-frequent dish names first so the
+    user's clicks have the biggest leverage (linking 'Chicken Parm' once
+    may update 6 pending menus, not just 1).
+
     Actions per row:
-      - Link to a candidate (POST)
-      - Create new recipe (routes through /recipe/new/ with prefill + link_menu)
-      - Skip (no-op, just stays unlinked)"""
+      - Link this menu → single POST with menu_id+recipe_id
+      - Link all N matching → POST with dish_freetext+recipe_id (batch)
+      - Create new recipe  → routes through /recipe/new/ prefill + link_menu
+      - Skip                → no-op"""
     from rapidfuzz import fuzz as _fuzz, process as _process
     from .management.commands.link_menus_to_recipes import _norm as _link_norm
+    from collections import Counter
 
     if request.method == 'POST':
-        menu_id = request.POST.get('menu_id')
         recipe_id = request.POST.get('recipe_id')
-        if menu_id and recipe_id:
+        menu_id = request.POST.get('menu_id')
+        batch_dish = (request.POST.get('batch_dish') or '').strip()
+        try:
+            r = Recipe.objects.get(pk=int(recipe_id)) if recipe_id else None
+        except (Recipe.DoesNotExist, ValueError):
+            messages.error(request, 'Invalid recipe.')
+            return redirect(reverse('menu_bulk_link'))
+
+        if r and batch_dish:
+            # Batch: link every unlinked menu whose dish_freetext matches
+            # (case-insensitive), excluding already-linked rows.
+            qs = (Menu.objects
+                  .filter(recipe__isnull=True)
+                  .filter(dish_freetext__iexact=batch_dish))
+            n = qs.update(recipe=r)
+            messages.success(request,
+                f'Linked {n} menu{"" if n == 1 else "s"} with "{batch_dish}" → {r.name}')
+        elif r and menu_id:
             try:
                 m = Menu.objects.get(pk=int(menu_id))
-                r = Recipe.objects.get(pk=int(recipe_id))
                 m.recipe = r
                 m.save(update_fields=['recipe'])
                 messages.success(request, f'Linked "{m.dish_freetext}" → {r.name}')
-            except (Menu.DoesNotExist, Recipe.DoesNotExist, ValueError):
-                messages.error(request, 'Invalid menu or recipe.')
+            except (Menu.DoesNotExist, ValueError):
+                messages.error(request, 'Invalid menu.')
         return redirect(reverse('menu_bulk_link'))
 
     # Pool of linkable recipes: composed_dish or meal, current, preloaded
@@ -943,10 +966,14 @@ def menu_bulk_link(request):
     recipe_names_norm = {_link_norm(r.name): r for r in recipes}
     norm_keys = list(recipe_names_norm.keys())
 
-    unlinked = (Menu.objects
-                .filter(recipe__isnull=True)
-                .exclude(dish_freetext='')
-                .order_by('date', 'meal_slot'))
+    unlinked = list(Menu.objects
+                    .filter(recipe__isnull=True)
+                    .exclude(dish_freetext='')
+                    .order_by('date', 'meal_slot'))
+
+    # Count frequency per normalized dish_freetext for leverage ranking
+    dish_key = lambda m: m.dish_freetext.lower().strip()
+    freq = Counter(dish_key(m) for m in unlinked)
 
     rows = []
     for m in unlinked:
@@ -965,9 +992,13 @@ def menu_bulk_link(request):
         rows.append({
             'menu': m,
             'candidates': candidates,
+            'frequency': freq[dish_key(m)],
             'create_url': (reverse('recipe_new')
                            + f'?prefill_name={m.dish_freetext}&link_menu={m.id}'),
         })
+
+    # Sort by frequency descending (leverage), then by date (chronology within group)
+    rows.sort(key=lambda r: (-r['frequency'], r['menu'].date, r['menu'].meal_slot))
 
     return render(request, 'myapp/menu_bulk_link.html', {
         'rows': rows,

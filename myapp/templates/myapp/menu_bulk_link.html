@@ -20,7 +20,7 @@
   {% if rows %}
     <div class="space-y-2">
       {% for row in rows %}
-        <div class="rounded border border-slate-200 bg-white p-3">
+        <div class="rounded border {% if row.frequency > 1 %}border-amber-300 bg-amber-50/30{% else %}border-slate-200 bg-white{% endif %} p-3">
           <!-- Menu header -->
           <div class="flex items-baseline justify-between gap-2 flex-wrap mb-2">
             <div>
@@ -28,6 +28,12 @@
                 {{ row.menu.date|date:"D M j" }} · {{ row.menu.get_meal_slot_display }}
               </span>
               <span class="font-medium text-slate-900">{{ row.menu.dish_freetext }}</span>
+              {% if row.frequency > 1 %}
+                <span class="ml-2 text-xs font-semibold bg-amber-100 text-amber-900 px-2 py-0.5 rounded-full"
+                      title="{{ row.frequency }} unlinked menus share this name — link once, apply to all">
+                  📌 appears {{ row.frequency }}× (high leverage)
+                </span>
+              {% endif %}
             </div>
             <a href="{{ row.create_url }}"
                class="text-xs px-2 py-1 bg-emerald-50 border border-emerald-200 text-emerald-800 rounded hover:bg-emerald-100">
@@ -39,19 +45,33 @@
             <!-- Candidate links -->
             <div class="flex gap-1 flex-wrap pl-2">
               {% for c in row.candidates %}
-                <form method="post" class="inline">
-                  {% csrf_token %}
-                  <input type="hidden" name="menu_id" value="{{ row.menu.id }}">
-                  <input type="hidden" name="recipe_id" value="{{ c.recipe.id }}">
-                  <button type="submit"
-                          class="text-xs px-2 py-1 rounded border
-                                 {% if c.score >= 85 %}bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100
-                                 {% elif c.score >= 70 %}bg-indigo-50 border-indigo-200 text-indigo-700 hover:bg-indigo-100
-                                 {% else %}bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100{% endif %}">
-                    → {{ c.recipe.name }}
-                    <span class="text-[10px] opacity-75">({{ c.score }})</span>
-                  </button>
-                </form>
+                <div class="inline-flex flex-col gap-0.5">
+                  <form method="post" class="inline">
+                    {% csrf_token %}
+                    <input type="hidden" name="menu_id" value="{{ row.menu.id }}">
+                    <input type="hidden" name="recipe_id" value="{{ c.recipe.id }}">
+                    <button type="submit"
+                            class="text-xs px-2 py-1 rounded border
+                                   {% if c.score >= 85 %}bg-emerald-50 border-emerald-200 text-emerald-800 hover:bg-emerald-100
+                                   {% elif c.score >= 70 %}bg-indigo-50 border-indigo-200 text-indigo-700 hover:bg-indigo-100
+                                   {% else %}bg-slate-50 border-slate-200 text-slate-600 hover:bg-slate-100{% endif %}">
+                      → {{ c.recipe.name }}
+                      <span class="text-[10px] opacity-75">({{ c.score }})</span>
+                    </button>
+                  </form>
+                  {% if row.frequency > 1 %}
+                    <form method="post" class="inline"
+                          onsubmit="return confirm('Link all {{ row.frequency }} menus named &quot;{{ row.menu.dish_freetext|escapejs }}&quot; to {{ c.recipe.name|escapejs }}?');">
+                      {% csrf_token %}
+                      <input type="hidden" name="batch_dish" value="{{ row.menu.dish_freetext }}">
+                      <input type="hidden" name="recipe_id" value="{{ c.recipe.id }}">
+                      <button type="submit"
+                              class="text-[10px] px-2 py-0.5 rounded bg-amber-100 border border-amber-300 text-amber-900 hover:bg-amber-200">
+                        ⇒ apply to all {{ row.frequency }}
+                      </button>
+                    </form>
+                  {% endif %}
+                </div>
               {% endfor %}
             </div>
           {% else %}
