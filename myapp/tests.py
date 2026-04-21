@@ -763,6 +763,156 @@ class AuditSuspectMappingsTests(TestCase):
                               "'egg'/'eggs' stem should overlap between canonical and desc")
 
 
+class ParserFarmArtIntegrationTests(TestCase):
+    """FarmArt parser — two-pass extraction with proximity matching.
+    Descriptions + price-pairs (unit_price, extended_amount) scanned
+    separately, then zipped by line position."""
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        return p
+
+    def test_basic_two_items_zipped_by_position(self):
+        """2 descriptions + 2 price pairs → 2 items, each pair matched to
+        the nearest subsequent description."""
+        parser_mod = self._import_parser()
+        raw = """Farm Art Invoice
+4/15/2026
+Description
+ROMAINE, 24CT
+United States
+12.50
+25.00
+CARROTS, 50LB CASE
+United States
+10.00
+15.00
+Invoice Total
+40.00
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Farm Art')
+        self.assertEqual(result['vendor'], 'Farm Art')
+        self.assertEqual(result['invoice_date'], '2026-04-15')
+
+        items = result['items']
+        self.assertEqual(len(items), 2)
+        # Items should have both unit_price and extended_amount
+        descs = {it['raw_description'] for it in items}
+        self.assertIn('ROMAINE, 24CT', descs)
+        self.assertIn('CARROTS, 50LB CASE', descs)
+
+        romaine = next(it for it in items if 'ROMAINE' in it['raw_description'])
+        self.assertEqual(romaine['unit_price'], 12.50)
+        self.assertEqual(romaine['extended_amount'], 25.00)
+
+    def test_invoice_total_from_nontaxable_marker(self):
+        """'Nontaxable' marker works as a fallback when 'Invoice Total'
+        isn't present (observed in Farm Art OCR variants)."""
+        parser_mod = self._import_parser()
+        raw = """Farm Art
+4/15/2026
+Description
+ROMAINE, 24CT
+United States
+12.50
+25.00
+Nontaxable
+25.00
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Farm Art')
+        self.assertEqual(result.get('invoice_total'), 25.00)
+
+    def test_zz_prefix_nonstock_items(self):
+        """Lines starting 'zz ' are non-stock delivery items. Parser
+        treats them as descriptions too (prefix stripped)."""
+        parser_mod = self._import_parser()
+        raw = """Farm Art
+4/15/2026
+Description
+zz DRIED, LENTIL, 24/1-LB BAGS
+United States
+15.00
+30.00
+Invoice Total
+30.00
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Farm Art')
+        items = result['items']
+        self.assertEqual(len(items), 1)
+        # 'zz ' prefix stripped in stored raw_description
+        self.assertNotIn('zz ', items[0]['raw_description'])
+        self.assertIn('LENTIL', items[0]['raw_description'])
+
+
+class ParserExceptionalIntegrationTests(TestCase):
+    """Exceptional Foods parser — DocAI-OCR text with columns:
+    Item ID | Qty Ordered | Description | Qty Shipped | Price | Per | Total.
+    Parser extracts per-lb pricing from 'N.NN LB' patterns + cross-multiplies
+    with shipped weights to compute total."""
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        return p
+
+    def test_per_lb_price_extraction(self):
+        """A single catch-weight item: 15.2 lb at $4.69/lb = $71.29.
+        Parser should extract price_per_unit=4.69, compute total via
+        cross-multiply, store unit_price=total for budget sync."""
+        parser_mod = self._import_parser()
+        raw = """Exceptional Foods
+4/15/2026
+Item ID
+1.00 CS Bacon Applewood Slice Martins 30530
+15.2
+4.69
+LB
+71.29
+Sale Amount
+71.29
+Balance Due
+71.29
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Exceptional Foods')
+        self.assertEqual(result['vendor'], 'Exceptional Foods')
+        items = result['items']
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertIn('Bacon', item['raw_description'])
+        # Price per unit (per-lb) captured
+        self.assertAlmostEqual(item.get('price_per_unit'), 4.69, places=2)
+        # unit_price = total (for budget-sheet compatibility)
+        self.assertAlmostEqual(item['unit_price'], 71.29, places=2)
+
+    def test_balance_due_invoice_total(self):
+        """Invoice total pulled from last standalone decimal after
+        'Balance Due' marker — the definitive Exceptional total."""
+        parser_mod = self._import_parser()
+        raw = """Exceptional Foods
+4/15/2026
+Item ID
+1.00 CS Bacon Applewood Slice Martins 30530
+15.2
+4.69
+LB
+71.29
+Sale Amount
+Balance Due
+71.29
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Exceptional Foods')
+        self.assertAlmostEqual(result.get('invoice_total'), 71.29, places=2)
+
+
 class ParserSyscoIntegrationTests(TestCase):
     """Sysco parser is parser.py's largest + most complex format: 5-pass
     anchor/description matching, catch-weight handling, pack-size extraction,
