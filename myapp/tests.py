@@ -704,6 +704,10 @@ class ManagementCommandSmokeTests(TestCase):
         """Without --dry-run the command writes — test the preview path."""
         self._run('regenerate_preptasks', dry_run=True)
 
+    def test_clean_ocr_cache_dry_run(self):
+        """Dry-run just reports; should not delete anything."""
+        self._run('clean_ocr_cache')
+
 
 class AuditOrphanProductsTests(TestCase):
     """`audit_orphan_products` — locks in zero-invoice-line detection + the
