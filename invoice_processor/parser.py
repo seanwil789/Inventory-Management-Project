@@ -1935,17 +1935,21 @@ def _parse_delaware_linen(text: str) -> list[dict]:
         i += 1
 
     # ── Extract and validate invoice total ────────────────────────────
+    # Delaware Linen prints totals with a dollar sign on a separate line
+    # below the "Total Due" label. The $ prefix is optional in the regex
+    # (line reads as "$91.37" not "91.37"). Tolerate comma thousands too.
     invoice_total = None
     for idx, line in enumerate(lines):
         m = re.match(r'^Total\s+Due\s*$', line, re.IGNORECASE)
         if m:
             for j in range(idx + 1, min(idx + 3, len(lines))):
-                nm = re.match(r'^(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                nm = re.match(r'^\$?\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
                 if nm:
                     invoice_total = float(nm.group(1).replace(",", ""))
                     break
             break
-        m = re.match(r'^Total\s*:?\s*(\d+[,\d]*\.\d{2})', line, re.IGNORECASE)
+        m = re.match(r'^Total\s*:?\s*\$?\s*(\d+[,\d]*\.\d{2})',
+                     line, re.IGNORECASE)
         if m:
             invoice_total = float(m.group(1).replace(",", ""))
             break
