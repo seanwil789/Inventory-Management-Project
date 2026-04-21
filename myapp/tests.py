@@ -659,6 +659,105 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class CalendarUtilsTests(TestCase):
+    """`calendar_utils.biweekly_start_for` — returns the Monday that begins
+    the biweekly cycle containing a given date. Anchor is 2026-01-05 (Mon)."""
+
+    def test_anchor_day_returns_anchor(self):
+        from myapp.calendar_utils import biweekly_start_for
+        from datetime import date
+        # 2026-01-05 is itself a biweekly anchor
+        self.assertEqual(biweekly_start_for(date(2026, 1, 5)),
+                         date(2026, 1, 5))
+
+    def test_within_first_week_returns_anchor(self):
+        from myapp.calendar_utils import biweekly_start_for
+        from datetime import date
+        # Wed in anchor week → still anchor
+        self.assertEqual(biweekly_start_for(date(2026, 1, 7)),
+                         date(2026, 1, 5))
+
+    def test_second_week_still_returns_anchor(self):
+        """Days 7-13 after anchor are still in the same biweekly cycle."""
+        from myapp.calendar_utils import biweekly_start_for
+        from datetime import date
+        # Mon + 10 days = 2026-01-15 → still same biweekly
+        self.assertEqual(biweekly_start_for(date(2026, 1, 15)),
+                         date(2026, 1, 5))
+
+    def test_next_biweekly_advances_14_days(self):
+        from myapp.calendar_utils import biweekly_start_for
+        from datetime import date
+        # Mon + 14 days = next biweekly
+        self.assertEqual(biweekly_start_for(date(2026, 1, 19)),
+                         date(2026, 1, 19))
+
+    def test_dates_before_anchor(self):
+        """Dates before the anchor should roll backward to a previous
+        biweekly, not forward."""
+        from myapp.calendar_utils import biweekly_start_for
+        from datetime import date
+        # 14 days before anchor = 2025-12-22
+        self.assertEqual(biweekly_start_for(date(2025, 12, 22)),
+                         date(2025, 12, 22))
+
+
+class KitchenFiltersTests(TestCase):
+    """Custom Django template filters — `pretty_qty` (Decimal → line-cook
+    fraction string) and `get_item` (dict key access from template)."""
+
+    def test_pretty_qty_whole_number(self):
+        from myapp.templatetags.kitchen_filters import pretty_qty
+        self.assertEqual(pretty_qty(2), '2')
+        self.assertEqual(pretty_qty(Decimal('5')), '5')
+
+    def test_pretty_qty_half(self):
+        from myapp.templatetags.kitchen_filters import pretty_qty
+        self.assertEqual(pretty_qty(Decimal('0.5')), '1/2')
+        self.assertEqual(pretty_qty(Decimal('1.5')), '1 1/2')
+
+    def test_pretty_qty_quarter(self):
+        from myapp.templatetags.kitchen_filters import pretty_qty
+        self.assertEqual(pretty_qty(Decimal('0.25')), '1/4')
+        self.assertEqual(pretty_qty(Decimal('3.75')), '3 3/4')
+
+    def test_pretty_qty_third(self):
+        """0.333 tolerates small decimal storage drift."""
+        from myapp.templatetags.kitchen_filters import pretty_qty
+        self.assertEqual(pretty_qty(Decimal('0.333')), '1/3')
+        self.assertEqual(pretty_qty(Decimal('2.667')), '2 2/3')
+
+    def test_pretty_qty_none_returns_empty(self):
+        from myapp.templatetags.kitchen_filters import pretty_qty
+        self.assertEqual(pretty_qty(None), '')
+
+    def test_pretty_qty_no_match_falls_to_decimal(self):
+        """3.1 doesn't match any common fraction → decimal string."""
+        from myapp.templatetags.kitchen_filters import pretty_qty
+        self.assertEqual(pretty_qty(Decimal('3.1')), '3.1')
+
+    def test_pretty_qty_invalid_input(self):
+        from myapp.templatetags.kitchen_filters import pretty_qty
+        self.assertEqual(pretty_qty('not a number'), 'not a number')
+
+    def test_get_item_basic(self):
+        from myapp.templatetags.kitchen_filters import get_item
+        d = {'a': 1, 'b': 2}
+        self.assertEqual(get_item(d, 'a'), 1)
+        self.assertEqual(get_item(d, 'missing'), None)
+
+    def test_get_item_none_dict(self):
+        """`get_item(None, key)` → None (template-safe, no crash)."""
+        from myapp.templatetags.kitchen_filters import get_item
+        self.assertIsNone(get_item(None, 'key'))
+
+    def test_get_item_non_dict(self):
+        """Non-dict inputs return None gracefully."""
+        from myapp.templatetags.kitchen_filters import get_item
+        self.assertIsNone(get_item('not a dict', 'key'))
+        self.assertIsNone(get_item([], 'key'))
+
+
 class ManagementCommandSmokeTests(TestCase):
     """Smoke tests for DB-only management commands. Each one runs in its
     safest mode (dry-run / no --apply) against an empty-or-minimal DB
