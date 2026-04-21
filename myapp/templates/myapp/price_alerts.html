@@ -9,9 +9,8 @@
     <div>
       <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Price Alerts</h1>
       <div class="text-sm text-slate-500">
-        Flagged in the last {{ window_days }} days —
-        {{ total_flagged_window }} product{{ total_flagged_window|pluralize }}
-        with price anomalies
+        {{ total_flagged_window }} alert{{ total_flagged_window|pluralize }} in last {{ window_days }} days, classified by failure mode.
+        Each bucket has its own fix path — don't treat them as one list.
       </div>
     </div>
     <div class="text-sm text-slate-500">
@@ -19,9 +18,33 @@
     </div>
   </div>
 
+  <!-- Bucket summary chips -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    <div class="rounded-lg border border-red-200 bg-red-50 p-3">
+      <div class="text-2xl font-bold text-red-700">{{ buckets.mapping_error|length }}</div>
+      <div class="text-xs text-red-800 uppercase tracking-wide">mapping errors</div>
+      <div class="text-[10px] text-red-700 mt-0.5">raw_desc doesn't match canonical</div>
+    </div>
+    <div class="rounded-lg border border-orange-200 bg-orange-50 p-3">
+      <div class="text-2xl font-bold text-orange-700">{{ buckets.extended_leak|length }}</div>
+      <div class="text-xs text-orange-800 uppercase tracking-wide">extended-amount leaks</div>
+      <div class="text-[10px] text-orange-700 mt-0.5">line total captured as unit price</div>
+    </div>
+    <div class="rounded-lg border border-amber-200 bg-amber-50 p-3">
+      <div class="text-2xl font-bold text-amber-700">{{ buckets.unit_drift|length }}</div>
+      <div class="text-xs text-amber-800 uppercase tracking-wide">unit drift</div>
+      <div class="text-[10px] text-amber-700 mt-0.5">$/lb vs $/case inconsistency</div>
+    </div>
+    <div class="rounded-lg border border-emerald-200 bg-emerald-50 p-3">
+      <div class="text-2xl font-bold text-emerald-700">{{ buckets.real_change|length }}</div>
+      <div class="text-xs text-emerald-800 uppercase tracking-wide">real price changes</div>
+      <div class="text-[10px] text-emerald-700 mt-0.5">genuine — review for sourcing</div>
+    </div>
+  </div>
+
   <!-- Trend strip -->
   <div class="rounded-lg bg-white border border-slate-200 p-4">
-    <div class="text-xs text-slate-500 uppercase tracking-wide mb-2">Alert volume by month</div>
+    <div class="text-xs text-slate-500 uppercase tracking-wide mb-2">Alert volume by month (all buckets combined)</div>
     <div class="flex items-end gap-4">
       {% for t in trend %}
         <div class="flex-1 text-center">
@@ -33,51 +56,74 @@
     </div>
   </div>
 
-  <!-- Recent anomalies -->
-  {% if alerts %}
-  <div class="rounded-lg bg-white border border-slate-200 p-5">
-    <h2 class="text-lg font-semibold text-slate-900 mb-3">Recent Anomalies</h2>
-    <p class="text-sm text-slate-500 mb-3">
-      Sorted by size of deviation. Each row is one (product, vendor) pair —
-      most-recent flagged price within the window.
+  <!-- Section: Mapping Errors -->
+  {% if buckets.mapping_error %}
+  <div class="rounded-lg bg-white border-2 border-red-300 p-5">
+    <div class="flex items-baseline justify-between gap-3 mb-2">
+      <h2 class="text-lg font-semibold text-red-900">🚩 Mapping Errors ({{ buckets.mapping_error|length }})</h2>
+      <span class="text-xs text-red-700">fix path: un-map + re-map in Bridge Review</span>
+    </div>
+    <p class="text-sm text-slate-600 mb-3">
+      Canonical product name shares no meaningful words with the raw invoice description. The price alert is fake —
+      the underlying bug is a wrong ProductMapping.
     </p>
-    <table class="w-full text-sm">
-      <thead class="text-xs uppercase text-slate-500 tracking-wide">
-        <tr class="border-b border-slate-200">
-          <th class="text-left py-2">Date</th>
-          <th class="text-left py-2">Product</th>
-          <th class="text-left py-2">Vendor</th>
-          <th class="text-right py-2">Current</th>
-          <th class="text-right py-2">90-day avg</th>
-          <th class="text-right py-2">Δ</th>
-        </tr>
-      </thead>
-      <tbody>
-        {% for a in alerts %}
-        <tr class="border-b border-slate-100">
-          <td class="py-2 text-slate-600 text-xs whitespace-nowrap">{{ a.ili.invoice_date|date:"M j" }}</td>
-          <td class="py-2 text-slate-800">{{ a.ili.product.canonical_name }}</td>
-          <td class="py-2 text-slate-600 text-xs">{{ a.ili.vendor.name|default:"—" }}</td>
-          <td class="py-2 text-right font-mono text-slate-900">${{ a.ili.unit_price|floatformat:2 }}</td>
-          <td class="py-2 text-right font-mono text-slate-500">${{ a.avg_price|floatformat:2 }}</td>
-          <td class="py-2 text-right font-mono whitespace-nowrap
-                     {% if a.direction == 'up' %}text-red-700{% else %}text-emerald-700{% endif %}">
-            {% if a.direction == 'up' %}▲{% else %}▼{% endif %}
-            {{ a.delta_pct|floatformat:0 }}%
-          </td>
-        </tr>
-        {% endfor %}
-      </tbody>
-    </table>
+    {% include "myapp/_price_alerts_table.html" with rows=buckets.mapping_error %}
   </div>
-  {% else %}
+  {% endif %}
+
+  <!-- Section: Extended-Amount Leaks -->
+  {% if buckets.extended_leak %}
+  <div class="rounded-lg bg-white border-2 border-orange-300 p-5">
+    <div class="flex items-baseline justify-between gap-3 mb-2">
+      <h2 class="text-lg font-semibold text-orange-900">💸 Extended-Amount Leaks ({{ buckets.extended_leak|length }})</h2>
+      <span class="text-xs text-orange-700">fix path: parser / db_write investigation</span>
+    </div>
+    <p class="text-sm text-slate-600 mb-3">
+      Current price is &gt;5× historical AND &gt; $50 absolute. Suggests the line total (extended_amount) leaked
+      into the unit_price field. Check the parser output for this vendor + format.
+    </p>
+    {% include "myapp/_price_alerts_table.html" with rows=buckets.extended_leak %}
+  </div>
+  {% endif %}
+
+  <!-- Section: Unit Drift -->
+  {% if buckets.unit_drift %}
+  <div class="rounded-lg bg-white border border-amber-300 p-5">
+    <div class="flex items-baseline justify-between gap-3 mb-2">
+      <h2 class="text-lg font-semibold text-amber-900">⚖️ Unit Drift ({{ buckets.unit_drift|length }})</h2>
+      <span class="text-xs text-amber-700">fix path: case_size standardization</span>
+    </div>
+    <p class="text-sm text-slate-600 mb-3">
+      Price ratio exceeds threshold AND product history has multiple case sizes or the price is small per-unit.
+      Most likely the two prices being compared are in different units ($/lb vs $/case, etc.).
+      Look at the product's <a href="{% url 'category_spend' %}" class="text-indigo-600 hover:underline">category spend</a> timeline — if the raw cost pattern flips between cases and units, that's the giveaway.
+    </p>
+    {% include "myapp/_price_alerts_table.html" with rows=buckets.unit_drift %}
+  </div>
+  {% endif %}
+
+  <!-- Section: Real Changes -->
+  {% if buckets.real_change %}
+  <div class="rounded-lg bg-white border border-emerald-300 p-5">
+    <div class="flex items-baseline justify-between gap-3 mb-2">
+      <h2 class="text-lg font-semibold text-emerald-900">📈 Real Price Changes ({{ buckets.real_change|length }})</h2>
+      <span class="text-xs text-emerald-700">fix path: review for sourcing / budget</span>
+    </div>
+    <p class="text-sm text-slate-600 mb-3">
+      Genuine price movement. These are the ones worth acting on — same product, same vendor, same unit, just a different price than last time.
+    </p>
+    {% include "myapp/_price_alerts_table.html" with rows=buckets.real_change %}
+  </div>
+  {% endif %}
+
+  {% if total_flagged_window == 0 %}
     <p class="text-slate-500 italic py-6">No price anomalies in the last {{ window_days }} days. 🎉</p>
   {% endif %}
 
   <!-- Vendor breakdown -->
   {% if vendor_counts %}
   <div class="rounded-lg bg-white border border-slate-200 p-5">
-    <h2 class="text-lg font-semibold text-slate-900 mb-3">By Vendor ({{ window_days }}-day window)</h2>
+    <h2 class="text-lg font-semibold text-slate-900 mb-3">By Vendor ({{ window_days }}-day window, all buckets)</h2>
     <table class="w-full text-sm">
       <thead class="text-xs uppercase text-slate-500 tracking-wide">
         <tr class="border-b border-slate-200">
@@ -99,12 +145,14 @@
 
   <!-- Caveat -->
   <div class="text-xs text-slate-500 bg-slate-50 rounded p-3">
-    <strong>How this works:</strong> each new invoice line is checked against
-    the 90-day average for the same product+vendor at write-time
-    (<code>invoice_processor/db_write.py</code>). Ratios &gt; 2× or &lt; 0.5×
-    trigger the <code>price_flagged</code> boolean. Outliers go both directions —
-    a drop from $10 to $4.50 is flagged the same as a spike from $10 to $22.
-    First-time buys have no history so they aren't flagged.
+    <strong>How classification works:</strong>
+    <ul class="list-disc ml-5 mt-1 space-y-0.5">
+      <li><strong>Mapping error:</strong> canonical name and raw invoice description share zero 3+letter word tokens (after stripping Sysco brand prefixes as noise).</li>
+      <li><strong>Extended leak:</strong> current &gt;5× historical AND absolute &gt; $50.</li>
+      <li><strong>Unit drift:</strong> ratio outside [0.5, 2.0] AND (distinct case_sizes in history OR tiny per-unit price).</li>
+      <li><strong>Real change:</strong> ratio outside [0.5, 2.0] but neither of the above patterns.</li>
+    </ul>
+    Classification is heuristic — edge cases get misfiled. Review by eye before acting.
   </div>
 
 </div>

@@ -1883,19 +1883,42 @@ def demo_ready(request):
 # ---- Price creep alerts ----
 
 def price_alerts(request):
-    """Surface price_flagged InvoiceLineItem rows (>2× or <0.5× 90-day avg).
-    Groups recent flags by (product, vendor) so repeated anomalies don't double-
-    count; shows current price, 90-day avg, delta direction.
+    """Classify price-flagged InvoiceLineItem rows into 4 buckets so each
+    failure mode gets its own fix path:
 
-    The price_flagged field is set in invoice_processor/db_write.py at write
-    time — no new computation here, just surfacing what's already computed."""
+      1. mapping_error — canonical name shares zero meaningful tokens with
+         raw_description. The alert is a symptom of a bad ProductMapping,
+         not a real price change. Fix: unmap + remap via bridge review.
+
+      2. extended_leak — current price >> historical AND absolute is high.
+         Suggests unit_price field captured an extended_amount (line total)
+         instead of per-unit. Fix: parser / db_write investigation.
+
+      3. unit_drift — ratio >2x or <0.5x AND either the case_size has
+         multiple distinct values in history OR one side of the ratio is
+         a small per-unit number (<$5). Suggests $/lb vs $/case comparison.
+         Fix: unit normalization or per-product case_size standardization.
+
+      4. real_change — none of the above; legitimate price movement worth
+         reviewing for sourcing / budget.
+
+    The underlying price_flagged field is set at write time in
+    invoice_processor/db_write.py; this view just classifies what's flagged."""
     from django.db.models import Avg, Count, Max
     from datetime import timedelta
     from collections import defaultdict
+    import re
 
     today = date.today()
     window_start = today - timedelta(days=30)
     history_start = today - timedelta(days=90)
+
+    # Sysco brand prefix tokens — treat as noise, not product identity
+    _NOISE = {'whlfcls', 'grecosn', 'coopr', 'emba', 'ssa', 'sys', 'cls',
+              'imp', 'cur', 'ckd', 'bnls', 'sysfpnat', 'syfpnat', 'sysclb'}
+
+    def _tokens(s):
+        return {t.lower() for t in re.findall(r'[A-Za-z]{3,}', s or '')} - _NOISE
 
     # Recent flags — group by (product, vendor), keep most-recent per group
     recent = (InvoiceLineItem.objects
@@ -1912,8 +1935,13 @@ def price_alerts(request):
         if key not in grouped:
             grouped[key] = ili
 
-    # For each group, compute the 90-day average for comparison
-    enriched = []
+    buckets: dict = {
+        'mapping_error': [],
+        'extended_leak': [],
+        'unit_drift': [],
+        'real_change': [],
+    }
+
     for (pid, vid), ili in grouped.items():
         avg_price = (InvoiceLineItem.objects
                      .filter(product_id=pid, vendor_id=vid,
@@ -1924,18 +1952,49 @@ def price_alerts(request):
                      .aggregate(a=Avg('unit_price')))['a']
         if avg_price is None or avg_price == 0:
             continue
-        delta_pct = (Decimal(ili.unit_price) / Decimal(avg_price) - 1) * 100
-        enriched.append({
+        avg = Decimal(avg_price)
+        cur = Decimal(ili.unit_price)
+        ratio = cur / avg
+        delta_pct = (ratio - 1) * 100
+
+        # Classification
+        canon_tokens = _tokens(ili.product.canonical_name)
+        desc_tokens = _tokens(ili.raw_description)
+        overlap = canon_tokens & desc_tokens
+
+        if canon_tokens and desc_tokens and len(canon_tokens) >= 1 and len(desc_tokens) >= 2 and not overlap:
+            bucket = 'mapping_error'
+        elif ratio > Decimal('5') and cur > Decimal('50'):
+            bucket = 'extended_leak'
+        elif ratio > Decimal('2') or ratio < Decimal('0.5'):
+            distinct_sizes = (InvoiceLineItem.objects
+                              .filter(product_id=pid, vendor_id=vid)
+                              .exclude(case_size='')
+                              .values_list('case_size', flat=True)
+                              .distinct()
+                              .count())
+            if distinct_sizes > 1 or cur < Decimal('5') or avg < Decimal('5'):
+                bucket = 'unit_drift'
+            else:
+                bucket = 'real_change'
+        else:
+            bucket = 'real_change'
+
+        buckets[bucket].append({
             'ili': ili,
-            'avg_price': Decimal(avg_price).quantize(Decimal('0.01')),
+            'avg_price': avg.quantize(Decimal('0.01')),
             'delta_pct': delta_pct.quantize(Decimal('0.1')),
             'direction': 'up' if delta_pct > 0 else 'down',
+            'ratio': ratio.quantize(Decimal('0.01')),
         })
 
-    # Sort by absolute delta magnitude, descending
-    enriched.sort(key=lambda e: abs(e['delta_pct']), reverse=True)
+    # Sort each bucket by magnitude descending
+    for b in buckets.values():
+        b.sort(key=lambda e: abs(e['delta_pct']), reverse=True)
 
-    # Vendor breakdown of flagged counts in window
+    total = sum(len(b) for b in buckets.values())
+
+    # Vendor breakdown of flagged counts in window (unchanged)
     vendor_counts = (InvoiceLineItem.objects
                      .filter(price_flagged=True, invoice_date__gte=window_start)
                      .values('vendor__name')
@@ -1961,8 +2020,8 @@ def price_alerts(request):
     return render(request, 'myapp/price_alerts.html', {
         'today': today,
         'window_days': 30,
-        'alerts': enriched,
-        'total_flagged_window': len(enriched),
+        'buckets': buckets,
+        'total_flagged_window': total,
         'vendor_counts': list(vendor_counts),
         'trend': trend,
         'trend_max': trend_max,
