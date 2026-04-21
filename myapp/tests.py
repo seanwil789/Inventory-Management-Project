@@ -2333,3 +2333,120 @@ class MapperNewTiersTests(TestCase):
         # Canonical has no qualifier, raw has qualifier → allowed
         self.assertFalse(mapper._has_missing_qualifier(
             'onion red jumbo', 'onion red'))
+
+    def _category_map(self, assignments: dict[str, str]) -> dict:
+        """Build a category_map where each canonical has its category set.
+        assignments = {canonical_name: category_name}"""
+        return {c: {'category': cat, 'primary_descriptor': '',
+                    'secondary_descriptor': ''}
+                for c, cat in assignments.items()}
+
+    def test_section_filter_builds_restricted_pool(self):
+        """_candidates_for_section returns only canonicals matching the
+        section's target categories. Pool must be >= 3 to be considered
+        useful (else returns empty = 'use full pool')."""
+        mapper = self._mapper()
+        cat_map = self._category_map({
+            'Milk': 'Dairy', 'Cheese': 'Cheese', 'Yogurt': 'Dairy',
+            'Butter': 'Dairy',
+            'Spaghetti': 'Drystock', 'Rice': 'Drystock',
+        })
+        # DAIRY section → Dairy + Cheese canonicals (4 items, >=3 ok)
+        dairy = mapper._candidates_for_section('**** DAIRY ****', cat_map)
+        self.assertEqual(set(dairy), {'Milk', 'Cheese', 'Yogurt', 'Butter'})
+
+        # PRODUCE section → no matching canonicals in this map
+        produce = mapper._candidates_for_section('**** PRODUCE ****', cat_map)
+        self.assertEqual(produce, [])  # 0 Produce items = empty
+
+        # Empty section → no filter
+        self.assertEqual(mapper._candidates_for_section('', cat_map), [])
+
+        # FROZEN — intentionally not in section map (too ambiguous)
+        frozen = mapper._candidates_for_section('**** FROZEN ****', cat_map)
+        self.assertEqual(frozen, [])
+
+    def test_section_filter_falls_back_when_too_small(self):
+        """Pool with <3 candidates in target category returns empty,
+        causing fall-through to unrestricted pool."""
+        mapper = self._mapper()
+        cat_map = self._category_map({
+            'Milk': 'Dairy',
+            'Spaghetti': 'Drystock', 'Rice': 'Drystock', 'Flour': 'Drystock',
+        })
+        # DAIRY section → only 1 Dairy item, below min-3 threshold
+        self.assertEqual(mapper._candidates_for_section('DAIRY', cat_map), [])
+
+    def test_section_aware_match_uses_restricted_pool_first(self):
+        """When section is provided and restricted pool has the right
+        canonical, match succeeds in the section-filtered pass. Uses the
+        WHLFCLS Sysco prefix so tier 6a (stripped + token_set) fires."""
+        mapper = self._mapper()
+        cat_map = self._category_map({
+            'Cheese, Parmesan':  'Dairy',
+            'Cheese, Cheddar':   'Dairy',
+            'Cheese, Mozzarella': 'Dairy',
+            'Cheese Sauce':      'Drystock',
+            'Cheddar Crackers':  'Drystock',
+            'Spaghetti':         'Drystock',
+        })
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': cat_map,
+        }
+        item = {
+            'sysco_item_code': '',
+            'raw_description': 'WHLFCLS CHEESE CHEDDAR',
+            'section': '**** DAIRY ****',
+        }
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        # Should match a Dairy-category Cheese Cheddar, NOT Drystock variants
+        self.assertIsNotNone(r.get('canonical'))
+        self.assertNotIn(r['canonical'], ('Cheddar Crackers', 'Cheese Sauce'))
+
+    def test_section_aware_falls_back_to_full_pool(self):
+        """When restricted pool has no good match, mapper falls back to
+        unrestricted pool. Preserves recall when Product.category is wrong
+        or empty in the DB."""
+        mapper = self._mapper()
+        # Buttermilk miscategorized as Drystock. Section says DAIRY.
+        # Restricted Dairy pool lacks Buttermilk; full pool has it.
+        cat_map = self._category_map({
+            'Milk':       'Dairy',
+            'Yogurt':     'Dairy',
+            'Cheese':     'Dairy',
+            'Buttermilk': 'Drystock',   # miscategorized
+            'Spaghetti':  'Drystock',
+        })
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': cat_map,
+        }
+        # WHLFCLS prefix → tier 6a fires after stripping
+        item = {
+            'sysco_item_code': '',
+            'raw_description': 'WHLFCLS BUTTERMILK',
+            'section': '**** DAIRY ****',
+        }
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        # Should still match Buttermilk via unrestricted fallback
+        self.assertEqual(r['canonical'], 'Buttermilk')
+
+    def test_section_awareness_ignored_for_non_sysco(self):
+        """Section field only populates from Sysco parser. Other vendors
+        don't emit it; behavior should be unchanged (no filter applied,
+        full pool used)."""
+        mapper = self._mapper()
+        cat_map = self._category_map({
+            'Milk': 'Dairy', 'Cheese': 'Dairy', 'Butter': 'Dairy',
+            'Rice': 'Drystock', 'Flour': 'Drystock',
+        })
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': cat_map,
+        }
+        # Clean single-token raw, Farm Art vendor — no section flag
+        item = {'sysco_item_code': '', 'raw_description': 'Milk'}
+        r = mapper.resolve_item(item, mappings, vendor='Farm Art')
+        # Should match Milk via tier 6b (stemmed) — clean 1:1 token match
+        self.assertEqual(r['canonical'], 'Milk')
