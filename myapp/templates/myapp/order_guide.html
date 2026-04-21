@@ -65,6 +65,7 @@
             <div class="font-medium">{{ line.product.canonical_name }}</div>
             <div class="text-xs text-slate-500">{{ line.product.category }}
               {% if line.contributors %} · from {{ line.contributors|join:", " }}{% endif %}
+              {% if line.last_date %} · last ordered {{ line.last_date|date:"M j" }}{% if line.days_since is not None %} ({{ line.days_since }}d ago){% endif %}{% endif %}
             </div>
           </td>
           <td class="px-4 py-2 text-right font-mono">{{ line.qty|floatformat:2 }}</td>
@@ -85,6 +86,59 @@
     No recipe-linked ingredients in this range. Author menus with linked recipes to see an order guide.
   </div>
   {% endfor %}
+
+  {% if usage_groups %}
+  <h2 class="text-lg font-bold mt-8 mb-2">Restocking due</h2>
+  <p class="text-sm text-slate-500 mb-4">
+    Non-recipe products (paper, chemicals, snacks, concessions) past their typical reorder cadence
+    based on invoice history. {{ usage_total }} item{{ usage_total|pluralize }} flagged as of {{ today|date:"M j" }}.
+  </p>
+  {% for g in usage_groups %}
+  <section class="mb-5 bg-white rounded shadow-sm border">
+    <div class="px-4 py-2.5 bg-slate-50 border-b flex items-center justify-between">
+      <div class="font-semibold">{{ g.vendor }}</div>
+      <div class="text-xs text-slate-500">{{ g.lines|length }} item{{ g.lines|length|pluralize }}</div>
+    </div>
+    <table class="w-full text-sm">
+      <thead class="text-xs font-semibold text-slate-500 uppercase tracking-wide">
+        <tr>
+          <th class="px-4 py-2 text-left">Product</th>
+          <th class="px-4 py-2 text-right w-28">Last Ordered</th>
+          <th class="px-4 py-2 text-right w-28">Typical Interval</th>
+          <th class="px-4 py-2 text-right w-24">Urgency</th>
+          <th class="px-4 py-2 text-right w-24">Last Price</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y">
+        {% for line in g.lines %}
+        <tr class="hover:bg-slate-50">
+          <td class="px-4 py-2">
+            <div class="font-medium">{{ line.product.canonical_name }}</div>
+            <div class="text-xs text-slate-500">
+              {{ line.product.category }} · {{ line.purchase_count }} past order{{ line.purchase_count|pluralize }}
+              {% if line.case_size %} · {{ line.case_size }}{% endif %}
+            </div>
+          </td>
+          <td class="px-4 py-2 text-right text-slate-600">
+            <div>{{ line.last_date|date:"M j" }}</div>
+            <div class="text-xs text-slate-400">{{ line.days_since_last }}d ago</div>
+          </td>
+          <td class="px-4 py-2 text-right text-slate-500 font-mono">
+            {{ line.avg_interval }}d
+          </td>
+          <td class="px-4 py-2 text-right font-mono {% if line.urgency >= 1.5 %}text-red-600 font-bold{% elif line.urgency >= 1.0 %}text-amber-600 font-semibold{% else %}text-slate-500{% endif %}">
+            {{ line.urgency }}x
+          </td>
+          <td class="px-4 py-2 text-right text-slate-500">
+            {% if line.unit_price %}${{ line.unit_price|floatformat:2 }}{% else %}—{% endif %}
+          </td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+  {% endfor %}
+  {% endif %}
 
   {% if unlinked_names %}
   <section class="mb-5 bg-white rounded shadow-sm border">

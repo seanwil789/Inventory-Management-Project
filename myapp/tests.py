@@ -2648,3 +2648,158 @@ class MapperRealisticScenariosTests(TestCase):
     # Empty description + no code → unmatched (guard)
     def test_scenario_empty_input_unmatched(self):
         self._assert_resolves('', 'Sysco', expected_canonical=None)
+
+
+class UsagePatternPredictionsTests(TestCase):
+    """`_usage_pattern_predictions` — order-guide second track that surfaces
+    non-recipe products likely due for reorder based on invoice cadence."""
+
+    def setUp(self):
+        super().setUp()
+        self.today = date(2026, 4, 21)
+        self.vendor = Vendor.objects.create(name='TestVendor')
+        # Non-recipe product with a tight weekly cadence, 8 days since last order
+        self.paper = Product.objects.create(canonical_name='Test Paper Towels',
+                                            category='Paper/Disposable')
+        # Product linked to a recipe — must NOT appear in predictions
+        self.chicken = Product.objects.create(canonical_name='Test Chicken',
+                                              category='Proteins')
+        recipe = Recipe.objects.create(name='Test Recipe', yield_servings=10)
+        RecipeIngredient.objects.create(recipe=recipe, name_raw='Chicken',
+                                        product=self.chicken, quantity=1, unit='lb')
+
+    def _add_invoices(self, product, dates, price=Decimal('10.00')):
+        for d in dates:
+            InvoiceLineItem.objects.create(
+                vendor=self.vendor, product=product,
+                raw_description=product.canonical_name,
+                unit_price=price, invoice_date=d,
+            )
+
+    def test_recipe_linked_excluded(self):
+        """A product referenced by any RecipeIngredient should never appear."""
+        from myapp.views import _usage_pattern_predictions
+        # Give chicken many invoices and long gap — still excluded
+        self._add_invoices(self.chicken, [
+            date(2025, 10, 1), date(2025, 10, 8), date(2025, 10, 15),
+            date(2025, 10, 22),
+        ])
+        preds = _usage_pattern_predictions(self.today)
+        ids = {p['product'].id for p in preds}
+        self.assertNotIn(self.chicken.id, ids)
+
+    def test_min_purchases_enforced(self):
+        """Fewer than 3 distinct purchase dates → skipped (noise guard)."""
+        from myapp.views import _usage_pattern_predictions
+        self._add_invoices(self.paper, [date(2026, 1, 1), date(2026, 2, 1)])
+        preds = _usage_pattern_predictions(self.today)
+        self.assertEqual([p for p in preds if p['product'].id == self.paper.id], [])
+
+    def test_overdue_product_surfaces(self):
+        """Weekly cadence + last order 14 days ago → urgency=2.0, flagged."""
+        from myapp.views import _usage_pattern_predictions
+        # 4 weekly orders, last one 14 days before 'today'
+        last = self.today - timedelta(days=14)
+        self._add_invoices(self.paper, [
+            last - timedelta(days=21), last - timedelta(days=14),
+            last - timedelta(days=7), last,
+        ])
+        preds = _usage_pattern_predictions(self.today)
+        paper_preds = [p for p in preds if p['product'].id == self.paper.id]
+        self.assertEqual(len(paper_preds), 1)
+        p = paper_preds[0]
+        self.assertEqual(p['avg_interval'], 7.0)
+        self.assertEqual(p['days_since_last'], 14)
+        self.assertEqual(p['urgency'], 2.0)
+        self.assertEqual(p['purchase_count'], 4)
+
+    def test_on_cadence_product_not_flagged(self):
+        """Ordered recently, still within interval → skipped."""
+        from myapp.views import _usage_pattern_predictions
+        # Weekly cadence, last order 2 days ago → urgency=0.29, below 0.9
+        self._add_invoices(self.paper, [
+            self.today - timedelta(days=23),
+            self.today - timedelta(days=16),
+            self.today - timedelta(days=9),
+            self.today - timedelta(days=2),
+        ])
+        preds = _usage_pattern_predictions(self.today)
+        self.assertEqual([p for p in preds if p['product'].id == self.paper.id], [])
+
+    def test_same_day_multiple_invoices_count_once(self):
+        """Multiple invoice lines on the same day should collapse to one
+        purchase event — we measure cadence in days, not line-items."""
+        from myapp.views import _usage_pattern_predictions
+        # 3 invoice lines on day 1, 3 on day 8 → only 2 distinct dates →
+        # skipped by min_purchases guard. Without dedup, 6 lines would
+        # spuriously qualify.
+        d1 = self.today - timedelta(days=8)
+        d2 = self.today - timedelta(days=1)
+        self._add_invoices(self.paper, [d1, d1, d1, d2, d2, d2])
+        preds = _usage_pattern_predictions(self.today)
+        self.assertEqual([p for p in preds if p['product'].id == self.paper.id], [])
+
+    def test_sorted_most_urgent_first(self):
+        """Results sorted by urgency descending — critical items float to top."""
+        from myapp.views import _usage_pattern_predictions
+        other = Product.objects.create(canonical_name='Test Gloves',
+                                       category='Paper/Disposable')
+        # paper: weekly cadence, 14d overdue (urgency 2.0)
+        self._add_invoices(self.paper, [
+            self.today - timedelta(days=35),
+            self.today - timedelta(days=28),
+            self.today - timedelta(days=21),
+            self.today - timedelta(days=14),
+        ])
+        # gloves: monthly cadence, 45d since last (urgency ~1.5)
+        self._add_invoices(other, [
+            self.today - timedelta(days=135),
+            self.today - timedelta(days=105),
+            self.today - timedelta(days=75),
+            self.today - timedelta(days=45),
+        ])
+        preds = _usage_pattern_predictions(self.today)
+        paper_idx = next(i for i, p in enumerate(preds) if p['product'].id == self.paper.id)
+        gloves_idx = next(i for i, p in enumerate(preds) if p['product'].id == other.id)
+        self.assertLess(paper_idx, gloves_idx, 'higher urgency must come first')
+
+
+class LatestInvoiceInfoBulkTests(TestCase):
+    """`_latest_invoice_info_bulk` — bulk lookup used by order_guide to avoid
+    N+1 queries. Returns 4-tuple with last_invoice_date for the UX stamp."""
+
+    def test_returns_four_tuple_with_last_date(self):
+        from myapp.views import _latest_invoice_info_bulk
+        vendor = Vendor.objects.create(name='V')
+        p = Product.objects.create(canonical_name='P')
+        InvoiceLineItem.objects.create(
+            vendor=vendor, product=p, raw_description='P',
+            unit_price=Decimal('9.99'), case_size='1/10LB',
+            invoice_date=date(2026, 3, 15),
+        )
+        out = _latest_invoice_info_bulk([p.id])
+        self.assertIn(p.id, out)
+        tup = out[p.id]
+        self.assertEqual(len(tup), 4)
+        v, price, case_size, last_date = tup
+        self.assertEqual(v.name, 'V')
+        self.assertEqual(price, Decimal('9.99'))
+        self.assertEqual(case_size, '1/10LB')
+        self.assertEqual(last_date, date(2026, 3, 15))
+
+    def test_returns_most_recent_date_when_multiple(self):
+        """With multiple invoices, the returned date is the most recent."""
+        from myapp.views import _latest_invoice_info_bulk
+        vendor = Vendor.objects.create(name='V')
+        p = Product.objects.create(canonical_name='P')
+        for d in [date(2026, 1, 1), date(2026, 3, 1), date(2026, 2, 1)]:
+            InvoiceLineItem.objects.create(
+                vendor=vendor, product=p, raw_description='P',
+                unit_price=Decimal('1.00'), invoice_date=d,
+            )
+        _, _, _, last_date = _latest_invoice_info_bulk([p.id])[p.id]
+        self.assertEqual(last_date, date(2026, 3, 1))
+
+    def test_empty_input(self):
+        from myapp.views import _latest_invoice_info_bulk
+        self.assertEqual(_latest_invoice_info_bulk([]), {})

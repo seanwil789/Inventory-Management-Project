@@ -677,21 +677,105 @@ class _VendorLite:
 
 
 def _latest_invoice_info_bulk(product_ids):
-    """Return {product_id: (vendor, unit_price, case_size)} for all products
-    in one DB query. Replaces N queries in order_guide's vendor loop."""
+    """Return {product_id: (vendor, unit_price, case_size, last_invoice_date)}
+    for all products in one DB query. Replaces N queries in order_guide's
+    vendor loop. `last_invoice_date` supports the "last ordered N days ago"
+    stamp on order-guide rows."""
     if not product_ids:
         return {}
     rows = (InvoiceLineItem.objects
             .filter(product_id__in=product_ids)
             .order_by('-invoice_date', '-imported_at')
-            .values('product_id', 'vendor__name', 'unit_price', 'case_size'))
+            .values('product_id', 'vendor__name', 'unit_price', 'case_size',
+                    'invoice_date'))
     out = {}
     for r in rows:
         pid = r['product_id']
         if pid not in out:
             v = _VendorLite(r['vendor__name']) if r['vendor__name'] else None
-            out[pid] = (v, r['unit_price'], r['case_size'])
+            out[pid] = (v, r['unit_price'], r['case_size'], r['invoice_date'])
     return out
+
+
+def _usage_pattern_predictions(as_of: date, min_purchases: int = 3,
+                               urgency_threshold: float = 0.9):
+    """Surface non-recipe products likely due for reorder based on purchase
+    cadence. Non-recipe = no RecipeIngredient references this Product.
+
+    Algorithm (from project_usage_pattern_order_guide.md):
+      - Need min_purchases historical invoices to avoid noise.
+      - avg_interval = mean days between consecutive purchases.
+      - days_since_last = as_of − most-recent invoice_date.
+      - urgency = days_since_last / avg_interval (>=1.0 = overdue).
+      - Flag when urgency >= urgency_threshold (default 0.9).
+
+    Returns list of dicts, sorted most-urgent first, for items past threshold.
+    """
+    from myapp.models import Product, RecipeIngredient, InvoiceLineItem
+    from collections import defaultdict
+
+    # Non-recipe products: any Product not referenced by a RecipeIngredient
+    recipe_linked_ids = set(RecipeIngredient.objects
+                            .exclude(product__isnull=True)
+                            .values_list('product_id', flat=True))
+    non_recipe_qs = Product.objects.exclude(id__in=recipe_linked_ids)
+
+    # Pull invoice history in one query, newest first
+    history_rows = (InvoiceLineItem.objects
+                    .filter(product_id__in=non_recipe_qs.values_list('id', flat=True),
+                            invoice_date__isnull=False)
+                    .values('product_id', 'invoice_date', 'vendor__name',
+                            'unit_price', 'case_size')
+                    .order_by('product_id', 'invoice_date'))
+
+    by_product: dict[int, list[dict]] = defaultdict(list)
+    for r in history_rows:
+        by_product[r['product_id']].append(r)
+
+    product_lookup = {p.id: p for p in non_recipe_qs}
+    predictions = []
+
+    for pid, invoices in by_product.items():
+        if len(invoices) < min_purchases:
+            continue
+        # Deduplicate same-day purchases (multi-line invoices count once)
+        dates_seen: list[date] = []
+        for inv in invoices:
+            d = inv['invoice_date']
+            if not dates_seen or d != dates_seen[-1]:
+                dates_seen.append(d)
+        if len(dates_seen) < min_purchases:
+            continue
+        intervals = [(dates_seen[i] - dates_seen[i-1]).days
+                     for i in range(1, len(dates_seen))]
+        if not intervals:
+            continue
+        avg_interval = sum(intervals) / len(intervals)
+        if avg_interval <= 0:
+            continue
+        last_date = dates_seen[-1]
+        days_since_last = (as_of - last_date).days
+        urgency = days_since_last / avg_interval
+        if urgency < urgency_threshold:
+            continue
+        last_inv = invoices[-1]
+        product = product_lookup.get(pid)
+        if not product:
+            continue
+        predictions.append({
+            'product':         product,
+            'vendor':          last_inv['vendor__name'] or '— unknown —',
+            'unit_price':      last_inv['unit_price'],
+            'case_size':       last_inv['case_size'],
+            'last_date':       last_date,
+            'days_since_last': days_since_last,
+            'avg_interval':    round(avg_interval, 1),
+            'urgency':         round(urgency, 2),
+            'purchase_count':  len(dates_seen),
+        })
+
+    predictions.sort(key=lambda p: -p['urgency'])
+    return predictions
 
 
 def order_guide(request):
@@ -776,8 +860,10 @@ def order_guide(request):
     latest_info = _latest_invoice_info_bulk(list(agg_by_product.keys()))
     by_vendor: dict[str, list[dict]] = defaultdict(list)
     for pid, data in agg_by_product.items():
-        vendor, unit_price, case_size = latest_info.get(pid, (None, None, None))
+        vendor, unit_price, case_size, last_date = latest_info.get(
+            pid, (None, None, None, None))
         vendor_name = vendor.name if vendor else '— unknown / no invoice history —'
+        days_since = (today - last_date).days if last_date else None
         for unit, qty in data['by_unit'].items():
             line_total = (float(unit_price) * qty) if unit_price else None
             by_vendor[vendor_name].append({
@@ -788,6 +874,8 @@ def order_guide(request):
                 'line_total':  line_total,
                 'contributors': sorted(data['contributors'])[:3],
                 'case_size':   case_size,
+                'last_date':   last_date,
+                'days_since':  days_since,
             })
 
     # Sort vendor groups alphabetically; inside, by product name
@@ -803,6 +891,17 @@ def order_guide(request):
     # Name-based (product=None) stragglers
     unlinked_names = sorted(agg_by_name.values(), key=lambda r: r['name_raw'].lower())
 
+    # Usage-pattern track: non-recipe products predicted due for reorder.
+    # Grouped by vendor to mirror the recipe-driven section.
+    usage_predictions = _usage_pattern_predictions(today)
+    usage_by_vendor: dict[str, list[dict]] = defaultdict(list)
+    for p in usage_predictions:
+        usage_by_vendor[p['vendor']].append(p)
+    usage_groups = [
+        {'vendor': v, 'lines': sorted(lines, key=lambda r: -r['urgency'])}
+        for v, lines in sorted(usage_by_vendor.items())
+    ]
+
     return render(request, 'myapp/order_guide.html', {
         'start':            start,
         'end':              end,
@@ -814,6 +913,9 @@ def order_guide(request):
         'unlinked_names':   unlinked_names,
         'freetext_list':    freetext_list,
         'default_headcount': default_headcount,
+        'usage_groups':     usage_groups,
+        'usage_total':      len(usage_predictions),
+        'today':            today,
     })
 
 
