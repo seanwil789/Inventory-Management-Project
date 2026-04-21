@@ -516,21 +516,23 @@ def _parse_sysco(text: str) -> list[dict]:
                 standalone_price_lines.append((i, price))
 
     # Phase 2: pair orphan codes with standalone prices.
-    # Known codes: nearest standalone price within 6 lines (forward or back).
-    # Unknown codes: stricter — nearest price within 2 lines (forward only,
-    # since backward pairing increases barcode false positives).
+    # Column-dump layouts stack N codes together, then N prices together, so
+    # a code at line 118 may pair with a price at line 124 (6 lines ahead).
+    # Both known and unknown codes use a 6-line forward window. Only known
+    # codes additionally accept backward-adjacent prices — that direction
+    # carries more barcode false-positive risk, and the _split_code_map
+    # membership acts as a safety gate.
     used_prices = set()
     for i, norm_code, raw_code, is_known in orphan_code_lines:
         best = None
-        forward_window = 6 if is_known else 2
-        # Prefer forward direction within the code's tolerance window
+        # Forward window: 6 lines for everyone (catches column-dump blocks)
         for pi, (pline, price) in enumerate(standalone_price_lines):
             if pi in used_prices:
                 continue
-            if pline > i and pline - i <= forward_window:
+            if pline > i and pline - i <= 6:
                 best = pi
                 break
-        # Known codes also accept backward-adjacent prices (column-dump layouts)
+        # Known codes also accept backward-adjacent prices
         if best is None and is_known:
             best_dist = 999
             for pi, (pline, price) in enumerate(standalone_price_lines):
