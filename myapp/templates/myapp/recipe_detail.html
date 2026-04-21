@@ -15,12 +15,30 @@
           {% if recipe.source_doc %} · <span class="text-xs text-slate-400">{{ recipe.source_doc }}</span>{% endif %}
         </div>
         <div class="mt-2 text-sm inline-flex items-center gap-2 flex-wrap">
-          <span class="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 font-medium">
-            ${{ breakdown.total|floatformat:2 }} total · ${{ breakdown.per_serving|floatformat:3 }}/serving
-          </span>
-          <span class="text-xs text-slate-500">
-            {{ breakdown.priced }}/{{ breakdown.total_count }} ingredients priced
-          </span>
+          {% if breakdown.coverage >= 0.9 %}
+            <span class="px-2 py-0.5 rounded bg-emerald-50 text-emerald-800 font-medium"
+                  title="Confident cost — {{ breakdown.priced }} of {{ breakdown.total_count }} ingredients priced">
+              ${{ breakdown.total|floatformat:2 }} total · ${{ breakdown.per_serving|floatformat:3 }}/serving
+            </span>
+            <span class="text-xs text-emerald-700">
+              {{ breakdown.priced }}/{{ breakdown.total_count }} priced ✓
+            </span>
+          {% elif breakdown.coverage >= 0.5 %}
+            <span class="px-2 py-0.5 rounded bg-amber-50 text-amber-900 font-medium border border-amber-200"
+                  title="Partial cost — only {{ breakdown.priced }} of {{ breakdown.total_count }} ingredients contributing. Real cost is higher.">
+              ≥ ${{ breakdown.total|floatformat:2 }} partial · ${{ breakdown.per_serving|floatformat:3 }}/serving
+            </span>
+            <span class="text-xs text-amber-800">
+              only {{ breakdown.priced }}/{{ breakdown.total_count }} priced — real cost higher
+            </span>
+          {% else %}
+            <span class="px-2 py-0.5 rounded bg-red-50 text-red-800 font-medium border border-red-200"
+                  title="Too few ingredients priced to produce a reliable cost. Fix the missing-reason rows below.">
+              cost unavailable — {{ breakdown.priced }}/{{ breakdown.total_count }} priced
+            </span>
+            <a href="{% url 'recipe_edit' recipe.id %}"
+               class="text-xs text-indigo-600 hover:underline">Edit to fix →</a>
+          {% endif %}
         </div>
         {% with flags=recipe.conflict_labels %}
         {% if flags %}
@@ -72,9 +90,15 @@
               </span>
             {% endif %}
           </span>
-          <span class="text-right w-20 whitespace-nowrap font-mono {% if line.cost %}text-emerald-700{% else %}text-slate-300{% endif %}"
-                title="{{ line.note }}">
-            {% if line.cost %}${{ line.cost|floatformat:2 }}{% else %}—{% endif %}
+          <span class="text-right whitespace-nowrap">
+            {% if line.cost %}
+              <span class="font-mono text-emerald-700" title="{{ line.note }}">${{ line.cost|floatformat:2 }}</span>
+            {% else %}
+              <span class="font-mono text-slate-300">—</span>
+              <span class="block text-[10px] text-amber-700 italic mt-0.5" title="{{ line.note }}">
+                {{ line.note|truncatechars:30 }}
+              </span>
+            {% endif %}
           </span>
         </li>
         {% endwith %}
