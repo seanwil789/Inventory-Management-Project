@@ -659,6 +659,129 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class ParserPipelineIntegrationTest(TestCase):
+    """T4: full parse → map → write_invoice_to_db round-trip. Verifies the
+    three layers cooperate — parser finds items, mapper links canonical
+    names, db_write upserts to InvoiceLineItem without losing provenance."""
+
+    def _import_pipeline(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as invoice_parser
+        import mapper
+        import db_write
+        return invoice_parser, mapper, db_write
+
+    def test_pbm_end_to_end(self):
+        """Synthetic PBM OCR → 2 InvoiceLineItem rows with correct vendor,
+        date, prices, and mapping linkage. Minimal proof the pipeline
+        works as a whole, not just in pieces."""
+        parser_mod, mapper, db_write = self._import_pipeline()
+        from myapp.models import Vendor, Product, InvoiceLineItem
+
+        product = Product.objects.create(
+            canonical_name='Assorted Donuts', category='Bakery',
+        )
+        mappings = {
+            'code_map': {},
+            'desc_map': {'ASSORTED DONUTS': 'Assorted Donuts'},
+            'vendor_desc_map': {},
+            'category_map': {
+                'Assorted Donuts': {
+                    'category': 'Bakery',
+                    'primary_descriptor': '',
+                    'secondary_descriptor': '',
+                },
+            },
+        }
+
+        raw_ocr = """ABC Bakery Invoice
+Invoice #12345
+4/15/2026
+Description
+2 0290/AsstDo... Assorted Donuts
+3 0100/Bagels... Plain Bagels
+Price Each
+Amount
+1.50
+3.00
+0.75
+2.25
+Total
+$5.25
+"""
+        parsed = parser_mod.parse_invoice(raw_ocr, vendor='PBM')
+        mapped = mapper.map_items(parsed['items'], mappings=mappings,
+                                   vendor=parsed['vendor'])
+        rows_written = db_write.write_invoice_to_db(
+            parsed['vendor'], parsed['invoice_date'], mapped,
+            source_file='test_fixture_pbm.jpg',
+        )
+
+        self.assertEqual(rows_written, 2)
+
+        vendor = Vendor.objects.get(name='PBM')
+        items = InvoiceLineItem.objects.filter(vendor=vendor)
+        self.assertEqual(items.count(), 2)
+        self.assertEqual(items.first().invoice_date.isoformat(), '2026-04-15')
+
+        donut_item = items.filter(product=product).first()
+        self.assertIsNotNone(donut_item)
+        self.assertEqual(str(donut_item.unit_price), '1.50')
+        self.assertEqual(str(donut_item.extended_amount), '3.00')
+        self.assertEqual(donut_item.match_confidence, 'exact')
+        self.assertEqual(donut_item.source_file, 'test_fixture_pbm.jpg')
+
+        # Unmapped bagel still written, raw_description preserved
+        bagel_item = items.filter(product__isnull=True).first()
+        self.assertIsNotNone(bagel_item)
+        self.assertIn('Bagel', bagel_item.raw_description)
+        self.assertEqual(bagel_item.match_confidence, 'unmatched')
+
+    def test_reprocess_is_idempotent(self):
+        """db_write upserts — running the pipeline twice must not
+        duplicate rows. This is what makes reprocess_invoices safe."""
+        parser_mod, mapper, db_write = self._import_pipeline()
+        from myapp.models import Vendor, Product, InvoiceLineItem
+
+        Product.objects.create(canonical_name='Assorted Donuts', category='Bakery')
+        mappings = {
+            'code_map': {},
+            'desc_map': {'ASSORTED DONUTS': 'Assorted Donuts'},
+            'vendor_desc_map': {},
+            'category_map': {'Assorted Donuts': {
+                'category': 'Bakery', 'primary_descriptor': '',
+                'secondary_descriptor': '',
+            }},
+        }
+        raw = """Bakery
+4/15/2026
+Description
+2 0290/AsstDo... Assorted Donuts
+Price Each
+Amount
+1.50
+3.00
+Total
+$3.00
+"""
+        for run in range(2):
+            parsed = parser_mod.parse_invoice(raw, vendor='PBM')
+            mapped = mapper.map_items(parsed['items'], mappings=mappings,
+                                      vendor='PBM')
+            db_write.write_invoice_to_db(
+                'PBM', parsed['invoice_date'], mapped,
+                source_file='test_pbm.jpg',
+            )
+
+        # Only 1 invoice, 1 item — second run should upsert, not duplicate
+        self.assertEqual(InvoiceLineItem.objects.count(), 1,
+                         "Upsert failed — second run created a duplicate row")
+
+
 class ParserUnknownVendorFallbackTest(TestCase):
     """Unknown vendor → falls through to generic parser + flags needs_review."""
 
