@@ -401,6 +401,208 @@ class PrepTaskAutoDeriveTests(AuthedTestCase):
         self.assertEqual(tasks.count(), 1)
 
 
+def _import_mapper():
+    """Import the mapper module (lives in invoice_processor/, not in myapp).
+    Inserting its dir on sys.path so `import mapper` works in tests."""
+    import sys
+    from django.conf import settings
+    path = str(settings.BASE_DIR / 'invoice_processor')
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import mapper
+    return mapper
+
+
+def _fixture_mappings():
+    """A minimal mappings dict for resolve_item tests — no DB, no Sheets."""
+    return {
+        "code_map": {
+            "1234567": "Romaine",
+            "9876543": "Olive Oil",
+        },
+        "desc_map": {
+            "ROMAINE HEARTS 3CT": "Romaine",
+            "OIL OLIVE EXTRA VIRGIN 4 1GAL": "Olive Oil",
+        },
+        "vendor_desc_map": {
+            "SYSCO": {
+                "WHLFCLS ROMAINE HEARTS 3CT": "Romaine",
+            },
+            "FARM ART": {
+                "LETTUCE ROMAINE 24CT": "Romaine",
+            },
+        },
+        "category_map": {
+            "Romaine": {
+                "category": "Produce",
+                "primary_descriptor": "Leaf",
+                "secondary_descriptor": "",
+            },
+            "Olive Oil": {
+                "category": "Drystock",
+                "primary_descriptor": "Oil",
+                "secondary_descriptor": "",
+            },
+        },
+    }
+
+
+class MapperResolveItemTests(TestCase):
+    """`resolve_item` — 7-tier matching priority. Covers every tier +
+    unmatched fallback + the category_map attach."""
+
+    def test_supc_code_match_wins(self):
+        """Code match beats everything else — even vendor-scoped exact."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '1234567', 'raw_description': 'totally different'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertEqual(r['canonical'], 'Romaine')
+        self.assertEqual(r['confidence'], 'code')
+        self.assertEqual(r['score'], 100)
+        self.assertEqual(r['category'], 'Produce')
+
+    def test_vendor_scoped_exact_match(self):
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '', 'raw_description': 'WHLFCLS ROMAINE HEARTS 3CT'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertEqual(r['canonical'], 'Romaine')
+        self.assertEqual(r['confidence'], 'vendor_exact')
+        self.assertEqual(r['score'], 100)
+
+    def test_vendor_scoped_fuzzy_match(self):
+        """Slight variation still matches inside vendor scope."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '', 'raw_description': 'WHLFCLS ROMAINE HEART 3CT'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertEqual(r['canonical'], 'Romaine')
+        self.assertEqual(r['confidence'], 'vendor_fuzzy')
+        self.assertGreaterEqual(r['score'], 90)
+
+    def test_global_exact_fallthrough(self):
+        """Vendor not known, but global exact desc match still works."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '', 'raw_description': 'ROMAINE HEARTS 3CT'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='')
+        self.assertEqual(r['canonical'], 'Romaine')
+        self.assertEqual(r['confidence'], 'exact')
+
+    def test_unmatched_returns_structured_none(self):
+        """No match anywhere → canonical=None, confidence='unmatched', category=''."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '',
+                'raw_description': 'COMPLETELY UNKNOWN PRODUCT NAME'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertIsNone(r['canonical'])
+        self.assertEqual(r['confidence'], 'unmatched')
+        self.assertEqual(r['score'], 0)
+        self.assertEqual(r['category'], '')
+
+    def test_empty_desc_and_no_code_returns_unmatched(self):
+        """Guard: no description AND no SUPC → don't fuzzy-match garbage."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '', 'raw_description': ''}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertIsNone(r['canonical'])
+        self.assertEqual(r['confidence'], 'unmatched')
+
+    def test_code_still_wins_when_desc_blank(self):
+        """A SUPC code alone should resolve even if description is empty."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '9876543', 'raw_description': ''}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertEqual(r['canonical'], 'Olive Oil')
+        self.assertEqual(r['confidence'], 'code')
+
+    def test_category_map_attached(self):
+        """Resolved items get category/primary/secondary descriptors."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '1234567'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertEqual(r['category'], 'Produce')
+        self.assertEqual(r['primary_descriptor'], 'Leaf')
+
+    def test_unmatched_has_blank_category(self):
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '', 'raw_description': 'XXYYZZ'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertEqual(r['category'], '')
+        self.assertEqual(r['primary_descriptor'], '')
+
+
+class MapperStripSyscoPrefixTests(TestCase):
+    """`_strip_sysco_prefix` — removes brand-code prefix from raw Sysco
+    descriptions so fuzzy matching can work on the product name itself."""
+
+    def test_strips_known_brand_prefix(self):
+        mapper = _import_mapper()
+        self.assertEqual(
+            mapper._strip_sysco_prefix("WHLFCLS ROMAINE HEARTS 3CT"),
+            "ROMAINE HEARTS",
+        )
+
+    def test_strips_multiword_prefix(self):
+        mapper = _import_mapper()
+        result = mapper._strip_sysco_prefix("SYS CLS MAYO REGULAR 4 1GAL")
+        self.assertNotIn("SYS CLS", result)
+        self.assertIn("MAYO", result)
+
+    def test_leaves_non_prefix_alone(self):
+        """A description without a known prefix should come through unchanged."""
+        mapper = _import_mapper()
+        original = "PLAIN PRODUCT DESCRIPTION"
+        self.assertEqual(mapper._strip_sysco_prefix(original), original)
+
+    def test_strips_leading_only_qty_noise(self):
+        """OCR artefact 'ONLY 2 LB ...' gets leading-qty noise removed."""
+        mapper = _import_mapper()
+        result = mapper._strip_sysco_prefix("ONLY 2 LB WHLFCLS CARROT BABY")
+        # Both leading qty AND brand prefix should be stripped
+        self.assertNotIn("ONLY", result)
+        self.assertIn("CARROT", result)
+
+    def test_short_result_reverts_to_original(self):
+        """If stripping leaves <5 chars, revert to avoid over-stripping."""
+        mapper = _import_mapper()
+        result = mapper._strip_sysco_prefix("WHLFCLS X")  # just 'X' after strip
+        self.assertEqual(result, "WHLFCLS X")  # too short — original preserved
+
+
+class MapperJunkFilterTests(TestCase):
+    """`_is_junk_item` — filter layer that keeps OCR noise out of the DB."""
+
+    def test_fuel_surcharge_is_junk(self):
+        mapper = _import_mapper()
+        self.assertTrue(mapper._is_junk_item({'raw_description': 'FUEL SURCHARGE'}))
+
+    def test_group_total_is_junk(self):
+        mapper = _import_mapper()
+        self.assertTrue(mapper._is_junk_item({'raw_description': 'GROUP TOTAL'}))
+        self.assertTrue(mapper._is_junk_item({'raw_description': 'Group total amt'}))
+
+    def test_credit_card_surcharge_is_junk(self):
+        mapper = _import_mapper()
+        self.assertTrue(mapper._is_junk_item(
+            {'raw_description': 'CREDIT CARD SRCHRG 2.5%'}))
+
+    def test_section_header_junk(self):
+        mapper = _import_mapper()
+        self.assertTrue(mapper._is_junk_item({'raw_description': '**** DAIRY ****'}))
+
+    def test_real_product_not_junk(self):
+        mapper = _import_mapper()
+        self.assertFalse(mapper._is_junk_item(
+            {'raw_description': 'CHICKEN BREAST BONELESS SKINLESS'}))
+
+    def test_empty_is_junk(self):
+        mapper = _import_mapper()
+        self.assertTrue(mapper._is_junk_item({'raw_description': ''}))
+        self.assertTrue(mapper._is_junk_item({'raw_description': '   '}))
+
+    def test_pure_number_is_junk(self):
+        mapper = _import_mapper()
+        self.assertTrue(mapper._is_junk_item({'raw_description': '1234'}))
+
+
 class CostUtilsParseCaseSizeTests(TestCase):
     """Pure-function tests on `cost_utils.parse_case_size` — no DB, no auth.
     Adds regression coverage to the crown-jewel-parallel math layer."""
