@@ -479,7 +479,10 @@ def _parse_sysco(text: str) -> list[dict]:
         return raw_code
 
     # Phase 1: collect orphan standalone-code lines and standalone-price lines.
-    orphan_code_lines = []   # (line_idx, normalized_code, raw_code)
+    # For codes NOT in the known code_map, tag them so pairing applies
+    # stricter proximity (2 lines). Real unmapped SUPCs usually have a price
+    # very close; barcode fragments in OCR noise rarely align that tightly.
+    orphan_code_lines = []   # (line_idx, normalized_code, raw_code, is_known)
     standalone_price_lines = []  # (line_idx, price)
     for i, line in enumerate(lines):
         if i in anchor_lines or i in group_total_lines or i in used_as_split_price:
@@ -498,11 +501,13 @@ def _parse_sysco(text: str) -> list[dict]:
             norm = _normalize_code(raw_code)
             if norm in found_codes:
                 continue
-            # Only accept codes that resolve to a known product — filters out
-            # 7-digit barcode fragments and stray numeric runs in OCR text.
-            if _split_code_map and norm not in _split_code_map:
-                continue
-            orphan_code_lines.append((i, norm, raw_code))
+            # Known codes get wide pairing (6 lines). Unknown codes (not in
+            # code_map) are accepted too but must pair with a price within
+            # 2 lines — recovers legitimate unmapped SUPCs while filtering
+            # out barcode fragments and stray numeric runs in OCR text.
+            is_known = bool(_split_code_map and norm in _split_code_map) \
+                       or not _split_code_map  # empty map = test fixture, accept all
+            orphan_code_lines.append((i, norm, raw_code, is_known))
             continue
         pm = _STANDALONE_PRICE_RE.match(stripped)
         if pm:
@@ -511,23 +516,22 @@ def _parse_sysco(text: str) -> list[dict]:
                 standalone_price_lines.append((i, price))
 
     # Phase 2: pair orphan codes with standalone prices.
-    # For each code, find the nearest standalone price AFTER it (within 6 lines)
-    # that hasn't been claimed. If that fails, accept the nearest standalone
-    # price overall (within 6 lines, forward or back). This handles both the
-    # column-dump layout (codes-column then prices-column) and the single-orphan
-    # case where a price lives 2–3 lines after the code.
+    # Known codes: nearest standalone price within 6 lines (forward or back).
+    # Unknown codes: stricter — nearest price within 2 lines (forward only,
+    # since backward pairing increases barcode false positives).
     used_prices = set()
-    for i, norm_code, raw_code in orphan_code_lines:
+    for i, norm_code, raw_code, is_known in orphan_code_lines:
         best = None
-        # Prefer forward direction
+        forward_window = 6 if is_known else 2
+        # Prefer forward direction within the code's tolerance window
         for pi, (pline, price) in enumerate(standalone_price_lines):
             if pi in used_prices:
                 continue
-            if pline > i and pline - i <= 6:
+            if pline > i and pline - i <= forward_window:
                 best = pi
                 break
-        # Fall back to any nearby (within 6 lines), backward or forward
-        if best is None:
+        # Known codes also accept backward-adjacent prices (column-dump layouts)
+        if best is None and is_known:
             best_dist = 999
             for pi, (pline, price) in enumerate(standalone_price_lines):
                 if pi in used_prices:
