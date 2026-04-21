@@ -17,7 +17,7 @@ from collections import defaultdict
 from .forms import MenuForm, RecipeForm, RecipeIngredientFormSet, YieldReferenceForm
 from .models import (
     Census, IngredientSkipNote, InvoiceLineItem, Menu, MenuFreetextComponent,
-    PrepTask, Product, Recipe, RecipeIngredient, YieldReference,
+    PrepTask, Product, Recipe, RecipeIngredient, Vendor, YieldReference,
     PROTEIN_CHOICES, CONFLICT_LABELS, CONFLICT_ICONS,
 )
 
@@ -2056,6 +2056,135 @@ def price_alerts(request):
         'vendor_counts': list(vendor_counts),
         'trend': trend,
         'trend_max': trend_max,
+    })
+
+
+# ---- Pipeline health dashboard ----
+
+def pipeline_health(request):
+    """Operational dashboard for the invoice pipeline — mapping rate,
+    match-confidence distribution, per-vendor fidelity, cache sizes,
+    recent batch log status. Central place to answer 'is the pipeline
+    actually healthy' in one glance.
+
+    Cheap to compute — no DocAI calls, just DB aggregates + filesystem
+    stats. Safe to hit frequently."""
+    from collections import Counter
+    from pathlib import Path
+    from django.db.models import Count
+    from datetime import timedelta
+    import os
+
+    today = date.today()
+    window_start = today - timedelta(days=30)
+
+    # --- DB-side coverage ---
+    total_ili = InvoiceLineItem.objects.count()
+    mapped = InvoiceLineItem.objects.filter(product__isnull=False).count()
+    with_price = InvoiceLineItem.objects.filter(unit_price__isnull=False).count()
+    flagged = InvoiceLineItem.objects.filter(
+        price_flagged=True, invoice_date__gte=window_start,
+    ).count()
+    unmatched = InvoiceLineItem.objects.filter(match_confidence='unmatched').count()
+
+    # --- Match confidence histogram ---
+    conf_rows = (InvoiceLineItem.objects
+                 .values('match_confidence')
+                 .annotate(n=Count('id'))
+                 .order_by('-n'))
+    confidence_rows = [
+        {'label': r['match_confidence'] or '(blank)', 'n': r['n']}
+        for r in conf_rows
+    ]
+
+    # --- Per-vendor fidelity ---
+    vendor_rows = []
+    for v in Vendor.objects.all().order_by('name'):
+        vt = InvoiceLineItem.objects.filter(vendor=v).count()
+        vm = InvoiceLineItem.objects.filter(vendor=v, product__isnull=False).count()
+        if vt:
+            vendor_rows.append({
+                'name': v.name, 'total': vt, 'mapped': vm,
+                'pct': round(vm / vt * 100, 1),
+            })
+    vendor_rows.sort(key=lambda r: -r['total'])
+
+    # --- Cache + artifact sizes ---
+    from django.conf import settings as _settings
+    base = _settings.BASE_DIR
+    def _dir_stats(p):
+        if not p.exists():
+            return {'exists': False, 'files': 0, 'size_mb': 0}
+        files = list(p.iterdir())
+        size = sum(f.stat().st_size for f in files if f.is_file())
+        return {'exists': True, 'files': len(files), 'size_mb': round(size / 1024 / 1024, 2)}
+
+    ocr_cache = _dir_stats(base / '.ocr_cache')
+    invoice_totals = _dir_stats(base / '.invoice_totals')
+    historical_stats = _dir_stats(base / '.historical_stats')
+
+    # --- Recent batch log health ---
+    logs_dir = base / 'logs'
+    recent_logs = sorted(logs_dir.glob('invoice_batch_*.log'))[-10:] if logs_dir.exists() else []
+    log_health = {'recent': len(recent_logs), 'errors_found': 0, 'last': None}
+    for log in recent_logs:
+        try:
+            content = log.read_text()
+            if 'Traceback' in content or 'ERROR' in content:
+                log_health['errors_found'] += 1
+            log_health['last'] = log.name
+        except OSError:
+            pass
+
+    # --- Orphan products + unmapped age ---
+    from django.db.models import Count as _Count
+    orphan_count = Product.objects.annotate(n=_Count('invoicelineitem')).filter(n=0).count()
+
+    # --- Unmapped queue — how long have unmapped items been sitting ---
+    oldest_unmapped = (InvoiceLineItem.objects
+                       .filter(match_confidence='unmatched')
+                       .order_by('invoice_date')
+                       .first())
+    unmapped_age_days = None
+    if oldest_unmapped and oldest_unmapped.invoice_date:
+        unmapped_age_days = (today - oldest_unmapped.invoice_date).days
+
+    # --- Recipe linkage ---
+    menu_total = Menu.objects.count()
+    menu_linked = Menu.objects.filter(recipe__isnull=False).count()
+
+    ri_total = RecipeIngredient.objects.count()
+    ri_with_product = RecipeIngredient.objects.filter(product__isnull=False).count()
+    ri_with_qty = RecipeIngredient.objects.filter(quantity__isnull=False).count()
+    ri_with_yieldref = RecipeIngredient.objects.filter(yield_ref__isnull=False).count()
+
+    return render(request, 'myapp/pipeline_health.html', {
+        'today': today,
+        'total_ili': total_ili,
+        'mapped': mapped,
+        'mapped_pct': round(mapped / total_ili * 100, 1) if total_ili else 0,
+        'with_price': with_price,
+        'with_price_pct': round(with_price / total_ili * 100, 1) if total_ili else 0,
+        'unmatched': unmatched,
+        'flagged_30d': flagged,
+        'confidence_rows': confidence_rows,
+        'vendor_rows': vendor_rows,
+        'ocr_cache': ocr_cache,
+        'invoice_totals': invoice_totals,
+        'historical_stats': historical_stats,
+        'log_health': log_health,
+        'orphan_count': orphan_count,
+        'unmapped_age_days': unmapped_age_days,
+        'menu_total': menu_total,
+        'menu_linked': menu_linked,
+        'menu_linked_pct': round(menu_linked / menu_total * 100, 1) if menu_total else 0,
+        'ri_total': ri_total,
+        'ri_with_product': ri_with_product,
+        'ri_with_product_pct': round(ri_with_product / ri_total * 100, 1) if ri_total else 0,
+        'ri_with_qty': ri_with_qty,
+        'ri_with_qty_pct': round(ri_with_qty / ri_total * 100, 1) if ri_total else 0,
+        'ri_with_yieldref': ri_with_yieldref,
+        'ri_with_yieldref_pct': round(ri_with_yieldref / ri_total * 100, 1) if ri_total else 0,
     })
 
 
