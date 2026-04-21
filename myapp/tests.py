@@ -1842,6 +1842,18 @@ class MapperStripSyscoPrefixTests(TestCase):
         result = mapper._strip_sysco_prefix("WHLFCLS X")  # just 'X' after strip
         self.assertEqual(result, "WHLFCLS X")  # too short — original preserved
 
+    def test_strips_propack_prefix(self):
+        mapper = _import_mapper()
+        result = mapper._strip_sysco_prefix("PROPACK BAG MERCHANDISE 12X15")
+        self.assertNotIn("PROPACK", result)
+        self.assertIn("BAG", result)
+
+    def test_strips_quaker_prefix(self):
+        mapper = _import_mapper()
+        result = mapper._strip_sysco_prefix("QUAKER OATS ROLLED OLD FASHION")
+        self.assertNotIn("QUAKER", result)
+        self.assertIn("OATS", result)
+
 
 class MapperJunkFilterTests(TestCase):
     """`_is_junk_item` — filter layer that keeps OCR noise out of the DB."""
