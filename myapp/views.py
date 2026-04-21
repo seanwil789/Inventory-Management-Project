@@ -654,7 +654,8 @@ def _expand_recipe(recipe: Recipe, scale: float, depth: int = 0) -> list[dict]:
 
 
 def _latest_invoice_info(product):
-    """Return (vendor, unit_price, case_size) from the most-recent InvoiceLineItem."""
+    """Return (vendor, unit_price, case_size) from most-recent InvoiceLineItem.
+    Single-product lookup. Use `_latest_invoice_info_bulk()` for loops."""
     from myapp.models import InvoiceLineItem
     latest = (InvoiceLineItem.objects
               .filter(product=product)
@@ -664,6 +665,33 @@ def _latest_invoice_info(product):
     if not latest:
         return None, None, None
     return latest.vendor, latest.unit_price, latest.case_size
+
+
+class _VendorLite:
+    """Lightweight vendor wrapper — gives `.name` attribute so callers
+    that treat `vendor` as an object don't break. Used by bulk lookup
+    since `.values()` doesn't hydrate full Vendor instances."""
+    __slots__ = ('name',)
+    def __init__(self, name):
+        self.name = name
+
+
+def _latest_invoice_info_bulk(product_ids):
+    """Return {product_id: (vendor, unit_price, case_size)} for all products
+    in one DB query. Replaces N queries in order_guide's vendor loop."""
+    if not product_ids:
+        return {}
+    rows = (InvoiceLineItem.objects
+            .filter(product_id__in=product_ids)
+            .order_by('-invoice_date', '-imported_at')
+            .values('product_id', 'vendor__name', 'unit_price', 'case_size'))
+    out = {}
+    for r in rows:
+        pid = r['product_id']
+        if pid not in out:
+            v = _VendorLite(r['vendor__name']) if r['vendor__name'] else None
+            out[pid] = (v, r['unit_price'], r['case_size'])
+    return out
 
 
 def order_guide(request):
@@ -742,11 +770,13 @@ def order_guide(request):
                 'name': fc.name, 'qty': q, 'unit': fc.unit,
             })
 
-    # Bucket products by vendor using latest invoice
+    # Bucket products by vendor using latest invoice.
+    # One bulk query instead of N: big win for menus with many ingredients.
     from collections import defaultdict
+    latest_info = _latest_invoice_info_bulk(list(agg_by_product.keys()))
     by_vendor: dict[str, list[dict]] = defaultdict(list)
     for pid, data in agg_by_product.items():
-        vendor, unit_price, case_size = _latest_invoice_info(data['product'])
+        vendor, unit_price, case_size = latest_info.get(pid, (None, None, None))
         vendor_name = vendor.name if vendor else '— unknown / no invoice history —'
         for unit, qty in data['by_unit'].items():
             line_total = (float(unit_price) * qty) if unit_price else None
