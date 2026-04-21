@@ -478,6 +478,7 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
 
 _JUNK_RE = re.compile(
     r'^\s*$'
+    r'|^\[Sysco\s*#\d+\]$'   # unknown-SUPC placeholder from parser
     r'|FUEL\s*SURCHARGE'
     r'|CREDIT\s*CARD\s*(?:SRCHRG|CHARGE)'
     r'|REMOTE.?STOCK'
