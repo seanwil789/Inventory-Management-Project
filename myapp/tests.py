@@ -96,6 +96,42 @@ class SmokeTests(AuthedTestCase):
     def test_display_200(self):
         self.assertEqual(self.client.get(reverse('kitchen_display')).status_code, 200)
 
+    def test_category_spend_200(self):
+        self.assertEqual(self.client.get(reverse('category_spend')).status_code, 200)
+
+    def test_popularity_dashboard_200(self):
+        self.assertEqual(self.client.get(reverse('popularity_dashboard')).status_code, 200)
+
+    def test_historical_dishes_200(self):
+        self.assertEqual(self.client.get(reverse('historical_dishes')).status_code, 200)
+
+    def test_demo_ready_200(self):
+        self.assertEqual(self.client.get(reverse('demo_ready')).status_code, 200)
+
+    def test_pipeline_health_200(self):
+        self.assertEqual(self.client.get(reverse('pipeline_health')).status_code, 200)
+
+    def test_menu_bulk_link_200(self):
+        self.assertEqual(self.client.get(reverse('menu_bulk_link')).status_code, 200)
+
+    def test_recipe_missing_quantities_200(self):
+        self.assertEqual(self.client.get(reverse('recipe_missing_quantities')).status_code, 200)
+
+    def test_leftovers_view_200(self):
+        self.assertEqual(self.client.get(reverse('leftovers_view')).status_code, 200)
+
+    def test_yield_new_200(self):
+        self.assertEqual(self.client.get(reverse('yield_new')).status_code, 200)
+
+    def test_yield_bridge_200(self):
+        self.assertEqual(self.client.get(reverse('yield_bridge')).status_code, 200)
+
+    def test_bridge_skipped_200(self):
+        self.assertEqual(self.client.get(reverse('bridge_skipped')).status_code, 200)
+
+    def test_price_alerts_200(self):
+        self.assertEqual(self.client.get(reverse('price_alerts')).status_code, 200)
+
 
 @override_settings(ALLOWED_HOSTS=['testserver'])
 class RecipeCreationTests(AuthedTestCase):

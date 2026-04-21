@@ -2257,7 +2257,9 @@ def category_spend(request):
         row['est_spend'] = row['est_spend'] or Decimal('0')
 
     total_lines = sum(r['line_count'] for r in current) or 1
-    total_est_spend = sum(r['est_spend'] for r in current)
+    # Start accumulator at Decimal('0') so empty-DB path doesn't degrade
+    # to int(0), which breaks the .quantize() call downstream.
+    total_est_spend = sum((r['est_spend'] for r in current), Decimal('0'))
 
     for row in current:
         row['pct_of_lines'] = (Decimal(row['line_count']) / Decimal(total_lines) * 100).quantize(Decimal('0.1'))
