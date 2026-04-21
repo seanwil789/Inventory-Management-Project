@@ -2177,3 +2177,159 @@ class DishSuggestionTests(AuthedTestCase):
         )
         # Penalty should fire; note reasons mention yesterday
         self.assertTrue(any('yesterday dinner' in r for r in reasons))
+
+
+class MapperNewTiersTests(TestCase):
+    """Coverage for the tiers added 2026-04-21: stemmed fuzzy, char-level
+    fallback, qualifier gate, per-vendor thresholds. Locks in the behavior
+    against future threshold tuning + false positives."""
+
+    def _mapper(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import mapper
+        return mapper
+
+    def _mappings(self, canonicals: list[str], vendor_map: dict = None,
+                  desc_map: dict = None) -> dict:
+        category_map = {c: {'category': 'Produce', 'primary_descriptor': '',
+                            'secondary_descriptor': ''} for c in canonicals}
+        return {
+            'code_map': {},
+            'desc_map': desc_map or {},
+            'vendor_desc_map': vendor_map or {},
+            'category_map': category_map,
+        }
+
+    def test_stemmer_basic(self):
+        """_stem_text strips trailing 's' for 4+ char words, not 'ss'."""
+        mapper = self._mapper()
+        self.assertEqual(mapper._stem_text('ONIONS RED'), 'onion red')
+        self.assertEqual(mapper._stem_text('PINEAPPLES'), 'pineapple')
+        # 'ss' ending preserved (grass, glass)
+        self.assertEqual(mapper._stem_text('GRASS FED'), 'grass fed')
+        # <4 chars preserved ('cs', 'lb' etc.)
+        self.assertEqual(mapper._stem_text('cs'), '')  # <3 chars rejected
+        self.assertEqual(mapper._stem_text(''), '')
+
+    def test_stemmed_fuzzy_catches_plurals(self):
+        """PINEAPPLES raw → Pineapple canonical via stemmed tier."""
+        mapper = self._mapper()
+        mappings = self._mappings(['Pineapple', 'Apple', 'Banana'])
+        item = {'sysco_item_code': '', 'raw_description': 'PINEAPPLES FRESH 6CT'}
+        r = mapper.resolve_item(item, mappings, vendor='Farm Art')
+        self.assertEqual(r['canonical'], 'Pineapple')
+        self.assertEqual(r['confidence'], 'stripped_fuzzy')
+
+    def test_stemmed_fuzzy_blocked_by_qualifier(self):
+        """SHIITAKE fresh raw must NOT match 'Dried Shiitake' canonical
+        because the 'dried' qualifier is missing from raw."""
+        mapper = self._mapper()
+        mappings = self._mappings(['Dried Shiitake', 'Mushroom'])
+        item = {'sysco_item_code': '',
+                'raw_description': 'MUSHROOMS, SHIITAKE, #1, 3 LB'}
+        r = mapper.resolve_item(item, mappings, vendor='Farm Art')
+        # Should NOT match 'Dried Shiitake' — qualifier gate blocks it
+        self.assertNotEqual(r['canonical'], 'Dried Shiitake')
+
+    def test_char_fallback_catches_spelling_variant(self):
+        """Canonical 'Cantaloupe' (correctly spelled) should match raw
+        'Canteloupe' (single-char typo). Either the stemmed tier or the
+        char-level tier catches it — whichever fires first is fine as long
+        as the match succeeds in the stripped_fuzzy bucket."""
+        mapper = self._mapper()
+        mappings = self._mappings(['Cantaloupe', 'Honeydew'])
+        item = {'sysco_item_code': '', 'raw_description': 'Canteloupe'}
+        r = mapper.resolve_item(item, mappings, vendor='Farm Art')
+        self.assertEqual(r['canonical'], 'Cantaloupe')
+        self.assertEqual(r['confidence'], 'stripped_fuzzy')
+
+    def test_char_fallback_blocked_on_short_strings(self):
+        """Char ratio threshold 95 + token_sort gate 60 prevents
+        short-string garbage like 'CS' vs 'CSA' from matching."""
+        mapper = self._mapper()
+        mappings = self._mappings(['Broccoli', 'Cauliflower'])
+        item = {'sysco_item_code': '', 'raw_description': 'CS'}
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        self.assertEqual(r['confidence'], 'unmatched')
+
+    def test_qualifier_gate_allows_raw_qualifier(self):
+        """When raw has an extra qualifier word (Fresh, Raw) that canonical
+        lacks, the match still proceeds — gate is one-directional (canonical
+        stricter than raw = blocked; raw stricter than canonical = allowed)."""
+        mapper = self._mapper()
+        # Raw has 'fresh' which IS a qualifier — canonical doesn't mention it
+        # _has_missing_qualifier checks canonical_qualifiers - raw_tokens.
+        # Since canonical has no qualifiers, nothing is missing — gate passes.
+        self.assertFalse(mapper._has_missing_qualifier(
+            'pork ground fresh cryo bag', 'ground pork'))
+
+    def test_per_vendor_threshold_lookup(self):
+        """_fuzzy_threshold_for returns 85 for relaxed vendors, 90 default."""
+        mapper = self._mapper()
+        self.assertEqual(mapper._fuzzy_threshold_for('Exceptional Foods'), 85)
+        self.assertEqual(mapper._fuzzy_threshold_for('EXCEPTIONAL FOODS'), 85)
+        self.assertEqual(mapper._fuzzy_threshold_for('Delaware County Linen'), 85)
+        self.assertEqual(mapper._fuzzy_threshold_for('Colonial Village Meat Markets'), 85)
+        # Default vendors get the global 90
+        self.assertEqual(mapper._fuzzy_threshold_for('Sysco'), 90)
+        self.assertEqual(mapper._fuzzy_threshold_for('Farm Art'), 90)
+        self.assertEqual(mapper._fuzzy_threshold_for('PBM'), 90)
+        # Unknown vendors fall through to default too
+        self.assertEqual(mapper._fuzzy_threshold_for('Random Supplier Co'), 90)
+        self.assertEqual(mapper._fuzzy_threshold_for(''), 90)
+
+    def test_per_vendor_threshold_applied_in_resolve(self):
+        """vendor_fuzzy tier uses the looked-up threshold, not the global."""
+        mapper = self._mapper()
+        # Exceptional's vendor_map has an entry that scores ~87 against the
+        # raw — above 85 (Exceptional) but below 90 (Sysco). Same text
+        # matched under Exceptional should hit vendor_fuzzy; under Sysco,
+        # it falls through.
+        raw = 'BACON APPLEWOOD PRE-COOKED SLICED 10LB'
+        mapping_key = 'BACON APPLEWOOD COOKED SLICED'
+
+        # Sanity check: score is in the 85-89 band as the test assumes
+        from rapidfuzz import fuzz
+        score = fuzz.token_sort_ratio(raw, mapping_key)
+        # If this fails, tune the fixture — test depends on score in band
+        self.assertGreaterEqual(score, 85, f'fixture drift: score={score}')
+        self.assertLess(score, 90, f'fixture drift: score={score}')
+
+        vendor_map = {'EXCEPTIONAL FOODS': {mapping_key: 'Applewood Bacon'},
+                      'SYSCO': {mapping_key: 'Applewood Bacon'}}
+        mappings = self._mappings(['Applewood Bacon'], vendor_map=vendor_map)
+
+        # Exceptional: 85 threshold → matches
+        r_exc = mapper.resolve_item(
+            {'sysco_item_code': '', 'raw_description': raw},
+            mappings, vendor='Exceptional Foods')
+        self.assertEqual(r_exc['canonical'], 'Applewood Bacon')
+        self.assertEqual(r_exc['confidence'], 'vendor_fuzzy')
+
+        # Sysco: 90 threshold → DOESN'T match via vendor_fuzzy (may hit a
+        # later tier, but definitely not vendor_fuzzy at a sub-90 score)
+        r_sys = mapper.resolve_item(
+            {'sysco_item_code': '', 'raw_description': raw},
+            mappings, vendor='Sysco')
+        if r_sys['confidence'] == 'vendor_fuzzy':
+            self.assertGreaterEqual(r_sys['score'], 90)
+
+    def test_qualifier_list_coverage(self):
+        """_has_missing_qualifier detects the key qualifiers."""
+        mapper = self._mapper()
+        # Canonical has 'dried', raw doesn't → should block
+        self.assertTrue(mapper._has_missing_qualifier(
+            'mushroom shiitake', 'dried shiitake'))
+        # Canonical has 'frozen', raw doesn't → should block
+        self.assertTrue(mapper._has_missing_qualifier(
+            'strawberry fresh', 'strawberry frozen'))
+        # Both sides have 'fresh' — no mismatch
+        self.assertFalse(mapper._has_missing_qualifier(
+            'basil fresh', 'basil fresh'))
+        # Canonical has no qualifier, raw has qualifier → allowed
+        self.assertFalse(mapper._has_missing_qualifier(
+            'onion red jumbo', 'onion red'))
