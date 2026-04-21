@@ -1241,8 +1241,15 @@ def recipe_edit(request, recipe_id: int):
     else:
         form = RecipeForm(instance=recipe)
         formset = RecipeIngredientFormSet(instance=recipe)
+    # Shared datalist sources — rendered once in the template, referenced
+    # by all yield_ref / sub_recipe inputs across the formset. Replaces
+    # per-row <select> bloat (was ~500KB page; now ~90KB).
+    yield_refs = list(YieldReference.objects.order_by('ingredient', 'prep_state'))
+    sub_recipes = list(Recipe.objects.order_by('name').exclude(pk=recipe.pk))
     return render(request, 'myapp/recipe_form.html', {
         'recipe': recipe, 'form': form, 'formset': formset,
+        'yield_refs': yield_refs,
+        'sub_recipes': sub_recipes,
     })
 
 

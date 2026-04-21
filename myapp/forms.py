@@ -1,6 +1,45 @@
 from django import forms
 from django.forms import inlineformset_factory
+from django.utils.safestring import mark_safe
+from django.utils.html import escape
 from .models import Menu, Recipe, RecipeIngredient, YieldReference, CONFLICT_CHOICES
+
+
+class SharedDatalistWidget(forms.Widget):
+    """Renders as visible text input + hidden PK input, both referencing a
+    shared <datalist> declared once in the template. Eliminates the N×M
+    <option> bloat of rendering a Select per row in an inline formset.
+
+    On POST, only the hidden input is submitted under `name`; a small
+    client-side hook (see recipe_form.html) resolves the visible typed
+    value to a PK via the shared datalist.
+
+    The visible initial label is populated on page load by the same hook,
+    looking up value→label in the datalist — no DB queries per widget.
+    """
+    input_type = 'text'
+    needs_multipart_form = False
+
+    def __init__(self, datalist_id, attrs=None):
+        self.datalist_id = datalist_id
+        super().__init__(attrs)
+
+    def value_from_datadict(self, data, files, name):
+        return data.get(name)
+
+    def render(self, name, value, attrs=None, renderer=None):
+        attrs = self.build_attrs(attrs or {})
+        css = escape(attrs.pop('class', 'border rounded px-2 py-1 w-full text-sm'))
+        hidden_id = attrs.get('id') or f'id_{name}'
+        vis_id = f'{hidden_id}_label'
+        pk_val = '' if value in (None, '') else escape(str(value))
+        return mark_safe(
+            f'<input type="text" id="{vis_id}" list="{self.datalist_id}" '
+            f'class="{css}" data-dl-pk-target="{hidden_id}" '
+            f'data-dl-list="{self.datalist_id}" autocomplete="off">'
+            f'<input type="hidden" name="{name}" id="{hidden_id}" '
+            f'value="{pk_val}">'
+        )
 
 
 class ConflictsField(forms.MultipleChoiceField):
@@ -97,8 +136,8 @@ RecipeIngredientFormSet = inlineformset_factory(
         'quantity':   forms.NumberInput(attrs={'class': 'border rounded px-2 py-1 w-full text-sm', 'step': '0.001'}),
         'unit':       forms.TextInput(attrs={'class': 'border rounded px-2 py-1 w-full text-sm'}),
         'yield_pct':  forms.NumberInput(attrs={'class': 'border rounded px-2 py-1 w-full text-sm', 'step': '0.01', 'placeholder': '%'}),
-        'yield_ref':  forms.Select(attrs={'class': 'border rounded px-2 py-1 w-full text-sm'}),
-        'sub_recipe': forms.Select(attrs={'class': 'border rounded px-2 py-1 w-full text-sm'}),
+        'yield_ref':  SharedDatalistWidget(datalist_id='dl-yield-refs'),
+        'sub_recipe': SharedDatalistWidget(datalist_id='dl-sub-recipes'),
     },
 )
 

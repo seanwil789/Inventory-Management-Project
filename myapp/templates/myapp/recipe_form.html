@@ -71,4 +71,49 @@
     </form>
   </div>
 </div>
+
+<datalist id="dl-yield-refs">
+  {% for yr in yield_refs %}<option value="{{ yr.id }}">{{ yr }}</option>{% endfor %}
+</datalist>
+<datalist id="dl-sub-recipes">
+  {% for r in sub_recipes %}<option value="{{ r.id }}">{{ r.name }}</option>{% endfor %}
+</datalist>
+
+<script>
+// Shared-datalist bridge for SharedDatalistWidget.
+// Each visible <input> has data-dl-pk-target (hidden input's id) and
+// data-dl-list (datalist id). We sync bidirectionally:
+//   - On page load: hidden PK → visible label (from datalist lookup)
+//   - On user input: visible label → hidden PK (if text matches an option)
+(function () {
+  function lookupLabel(datalistId, pk) {
+    const dl = document.getElementById(datalistId);
+    if (!dl || !pk) return '';
+    const opt = Array.from(dl.options).find(o => o.value === String(pk));
+    return opt ? opt.textContent : '';
+  }
+  function lookupPk(datalistId, label) {
+    const dl = document.getElementById(datalistId);
+    if (!dl || !label) return '';
+    const opt = Array.from(dl.options).find(o => o.textContent === label);
+    return opt ? opt.value : '';
+  }
+  document.querySelectorAll('input[data-dl-pk-target]').forEach(function (visible) {
+    const hidden = document.getElementById(visible.dataset.dlPkTarget);
+    const listId = visible.dataset.dlList;
+    // Initial hydrate: if hidden has a PK, set visible text to the matching label
+    if (hidden && hidden.value) {
+      visible.value = lookupLabel(listId, hidden.value);
+    }
+    // On change/input: resolve visible text → hidden PK
+    function sync() {
+      if (!visible.value) { hidden.value = ''; return; }
+      const pk = lookupPk(listId, visible.value);
+      hidden.value = pk;  // blank if no match — form will re-validate
+    }
+    visible.addEventListener('change', sync);
+    visible.addEventListener('input', sync);
+  });
+})();
+</script>
 {% endblock %}
