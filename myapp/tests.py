@@ -659,6 +659,71 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class AuditSuspectMappingsTests(TestCase):
+    """`audit_suspect_mappings` — locks in the zero-token-overlap detector
+    and the plural-stem fix (Canteloupe ← CANTALOUPES shouldn't false-positive)."""
+
+    def _run(self):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_suspect_mappings', stdout=out)
+        return out.getvalue()
+
+    def test_zero_overlap_flagged(self):
+        """Real mapping error (Bib Aprons → Mop Heads) should appear in output."""
+        from myapp.models import Product, Vendor, InvoiceLineItem
+        v = Vendor.objects.create(name='Test Linen')
+        p = Product.objects.create(canonical_name='Mop Heads', category='Chemicals')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='Bib Aprons - White',
+            unit_price=Decimal('10.00'),
+            invoice_date=date.today(),
+        )
+        output = self._run()
+        self.assertIn('Mop Heads', output)
+        self.assertIn('Bib Aprons', output)
+
+    def test_plural_stem_overlap_not_flagged(self):
+        """'PINEAPPLES' in desc vs 'Pineapple' canonical should NOT be flagged
+        — the naive plural-strip collapses them to the same stem."""
+        from myapp.models import Product, Vendor, InvoiceLineItem
+        v = Vendor.objects.create(name='Test Produce')
+        p = Product.objects.create(canonical_name='Pineapple', category='Produce')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='PINEAPPLES GOLDEN RIPE 6CT',
+            unit_price=Decimal('10.00'),
+            invoice_date=date.today(),
+        )
+        output = self._run()
+        # 'Pineapple' might appear in overall summary text, but NOT in the
+        # Suspects section. Split on the Suspects header and check.
+        if '=== Suspects' in output:
+            suspects_section = output.split('=== Suspects')[1]
+            self.assertNotIn('Pineapple', suspects_section,
+                              "Plural stems should make Pineapple/PINEAPPLES overlap")
+
+    def test_brand_prefix_ignored(self):
+        """Sysco brand prefix 'WHLFCLS' is noise — canonical 'Eggs' should
+        still match raw 'WHLFCLS EGG SHELL MED GR AA USDA WHT' via 'egg' stem."""
+        from myapp.models import Product, Vendor, InvoiceLineItem
+        v = Vendor.objects.create(name='Test Sysco')
+        p = Product.objects.create(canonical_name='Eggs', category='Dairy')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='WHLFCLS EGG SHELL MED GR AA USDA WHT',
+            unit_price=Decimal('25.00'),
+            invoice_date=date.today(),
+        )
+        output = self._run()
+        if '=== Suspects' in output:
+            suspects_section = output.split('=== Suspects')[1]
+            self.assertNotIn('Eggs', suspects_section,
+                              "'egg'/'eggs' stem should overlap between canonical and desc")
+
+
 class ParserPipelineIntegrationTest(TestCase):
     """T4: full parse → map → write_invoice_to_db round-trip. Verifies the
     three layers cooperate — parser finds items, mapper links canonical
