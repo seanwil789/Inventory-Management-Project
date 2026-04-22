@@ -68,6 +68,88 @@ def parse_case_size(s: str | None) -> Optional[CaseInfo]:
     return None
 
 
+# ---- Description-weight extraction (Phase 2A unlock for cost calc) ----
+
+# "36/1#" or "1/40LB" — N packs of M pounds each.
+# `#(?![\d.])` rejects '1#234' (# can't be followed by a digit/decimal —
+# would be a SUPC code or part number, not a pound symbol). `LBS?\b`
+# allows LB or LBS with word-boundary terminator.
+_DESC_PER_LB = re.compile(
+    r'(\d+\.?\d*)\s*/\s*(\d+\.?\d*)\s*(?:#(?![\d.])|LBS?\b)',
+    re.IGNORECASE,
+)
+# "20 LB", "11LB", "5#", "50#" — single weight (the case total).
+# Negative-lookbehind avoids capturing the "M" half of an N/M# pattern handled above.
+_DESC_BARE_LB = re.compile(
+    r'(?<![\d/])(\d+\.?\d*)\s*(?:#(?![\d.])|LBS?\b)',
+    re.IGNORECASE,
+)
+
+
+def extract_weight_from_description(desc: str | None) -> Optional[str]:
+    """Extract a `parse_case_size`-shaped weight string from a raw invoice
+    description. Catches patterns the case_size column missed:
+      - "CS Butter Prints 36/1# Unsalted Sweet" → '36/1LB'
+      - "SWEET POTATO, YAMS, #1, 40 LB"        → '40LB'
+      - "BROCCOLI, CROWNS, 20 LB"              → '20LB'
+      - "RICOTTA, ITALIAN, 6/3 LB"             → '6/3LB'
+
+    Returns None if no weight pattern is found. Used by
+    `effective_case_size_for_cost` to fall back when the structured
+    case_size column is bare-qty (e.g. '1', '4') or missing entirely.
+    """
+    if not desc:
+        return None
+    m = _DESC_PER_LB.search(desc)
+    if m:
+        return f'{m.group(1)}/{m.group(2)}LB'
+    m = _DESC_BARE_LB.search(desc)
+    if m:
+        return f'{m.group(1)}LB'
+    return None
+
+
+# Bare 'N/M' (no unit) — interpreted as N packs of M lbs when nothing better is
+# available. Sysco uses this format ('36/1' for butter prints, '6/12' for some
+# packs). Sanity range guards against typos / non-weight ratios.
+_BARE_N_OVER_M = re.compile(r'^(\d+)/(\d+(?:\.\d+)?)$')
+_BARE_NM_MIN_LBS = Decimal('0.5')
+_BARE_NM_MAX_LBS = Decimal('200')
+
+
+def effective_case_size_for_cost(case_size: str | None,
+                                  raw_description: str | None) -> str:
+    """Return the most-useful case_size string for cost calc, in priority order:
+      1. The literal `case_size` if it already parses (no change).
+      2. Weight extracted from the invoice description (`'5# BAG'`, `'36/1#'`).
+      3. Bare 'N/M' (no unit) treated as 'N/MLB' if N×M is within a sane
+         range (0.5–200 lbs). Last-resort heuristic for Sysco notation
+         where the unit is conventionally LB.
+    Returns the original `case_size` (possibly unparseable) when no
+    strategy yields a better value, so the caller's downstream behavior
+    is unchanged in that case.
+    """
+    cs = (case_size or '').strip()
+    # 1. Original parses?
+    if parse_case_size(cs):
+        return cs
+    # 2. Description has weight?
+    desc_w = extract_weight_from_description(raw_description)
+    if desc_w and parse_case_size(desc_w):
+        return desc_w
+    # 3. Bare N/M with sane total → assume lbs
+    m = _BARE_N_OVER_M.match(cs)
+    if m:
+        n = Decimal(m.group(1))
+        per = Decimal(m.group(2))
+        total = n * per
+        if _BARE_NM_MIN_LBS <= total <= _BARE_NM_MAX_LBS:
+            synth = f'{m.group(1)}/{m.group(2)}LB'
+            if parse_case_size(synth):
+                return synth
+    return cs
+
+
 # ---- Unit conversion ----
 
 # Grams of each weight unit → canonical oz (avoirdupois)

@@ -2377,6 +2377,132 @@ class CostUtilsParseCaseSizeTests(TestCase):
             self.assertEqual(info.pack_size, Decimal("1"))
 
 
+class ExtractWeightFromDescriptionTests(TestCase):
+    """Phase 2A unlock helper. Extracts a parse_case_size-shaped weight
+    string from raw invoice descriptions. Surfaced 2026-04-22 during the
+    cost-coverage audit when ~50% of cost-eligible RIs were blocked by
+    bare-qty case_size despite the description carrying the real weight."""
+
+    def test_n_over_m_pound_pattern(self):
+        from myapp.cost_utils import extract_weight_from_description
+        # Sysco Butter: "CS Butter Prints 36/1# Unsalted Sweet" → 36 packs of 1 lb
+        self.assertEqual(
+            extract_weight_from_description('CS Butter Prints 36/1# Unsalted Sweet'),
+            '36/1LB')
+        # Farm Art: "RICOTTA, ITALIAN, 6/3 LB" → 6 packs of 3 lb
+        self.assertEqual(
+            extract_weight_from_description('RICOTTA, ITALIAN, 6/3 LB'),
+            '6/3LB')
+        # Sweet Potato bag pattern with leading punctuation
+        self.assertEqual(
+            extract_weight_from_description('SWEET POTATO, YAMS, #1, 1/40LB'),
+            '1/40LB')
+
+    def test_bare_weight_pattern(self):
+        from myapp.cost_utils import extract_weight_from_description
+        self.assertEqual(
+            extract_weight_from_description('SWEET POTATO, YAMS, #1, 40 LB'),
+            '40LB')
+        self.assertEqual(
+            extract_weight_from_description('BROCCOLI, CROWNS, 20 LB'),
+            '20LB')
+        self.assertEqual(
+            extract_weight_from_description('Flour AP 50#'),
+            '50LB')
+
+    def test_no_weight_returns_none(self):
+        from myapp.cost_utils import extract_weight_from_description
+        self.assertIsNone(extract_weight_from_description(''))
+        self.assertIsNone(extract_weight_from_description(None))
+        self.assertIsNone(extract_weight_from_description('CELERY, 24-30 CT, CS'))
+        self.assertIsNone(extract_weight_from_description('GREENS, BOK CHOY, BABY, BUSHEL'))
+        self.assertIsNone(extract_weight_from_description('EGGS XL LOOSE, 15-DOZ'))
+
+    def test_n_over_m_takes_priority(self):
+        """When both N/M# and bare-N# match, N/M wins (more specific)."""
+        from myapp.cost_utils import extract_weight_from_description
+        # "36/1# CS, 50# net" — 36/1 is the structured weight, 50# is descriptive
+        result = extract_weight_from_description('CS Butter 36/1# Net 50LB')
+        self.assertEqual(result, '36/1LB')
+
+
+class EffectiveCaseSizeForCostTests(TestCase):
+    """Composite helper that decides the best case_size string for cost calc:
+    falls back from the literal case_size column to description-extracted
+    weight to a bare-N/M-as-LB heuristic. Drives the +20 RI cost-coverage
+    unlock for Sysco Butter and similar bare-qty rows."""
+
+    def _f(self):
+        from myapp.cost_utils import effective_case_size_for_cost
+        return effective_case_size_for_cost
+
+    def test_passes_through_when_already_parseable(self):
+        f = self._f()
+        # '1/25LB' parses fine — no fallback needed
+        self.assertEqual(f('1/25LB', 'Sugar 1/25 LB bag'), '1/25LB')
+        self.assertEqual(f('50LB', 'Flour AP 50#'), '50LB')
+
+    def test_extracts_from_description_when_cs_unparseable(self):
+        f = self._f()
+        # '36/1' alone doesn't parse (no unit); description carries '36/1#'
+        self.assertEqual(f('36/1', 'CS Butter Prints 36/1# Unsalted Sweet'),
+                         '36/1LB')
+
+    def test_falls_back_to_bare_n_over_m_as_lbs(self):
+        f = self._f()
+        # cs='36/1', no description weight — heuristic fallback applies
+        self.assertEqual(f('36/1', ''), '36/1LB')
+        # Sanity range: 200 lb cap rejects '75/25' (1875 lb total)
+        # — returns original because no strategy succeeded
+        self.assertEqual(f('75/25', ''), '75/25')
+
+    def test_returns_original_when_nothing_helps(self):
+        f = self._f()
+        # Bare '1' is rejected by parse_case_size; description has no weight
+        self.assertEqual(f('1', 'CELERY, 24-30 CT, CS'), '1')
+        # Empty case_size + non-weight description
+        self.assertEqual(f('', 'BUSHEL of greens'), '')
+
+    def test_description_priority_over_bare_n_over_m(self):
+        """When both fallbacks would succeed, description wins (more reliable)."""
+        f = self._f()
+        # '36/1' → description '36/1#' AND bare-N/M heuristic both produce '36/1LB'
+        self.assertEqual(f('36/1', '36/1# product'), '36/1LB')
+
+
+class RecipeIngredientCostUnlockTests(TestCase):
+    """Integration test for the Phase 2A wiring. Confirms that
+    `RecipeIngredient.estimated_cost` now succeeds for the Sysco-Butter
+    pattern that was the canonical unlock target."""
+
+    def test_butter_36_1_cs_with_pound_description_unlocks(self):
+        from myapp.models import (
+            Vendor, Product, ProductMapping, InvoiceLineItem,
+            Recipe, RecipeIngredient,
+        )
+        from datetime import date
+        v = Vendor.objects.create(name='Sysco')
+        p = Product.objects.create(canonical_name='Butter')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='CS Butter Prints 36/1# Unsalted Sweet',
+            unit_price=Decimal('50.40'),
+            extended_amount=Decimal('50.40'),
+            case_size='36/1',
+            invoice_date=date(2026, 4, 13),
+        )
+        r = Recipe.objects.create(name='TestBiscuits')
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='Butter',
+            quantity=Decimal('1'), unit='cup', product=p,
+        )
+        cost, note = ri.estimated_cost()
+        self.assertIsNotNone(cost,
+            f'Butter 36/1 case must price after Phase 2A wiring (got {note!r})')
+        # 1 cup butter = 8 oz; case = 36 lb = 576 oz; 50.40 × (8/576) = $0.70
+        self.assertAlmostEqual(float(cost), 0.70, places=2)
+
+
 class DriveVendorCanonicalizerTests(TestCase):
     """`drive.canonical_vendor` maps short-form vendor strings to the
     long-form canonical names that detect_vendor() + _normalize_vendor()

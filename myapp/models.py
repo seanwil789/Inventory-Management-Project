@@ -368,7 +368,7 @@ class RecipeIngredient(models.Model):
 
     def estimated_cost(self):
         """Latest-price $ cost for this ingredient line. Returns (cost_or_None, note)."""
-        from .cost_utils import ingredient_cost
+        from .cost_utils import ingredient_cost, effective_case_size_for_cost
         from .models import InvoiceLineItem   # self-import ok — called at runtime
         if not self.product or self.quantity is None:
             return None, 'missing product or quantity'
@@ -381,9 +381,16 @@ class RecipeIngredient(models.Model):
         density = (self.yield_ref.ounce_weight_per_cup
                    if self.yield_ref and self.yield_ref.ounce_weight_per_cup
                    else None)
+        # Phase 2A unlock: when latest.case_size is bare-qty or empty,
+        # extract weight from the raw_description ('5# BAG', '36/1#') or
+        # fall back to interpreting bare 'N/M' as 'N/MLB'. Sysco Butter
+        # rows ('36/1' case_size, "Butter Prints 36/1#" description)
+        # are the canonical case this unlocks.
+        eff_cs = effective_case_size_for_cost(latest.case_size,
+                                              latest.raw_description)
         return ingredient_cost(
             self.quantity, self.unit, self.name_raw,
-            latest.unit_price, latest.case_size,
+            latest.unit_price, eff_cs,
             yield_pct=self.effective_yield_pct,
             ounce_weight_per_cup=density,
         )
