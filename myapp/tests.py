@@ -941,6 +941,88 @@ class ManagementCommandSmokeTests(TestCase):
         """Empty DB → command short-circuits cleanly, no OCR cache access."""
         self._run('backfill_section_hints', dry_run=True)
 
+    def test_audit_semantic_mismatches_empty_db(self):
+        """Empty DB → command runs, reports zero mismatches."""
+        out = self._run('audit_semantic_mismatches')
+        self.assertIn('Semantic mismatches', out)
+        self.assertIn('0 unique', out)
+
+
+class AuditSemanticMismatchesTests(TestCase):
+    """`audit_semantic_mismatches` — flags ILI rows whose section_hint
+    disagrees with the linked product's category."""
+
+    def _run(self, *args):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_semantic_mismatches', *args, stdout=out)
+        return out.getvalue()
+
+    def setUp(self):
+        super().setUp()
+        self.v = Vendor.objects.create(name='Sysco')
+
+    def _ili(self, product, section_hint):
+        return InvoiceLineItem.objects.create(
+            vendor=self.v, product=product, section_hint=section_hint,
+            raw_description=f'raw {product.canonical_name}',
+            unit_price=Decimal('1.00'), invoice_date=date(2026, 4, 1),
+        )
+
+    def test_flags_chemical_section_with_dairy_category(self):
+        p = Product.objects.create(canonical_name='TestDairyItem', category='Dairy')
+        self._ili(p, 'CHEMICAL & JANITORIAL')
+        out = self._run()
+        self.assertIn('TestDairyItem', out)
+        self.assertIn('CHEMICAL & JANITORIAL', out)
+
+    def test_ignores_matching_section_category(self):
+        p = Product.objects.create(canonical_name='TestProduce', category='Produce')
+        self._ili(p, 'PRODUCE')
+        out = self._run()
+        self.assertNotIn('TestProduce', out)
+        self.assertIn('0 unique', out)
+
+    def test_dairy_section_accepts_cheese_category(self):
+        """Sysco DAIRY section commonly includes cheese — should NOT flag."""
+        p = Product.objects.create(canonical_name='TestCheese', category='Cheese')
+        self._ili(p, 'DAIRY')
+        out = self._run()
+        self.assertNotIn('TestCheese', out)
+
+    def test_ambiguous_sections_hidden_by_default(self):
+        """CANNED & DRY has too broad a valid set — suppress without --show-all."""
+        p = Product.objects.create(canonical_name='TestOddItem', category='Dairy')
+        self._ili(p, 'CANNED & DRY')
+        out_hidden = self._run()
+        self.assertNotIn('TestOddItem', out_hidden)
+        out_shown = self._run('--show-all')
+        self.assertIn('TestOddItem', out_shown)
+
+    def test_ignores_rows_without_section_hint(self):
+        p = Product.objects.create(canonical_name='TestNoHint', category='Dairy')
+        self._ili(p, '')
+        out = self._run()
+        self.assertNotIn('TestNoHint', out)
+
+    def test_ignores_rows_without_product(self):
+        InvoiceLineItem.objects.create(
+            vendor=self.v, product=None, section_hint='PRODUCE',
+            raw_description='unknown thing', unit_price=Decimal('1.00'),
+            invoice_date=date(2026, 4, 1),
+        )
+        out = self._run()
+        self.assertIn('0 unique', out)
+
+    def test_unknown_section_warned(self):
+        """Section_hint not in the mapping table → warning, but not a flag."""
+        p = Product.objects.create(canonical_name='TestWeird', category='Proteins')
+        self._ili(p, 'WEIRD NEW SECTION')
+        out = self._run()
+        self.assertIn('WEIRD NEW SECTION', out)
+        self.assertIn('not in mapping', out)
+
 
 class SectionHintBackfillTests(TestCase):
     """Unit tests for the section-header detection logic used by

@@ -116,19 +116,25 @@ class Command(BaseCommand):
         code_re = re.compile(r'\[Sysco\s*#(\d+)\]')
 
         for row in qs.iterator():
-            # For unknown-code rows, extract from placeholder; else skip empty
+            # Try two probes in order: (1) [Sysco #NNN] code, (2) raw_description
+            # text itself. Mapped rows have real descriptions; unmapped rows have
+            # the code placeholder.
+            probe = None
             m = code_re.search(row.raw_description or '')
-            if not m:
-                # --all mode: use source_file + raw_description as probe
-                # (skip rows we can't locate without a code)
+            if m:
+                probe = m.group(1)
+            elif row.raw_description and len(row.raw_description) >= 10:
+                # Use the raw_description as probe — long enough to be
+                # distinctive in the OCR text.
+                probe = row.raw_description[:40]
+            else:
                 not_found += 1
                 continue
-            code = m.group(1)
 
-            # Find the code in the OCR caches
+            # Find the probe in the OCR caches
             section_found = ''
             for raw_text in caches:
-                pos = raw_text.find(code)
+                pos = raw_text.find(probe)
                 if pos < 0:
                     continue
                 section = _section_before(raw_text, pos)
