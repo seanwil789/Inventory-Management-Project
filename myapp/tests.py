@@ -1230,6 +1230,71 @@ Total Due
         result = parser_mod.parse_invoice(raw, vendor='Delaware County Linen')
         self.assertEqual(result.get('invoice_total'), 66.00)
 
+    def test_column_dump_fallback(self):
+        """Google Document AI emits Delaware Linen invoices as full columns
+        (all qtys, then all item codes, then all descriptions, then all
+        prices) rather than row-interleaved. The primary parser's
+        'Amount'-header anchor produces 0 items on that layout. A
+        column-dump fallback must kick in when the primary path yields
+        nothing, pairing each description with a (qty, unit, amount)
+        triple where qty × unit ≈ amount. Regression for the 2026-04-21
+        scour finding on cached DocAI OCR."""
+        parser_mod = self._import_parser()
+        raw = """Delaware County Linen, Inc
+2626 W. 4th Street
+Chester, PA 19013
+Bill To
+Synergy Housung
+Customer Contact
+Customer Phone
+Terms
+484-888-3429
+Net 7
+Qty
+Item Code
+Description
+300
+25
+MOPS
+BAPSWT
+Bar Mops
+Bib Aprons White
+Invoice
+Date
+Invoice #
+2/18/2026
+224885
+Route No.
+32
+Unit Price
+Amount
+Qty Adjustment
+0.22
+66.00T
+0.40
+10.00
+76.00
+Total Due
+$76.00
+Payments/Credits
+$0.00
+Balance Due
+$76.00
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Delaware County Linen')
+        items = result['items']
+        self.assertEqual(len(items), 2,
+            f'expected 2 items via column-dump fallback, got {len(items)}: '
+            f'{[it.get("raw_description") for it in items]}')
+        by_desc = {it['raw_description']: it for it in items}
+        self.assertIn('Bar Mops', by_desc)
+        self.assertIn('Bib Aprons White', by_desc)
+        # Line-total reconciliation: 300 × 0.22 = 66.00; 25 × 0.40 = 10.00
+        self.assertAlmostEqual(by_desc['Bar Mops']['extended_amount'],
+                               66.00, places=2)
+        self.assertAlmostEqual(by_desc['Bib Aprons White']['extended_amount'],
+                               10.00, places=2)
+
 
 class ParserColonialAndFallbackTests(TestCase):
     """Colonial Meat (handwritten — all items flagged needs_review) +

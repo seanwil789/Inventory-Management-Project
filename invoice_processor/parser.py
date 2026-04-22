@@ -1887,6 +1887,120 @@ def _parse_pbm(text: str) -> list[dict]:
 # Delaware County Linen parser
 # ---------------------------------------------------------------------------
 
+def _parse_delaware_linen_column_dump(text: str) -> list[dict]:
+    """Fallback column-dump parser for Delaware Linen invoices whose OCR
+    emits full columns (all qtys, then all codes, then all descriptions,
+    then all prices) rather than the row-interleaved layout the primary
+    parser expects. Google Document AI produces this shape.
+
+    Strategy:
+      1. Scan the full text for positive-integer standalone lines → qty pool.
+      2. Collect description-like lines (letters, not headers/footnotes).
+      3. Collect price-like lines (N.NN optionally trailing T/*).
+      4. For each description, look for a (qty, price) pair where
+         qty × price ≈ some amount in the pool. That (qty, price, amount)
+         triple becomes the item's quantity / unit_price / extended_amount.
+
+    Descriptions without a matching triple are dropped — they're usually
+    fee/footer text the description filter didn't catch.
+    """
+    lines = [l.strip() for l in text.splitlines()]
+
+    # Skip lines that look like descriptions but aren't product items
+    skip_desc = re.compile(
+        r'^(Qty|Item Code|Description|Unit Price|Amount|Qty Adjustment|'
+        r'Customer|Invoice|Date|Route|Driver|Terms|Bill To|Ship To|'
+        r'Net \d|Net$|'                           # payment terms: "Net 7"
+        r'Delaware County|Fuel\s?Surcharge|Delivery Cha|PA Sales Tax|'
+        r'All items|Please|Thank|PLEASE|PO BOX|www\.|Total|Subtotal|'
+        r'Payments|Balance|FuelSurcharge|P\.\s*O\.|Phone|Fax|'
+        r'Synergy|David|Chester|Linwood|West Chester)',  # address/contact seen in real OCR
+        re.IGNORECASE,
+    )
+    # Address-like patterns: street numbers (line starts with digit) and
+    # "City, ST 12345" lines. Product descriptions at Delaware Linen never
+    # start with digits and never match a city-state-zip shape.
+    address_re = re.compile(
+        r'^\d'                                      # starts with digit → street #
+        r'|,\s*[A-Z]{2}\s+\d{5}'                    # ", PA 19013" anywhere in line
+        r'|^\d{3}\s*-\s*\d{3}\s*-\s*\d{4}$',         # phone number
+    )
+
+    qty_candidates: list[tuple[int, int]] = []       # (line_idx, value)
+    desc_candidates: list[tuple[int, str]] = []      # (line_idx, text)
+    price_candidates: list[tuple[int, float]] = []   # (line_idx, value)
+
+    for idx, line in enumerate(lines):
+        if not line:
+            continue
+        # Standalone positive integer → qty candidate
+        m = re.match(r'^(\d+)$', line)
+        if m:
+            val = int(m.group(1))
+            if 1 <= val <= 9999:
+                qty_candidates.append((idx, val))
+            continue
+        # Standalone decimal (with optional trailing T or *) → price candidate
+        m = re.match(r'^(\d+(?:\.\d+)?)[T*]?$', line)
+        if m:
+            val = float(m.group(1))
+            if 0.01 <= val <= 10000:
+                price_candidates.append((idx, val))
+            continue
+        # Description-like: has letters, not a header/footer, not an address
+        if re.search(r'[A-Za-z]{3,}', line) and not skip_desc.match(line):
+            # Drop all-caps single words (item codes like MOPS, BAPSWT)
+            if re.match(r'^[A-Z]+$', line) and len(line) <= 8:
+                continue
+            # Drop street addresses, city-state-zip, phone numbers
+            if address_re.search(line):
+                continue
+            desc_candidates.append((idx, line))
+
+    prices_by_idx = {i: v for i, v in price_candidates}
+    price_values = [v for _, v in price_candidates]
+
+    items: list[dict] = []
+    used_prices: set[int] = set()
+    used_qtys: set[int] = set()
+
+    # For each description, try to match to a (qty, unit_price, amount) triple.
+    # qty × unit_price ≈ amount  within a $0.50 tolerance.
+    for di, (d_idx, desc) in enumerate(desc_candidates):
+        best = None
+        for qi, (q_idx, qty) in enumerate(qty_candidates):
+            if qi in used_qtys:
+                continue
+            for ui, (u_idx, unit) in enumerate(price_candidates):
+                if ui in used_prices:
+                    continue
+                expected = round(qty * unit, 2)
+                for ai, (a_idx, amt) in enumerate(price_candidates):
+                    if ai in used_prices or ai == ui:
+                        continue
+                    if abs(amt - expected) <= 0.50:
+                        best = (qi, ui, ai, qty, unit, amt)
+                        break
+                if best:
+                    break
+            if best:
+                break
+        if best:
+            qi, ui, ai, qty, unit, amt = best
+            used_qtys.add(qi)
+            used_prices.add(ui)
+            used_prices.add(ai)
+            items.append({
+                "raw_description": desc,
+                "unit_price":      unit,
+                "extended_amount": amt,
+                "case_size_raw":   "",
+                "quantity":        qty,
+            })
+
+    return items
+
+
 def _parse_delaware_linen(text: str) -> list[dict]:
     """
     Delaware County Linen invoices:
@@ -2002,6 +2116,12 @@ def _parse_delaware_linen(text: str) -> list[dict]:
         if m:
             invoice_total = float(m.group(1).replace(",", ""))
             break
+
+    # Fallback: DocAI OCR dumps full columns rather than row-interleaved
+    # rows, so the primary parser's "Amount"-header anchor doesn't fire.
+    # When we extracted zero items, retry with a column-dump strategy.
+    if not items:
+        items = _parse_delaware_linen_column_dump(text)
 
     items_total = round(sum(it.get("extended_amount", 0) for it in items), 2)
     if invoice_total is not None:
