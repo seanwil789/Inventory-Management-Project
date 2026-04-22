@@ -1,11 +1,18 @@
 """
 Reprocess only JPG invoices from the Drive archive with updated DocAI + Vision fallback.
 Skips PDFs (which have the merge-vendor bug on multi-page scans).
+
+Usage:
+  python reprocess_jpgs.py --dry-run                # preview, no DB/Sheet writes
+  python reprocess_jpgs.py --year 2025 --year 2026  # restrict to 2025 and 2026
+  python reprocess_jpgs.py --dry-run --year 2026    # combine flags
+  python reprocess_jpgs.py                          # full archive, live mode
 """
 import os
 import sys
 import tempfile
 import time
+import argparse
 
 sys.path.insert(0, os.path.dirname(__file__))
 os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myproject.settings')
@@ -26,9 +33,30 @@ from sheets import append_to_data_sheet
 from synergy_sync import sync_prices_from_items
 from reprocess_archive import walk_archive, download_file
 
+
+def _folder_path_year(folder_path: str) -> str:
+    """Extract the year from a folder path like '2025/05 May 2025/...'"""
+    return folder_path.split('/', 1)[0] if folder_path else ''
+
+
 def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('--dry-run', action='store_true',
+                        help='Preview the reprocess — no DB writes, no Sheet writes, '
+                             'no price syncs. Downloads + OCR + parse only.')
+    parser.add_argument('--year', action='append', default=None,
+                        help='Restrict to one or more year folders (e.g. --year 2025 '
+                             '--year 2026). Case-insensitive exact folder-name match. '
+                             'Default: walk all year folders.')
+    args = parser.parse_args()
+
     drive = get_drive_client()
-    print("=== JPG Reprocessor [LIVE MODE] ===\n")
+    mode_label = "[DRY RUN]" if args.dry_run else "[LIVE MODE]"
+    year_label = f" — years: {', '.join(args.year)}" if args.year else ""
+    print(f"=== JPG Reprocessor {mode_label}{year_label} ===\n")
+
+    year_filter = set(args.year) if args.year else None
+
     print("Loading item mappings...")
     mappings = load_mappings(force_refresh=True)
     print(f"  {len(mappings.get('desc_map', {}))} desc mappings, "
@@ -36,6 +64,7 @@ def main():
 
     processed = 0
     errors = 0
+    skipped_year = 0
     total_items = 0
     total_with_desc = 0
     total_matched = 0
@@ -47,6 +76,13 @@ def main():
         # Only process JPGs
         if ext not in ('.jpg', '.jpeg'):
             continue
+
+        # Year filter
+        if year_filter is not None:
+            year = _folder_path_year(folder_path)
+            if year not in year_filter:
+                skipped_year += 1
+                continue
 
         file_id = drive_file["id"]
         print(f"[{processed+1}] {folder_path}/{file_name}")
@@ -90,18 +126,21 @@ def main():
             n_desc = sum(1 for i in items if i.get("raw_description", "").strip())
             still_missing = len(items) - n_desc
 
-            # Map items
+            # Map items (pure read — safe in dry-run)
             mapped = map_items(items, mappings=mappings, vendor=parsed["vendor"])
             matched = sum(1 for i in mapped if i["confidence"] != "unmatched")
 
-            # Write to DB
-            if parsed.get("invoice_date"):
+            # Write to DB (skipped in dry-run)
+            if args.dry_run:
+                db_rows = 0
+                print(f"  [DRY RUN] would write {len(mapped)} rows for "
+                      f"{parsed.get('vendor', '?')} {parsed.get('invoice_date', '?')}")
+            elif parsed.get("invoice_date"):
                 db_rows = write_invoice_to_db(
                     parsed["vendor"], parsed["invoice_date"], mapped,
                     source_file=file_name,
                 )
-
-                # Sync prices
+                # Sync prices (skipped in dry-run)
                 sync_prices_from_items(
                     mapped, vendor=parsed["vendor"],
                     invoice_date=parsed["invoice_date"],
@@ -115,7 +154,8 @@ def main():
             processed += 1
 
             status = "OK" if still_missing == 0 else f"{still_missing} no desc"
-            print(f"  {len(items)} items, {n_desc} desc, {matched} mapped, {db_rows} written — {status}")
+            print(f"  {len(items)} items, {n_desc} desc, {matched} mapped, "
+                  f"{db_rows} written — {status}")
 
         except Exception as e:
             print(f"  ERROR: {e}")
@@ -125,13 +165,17 @@ def main():
                 os.remove(tmp_path)
 
     print(f"\n{'=' * 60}")
-    print(f"DONE — {processed} JPGs processed, {errors} errors")
+    print(f"DONE {mode_label} — {processed} JPGs processed, {errors} errors")
+    if year_filter:
+        print(f"Skipped (outside year filter): {skipped_year}")
     print(f"{'=' * 60}")
     print(f"Total items:       {total_items}")
     print(f"With description:  {total_with_desc} ({total_with_desc/max(total_items,1)*100:.1f}%)")
     print(f"Mapped to product: {total_matched} ({total_matched/max(total_items,1)*100:.1f}%)")
     still = total_items - total_with_desc
     print(f"Still missing desc: {still} ({still/max(total_items,1)*100:.1f}%)")
+    if args.dry_run:
+        print(f"\n[DRY RUN] No DB rows written, no Sheet syncs performed.")
 
 
 if __name__ == "__main__":

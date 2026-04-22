@@ -2431,6 +2431,33 @@ class DriveVendorCanonicalizerTests(TestCase):
                 f'{variant!r} should normalize to "Farm Art"')
 
 
+class ReprocessJpgsYearFilterTests(TestCase):
+    """`reprocess_jpgs._folder_path_year` extracts the year folder name
+    from a walk_archive folder_path string. Powers the `--year` CLI
+    filter so reprocess runs can be restricted to one or more years
+    (e.g. skip 2022 pre-Synergy archive data)."""
+
+    def _import_script(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import reprocess_jpgs
+        return reprocess_jpgs
+
+    def test_extracts_year(self):
+        rj = self._import_script()
+        self.assertEqual(rj._folder_path_year('2025/05 May 2025/Sysco/Week 1'), '2025')
+        self.assertEqual(rj._folder_path_year('2026/04 April 2026/Farm Art/Week 2'), '2026')
+        self.assertEqual(rj._folder_path_year('2022/08 August 2022/Exceptional'), '2022')
+
+    def test_empty_path(self):
+        rj = self._import_script()
+        self.assertEqual(rj._folder_path_year(''), '')
+        self.assertEqual(rj._folder_path_year('2026'), '2026')
+
+
 class CostUtilsUnitKindTests(TestCase):
     """`unit_kind` classification — weight / volume / count / unknown."""
 
