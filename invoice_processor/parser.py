@@ -841,9 +841,6 @@ def _parse_sysco(text: str) -> list[dict]:
 
     # Build final items, tagging each with its section
     for ai, (line_idx, item_code, price, prefix) in enumerate(anchors):
-        # Best source: code_map canonical name (reliable, code-based)
-        code_canonical = _code_map.get(item_code, "")
-
         if anchor_matches[ai]:
             ocr_description, case_size, catch_wt = anchor_matches[ai]
         else:
@@ -851,13 +848,20 @@ def _parse_sysco(text: str) -> list[dict]:
             case_size = ""
             catch_wt = None
 
-        # Use code_map canonical as the description when available.
-        # It's more reliable than OCR text (which can be misaligned
-        # when columns are read in different orders).
-        # Fall back to OCR description for unknown codes.
-        if code_canonical:
-            description = code_canonical
-        elif ocr_description:
+        # raw_description always preserves the OCR text when available.
+        # The canonical (product resolution) comes from the mapper's code
+        # tier via sysco_item_code — we don't need to bake it into the
+        # description. This keeps the original text searchable for audits,
+        # enables re-derivation of more-specific canonicals later (e.g.
+        # distinguishing Chobani flavors that all share one code_map entry),
+        # and lets the semantic audit flag mismatches.
+        #
+        # Column misalignment risk: when anchor is assigned a wrong-column
+        # description, raw_description may not match the product FK set by
+        # the code-tier mapper. That's a known minor cost; the code-tier
+        # resolution still yields the correct product. Worth it for the
+        # audit/recovery capability.
+        if ocr_description:
             description = ocr_description
         else:
             description = f"[Sysco #{item_code}]"
