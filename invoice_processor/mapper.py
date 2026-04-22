@@ -535,7 +535,23 @@ _JUNK_RE = re.compile(
     r'|^6#10$'
     r'|CANNED\s*&\s*DRY\s*\*'
     r'|^[\d\s.,/]+$'
-    r'|CHEMICAL\s+JANITORIAL\s+GROUP',
+    r'|CHEMICAL\s+JANITORIAL\s+GROUP'
+    # Additional Sysco header/footer OCR artifacts surfaced 2026-04-21
+    r'|CONFIDENTIAL\s+PROPERTY\s+OF\s+SYSCO'
+    r'|^CUBE\s+QUOPSTOCK$'
+    r'|^DELV\.?\s*DATE\s*$'
+    r'|^DFL\d+\w+$'
+    r'|FRESH["\'\s]*MENU\s+ITEM'
+    r'|^INVOICE\s+NUMBER\s*$'
+    r'|^ITEM\s+DESCRIPTION\s*$'
+    r'|^MA:\s+\w+'                       # 'MA: T4CBZ DAVID CIANFARO'
+    r'|MANIFEST#\s*\d+'                  # 'MANIFEST# 1238296 NORMAL DELIVERY'
+    r'|^ONLY\s*\d+\s*KILOROLAND$'        # odd pickup-truncation artifact
+    r'|^ONLY\d+GAL\s*$'                  # 'ONLY1GAL' — size orphan
+    r'|^PURCHASE\s+ORDER\s*$'
+    r'|^RIBEYE\d+\w*$'                   # 'RIBEYE00STH' — item-code orphan
+    r'|TERMS\s*-?\s*PAST\s+DUE'
+    r'|^YP\d+\w+$',                      # 'YP160CSYSA' — code orphan
     re.IGNORECASE,
 )
 

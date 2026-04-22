@@ -1890,6 +1890,33 @@ class MapperJunkFilterTests(TestCase):
         mapper = _import_mapper()
         self.assertTrue(mapper._is_junk_item({'raw_description': '1234'}))
 
+    def test_sysco_header_footer_artifacts_filtered(self):
+        """Sysco OCR frequently leaks invoice header/footer lines into the
+        item list. These should not reach the DB as "unmapped products"."""
+        mapper = _import_mapper()
+        artifacts = [
+            'CONFIDENTIAL PROPERTY OF SYSCO',
+            'CUBE QUOPSTOCK',
+            'DELV. DATE',
+            'DFL124TBWSYS',
+            'FRESH" MENU ITEM.',
+            'INVOICE NUMBER',
+            'ITEM DESCRIPTION',
+            'MA: T4CBZ DAVID CIANFARO',
+            'MANIFEST# 1238296 NORMAL DELIVERY',
+            'ONLY 2 KILOROLAND',
+            'ONLY1GAL',
+            'PURCHASE ORDER',
+            'RIBEYE00STH',
+            'TERMS -PAST DUE BALANCES ARE SUBJECT TO SERVICE CHARGE',
+            'YP160CSYSA',
+        ]
+        for raw in artifacts:
+            self.assertTrue(
+                mapper._is_junk_item({'raw_description': raw}),
+                f'{raw!r} should be filtered as junk',
+            )
+
 
 class CostUtilsParseCaseSizeTests(TestCase):
     """Pure-function tests on `cost_utils.parse_case_size` — no DB, no auth.
