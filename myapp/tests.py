@@ -3305,3 +3305,82 @@ class LatestInvoiceInfoBulkTests(TestCase):
     def test_empty_input(self):
         from myapp.views import _latest_invoice_info_bulk
         self.assertEqual(_latest_invoice_info_bulk([]), {})
+
+
+class SynergySyncCalcPricePerLbTests(TestCase):
+    """`calc_price_per_lb` — the per-pound formula that drives col J on the
+    Synergy sheet. Bare-'1' bug surfaced 2026-04-22 produced the misleading
+    E==J pattern (Yellow Onion E=$32.50 / J=$32.50, Pork Butt E=$40.50 /
+    J=$40.50) — bare integers <2 must NOT be interpreted as pounds."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from synergy_sync import calc_price_per_lb
+        return calc_price_per_lb
+
+    def test_bare_one_with_pound_unit_returns_none(self):
+        """The headline bug: case_size='1' + unit='#' must NOT yield
+        J = case_price ÷ 1 = case_price."""
+        calc = self._import()
+        self.assertIsNone(calc(32.50, '1', '#'),
+            "bare '1' is almost always '1 case' from OCR, not '1 pound'")
+        self.assertIsNone(calc(40.50, '1', '#'),
+            "bare '1' must not produce J equal to case price")
+
+    def test_bare_fractional_under_two_returns_none(self):
+        """Fractional values < 2 are also not credible weights."""
+        calc = self._import()
+        self.assertIsNone(calc(20.00, '0.5', '#'))
+        self.assertIsNone(calc(20.00, '1.5', '#'))
+
+    def test_bare_two_or_more_still_computes(self):
+        """The fix only blocks <2 — 2+ remains a usable weight."""
+        calc = self._import()
+        self.assertAlmostEqual(calc(2.90, '2', '#'), 1.45, places=4,
+            msg='Red Onion 2 lb @ $2.90 case = $1.45/lb')
+        self.assertAlmostEqual(calc(6.50, '3', '#'), 2.1667, places=3,
+            msg='Bell Pepper 3 lb @ $6.50 case ≈ $2.17/lb')
+        self.assertAlmostEqual(calc(50.00, '10', '#'), 5.00, places=4)
+
+    def test_n_over_m_unaffected(self):
+        """The N/M bare-integer-with-unit=# path is preserved when total >= 2.
+        Picks examples that don't trip the M/D-date heuristic
+        (which rejects 1<=first<=12 with second>12)."""
+        calc = self._import()
+        # 36 packs × 1 lb each = 36 lbs total; $50.40 ÷ 36 = $1.40/lb (butter)
+        self.assertAlmostEqual(calc(50.40, '36/1', '#'), 1.40, places=4)
+        # 6 packs × 5 lb each = 30 lbs; $90 ÷ 30 = $3/lb
+        self.assertAlmostEqual(calc(90.00, '6/5', '#'), 3.00, places=4)
+
+    def test_n_over_m_rejects_total_under_two(self):
+        """N/M with N*M < 2 hits the same E==J bug as bare '1'.
+        Example from Apr 22 protein sheet: Prosciutto cs='1/1' (1*1=1 lb)
+        produced J = $15.28/1 = $15.28 = E. Extension of the bare-2 fix."""
+        calc = self._import()
+        self.assertIsNone(calc(15.28, '1/1', '#'),
+            msg="'1/1' = 1 lb total — same E==J symptom as bare '1'")
+
+    def test_explicit_lb_suffix_unaffected(self):
+        """When parse_total_weight_lbs succeeds, the bare-fallback never runs."""
+        calc = self._import()
+        self.assertAlmostEqual(calc(99.80, '20.0LB', '#'), 4.99, places=4)
+        self.assertAlmostEqual(calc(50.00, '10LB', '#'), 5.00, places=4)
+
+    def test_no_pound_unit_returns_none(self):
+        """Without unit='#', bare numbers don't trigger the lbs path at all."""
+        calc = self._import()
+        self.assertIsNone(calc(32.50, '1', ''))
+        self.assertIsNone(calc(32.50, '1', 'EA'))
+        self.assertIsNone(calc(32.50, '5', 'GAL'))
+
+    def test_dates_rejected(self):
+        """Date-shaped strings are rejected (regression for prior fix)."""
+        calc = self._import()
+        self.assertIsNone(calc(38.40, '10/14', '#'),
+            msg="'10/14' parses as Oct 14 — must NOT be 10×14=140 lbs")
+        self.assertIsNone(calc(20.00, '04/06', '#'),
+            msg="'04/06' is Apr 6 — leading-zero pattern always a date")

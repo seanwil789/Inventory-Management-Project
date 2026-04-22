@@ -201,18 +201,26 @@ def calc_price_per_lb(unit_price: float, case_size: str,
         s = case_size.strip()
         if _looks_like_date(s):
             return None
-        # Bare number
+        # Bare number — only trust as lbs when >= 2.
+        # Bare '1' with unit='#' produced J = case_price ÷ 1 = case_price, the
+        # misleading E==J symptom on the Synergy sheet (Yellow Onion $32.50 /
+        # $32.50, Pork Butt $40.50 / $40.50, etc.). No real product is sold as
+        # a 1-lb case marked with weight unit; '1' here is almost always
+        # "1 case" from OCR, not "1 pound". Same for fractional values < 2.
         m = re.match(r'^(\d+\.?\d*)$', s)
         if m:
             lbs = float(m.group(1))
-            if lbs > 0:
+            if lbs >= 2:
                 return round(unit_price / lbs, 4)
-        # N/M with unit=# → N × M total pounds
+        # N/M with unit=# → N × M total pounds.
+        # Same threshold as bare numbers: total weight must be >= 2 lbs.
+        # Catches '1/1' (Prosciutto) where 1×1 = 1 lb total reproduces the
+        # E==J symptom via N/M path instead of bare-number path.
         m = re.match(r'^(\d+)\s*/\s*(\d+\.?\d*)$', s)
         if m:
             n, per = int(m.group(1)), float(m.group(2))
             total = n * per
-            if total > 0:
+            if total >= 2:
                 return round(unit_price / total, 4)
 
     return None
