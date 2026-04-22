@@ -379,10 +379,18 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
         vendor_name = ili.vendor.name if ili.vendor else ""
         key = (canonical, vendor_name)
         if key not in seen:
+            # Phase 4: prefer extended_amount (line total = case price for
+            # multi-unit Farm Art / PBM lines like '4 BAG bananas at $2.70 ea'
+            # totaling $10.69). For Sysco / Exceptional, ext == unit so this
+            # is a no-op. The sheet's col E semantics are "case price" and
+            # the line total IS the case price for per-unit-priced vendors.
+            case_price = (float(ili.extended_amount)
+                          if ili.extended_amount and ili.extended_amount > 0
+                          else float(ili.unit_price))
             seen[key] = {
                 "canonical":             canonical,
                 "vendor_name":           vendor_name,
-                "unit_price":            float(ili.unit_price),
+                "unit_price":            case_price,
                 "case_size_raw":         ili.case_size or "",
                 "category":              ili.product.category,
                 "primary_descriptor":    ili.product.primary_descriptor,
