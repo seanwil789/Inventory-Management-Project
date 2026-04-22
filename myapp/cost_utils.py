@@ -254,6 +254,11 @@ _VOLUME_TO_FL_OZ: dict[str, Decimal] = {
     'ml':     Decimal('0.033814'),
     'l':      Decimal('33.814'),
     'liter':  Decimal('33.814'),
+    # #10 can — standard food-service can size, ~13.625 cups = 109 fl_oz.
+    # Recipes write '#10 Can' as the unit; case is "6/10CAN" pack.
+    '#10_can': Decimal('109'),
+    '#10can':  Decimal('109'),
+    '10_can':  Decimal('109'),  # in case '#' is stripped
 }
 
 # Count-type units. Most resolve 1:1 to 'ct' (count). 'doz'/'dozen' is the
@@ -406,6 +411,46 @@ _CUP_WEIGHT_OZ: dict[str, Decimal] = {
     'bread_crumbs':    Decimal('4'),
     'breadcrumbs':     Decimal('4'),
     'panko':           Decimal('1.75'),
+    # Produce — densities for chopped/diced (recipe context).
+    # The cost calc treats the canonical name's density as approximate
+    # for whatever prep state. These are USDA-derived approximations:
+    'onion':           Decimal('5.6'),  # chopped
+    'red_onion':       Decimal('5.6'),
+    'yellow_onion':    Decimal('5.6'),
+    'onion_yellow':    Decimal('5.6'),  # canonical-name variant
+    'onion_red':       Decimal('5.6'),
+    'white_onion':     Decimal('5.6'),
+    'shallot':         Decimal('5.3'),  # chopped
+    'carrot':          Decimal('4.4'),  # chopped/grated
+    'celery':          Decimal('4.2'),  # chopped
+    'potato':          Decimal('5.3'),  # diced raw
+    'idaho_potato':    Decimal('5.3'),
+    'potato_idaho':    Decimal('5.3'),
+    'russet_potato':   Decimal('5.3'),
+    'sweet_potato':    Decimal('4.6'),
+    'tomato':          Decimal('6.3'),  # chopped
+    'plum_tomato':     Decimal('6.3'),
+    'plum_tomatoes':   Decimal('6.3'),
+    'cherry_tomato':   Decimal('6.0'),
+    'bell_pepper':     Decimal('5.3'),  # chopped
+    'jalapeno':        Decimal('3.5'),  # chopped (small dice)
+    'cucumber':        Decimal('4.7'),  # diced
+    'mushroom':        Decimal('2.5'),  # sliced
+    'mushrooms':       Decimal('2.5'),
+    'cabbage':         Decimal('2.5'),  # shredded
+    'broccoli':        Decimal('3.1'),  # florets
+    'cauliflower':     Decimal('3.5'),
+    'corn':            Decimal('5.8'),  # kernels
+    'green_beans':     Decimal('3.9'),  # cut
+    'spinach':         Decimal('1.0'),  # raw, packed loosely
+    'lettuce':         Decimal('2.0'),  # shredded
+    'parsley':         Decimal('1.4'),  # fresh chopped (separate from dried 1.5 above
+                                         # — same value, kept in produce block)
+    'cilantro':        Decimal('1.3'),  # fresh chopped
+    'basil':           Decimal('1.5'),  # fresh chopped (overrides dried entry above —
+                                         # most recipe contexts mean fresh; close enough)
+    'garlic':          Decimal('4.8'),  # peeled / minced
+    'ginger':          Decimal('4.0'),  # peeled / grated (~ same as ground)
 }
 
 
