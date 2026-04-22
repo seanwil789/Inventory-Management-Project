@@ -2377,6 +2377,60 @@ class CostUtilsParseCaseSizeTests(TestCase):
             self.assertEqual(info.pack_size, Decimal("1"))
 
 
+class DriveVendorCanonicalizerTests(TestCase):
+    """`drive.canonical_vendor` maps short-form vendor strings to the
+    long-form canonical names that detect_vendor() + _normalize_vendor()
+    produce. Prevents the archiver from silently creating "FarmArt"
+    next to an existing "Farm Art" folder when upstream returns a short
+    form. Regression guard — the accountant reviews the archive as a
+    production surface, so duplicate vendor folders are a real cost."""
+
+    def _import_drive(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import drive
+        return drive
+
+    def test_known_aliases_map_to_canonical(self):
+        drive = self._import_drive()
+        pairs = [
+            ('FarmArt',                        'Farm Art'),
+            ('Farm Art',                       'Farm Art'),
+            ('farmart',                        'Farm Art'),
+            ('PBM',                            'Philadelphia Bakery Merchants'),
+            ('Philadelphia Bakery',            'Philadelphia Bakery Merchants'),
+            ('Philadelphia Bakery Merchants',  'Philadelphia Bakery Merchants'),
+            ('Exceptional',                    'Exceptional Foods'),
+            ('Exceptional Foods',              'Exceptional Foods'),
+            ('Delaware County Linens',         'Delaware County Linen'),
+            ('Delaware County Linen',          'Delaware County Linen'),
+            ('Sysco',                          'Sysco'),
+            ('Colonial Meat',                  'Colonial Village Meat Markets'),
+            ('Aramark',                        'Aramark'),
+        ]
+        for raw, expected in pairs:
+            self.assertEqual(drive.canonical_vendor(raw), expected,
+                f'{raw!r} should canonicalize to {expected!r}')
+
+    def test_unknown_vendors_pass_through(self):
+        """New vendors not in the alias map pass through unchanged so the
+        archiver can still file them — the expectation is that we add
+        them to _VENDOR_CANONICAL once we see them."""
+        drive = self._import_drive()
+        self.assertEqual(drive.canonical_vendor('SomeNewVendor'), 'SomeNewVendor')
+        self.assertEqual(drive.canonical_vendor(''),   '')
+        self.assertEqual(drive.canonical_vendor(None), None)
+
+    def test_case_and_whitespace_tolerant(self):
+        drive = self._import_drive()
+        for variant in ('  FarmArt ', 'FARMART', 'farmart', 'FarmArt\n'):
+            self.assertEqual(drive.canonical_vendor(variant), 'Farm Art',
+                f'{variant!r} should normalize to "Farm Art"')
+
+
 class CostUtilsUnitKindTests(TestCase):
     """`unit_kind` classification — weight / volume / count / unknown."""
 

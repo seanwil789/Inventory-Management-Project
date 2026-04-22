@@ -22,6 +22,38 @@ MONTH_NAMES = {
     9: "September", 10: "October", 11: "November", 12: "December",
 }
 
+# Vendor folder canonicalization. Short-form names ("FarmArt", "PBM",
+# "Exceptional", "Delaware County Linens") get mapped to the long-form
+# canonical names that detect_vendor() and docai._normalize_vendor()
+# produce. Prevents the archiver (or any caller passing a non-canonical
+# string) from silently creating a duplicate folder next to an existing
+# canonical one. The accountant reviews the archive as a production
+# surface, so duplicates are a real cost, not just tidiness.
+_VENDOR_CANONICAL = {
+    'farmart':                         'Farm Art',
+    'farm art':                        'Farm Art',
+    'pbm':                             'Philadelphia Bakery Merchants',
+    'philadelphia bakery':             'Philadelphia Bakery Merchants',
+    'philadelphia bakery merchants':   'Philadelphia Bakery Merchants',
+    'exceptional':                     'Exceptional Foods',
+    'exceptional foods':               'Exceptional Foods',
+    'delaware county linen':           'Delaware County Linen',
+    'delaware county linens':          'Delaware County Linen',
+    'sysco':                           'Sysco',
+    'colonial meat':                   'Colonial Village Meat Markets',
+    'colonial village':                'Colonial Village Meat Markets',
+    'colonial village meat markets':   'Colonial Village Meat Markets',
+    'aramark':                         'Aramark',
+}
+
+
+def canonical_vendor(vendor: str) -> str:
+    """Map a vendor string to its canonical folder name. Unknown vendors
+    pass through unchanged so new vendors can still be archived without a
+    code update — the next time a new vendor is seen, add it to
+    _VENDOR_CANONICAL to lock it in."""
+    return _VENDOR_CANONICAL.get((vendor or '').strip().lower(), vendor)
+
 
 def get_drive_client():
     credentials = service_account.Credentials.from_service_account_file(
@@ -97,6 +129,11 @@ def archive_invoice(file_id: str, file_name: str,
     """
     drive = get_drive_client()
     date  = datetime.strptime(invoice_date_str, "%Y-%m-%d")
+
+    # Canonicalize the vendor folder name so short-form inputs ("FarmArt",
+    # "PBM", "Exceptional") don't create duplicate folders next to the
+    # long-form canonical ones.
+    vendor = canonical_vendor(vendor)
 
     year_folder  = str(date.year)
     month_folder = f"{date.month:02d} {MONTH_NAMES[date.month]} {date.year}"
