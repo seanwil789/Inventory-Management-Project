@@ -626,16 +626,21 @@ def _sync_prices_core(
                     "range": f"'{tab}'!F{row_num}",
                     "values": [[case_size]],
                 })
-            if iup is not None:
-                batch_data.append({
-                    "range": f"'{tab}'!I{row_num}",
-                    "values": [[iup]],
-                })
-            if pplb is not None:
-                batch_data.append({
-                    "range": f"'{tab}'!J{row_num}",
-                    "values": [[pplb]],
-                })
+            # Always write I and J — clear the cell when calc returns None.
+            # Otherwise stale derived values from a prior sync (back when
+            # calc_price_per_lb was over-eager on bare '1' / '1/1' case sizes)
+            # persist on the sheet and reproduce the misleading E==J symptom.
+            # Manually-entered I/J on rows that get a fresh price write are
+            # also wiped — preserving their accuracy is the caller's job
+            # (re-enter after sync, or skip the sync for that row).
+            batch_data.append({
+                "range": f"'{tab}'!I{row_num}",
+                "values": [[iup if iup is not None else ""]],
+            })
+            batch_data.append({
+                "range": f"'{tab}'!J{row_num}",
+                "values": [[pplb if pplb is not None else ""]],
+            })
 
             calc_strs = []
             if iup is not None:
