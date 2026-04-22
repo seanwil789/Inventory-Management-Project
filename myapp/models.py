@@ -14,6 +14,13 @@ class Product(models.Model):
     category             = models.CharField(max_length=100, blank=True)
     primary_descriptor   = models.CharField(max_length=100, blank=True)
     secondary_descriptor = models.CharField(max_length=100, blank=True)
+    default_case_size    = models.CharField(
+        max_length=30, blank=True,
+        help_text="Canonical pack size for this product (e.g. '4/1GAL'). "
+                  "Fallback when an InvoiceLineItem has no case_size from "
+                  "its raw description. Inferred from mode of historical "
+                  "invoices by `infer_product_default_case_sizes`.",
+    )
 
     def __str__(self):
         return self.canonical_name
@@ -85,6 +92,13 @@ class InvoiceLineItem(models.Model):
     def __str__(self):
         name = self.product.canonical_name if self.product else self.raw_description
         return f"{self.invoice_date} | {self.vendor} | {name} | ${self.unit_price}"
+
+    @property
+    def effective_case_size(self) -> str:
+        """Return this line's case_size, falling back to the linked product's
+        default_case_size when the invoice didn't specify one. Consumers
+        doing per-unit math should prefer this over the raw case_size field."""
+        return self.case_size or (self.product.default_case_size if self.product else '')
 
 
 ASSIGNEE_CHOICES = [

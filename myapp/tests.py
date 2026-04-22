@@ -1943,6 +1943,115 @@ class CaseSizeDecoderTests(TestCase):
         self.assertIsNone(self._decode('Bacon', 'Sysco'))
 
 
+class EffectiveCaseSizeTests(TestCase):
+    """`InvoiceLineItem.effective_case_size` — falls back to the linked
+    product's `default_case_size` when the invoice row has none."""
+
+    def setUp(self):
+        super().setUp()
+        self.v = Vendor.objects.create(name='V')
+        self.p = Product.objects.create(
+            canonical_name='Test Milk', default_case_size='4/1GAL')
+        self.p_no_default = Product.objects.create(canonical_name='Test Unknown')
+
+    def _ili(self, **kwargs):
+        defaults = dict(
+            vendor=self.v, raw_description='Test', unit_price=Decimal('1.00'),
+            invoice_date=date(2026, 4, 1),
+        )
+        defaults.update(kwargs)
+        return InvoiceLineItem.objects.create(**defaults)
+
+    def test_uses_direct_case_size_when_set(self):
+        ili = self._ili(product=self.p, case_size='8/1GAL')
+        self.assertEqual(ili.effective_case_size, '8/1GAL')
+
+    def test_falls_back_to_product_default_when_empty(self):
+        ili = self._ili(product=self.p, case_size='')
+        self.assertEqual(ili.effective_case_size, '4/1GAL')
+
+    def test_empty_when_neither_set(self):
+        ili = self._ili(product=self.p_no_default, case_size='')
+        self.assertEqual(ili.effective_case_size, '')
+
+    def test_empty_when_no_product(self):
+        ili = self._ili(product=None, case_size='')
+        self.assertEqual(ili.effective_case_size, '')
+
+
+class InferDefaultCaseSizeCommandTests(TestCase):
+    """Unit tests for the `infer_product_default_case_sizes` command —
+    core logic is mode-pick with count + share thresholds."""
+
+    def _run(self, *args, **kwargs):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('infer_product_default_case_sizes', *args, stdout=out, **kwargs)
+        return out.getvalue()
+
+    def setUp(self):
+        super().setUp()
+        self.v = Vendor.objects.create(name='V')
+
+    def _add_ili(self, product, case_size, n=1):
+        for i in range(n):
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=product, case_size=case_size,
+                raw_description=product.canonical_name,
+                unit_price=Decimal('1.00'),
+                invoice_date=date(2026, 4, i + 1),
+            )
+
+    def test_sets_default_when_mode_strong(self):
+        p = Product.objects.create(canonical_name='P1')
+        self._add_ili(p, '4/1GAL', n=5)
+        self._add_ili(p, '8/1GAL', n=1)
+        self._run('--apply')
+        p.refresh_from_db()
+        self.assertEqual(p.default_case_size, '4/1GAL')
+
+    def test_skips_when_mode_below_min_count(self):
+        """Singleton mode is noise — don't set a default."""
+        p = Product.objects.create(canonical_name='P2')
+        self._add_ili(p, '4/1GAL', n=1)
+        self._run('--apply')
+        p.refresh_from_db()
+        self.assertEqual(p.default_case_size, '')
+
+    def test_skips_when_mode_below_min_share(self):
+        """50/50 split means neither is the clear default."""
+        p = Product.objects.create(canonical_name='P3')
+        self._add_ili(p, '4/1GAL', n=3)
+        self._add_ili(p, '8/1GAL', n=3)
+        self._add_ili(p, '12/1GAL', n=3)
+        # Mode (3/9) is only 33% — below default 50% threshold
+        self._run('--apply')
+        p.refresh_from_db()
+        self.assertEqual(p.default_case_size, '')
+
+    def test_preserves_existing_default_without_overwrite(self):
+        p = Product.objects.create(canonical_name='P4', default_case_size='manual')
+        self._add_ili(p, '4/1GAL', n=5)
+        self._run('--apply')
+        p.refresh_from_db()
+        self.assertEqual(p.default_case_size, 'manual')
+
+    def test_overwrite_replaces_existing_default(self):
+        p = Product.objects.create(canonical_name='P5', default_case_size='old')
+        self._add_ili(p, '4/1GAL', n=5)
+        self._run('--apply', '--overwrite')
+        p.refresh_from_db()
+        self.assertEqual(p.default_case_size, '4/1GAL')
+
+    def test_dry_run_does_not_write(self):
+        p = Product.objects.create(canonical_name='P6')
+        self._add_ili(p, '4/1GAL', n=5)
+        self._run()  # no --apply
+        p.refresh_from_db()
+        self.assertEqual(p.default_case_size, '')
+
+
 class MapperJunkFilterTests(TestCase):
     """`_is_junk_item` — filter layer that keeps OCR noise out of the DB."""
 
