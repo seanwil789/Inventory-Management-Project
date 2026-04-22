@@ -34,6 +34,10 @@ _CASE_RE_SIMPLE = re.compile(
     r'^\s*(?P<count>\d+(?:\.\d+)?)\s*(?P<unit>LB|OZ|GAL|CT|HD|BU|PT|QT|FLOZ|FL_OZ|ML|L|KG|G|EACH|EA)\s*$',
     re.I,
 )
+# '6/10CAN' is 6 × #10-size cans, not 6 packs of 10 items.
+# #10 is a can-size designation (~109 oz each), so multiplying count×10 would
+# overstate the pack by 10x. Treat as (count, 1, can) — N individual cans.
+_TEN_CAN_RE = re.compile(r'^\s*(?P<count>\d+)\s*/\s*#?10\s*CAN\s*$', re.I)
 
 
 def parse_case_size(s: str | None) -> Optional[CaseInfo]:
@@ -43,6 +47,13 @@ def parse_case_size(s: str | None) -> Optional[CaseInfo]:
     s = s.strip()
     if not s or s in {'1', '2', '4'}:
         return None  # bare counts with no unit — too ambiguous
+    m = _TEN_CAN_RE.match(s)
+    if m:
+        return CaseInfo(
+            pack_count=int(m.group('count')),
+            pack_size=Decimal('1'),
+            pack_unit='can',
+        )
     m = _CASE_RE.match(s)
     if m:
         return CaseInfo(

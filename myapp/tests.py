@@ -2261,6 +2261,27 @@ class CostUtilsParseCaseSizeTests(TestCase):
         info = parse_case_size("12/32OZ")
         self.assertEqual(info.total_in_base_unit, Decimal("384"))
 
+    def test_number_10_can_format(self):
+        """'6/10CAN' = 6 individual #10 cans, NOT 6 packs of 10 cans.
+        #10 is a can-size designation (~109 oz each), not a multiplier.
+        Treating it as (6, 10, can) would overstate the pack by 10x and
+        silently understate per-can cost on every canned-good recipe."""
+        from myapp.cost_utils import parse_case_size
+        info = parse_case_size("6/10CAN")
+        self.assertIsNotNone(info, "'6/10CAN' should parse")
+        self.assertEqual(info.pack_count, 6)
+        self.assertEqual(info.pack_size, Decimal("1"))
+        self.assertEqual(info.pack_unit, 'can')
+
+    def test_number_10_can_variants(self):
+        """Accept with or without '#' prefix and flexible whitespace."""
+        from myapp.cost_utils import parse_case_size
+        for s in ("6/10CAN", "6/#10CAN", "12/10 CAN", " 6 / 10 CAN "):
+            info = parse_case_size(s)
+            self.assertIsNotNone(info, f"{s!r} should parse as #10-can format")
+            self.assertEqual(info.pack_unit, 'can')
+            self.assertEqual(info.pack_size, Decimal("1"))
+
 
 class CostUtilsUnitKindTests(TestCase):
     """`unit_kind` classification — weight / volume / count / unknown."""
