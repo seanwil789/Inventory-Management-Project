@@ -1213,6 +1213,154 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# 6.  Carry-forward refresh — update stale rows that have no current-month invoice
+# ─────────────────────────────────────────────────────────────────────────────
+
+def refresh_stale_carryover(sheet_tab: str = None, dry_run: bool = False) -> dict:
+    """For each product on the sheet that has NO invoice in the tab's month,
+    pull the latest historical invoice (any prior month, prefer matching
+    vendor) and refresh E + recompute I/J. Skips rows that have a current-
+    month invoice — `sync_prices_for_tab` already handles those.
+
+    Closes the gap where stale prices inherited at sheet-creation time
+    persist on the sheet because no fresh invoice arrives for that product
+    during the active month. Without this, regular sync silently leaves
+    those rows alone and the operator has no signal that the price might
+    be months out of date.
+
+    Returns: { refreshed, skipped_current_month, skipped_no_history,
+               skipped_anomalous }.
+    """
+    _bootstrap_django()
+    from myapp.models import InvoiceLineItem
+    from datetime import date
+    from calendar import monthrange
+
+    tab = sheet_tab or ACTIVE_SHEET_TAB
+    year, month = parse_tab_month(tab)
+    month_start = date(year, month, 1)
+    month_end = date(year, month, monthrange(year, month)[1])
+
+    # Anomaly guard: skip refresh when the candidate price exceeds this
+    # ceiling — almost certainly an extended_amount leak (e.g., Ribs Feb 10
+    # Colonial Village row at $497,803.16, which is the line total leaking
+    # into unit_price). Real cases top out around $200-300; setting the
+    # ceiling at $2,000 catches leaks while allowing high-end legitimate
+    # cases (Pepperoni 25-lb cases, bulk specialty items, etc.).
+    PRICE_SANITY_CEILING = 2000.0
+
+    print(f"   Loading sheet index for '{tab}'...")
+    products, _ = build_sheet_index(tab)
+    if not products:
+        print(f"   [!] No products in '{tab}'")
+        return {"refreshed": 0, "skipped_current_month": 0,
+                "skipped_no_history": 0, "skipped_anomalous": 0}
+
+    client = get_sheets_client()
+    batch_data = []
+    summary = {"refreshed": 0, "skipped_current_month": 0,
+               "skipped_no_history": 0, "skipped_anomalous": 0}
+
+    for entry in products:
+        product_name = entry["product"]
+        row_num = entry["row"]
+        sheet_vendor = entry.get("vendor", "")
+        sheet_unit = entry.get("unit", "")
+
+        # Skip if a current-month invoice exists — regular sync handles it.
+        current = (InvoiceLineItem.objects
+                   .filter(product__canonical_name__iexact=product_name,
+                           invoice_date__gte=month_start,
+                           invoice_date__lte=month_end,
+                           unit_price__isnull=False)
+                   .exists())
+        if current:
+            summary["skipped_current_month"] += 1
+            continue
+
+        # Find latest historical invoice (prefer matching vendor).
+        # `unit_price__gt=0` excludes zero-price rows from the
+        # extended_amount-leak / parser-glitch era — refreshing the sheet
+        # to $0 is worse than leaving the prior value alone.
+        if sheet_vendor:
+            latest = (InvoiceLineItem.objects
+                      .filter(product__canonical_name__iexact=product_name,
+                              vendor__name__iexact=sheet_vendor,
+                              invoice_date__lte=month_end,
+                              unit_price__gt=0)
+                      .select_related('vendor')
+                      .order_by("-invoice_date", "-imported_at")
+                      .first())
+        else:
+            latest = None
+        if latest is None:
+            latest = (InvoiceLineItem.objects
+                      .filter(product__canonical_name__iexact=product_name,
+                              invoice_date__lte=month_end,
+                              unit_price__gt=0)
+                      .select_related('vendor')
+                      .order_by("-invoice_date", "-imported_at")
+                      .first())
+
+        if not latest:
+            summary["skipped_no_history"] += 1
+            continue
+
+        unit_price = float(latest.unit_price)
+
+        # Anomaly guard — skip extended_amount leaks rather than
+        # propagating them to the sheet.
+        if unit_price > PRICE_SANITY_CEILING:
+            print(f"   [!] row {row_num}: '{product_name}' candidate "
+                  f"${unit_price:,.2f} from {latest.invoice_date} exceeds sanity "
+                  f"ceiling — skipping (probable extended_amount leak; clear "
+                  f"the sheet cell manually if needed)")
+            summary["skipped_anomalous"] += 1
+            continue
+
+        case_size = latest.case_size or entry.get("case_size", "")
+        latest_vendor = latest.vendor.name if latest.vendor else "?"
+        iup = calc_iup(unit_price, case_size)
+        pplb = calc_price_per_lb(unit_price, case_size, sheet_unit)
+
+        if dry_run:
+            print(f"   [DRY RUN] row {row_num}: '{product_name}' → ${unit_price:.2f} "
+                  f"from {latest.invoice_date} ({latest_vendor})")
+        else:
+            batch_data.append({
+                "range": f"'{tab}'!E{row_num}",
+                "values": [[unit_price]],
+            })
+            if case_size:
+                batch_data.append({
+                    "range": f"'{tab}'!F{row_num}",
+                    "values": [[case_size]],
+                })
+            batch_data.append({
+                "range": f"'{tab}'!I{row_num}",
+                "values": [[iup if iup is not None else ""]],
+            })
+            batch_data.append({
+                "range": f"'{tab}'!J{row_num}",
+                "values": [[pplb if pplb is not None else ""]],
+            })
+            print(f"   [✓] row {row_num}: '{product_name}' → ${unit_price:.2f} "
+                  f"from {latest.invoice_date} ({latest_vendor})")
+        summary["refreshed"] += 1
+
+    if batch_data and not dry_run:
+        try:
+            client.values().batchUpdate(
+                spreadsheetId=SPREADSHEET_ID,
+                body={"valueInputOption": "USER_ENTERED", "data": batch_data},
+            ).execute()
+        except Exception as e:
+            print(f"   [!] Batch carryover refresh failed: {e}")
+
+    return summary
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # CLI entry point
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -1233,6 +1381,12 @@ def main():
                              "(e.g. 'Synergy Apr 2026')")
     parser.add_argument("--find-new", action="store_true",
                         help="List canonical names that have no row in the tab")
+    parser.add_argument("--refresh-carryover", metavar="TAB",
+                        help="For products with no current-month invoice on this tab, "
+                             "pull the latest historical invoice and refresh E/I/J. "
+                             "Closes the stale-carryover gap (sheet inherits an old "
+                             "price at creation, no new invoice arrives, sync never "
+                             "updates it). Pair with --dry-run to preview.")
     parser.add_argument("--dry-run", action="store_true",
                         help="Preview without writing anything")
     args = parser.parse_args()
@@ -1266,6 +1420,22 @@ def main():
         year, month = int(args.create_month[0]), int(args.create_month[1])
         new_tab = create_month_sheet(year, month, dry_run=args.dry_run)
         print(f"New tab: '{new_tab}'")
+        return
+
+    if args.refresh_carryover:
+        _bootstrap_django()
+        tab = args.refresh_carryover
+        try:
+            parse_tab_month(tab)
+        except ValueError as e:
+            print(f"[!] {e}")
+            return
+        print(f"\nRefreshing stale carryover for '{tab}'...")
+        summary = refresh_stale_carryover(sheet_tab=tab, dry_run=args.dry_run)
+        print(f"\nDone — Refreshed: {summary['refreshed']}  |  "
+              f"Skipped (current-month invoice): {summary['skipped_current_month']}  |  "
+              f"No history: {summary['skipped_no_history']}  |  "
+              f"Skipped anomalous: {summary['skipped_anomalous']}")
         return
 
     tab = args.tab or ACTIVE_SHEET_TAB
