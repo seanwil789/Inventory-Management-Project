@@ -333,8 +333,79 @@ _CUP_WEIGHT_OZ: dict[str, Decimal] = {
     # Condiments / fine-dispense
     'salt':            Decimal('10'),
     'kosher_salt':     Decimal('5'),
+    'salt_kosher':     Decimal('5'),  # canonical-name variant ("Salt, Kosher")
     'baking_powder':   Decimal('8'),
     'baking_soda':     Decimal('8'),
+    # Spices (mostly ground, ~4 oz/cup) — Phase 2E unlock for no_density bucket
+    'paprika':         Decimal('4.5'),
+    'cinnamon':        Decimal('4.5'),
+    'cinnamon_ground': Decimal('4.5'),
+    'ground_cinnamon': Decimal('4.5'),
+    'nutmeg':          Decimal('4'),
+    'ground_nutmeg':   Decimal('4'),
+    'black_pepper':    Decimal('4'),       # ground
+    'pepper':          Decimal('4'),
+    'white_pepper':    Decimal('4'),
+    'whole_black_pepper': Decimal('4.5'),  # whole peppercorns
+    'black_pepper_whole': Decimal('4.5'),
+    'cumin':           Decimal('4'),
+    'ground_cumin':    Decimal('4'),
+    'whole_cumin':     Decimal('4'),
+    'chili_powder':    Decimal('4.5'),
+    'curry_powder':    Decimal('3.5'),
+    'garlic_powder':   Decimal('5'),
+    'onion_powder':    Decimal('5'),
+    'allspice':        Decimal('4'),
+    'ground_allspice': Decimal('4'),
+    'cloves':          Decimal('3.5'),
+    'whole_cloves':    Decimal('3.5'),
+    'ginger':          Decimal('4'),
+    'ground_ginger':   Decimal('4'),
+    'turmeric':        Decimal('5'),
+    'mustard_powder':  Decimal('3.5'),
+    'cayenne':         Decimal('4'),
+    # Dried herbs — much lighter (~1.5 oz/cup)
+    'oregano':         Decimal('1.5'),
+    'basil':           Decimal('1.5'),
+    'thyme':           Decimal('1.5'),
+    'rosemary':        Decimal('1.5'),
+    'parsley':         Decimal('1.5'),
+    'dill':            Decimal('1.5'),
+    'sage':            Decimal('1.5'),
+    'bay_leaves':      Decimal('0.5'),
+    'whole_bay_leaves': Decimal('0.5'),
+    # Liquids / pourables
+    'vanilla':         Decimal('8.5'),
+    'vanilla_extract': Decimal('8.5'),
+    'soy_sauce':       Decimal('9'),
+    'fish_sauce':      Decimal('9'),
+    'vinegar':         Decimal('8'),
+    'maple_syrup':     Decimal('11'),
+    'molasses':        Decimal('11'),
+    'corn_syrup':      Decimal('11.5'),
+    'mayonnaise':      Decimal('7.7'),
+    'mayo':            Decimal('7.7'),
+    'mustard':         Decimal('8.5'),     # prepared dijon/yellow
+    'ketchup':         Decimal('8.5'),
+    'tahini':          Decimal('9.5'),
+    'peanut_butter':   Decimal('9'),
+    # Yeast (instant/active dry — granulated)
+    'yeast':           Decimal('5'),
+    'active_dry_yeast': Decimal('5'),
+    'dry_active_yeast': Decimal('5'),
+    'yeast_dry_active': Decimal('5'),  # canonical-name variant
+    # Dairy add-ons
+    'sour_cream':      Decimal('8.5'),
+    'yogurt':          Decimal('8.5'),
+    'ricotta':         Decimal('8.7'),
+    'cream_cheese':    Decimal('8'),
+    # Grains / bulk dry
+    'cornmeal':        Decimal('5'),
+    'corn_meal':       Decimal('5'),
+    'grits':           Decimal('5.6'),
+    'bread_crumbs':    Decimal('4'),
+    'breadcrumbs':     Decimal('4'),
+    'panko':           Decimal('1.75'),
 }
 
 

@@ -2566,6 +2566,27 @@ class RecipeIngredientCostTryAllCandidatesTests(TestCase):
     Flour pattern unlocks (literal parses but recipe needs density-bridged
     weight; product default is what actually computes)."""
 
+    def test_phase_2e_spice_densities_resolve(self):
+        """Phase 2E expanded _CUP_WEIGHT_OZ to cover spices, dried herbs,
+        condiments, and canonical-name variants. Smoke test that the most
+        common bucket (paprika, cinnamon, black pepper) actually computes."""
+        from myapp.cost_utils import cup_weight_oz_for
+        from decimal import Decimal
+        # Spices ~4-5 oz/cup
+        self.assertEqual(cup_weight_oz_for('Paprika'), Decimal('4.5'))
+        self.assertEqual(cup_weight_oz_for('Cinnamon, Ground'), Decimal('4.5'))
+        self.assertEqual(cup_weight_oz_for('Ground Cinnamon'), Decimal('4.5'))
+        self.assertEqual(cup_weight_oz_for('Black Pepper, Whole'), Decimal('4.5'))
+        # Canonical-name variant for kosher salt — was returning 10 (table salt)
+        # because the lookup hit 'salt' before finding 'salt_kosher'.
+        self.assertEqual(cup_weight_oz_for('Salt, Kosher'), Decimal('5'))
+        # Dried herbs are MUCH lighter
+        self.assertEqual(cup_weight_oz_for('Oregano'), Decimal('1.5'))
+        self.assertEqual(cup_weight_oz_for('Whole Bay Leaves'), Decimal('0.5'))
+        # Liquids
+        self.assertEqual(cup_weight_oz_for('Fish Sauce'), Decimal('9'))
+        self.assertEqual(cup_weight_oz_for('Maple Syrup'), Decimal('11'))
+
     def test_ap_flour_30_85ct_with_50lb_default_unlocks_via_default(self):
         from myapp.models import (
             Vendor, Product, InvoiceLineItem, Recipe, RecipeIngredient,
