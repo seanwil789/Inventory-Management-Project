@@ -1425,6 +1425,35 @@ Balance Due
         result = parser_mod.parse_invoice(raw, vendor='Exceptional Foods')
         self.assertAlmostEqual(result.get('invoice_total'), 71.29, places=2)
 
+    def test_skips_zero_placeholder_when_finding_total(self):
+        """Real Exceptional OCR has 0.00 Qty-Adjustment dumps between the
+        price-per line and the true line total. The parser must skip
+        zero-valued lines when looking for the total, otherwise items
+        silently bind to ext=$0.00. Regression for the 2026-04-21 scour
+        finding that recovered a $97.93 line total from a real invoice."""
+        parser_mod = self._import_parser()
+        # Synthetic layout mirrors the real failure: 19.99 LB price-per
+        # followed by a LB noise line, a 0.00 placeholder, THEN the total.
+        raw = """Exceptional Foods
+4/15/2026
+Item ID
+10.00 EA Beef Bavette Steak C/C 8 oz SQUARES
+4.90
+19.99 LB
+LB
+0.00
+97.93
+Sale Amount
+Balance Due
+97.93
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Exceptional Foods')
+        items = result['items']
+        self.assertEqual(len(items), 1)
+        self.assertAlmostEqual(items[0]['extended_amount'], 97.93, places=2,
+            msg='line total must be $97.93, not the 0.00 Qty-Adjustment placeholder')
+        self.assertAlmostEqual(items[0]['price_per_unit'], 19.99, places=2)
+
 
 class ParserSyscoIntegrationTests(TestCase):
     """Sysco parser is parser.py's largest + most complex format: 5-pass

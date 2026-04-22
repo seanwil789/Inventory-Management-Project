@@ -1204,13 +1204,18 @@ def _parse_exceptional(text: str) -> list[dict]:
         if m:
             price = float(m.group(1))
             per = m.group(2).upper()
-            # Try to find the total: next standalone number after this
+            # Try to find the total: next non-zero standalone number after this.
+            # Skip 0.00 — it's typically a Qty Adjustment / tax placeholder dump,
+            # not a line total. Without the skip, items that come right before
+            # a zero placeholder bind to $0.00 instead of their real total.
             total = None
             for look in range(idx + 1, min(idx + 4, len(block))):
                 tm = standalone_re.match(block[look])
                 if tm:
-                    total = float(tm.group(1))
-                    break
+                    val = float(tm.group(1))
+                    if val > 0:
+                        total = val
+                        break
             price_pers.append({
                 "price_per_unit": price,
                 "per": per,
@@ -1265,15 +1270,23 @@ def _parse_exceptional(text: str) -> list[dict]:
         price_per_unit = best_pp["price_per_unit"]
         per = best_pp["per"]
 
-        # Cross-multiply: find (weight, total) pair where weight × P/# ≈ total
+        # Cross-multiply: find (weight, total) pair where weight × P/# ≈ total.
+        # Skip zero-valued candidates — they're OCR dumps of freight/discount
+        # placeholders, not legitimate weight/total pairs. Without the skip,
+        # the (0, 0) pair always matches (0 × ppu = 0) and the winning item
+        # silently gets unit_price=$0.
         best = None
         best_diff = float("inf")
         for i, cw in enumerate(number_pool):
             if i in used_pool or round(cw, 2) in known_ppus:
                 continue  # skip P/# values as weights
+            if cw == 0:
+                continue
             expected = round(cw * price_per_unit, 2)
             for j, ct in enumerate(number_pool):
                 if j in used_pool or j == i:
+                    continue
+                if ct == 0:
                     continue
                 diff = abs(ct - expected)
                 if diff <= 0.10 and diff < best_diff:
