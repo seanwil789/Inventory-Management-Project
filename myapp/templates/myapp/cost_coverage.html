@@ -1,0 +1,155 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Cost Coverage{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Recipe Cost Coverage</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Live audit of which RecipeIngredients price and which don't. Drift between
+      visits flags either a regression or a new invoice unlocking a product.
+      Checked {{ today|date:"D M j, Y" }}.
+    </p>
+  </div>
+
+  <!-- Headline KPI -->
+  <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+    <div class="rounded-lg border
+      {% if priced_pct >= 70 %}border-emerald-200 bg-emerald-50
+      {% elif priced_pct >= 40 %}border-amber-200 bg-amber-50
+      {% else %}border-red-200 bg-red-50{% endif %} p-4">
+      <div class="text-xs uppercase tracking-wide
+        {% if priced_pct >= 70 %}text-emerald-800
+        {% elif priced_pct >= 40 %}text-amber-800
+        {% else %}text-red-800{% endif %}">Coverage</div>
+      <div class="text-3xl font-bold">{{ priced_pct }}%</div>
+      <div class="text-sm">{{ priced }} / {{ total_eligible }} cost-eligible RIs</div>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Cost-eligible</div>
+      <div class="text-3xl font-bold text-slate-900">{{ total_eligible }}</div>
+      <div class="text-sm text-slate-500">RecipeIngredients with quantity + product</div>
+    </div>
+    <div class="rounded-lg border border-slate-200 bg-white p-4">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Worst recipe</div>
+      {% if worst_recipes %}
+      <div class="text-base font-semibold text-slate-900">{{ worst_recipes.0.recipe.name }}</div>
+      <div class="text-sm text-slate-500">{{ worst_recipes.0.priced }} / {{ worst_recipes.0.total }} priced ({{ worst_recipes.0.pct }}%)</div>
+      {% else %}
+      <div class="text-base text-slate-400">—</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- Bucket breakdown -->
+  <section class="rounded-lg border border-slate-200 bg-white p-4">
+    <h2 class="text-base font-semibold text-slate-900 mb-3">Why RIs do or don't price</h2>
+    <table class="w-full text-sm">
+      <tbody class="divide-y">
+        {% for b in bucket_rows %}
+        <tr>
+          <td class="py-1.5 pr-2 font-mono text-xs">{{ b.name }}</td>
+          <td class="py-1.5 pr-4 text-right tabular-nums">{{ b.count }}</td>
+          <td class="py-1.5 text-right tabular-nums w-16 text-slate-500">{{ b.pct }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Per-vendor coverage -->
+  <section class="rounded-lg border border-slate-200 bg-white p-4">
+    <h2 class="text-base font-semibold text-slate-900 mb-3">Per-vendor coverage</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs text-slate-500 uppercase">
+        <tr>
+          <th class="text-left py-1.5">Vendor</th>
+          <th class="text-right py-1.5 w-20">RIs</th>
+          <th class="text-right py-1.5 w-24">Priced</th>
+          <th class="text-right py-1.5 w-20">Cov%</th>
+        </tr>
+      </thead>
+      <tbody class="divide-y">
+        {% for v in vendor_rows %}
+        <tr>
+          <td class="py-1.5">{{ v.name }}</td>
+          <td class="py-1.5 text-right tabular-nums">{{ v.total }}</td>
+          <td class="py-1.5 text-right tabular-nums">{{ v.priced }}</td>
+          <td class="py-1.5 text-right tabular-nums
+            {% if v.pct >= 70 %}text-emerald-700
+            {% elif v.pct >= 40 %}text-amber-700
+            {% else %}text-red-600{% endif %}">{{ v.pct }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Top blocking products per bucket -->
+  <section class="rounded-lg border border-slate-200 bg-white p-4">
+    <h2 class="text-base font-semibold text-slate-900 mb-3">Top blocked products (by bucket)</h2>
+    <div class="grid grid-cols-1 md:grid-cols-2 gap-4">
+      {% for bucket, products in blocking.items %}
+        {% if bucket != 'priced' and products %}
+        <div>
+          <h3 class="text-xs font-semibold text-slate-700 uppercase tracking-wide mb-1">{{ bucket }}</h3>
+          <ul class="text-sm space-y-0.5">
+            {% for p in products %}
+            <li class="flex justify-between">
+              <span class="text-slate-700">{{ p.product }}</span>
+              <span class="text-slate-500 tabular-nums">{{ p.count }}</span>
+            </li>
+            {% endfor %}
+          </ul>
+        </div>
+        {% endif %}
+      {% endfor %}
+    </div>
+  </section>
+
+  <!-- Worst-covered recipes -->
+  <section class="rounded-lg border border-slate-200 bg-white p-4">
+    <h2 class="text-base font-semibold text-slate-900 mb-3">Worst-covered recipes (≥3 ingredients)</h2>
+    <table class="w-full text-sm">
+      <tbody class="divide-y">
+        {% for r in worst_recipes %}
+        <tr>
+          <td class="py-1.5"><a href="{% url 'recipe_detail' r.recipe.id %}" class="text-indigo-700 hover:underline">{{ r.recipe.name }}</a></td>
+          <td class="py-1.5 text-right tabular-nums">{{ r.priced }} / {{ r.total }}</td>
+          <td class="py-1.5 text-right tabular-nums w-16
+            {% if r.pct >= 70 %}text-emerald-700
+            {% elif r.pct >= 40 %}text-amber-700
+            {% else %}text-red-600{% endif %}">{{ r.pct }}%</td>
+        </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </section>
+
+  <!-- Sample failures (debugging aid) -->
+  <section class="rounded-lg border border-slate-200 bg-white p-4">
+    <h2 class="text-base font-semibold text-slate-900 mb-3">Sample failures (per bucket)</h2>
+    {% for bucket, samples in sample_failures.items %}
+      {% if samples %}
+      <div class="mb-4">
+        <h3 class="text-xs font-semibold text-slate-700 uppercase tracking-wide mb-1">{{ bucket }}</h3>
+        <table class="w-full text-xs font-mono">
+          <tbody class="divide-y">
+            {% for s in samples %}
+            <tr>
+              <td class="py-1 pr-2 text-slate-600">{{ s.recipe }}</td>
+              <td class="py-1 pr-2">{{ s.product }}</td>
+              <td class="py-1 pr-2 tabular-nums">{{ s.qty }} {{ s.unit }}</td>
+              <td class="py-1 pr-2 text-slate-500">cs={{ s.case_size }}</td>
+              <td class="py-1 text-slate-400">{{ s.note|truncatechars:60 }}</td>
+            </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+      </div>
+      {% endif %}
+    {% endfor %}
+  </section>
+
+</div>
+{% endblock %}

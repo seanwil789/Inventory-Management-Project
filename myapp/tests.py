@@ -2566,6 +2566,24 @@ class RecipeIngredientCostTryAllCandidatesTests(TestCase):
     Flour pattern unlocks (literal parses but recipe needs density-bridged
     weight; product default is what actually computes)."""
 
+    def test_cost_coverage_view_renders(self):
+        """Phase 5 smoke test: /cost-coverage/ loads without errors,
+        returns 200, and contains the headline KPI + per-vendor table.
+        Lightweight check — full bucket math is implicit through the
+        same RecipeIngredient.estimated_cost code path the dashboard runs."""
+        from django.contrib.auth.models import User
+        from django.test import Client
+        u = User.objects.create_user(username='cc_smoke', password='x')
+        c = Client()
+        c.force_login(u)
+        resp = c.get('/cost-coverage/')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn('Recipe Cost Coverage', body)
+        self.assertIn('Per-vendor coverage', body)
+        self.assertIn('Worst-covered', body)
+        self.assertIn('Top blocked', body)
+
     def test_phase_2e_spice_densities_resolve(self):
         """Phase 2E expanded _CUP_WEIGHT_OZ to cover spices, dried herbs,
         condiments, and canonical-name variants. Smoke test that the most

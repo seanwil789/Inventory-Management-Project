@@ -43,6 +43,7 @@ urlpatterns = [
     path('alerts/',                         views.price_alerts,        name='price_alerts'),
     path('demo/ready/',                     views.demo_ready,          name='demo_ready'),
     path('pipeline-health/',                views.pipeline_health,     name='pipeline_health'),
+    path('cost-coverage/',                  views.cost_coverage,       name='cost_coverage'),
     path('historical/',                     views.historical_dishes,   name='historical_dishes'),
     path('popularity/',                     views.popularity_dashboard, name='popularity_dashboard'),
     path('suggestions/',                    views.menu_suggestions,    name='menu_suggestions'),

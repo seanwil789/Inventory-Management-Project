@@ -2384,6 +2384,122 @@ def pipeline_health(request):
     })
 
 
+# ---- Recipe cost-coverage dashboard (Phase 5 of cost-accuracy push) ----
+
+def cost_coverage(request):
+    """Per-RecipeIngredient classification of why each does/doesn't price.
+
+    The 2026-04-22 cost-accuracy push lifted coverage from 19% → 57%; this
+    view is the live audit — coverage moves up or down as new invoices
+    arrive, parsers change, or recipe data is edited. Drift between visits
+    flags either a regression (a fix broke something) or an improvement
+    (a new invoice unlocked a previously-blocked product).
+
+    Buckets: priced / no_invoice / unparseable_cs / incompat / no_density /
+    other. Per-vendor table tracks where each vendor's coverage stands.
+    Worst-covered recipes surface places to fix data first.
+
+    Performance: ~398 RIs × 1 InvoiceLineItem lookup each = ~400 queries.
+    Acceptable for an audit page; not in any hot path.
+    """
+    from .models import InvoiceLineItem, RecipeIngredient, Recipe
+    from collections import Counter, defaultdict
+
+    buckets = Counter()
+    bucket_products: dict[str, Counter] = defaultdict(Counter)
+    vendor_total: dict[str, int] = defaultdict(int)
+    vendor_priced: dict[str, int] = defaultdict(int)
+    recipe_total: dict[int, int] = defaultdict(int)
+    recipe_priced: dict[int, int] = defaultdict(int)
+    sample_failures: dict[str, list[dict]] = defaultdict(list)
+
+    for ri in (RecipeIngredient.objects
+               .filter(quantity__isnull=False, product__isnull=False)
+               .select_related('product', 'recipe')):
+        recipe_total[ri.recipe_id] += 1
+        cost, note = ri.estimated_cost()
+        # Find the latest invoice we used (for vendor attribution)
+        li = (InvoiceLineItem.objects
+              .filter(product=ri.product, unit_price__gt=0)
+              .select_related('vendor').order_by('-invoice_date').first())
+        v = (li.vendor.name if li and li.vendor else '—')
+        vendor_total[v] += 1
+
+        if cost is not None:
+            buckets['priced'] += 1
+            vendor_priced[v] += 1
+            recipe_priced[ri.recipe_id] += 1
+            continue
+
+        if 'no invoice' in note:
+            bucket = 'no_invoice'
+        elif 'unparseable case_size' in note:
+            bucket = 'unparseable_cs'
+        elif 'no density' in note:
+            bucket = 'no_density'
+        elif 'incompatible' in note or 'conversion failed' in note:
+            bucket = 'incompat'
+        else:
+            bucket = 'other'
+
+        buckets[bucket] += 1
+        bucket_products[bucket][ri.product.canonical_name] += 1
+        if len(sample_failures[bucket]) < 8:
+            sample_failures[bucket].append({
+                'recipe': ri.recipe.name,
+                'product': ri.product.canonical_name,
+                'qty': ri.quantity,
+                'unit': ri.unit,
+                'case_size': li.case_size if li else '',
+                'note': note,
+            })
+
+    total = sum(buckets.values()) or 1
+    bucket_rows = [
+        {'name': b, 'count': n, 'pct': round(100 * n / total, 1)}
+        for b, n in buckets.most_common()
+    ]
+    vendor_rows = [
+        {'name': v, 'total': vt, 'priced': vendor_priced[v],
+         'pct': round(100 * vendor_priced[v] / vt, 1) if vt else 0}
+        for v, vt in sorted(vendor_total.items(), key=lambda x: -x[1])
+    ]
+
+    # Worst-covered recipes (with at least 3 ingredients)
+    worst = []
+    recipes_by_id = {r.id: r for r in Recipe.objects.filter(
+        id__in=[rid for rid in recipe_total if recipe_total[rid] >= 3])}
+    for rid, t in recipe_total.items():
+        if t < 3 or rid not in recipes_by_id:
+            continue
+        p = recipe_priced.get(rid, 0)
+        worst.append({
+            'recipe': recipes_by_id[rid],
+            'priced': p,
+            'total': t,
+            'pct': round(100 * p / t, 1),
+        })
+    worst.sort(key=lambda r: (r['pct'], -r['total']))
+
+    # Top blocking products per bucket (for "what to fix next")
+    blocking = {
+        b: [{'product': p, 'count': n} for p, n in c.most_common(8)]
+        for b, c in bucket_products.items()
+    }
+
+    return render(request, 'myapp/cost_coverage.html', {
+        'today': date.today(),
+        'total_eligible': total,
+        'priced': buckets.get('priced', 0),
+        'priced_pct': round(100 * buckets.get('priced', 0) / total, 1),
+        'bucket_rows': bucket_rows,
+        'vendor_rows': vendor_rows,
+        'worst_recipes': worst[:15],
+        'blocking': blocking,
+        'sample_failures': dict(sample_failures),
+    })
+
+
 # ---- Category spend/activity dashboard ----
 
 def category_spend(request):
