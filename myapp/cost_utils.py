@@ -27,11 +27,11 @@ class CaseInfo:
 
 
 _CASE_RE = re.compile(
-    r'^\s*(?P<count>\d+)\s*/\s*(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>LB|OZ|GAL|CT|HD|BU|PT|QT|FLOZ|FL_OZ|ML|L|KG|G)\s*$',
+    r'^\s*(?P<count>\d+)\s*/\s*(?P<size>\d+(?:\.\d+)?)\s*(?P<unit>LB|OZ|GAL|CT|HD|BU|PT|QT|FLOZ|FL_OZ|ML|L|KG|G|DOZ|DOZEN|DZ)\s*$',
     re.I,
 )
 _CASE_RE_SIMPLE = re.compile(
-    r'^\s*(?P<count>\d+(?:\.\d+)?)\s*(?P<unit>LB|OZ|GAL|CT|HD|BU|PT|QT|FLOZ|FL_OZ|ML|L|KG|G|EACH|EA)\s*$',
+    r'^\s*(?P<count>\d+(?:\.\d+)?)\s*(?P<unit>LB|OZ|GAL|CT|HD|BU|PT|QT|FLOZ|FL_OZ|ML|L|KG|G|EACH|EA|DOZ|DOZEN|DZ)\s*$',
     re.I,
 )
 # '6/10CAN' is 6 × #10-size cans, not 6 packs of 10 items.
@@ -196,8 +196,16 @@ _VOLUME_TO_FL_OZ: dict[str, Decimal] = {
     'liter':  Decimal('33.814'),
 }
 
-# Count-type units
-_COUNT_UNITS = {'ct', 'each', 'ea', 'hd', 'head', 'bu', 'bunch', 'bag', 'bottle', 'jar', 'can'}
+# Count-type units. Most resolve 1:1 to 'ct' (count). 'doz'/'dozen' is the
+# exception — 1 dozen = 12 ct — handled by `to_base_unit` and is the unlock
+# for products like Eggs sold by '15 DOZ' (= 180 ct).
+_COUNT_UNITS = {'ct', 'each', 'ea', 'hd', 'head', 'bu', 'bunch', 'bag',
+                'bottle', 'jar', 'can', 'doz', 'dozen', 'dz'}
+_COUNT_TO_CT: dict[str, Decimal] = {
+    'doz':    Decimal('12'),
+    'dozen':  Decimal('12'),
+    'dz':     Decimal('12'),
+}
 
 
 def normalize_unit(u: str) -> str:
@@ -225,7 +233,8 @@ def to_base_unit(qty: Decimal, u: str) -> Optional[tuple[Decimal, str]]:
     if u in _VOLUME_TO_FL_OZ:
         return qty * _VOLUME_TO_FL_OZ[u], 'fl_oz'
     if u in _COUNT_UNITS:
-        return qty, 'ct'
+        # 'doz' → 12 ct, 'each'/'ct' → 1 ct
+        return qty * _COUNT_TO_CT.get(u, Decimal('1')), 'ct'
     return None
 
 
@@ -371,10 +380,22 @@ def ingredient_cost(
         cost = case_price * (recipe_floz / total_case_floz)
         return cost.quantize(Decimal('0.01')), f'weight→volume via density {density} oz/c'
 
-    # Count vs something else — only works when matched exactly
+    # Count vs something else — only works when matched exactly,
+    # OR when recipe is a small integer with empty unit AND case is count
+    # (the canonical "6 eggs" pattern: recipe says "6" with no unit,
+    #  case says "15 DOZ" = 180 ct → cost = case_price × 6/180).
     if r_kind == 'count' and c_kind == 'count':
-        total_case_ct = Decimal(case_info.pack_count) * case_info.pack_size
+        case_total = to_base_unit(case_info.pack_size, case_info.pack_unit)
+        total_case_ct = (case_total[0] if case_total else case_info.pack_size) * case_info.pack_count
         cost = case_price * (qty / total_case_ct)
         return cost.quantize(Decimal('0.01')), 'count↔count'
+
+    if (r_kind == 'unknown' and not normalize_unit(recipe_unit)
+            and c_kind == 'count' and qty == qty.to_integral_value()
+            and Decimal('1') <= qty <= Decimal('200')):
+        case_total = to_base_unit(case_info.pack_size, case_info.pack_unit)
+        total_case_ct = (case_total[0] if case_total else case_info.pack_size) * case_info.pack_count
+        cost = case_price * (qty / total_case_ct)
+        return cost.quantize(Decimal('0.01')), 'count↔count (unitless recipe inferred as count)'
 
     return None, f'incompatible units: recipe={recipe_unit!r}({r_kind}) vs case={case_info.pack_unit!r}({c_kind})'

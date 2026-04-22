@@ -2540,6 +2540,113 @@ class RecipeIngredientCostUnlockTests(TestCase):
         # 1 cup butter = 8 oz; case = 36 lb = 576 oz; 50.40 × (8/576) = $0.70
         self.assertAlmostEqual(float(cost), 0.70, places=2)
 
+    def test_eggs_unitless_recipe_with_doz_case_unlocks(self):
+        """Phase 2C: 'Recipe asks for 6 (eggs), case is 15 DOZ' must price.
+        - Recipe unit is empty (Sean writes "qty=6" with no unit for count items)
+        - Case '15 DOZ' must parse as 15 × 12 = 180 ct
+        - cost = case_price × (6 / 180)"""
+        from myapp.models import (
+            Vendor, Product, InvoiceLineItem, Recipe, RecipeIngredient,
+        )
+        from datetime import date
+        v = Vendor.objects.create(name='Farm Art')
+        p = Product.objects.create(canonical_name='Eggs', default_case_size='15DOZ')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='EGGS XL LOOSE, WHITE, 15-DOZ',
+            unit_price=Decimal('45.00'),
+            extended_amount=Decimal('45.00'),
+            case_size='1',
+            invoice_date=date(2026, 4, 7),
+        )
+        r = Recipe.objects.create(name='TestCake')
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='Eggs',
+            quantity=Decimal('6'), unit='', product=p,
+        )
+        cost, note = ri.estimated_cost()
+        self.assertIsNotNone(cost,
+            f'Eggs unitless+DOZ case must price after Phase 2C (got {note!r})')
+        # 6 eggs × $45.00 / 180 ct = $1.50
+        self.assertAlmostEqual(float(cost), 1.50, places=2)
+
+
+class CostUtilsDozUnitTests(TestCase):
+    """Phase 2C: 'doz'/'dozen'/'dz' as count units, 1 doz = 12 ct."""
+
+    def test_doz_parses(self):
+        from myapp.cost_utils import parse_case_size
+        from decimal import Decimal
+        info = parse_case_size('15DOZ')
+        self.assertIsNotNone(info)
+        self.assertEqual(info.pack_unit, 'doz')
+        self.assertEqual(info.pack_count, 1)
+        self.assertEqual(info.pack_size, Decimal('15'))
+
+    def test_doz_to_ct_conversion(self):
+        from myapp.cost_utils import to_base_unit
+        from decimal import Decimal
+        # 15 doz → 180 ct
+        result = to_base_unit(Decimal('15'), 'doz')
+        self.assertEqual(result, (Decimal('180'), 'ct'))
+        # 1 dozen → 12 ct
+        self.assertEqual(to_base_unit(Decimal('1'), 'dozen'), (Decimal('12'), 'ct'))
+
+    def test_unit_kind_doz_is_count(self):
+        from myapp.cost_utils import unit_kind
+        self.assertEqual(unit_kind('doz'), 'count')
+        self.assertEqual(unit_kind('dozen'), 'count')
+        self.assertEqual(unit_kind('dz'), 'count')
+
+
+class CostUtilsUnitlessCountTests(TestCase):
+    """Phase 2C: when recipe unit is empty AND case is count AND qty is a
+    small integer, treat the recipe as count. Eggs are the canonical case."""
+
+    def test_unitless_integer_with_count_case_computes(self):
+        from myapp.cost_utils import ingredient_cost
+        from decimal import Decimal
+        # 6 (eggs), $45.00 case of 15 DOZ (= 180 ct)
+        cost, note = ingredient_cost(
+            Decimal('6'), '', 'Eggs',
+            Decimal('45.00'), '15DOZ',
+        )
+        self.assertIsNotNone(cost)
+        self.assertAlmostEqual(float(cost), 1.50, places=2)
+        self.assertIn('unitless', note)
+
+    def test_unitless_fractional_qty_does_not_match(self):
+        """Don't treat fractional qty as count — almost certainly meant
+        cups/lbs and the unit was forgotten."""
+        from myapp.cost_utils import ingredient_cost
+        from decimal import Decimal
+        cost, _ = ingredient_cost(
+            Decimal('0.5'), '', 'Eggs',
+            Decimal('45.00'), '15DOZ',
+        )
+        self.assertIsNone(cost)
+
+    def test_unitless_huge_qty_does_not_match(self):
+        """200+ qty without unit isn't a realistic count for a single line."""
+        from myapp.cost_utils import ingredient_cost
+        from decimal import Decimal
+        cost, _ = ingredient_cost(
+            Decimal('500'), '', 'Eggs',
+            Decimal('45.00'), '15DOZ',
+        )
+        self.assertIsNone(cost)
+
+    def test_unitless_with_weight_case_does_not_falsely_match(self):
+        """Recipe '6' with case in pounds isn't 6 lbs — could be 6 cups,
+        6 oz, 6 of-something. Don't guess; require explicit unit."""
+        from myapp.cost_utils import ingredient_cost
+        from decimal import Decimal
+        cost, _ = ingredient_cost(
+            Decimal('6'), '', 'Flour',
+            Decimal('40.00'), '50LB',
+        )
+        self.assertIsNone(cost)
+
 
 class DriveVendorCanonicalizerTests(TestCase):
     """`drive.canonical_vendor` maps short-form vendor strings to the
