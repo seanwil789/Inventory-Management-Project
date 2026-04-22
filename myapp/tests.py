@@ -2508,6 +2508,91 @@ class EffectiveCaseSizeForCostTests(TestCase):
         self.assertEqual(f('1', '', product_default=''), '1')
 
 
+class CaseSizeCandidatesForCostTests(TestCase):
+    """Phase 2D: returns ALL parseable case_size candidates so the cost
+    calc can try each. Critical when the literal case_size parses but is
+    semantically wrong (AP Flour cs='30/85CT' parses as count, but the
+    product is sold by weight). Single-best-effort form would lock in
+    the wrong literal; trying all candidates allows the product default
+    ('1/50LB') to win when the literal yields incompat units."""
+
+    def _f(self):
+        from myapp.cost_utils import case_size_candidates_for_cost
+        return case_size_candidates_for_cost
+
+    def test_returns_all_parseable_candidates_in_priority_order(self):
+        f = self._f()
+        # AP Flour scenario: literal '30/85CT' parses (as count, wrong),
+        # product default '1/50LB' parses (weight, correct).
+        # Both should be in the list, literal first (priority order).
+        result = f('30/85CT', 'AP Flour', product_default='1/50LB')
+        self.assertEqual(result, ['30/85CT', '1/50LB'])
+
+    def test_deduplicates_when_candidates_overlap(self):
+        """If literal and default are the same parseable string, return one."""
+        f = self._f()
+        result = f('1/50LB', '', product_default='1/50LB')
+        self.assertEqual(result, ['1/50LB'])
+
+    def test_skips_unparseable_candidates(self):
+        """Bare '1' won't be in the list — wouldn't help cost calc anyway."""
+        f = self._f()
+        result = f('1', '', product_default='4/1GAL')
+        self.assertEqual(result, ['4/1GAL'])
+
+    def test_empty_when_nothing_parses(self):
+        f = self._f()
+        self.assertEqual(f('1', '', product_default=''), [])
+        self.assertEqual(f('1', 'no weight here', product_default=None), [])
+
+    def test_includes_description_weight(self):
+        """Description weight added between literal and product default."""
+        f = self._f()
+        result = f('1', '36/1# Butter', product_default='4/1GAL')
+        # literal '1' fails to parse → desc '36/1LB' first valid → default after
+        self.assertEqual(result, ['36/1LB', '4/1GAL'])
+
+    def test_bare_n_over_m_heuristic_appears_last(self):
+        f = self._f()
+        # cs='6/5' (no unit) → bare-N/M heuristic kicks in
+        # No description, no product default
+        result = f('6/5', '', product_default='')
+        self.assertEqual(result, ['6/5LB'])
+
+
+class RecipeIngredientCostTryAllCandidatesTests(TestCase):
+    """Phase 2D integration: RecipeIngredient.estimated_cost iterates the
+    candidate list from case_size_candidates_for_cost. Verifies the AP
+    Flour pattern unlocks (literal parses but recipe needs density-bridged
+    weight; product default is what actually computes)."""
+
+    def test_ap_flour_30_85ct_with_50lb_default_unlocks_via_default(self):
+        from myapp.models import (
+            Vendor, Product, InvoiceLineItem, Recipe, RecipeIngredient,
+        )
+        from datetime import date
+        v = Vendor.objects.create(name='Sysco')
+        p = Product.objects.create(canonical_name='AP Flour', default_case_size='1/50LB')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='AP Flour',  # no weight in desc
+            unit_price=Decimal('19.95'),
+            extended_amount=Decimal('19.95'),
+            case_size='30/85CT',  # parses to count — wrong semantic for flour
+            invoice_date=date(2026, 4, 20),
+        )
+        r = Recipe.objects.create(name='TestBiscuits')
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='AP Flour',
+            quantity=Decimal('6'), unit='cups', product=p,
+        )
+        cost, note = ri.estimated_cost()
+        self.assertIsNotNone(cost,
+            f'AP Flour cups must price via product default fallback (got {note!r})')
+        # 6 cups × 4.25 oz/cup = 25.5 oz; case = 50 lb = 800 oz; 19.95 × (25.5/800) = $0.64
+        self.assertAlmostEqual(float(cost), 0.64, places=2)
+
+
 class RecipeIngredientCostUnlockTests(TestCase):
     """Integration test for the Phase 2A wiring. Confirms that
     `RecipeIngredient.estimated_cost` now succeeds for the Sysco-Butter

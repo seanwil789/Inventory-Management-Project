@@ -368,7 +368,7 @@ class RecipeIngredient(models.Model):
 
     def estimated_cost(self):
         """Latest-price $ cost for this ingredient line. Returns (cost_or_None, note)."""
-        from .cost_utils import ingredient_cost, effective_case_size_for_cost
+        from .cost_utils import ingredient_cost, case_size_candidates_for_cost
         from .models import InvoiceLineItem   # self-import ok — called at runtime
         if not self.product or self.quantity is None:
             return None, 'missing product or quantity'
@@ -381,25 +381,37 @@ class RecipeIngredient(models.Model):
         density = (self.yield_ref.ounce_weight_per_cup
                    if self.yield_ref and self.yield_ref.ounce_weight_per_cup
                    else None)
-        # Phase 2A/2B fallback chain for when the literal case_size column
-        # is bare-qty or OCR-mangled:
-        #   2A. extract weight from raw_description ('5# BAG', '36/1#')
-        #   2B. fall back to Product.default_case_size (the inferred
-        #       canonical pack — e.g. Milk='4/1GAL', Garlic='4/1GAL'),
-        #       populated by `infer_product_default_case_sizes` from
-        #       the mode of historical invoice case_sizes
-        #   2C. bare 'N/M' as 'N/MLB' as a last-resort heuristic
-        eff_cs = effective_case_size_for_cost(
+
+        # Try each parseable case_size candidate in priority order; first
+        # one that produces a non-None cost wins. Important when the literal
+        # case_size parses to a unit incompatible with the recipe (e.g. AP
+        # Flour invoice cs='30/85CT' parses as count, but the product is
+        # 50-lb bag and recipes ask cups — Product.default_case_size='1/50LB'
+        # is the right fallback there).
+        candidates = case_size_candidates_for_cost(
             latest.case_size,
             latest.raw_description,
             product_default=self.product.default_case_size,
         )
-        return ingredient_cost(
-            self.quantity, self.unit, self.name_raw,
-            latest.unit_price, eff_cs,
-            yield_pct=self.effective_yield_pct,
-            ounce_weight_per_cup=density,
-        )
+        if not candidates:
+            return ingredient_cost(
+                self.quantity, self.unit, self.name_raw,
+                latest.unit_price, latest.case_size or '',
+                yield_pct=self.effective_yield_pct,
+                ounce_weight_per_cup=density,
+            )
+        last_result = (None, '')
+        for cs in candidates:
+            cost, note = ingredient_cost(
+                self.quantity, self.unit, self.name_raw,
+                latest.unit_price, cs,
+                yield_pct=self.effective_yield_pct,
+                ounce_weight_per_cup=density,
+            )
+            if cost is not None:
+                return cost, note
+            last_result = (cost, note)
+        return last_result
 
 
 class Menu(models.Model):

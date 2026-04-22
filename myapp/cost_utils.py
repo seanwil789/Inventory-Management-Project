@@ -134,6 +134,12 @@ def effective_case_size_for_cost(case_size: str | None,
     Returns the original `case_size` (possibly unparseable) when no
     strategy yields a better value, so the caller's downstream behavior
     is unchanged in that case.
+
+    NOTE: this is the SINGLE-best-effort form. Callers that want to try
+    multiple candidates against `ingredient_cost` (because the literal
+    parses but is semantically wrong — e.g. AP Flour cs='30/85CT' parses
+    to count but the product is sold by weight) should use
+    `case_size_candidates_for_cost` instead and try each.
     """
     cs = (case_size or '').strip()
     # 1. Original parses?
@@ -158,6 +164,60 @@ def effective_case_size_for_cost(case_size: str | None,
             if parse_case_size(synth):
                 return synth
     return cs
+
+
+def case_size_candidates_for_cost(case_size: str | None,
+                                   raw_description: str | None,
+                                   product_default: str | None = None) -> list[str]:
+    """Return all parseable case_size candidates in preference order.
+
+    Unlike `effective_case_size_for_cost` which returns one string,
+    this returns the full set so the cost calculator can try each
+    against `ingredient_cost`. Important when the literal `case_size`
+    parses but is semantically wrong — AP Flour invoice carries
+    cs='30/85CT' which parses as count, but recipes ask cups (volume)
+    and the product is actually sold by weight (50-lb bag). Trying the
+    product default ('1/50LB') as a second candidate unlocks the cost.
+
+    Order:
+      1. Literal `case_size` (most invoice-specific)
+      2. Description-extracted weight ('5# BAG', '36/1#')
+      3. Product.default_case_size (inferred canonical pack)
+      4. Bare 'N/M' treated as 'N/MLB' (last-resort heuristic)
+
+    Caller iterates and returns the first candidate that produces a
+    non-None cost from `ingredient_cost`.
+    """
+    out: list[str] = []
+    seen: set[str] = set()
+
+    def _add(c):
+        if not c:
+            return
+        c = c.strip()
+        if not c or c in seen:
+            return
+        if parse_case_size(c):
+            out.append(c)
+            seen.add(c)
+
+    cs = (case_size or '').strip()
+    _add(cs)
+
+    desc_w = extract_weight_from_description(raw_description)
+    _add(desc_w)
+
+    _add((product_default or '').strip())
+
+    m = _BARE_N_OVER_M.match(cs)
+    if m:
+        n = Decimal(m.group(1))
+        per = Decimal(m.group(2))
+        total = n * per
+        if _BARE_NM_MIN_LBS <= total <= _BARE_NM_MAX_LBS:
+            _add(f'{m.group(1)}/{m.group(2)}LB')
+
+    return out
 
 
 # ---- Unit conversion ----
