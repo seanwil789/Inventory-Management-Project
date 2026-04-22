@@ -2469,6 +2469,44 @@ class EffectiveCaseSizeForCostTests(TestCase):
         # '36/1' → description '36/1#' AND bare-N/M heuristic both produce '36/1LB'
         self.assertEqual(f('36/1', '36/1# product'), '36/1LB')
 
+    def test_product_default_used_when_literal_unparseable(self):
+        """Phase 2B: Product.default_case_size is the inferred canonical pack;
+        kicks in when literal case_size is bare-qty or OCR-mangled."""
+        f = self._f()
+        # Milk: Farm Art ships invoice cs='1', product default='4/1GAL'
+        self.assertEqual(f('1', 'DAIRY MILK 2%, 4/1-GAL', product_default='4/1GAL'),
+                         '4/1GAL')
+        # Garlic: same pattern
+        self.assertEqual(f('1', '', product_default='4/1GAL'), '4/1GAL')
+
+    def test_product_default_skipped_when_literal_parses(self):
+        """Don't override an invoice's specific case_size with the
+        product-level default — invoice is more current."""
+        f = self._f()
+        # cs='1/25LB' parses → use it, ignore the product default
+        self.assertEqual(f('1/25LB', '', product_default='4/1GAL'), '1/25LB')
+
+    def test_product_default_takes_priority_over_bare_n_over_m_heuristic(self):
+        """Product default is more reliable than the lbs-fallback guess."""
+        f = self._f()
+        # cs='6/15' would heuristic to '6/15LB' (90 lbs), but if product
+        # default exists and parses, it wins.
+        self.assertEqual(f('6/15', '', product_default='1/50LB'), '1/50LB')
+
+    def test_description_priority_over_product_default(self):
+        """Invoice description weight beats product default — invoice is
+        more current data than the inferred-from-history default."""
+        f = self._f()
+        self.assertEqual(f('1', 'BUTTER 36/1# Sweet', product_default='4/1GAL'),
+                         '36/1LB')
+
+    def test_no_product_default_falls_through(self):
+        """Backward-compat: callers that don't pass product_default still work."""
+        f = self._f()
+        self.assertEqual(f('1', 'something with 50LB'), '50LB')
+        self.assertEqual(f('1', '', product_default=None), '1')
+        self.assertEqual(f('1', '', product_default=''), '1')
+
 
 class RecipeIngredientCostUnlockTests(TestCase):
     """Integration test for the Phase 2A wiring. Confirms that

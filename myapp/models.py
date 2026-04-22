@@ -381,13 +381,19 @@ class RecipeIngredient(models.Model):
         density = (self.yield_ref.ounce_weight_per_cup
                    if self.yield_ref and self.yield_ref.ounce_weight_per_cup
                    else None)
-        # Phase 2A unlock: when latest.case_size is bare-qty or empty,
-        # extract weight from the raw_description ('5# BAG', '36/1#') or
-        # fall back to interpreting bare 'N/M' as 'N/MLB'. Sysco Butter
-        # rows ('36/1' case_size, "Butter Prints 36/1#" description)
-        # are the canonical case this unlocks.
-        eff_cs = effective_case_size_for_cost(latest.case_size,
-                                              latest.raw_description)
+        # Phase 2A/2B fallback chain for when the literal case_size column
+        # is bare-qty or OCR-mangled:
+        #   2A. extract weight from raw_description ('5# BAG', '36/1#')
+        #   2B. fall back to Product.default_case_size (the inferred
+        #       canonical pack — e.g. Milk='4/1GAL', Garlic='4/1GAL'),
+        #       populated by `infer_product_default_case_sizes` from
+        #       the mode of historical invoice case_sizes
+        #   2C. bare 'N/M' as 'N/MLB' as a last-resort heuristic
+        eff_cs = effective_case_size_for_cost(
+            latest.case_size,
+            latest.raw_description,
+            product_default=self.product.default_case_size,
+        )
         return ingredient_cost(
             self.quantity, self.unit, self.name_raw,
             latest.unit_price, eff_cs,

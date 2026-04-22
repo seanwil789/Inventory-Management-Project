@@ -118,11 +118,17 @@ _BARE_NM_MAX_LBS = Decimal('200')
 
 
 def effective_case_size_for_cost(case_size: str | None,
-                                  raw_description: str | None) -> str:
+                                  raw_description: str | None,
+                                  product_default: str | None = None) -> str:
     """Return the most-useful case_size string for cost calc, in priority order:
       1. The literal `case_size` if it already parses (no change).
       2. Weight extracted from the invoice description (`'5# BAG'`, `'36/1#'`).
-      3. Bare 'N/M' (no unit) treated as 'N/MLB' if N×M is within a sane
+      3. `Product.default_case_size` if it parses — populated by
+         `infer_product_default_case_sizes` from the mode of historical
+         invoice case_sizes. Used when the current invoice's case_size
+         is bare-qty / OCR-mangled but the product has a known canonical
+         pack (e.g. Milk default='4/1GAL', Garlic='4/1GAL').
+      4. Bare 'N/M' (no unit) treated as 'N/MLB' if N×M is within a sane
          range (0.5–200 lbs). Last-resort heuristic for Sysco notation
          where the unit is conventionally LB.
     Returns the original `case_size` (possibly unparseable) when no
@@ -137,7 +143,11 @@ def effective_case_size_for_cost(case_size: str | None,
     desc_w = extract_weight_from_description(raw_description)
     if desc_w and parse_case_size(desc_w):
         return desc_w
-    # 3. Bare N/M with sane total → assume lbs
+    # 3. Product default (the inferred canonical pack)?
+    pd = (product_default or '').strip()
+    if pd and parse_case_size(pd):
+        return pd
+    # 4. Bare N/M with sane total → assume lbs
     m = _BARE_N_OVER_M.match(cs)
     if m:
         n = Decimal(m.group(1))
