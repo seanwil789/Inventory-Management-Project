@@ -6,8 +6,9 @@ from Sysco, Farm Art, and Exceptional Foods raw descriptions.
 """
 import re
 
-COMMON_PACK_COUNTS = [1,2,3,4,5,6,8,10,12,15,16,20,24,30,32,36,48,50,60,72,80,
-                      100,120,150,180,200,240,250,300,500,1000,2000]
+COMMON_PACK_COUNTS = [1,2,3,4,5,6,8,10,12,15,16,18,20,24,30,32,36,40,48,50,60,
+                      72,80,96,100,120,144,150,160,180,192,200,240,250,288,300,
+                      500,1000,2000]
 
 COMMON_PER_UNIT = {
     'OZ': [0.5,1,1.3,1.5,2,2.38,2.6,2.75,3,3.25,3.8,4,5,5.3,6,7,8,10,12,
@@ -16,7 +17,7 @@ COMMON_PER_UNIT = {
     'LB': [0.5,1,2,2.2,2.5,3,3.5,4,5,5.75,6,6.6,7.5,7.51,8.6,9.8,10,
            10.55,11,12.5,13.1,15,17.3,17.9,19.3,20,22,22.92,23,24,25,30,
            35,40,42.5,50],
-    'GAL': [0.5,1,2.5,5],
+    'GAL': [0.5,1,2.5,5,12.5],
     'CT': None,  # any count valid
     'LTR': [1,2,2.5,5],
     'QT': [1],
@@ -145,8 +146,8 @@ def decode_farmart(desc):
     if m:
         per = m.group(2) or '1'
         return f'{m.group(1)}/{per}GAL'
-    # N LB
-    m = re.search(r'(\d+\.?\d*)\s+LB\b', desc, re.IGNORECASE)
+    # N LB — space optional (handles '35LB' and '35 LB')
+    m = re.search(r'(\d+\.?\d*)\s*LB\b', desc, re.IGNORECASE)
     if m:
         return f'1/{m.group(1)}LB'
     # N DOZ

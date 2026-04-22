@@ -1895,6 +1895,54 @@ class MapperStripSyscoPrefixTests(TestCase):
         self.assertIn("OATS", result)
 
 
+class CaseSizeDecoderTests(TestCase):
+    """`invoice_processor.case_size_decoder.decode` — extracts normalized
+    pack sizes from raw invoice descriptions. Covers Sysco's packed-number
+    format (2416OZ → 24/16OZ) and the decimal-split variant (482.6OZ → 48/2.6OZ)."""
+
+    def _decode(self, desc, vendor=''):
+        import sys
+        from pathlib import Path
+        sys.path.insert(0, str(Path(__file__).parent.parent / 'invoice_processor'))
+        from case_size_decoder import decode
+        return decode(desc, vendor)
+
+    def test_sysco_packed_integer(self):
+        self.assertEqual(self._decode('2416OZ ARIZONA ICED TEA', 'Sysco'), '24/16OZ')
+
+    def test_sysco_decimal_split_two_digit_count(self):
+        """482.6OZ should split as count=48, per=2.6 (decimal stays with per)."""
+        self.assertEqual(self._decode('482.6OZ STACYS PITA CHIPS', 'Sysco'), '48/2.6OZ')
+
+    def test_sysco_decimal_split_three_digit_count(self):
+        """961.42OZ should split as count=96, per=1.42OZ — regression for
+        the bug where 96 was missing from COMMON_PACK_COUNTS."""
+        self.assertEqual(self._decode('961.42OZ GENMILLS CEREAL BAR', 'Sysco'),
+                         '96/1.42OZ')
+
+    def test_sysco_only_prefix(self):
+        self.assertEqual(self._decode('ONLY 2.5LB CHICKEN', 'Sysco'), '1/2.5LB')
+
+    def test_sysco_gallon(self):
+        self.assertEqual(self._decode('12.5GAL ECOLAB SANITIZER', 'Sysco'),
+                         '1/12.5GAL')
+
+    def test_farmart_slash_format(self):
+        self.assertEqual(self._decode('DAIRY MILK WHOLE, 4/1-GAL', 'Farm Art'),
+                         '4/1GAL')
+
+    def test_farmart_lb_suffix(self):
+        self.assertEqual(self._decode('CABBAGE, GREEN, 35LB', 'Farm Art'),
+                         '1/35LB')
+
+    def test_exceptional_pounds(self):
+        self.assertEqual(self._decode('Chicken Breast 5 oz Frozen 40lb', 'Exceptional Foods'),
+                         '1/40LB')
+
+    def test_no_size_returns_none(self):
+        self.assertIsNone(self._decode('Bacon', 'Sysco'))
+
+
 class MapperJunkFilterTests(TestCase):
     """`_is_junk_item` — filter layer that keeps OCR noise out of the DB."""
 
