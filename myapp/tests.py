@@ -937,6 +937,46 @@ class ManagementCommandSmokeTests(TestCase):
         """Dry-run just reports; should not delete anything."""
         self._run('clean_ocr_cache')
 
+    def test_backfill_section_hints_dry_run(self):
+        """Empty DB → command short-circuits cleanly, no OCR cache access."""
+        self._run('backfill_section_hints', dry_run=True)
+
+
+class SectionHintBackfillTests(TestCase):
+    """Unit tests for the section-header detection logic used by
+    backfill_section_hints — isolates the _section_before helper."""
+
+    def _section_before(self, raw_text, pos):
+        from myapp.management.commands.backfill_section_hints import _section_before
+        return _section_before(raw_text, pos)
+
+    def test_finds_nearest_preceding_header(self):
+        text = "**** DAIRY ****\nline1\nline2\n7136165 67.85\n"
+        pos = text.find('7136165')
+        self.assertEqual(self._section_before(text, pos), 'DAIRY')
+
+    def test_skips_group_total_lines(self):
+        """GROUP TOTAL**** should not be mistaken for a section header."""
+        text = "**** PRODUCE ****\napples\nGROUP TOTAL****\n7136165 67.85\n"
+        pos = text.find('7136165')
+        self.assertEqual(self._section_before(text, pos), 'PRODUCE')
+
+    def test_handles_sections_with_ampersand(self):
+        text = "**** CHEMICAL & JANITORIAL ****\n7136165 67.85\n"
+        pos = text.find('7136165')
+        self.assertEqual(self._section_before(text, pos), 'CHEMICAL & JANITORIAL')
+
+    def test_returns_empty_when_no_header_before(self):
+        text = "no asterisks anywhere\n7136165 67.85\n"
+        pos = text.find('7136165')
+        self.assertEqual(self._section_before(text, pos), '')
+
+    def test_picks_most_recent_when_multiple(self):
+        """Multiple section headers → return the nearest preceding one."""
+        text = "**** DAIRY ****\nmilk\n**** FROZEN ****\n7136165 67.85\n"
+        pos = text.find('7136165')
+        self.assertEqual(self._section_before(text, pos), 'FROZEN')
+
 
 class AuditOrphanProductsTests(TestCase):
     """`audit_orphan_products` — locks in zero-invoice-line detection + the

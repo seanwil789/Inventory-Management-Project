@@ -134,6 +134,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             match_confidence=confidence,
             match_score=match_score,
             price_flagged=price_flagged,
+            section_hint=(item.get('section') or '')[:60],
         )
 
         if product and parsed_date:

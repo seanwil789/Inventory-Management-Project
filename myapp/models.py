@@ -68,6 +68,12 @@ class InvoiceLineItem(models.Model):
     match_confidence = models.CharField(max_length=20, blank=True, choices=CONFIDENCE_CHOICES)
     match_score     = models.IntegerField(null=True, blank=True)  # 0-100 fuzzy score
     price_flagged   = models.BooleanField(default=False)  # True if price anomaly detected
+    section_hint    = models.CharField(
+        max_length=60, blank=True, db_index=True,
+        help_text="Section header from the invoice (e.g. 'DAIRY', "
+                  "'CHEMICAL & JANITORIAL'). Used to categorize unknown-code "
+                  "rows where the OCR dropped the description column.",
+    )
     imported_at     = models.DateTimeField(auto_now_add=True)
 
     class Meta:
