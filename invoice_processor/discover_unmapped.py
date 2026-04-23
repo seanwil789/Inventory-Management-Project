@@ -702,8 +702,19 @@ def apply_approved():
     # Append new mapping rows to Item Mapping. Note: Item Mapping schema is
     # different from the Mapping Review schema — here col F is the canonical.
     if new_appends:
+        # SUPC-recovery notes encode the Sysco item code as 'code=XXXXX'.
+        # When present, populate col G so the mapping is code-indexed (not
+        # just description-fuzzy-indexed) — strictly better match quality
+        # for future invoices carrying that SUPC.
+        _SUPC_FROM_NOTES = re.compile(r'code=(\d{6,8})\b')
+
         mapping_rows = []
         for a in new_appends:
+            supc_code = ''
+            if a.get('notes'):
+                m = _SUPC_FROM_NOTES.search(a['notes'])
+                if m:
+                    supc_code = m.group(1)
             mapping_rows.append([
                 a["vendor"],           # A: Vendor
                 a["raw_description"],  # B: Raw Description
@@ -711,7 +722,7 @@ def apply_approved():
                 "",                    # D: Primary descriptor
                 "",                    # E: Secondary descriptor
                 a["canonical"],        # F: Canonical name
-                "",                    # G: SUPC Code
+                supc_code,             # G: SUPC Code (populated for SUPC-recovery rows)
             ])
 
         client.values().append(
