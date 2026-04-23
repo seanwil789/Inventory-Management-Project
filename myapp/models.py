@@ -368,6 +368,7 @@ class RecipeIngredient(models.Model):
 
     def estimated_cost(self):
         """Latest-price $ cost for this ingredient line. Returns (cost_or_None, note)."""
+        from decimal import Decimal
         from .cost_utils import ingredient_cost, case_size_candidates_for_cost
         from .models import InvoiceLineItem   # self-import ok — called at runtime
         if not self.product or self.quantity is None:
@@ -382,6 +383,30 @@ class RecipeIngredient(models.Model):
                    if self.yield_ref and self.yield_ref.ounce_weight_per_cup
                    else None)
 
+        # Piece-weight rewrite: when recipe asks for a size-word or each
+        # (medium/large/small/ea/each) AND yield_ref is linked with a
+        # piece-type ap_unit (each/head/bunch) + ap_weight_oz populated,
+        # rewrite (qty, unit) to AP weight in oz. This is the Phase 6
+        # unlock for piece-unit RIs.
+        #
+        # Critical: ap_weight_oz IS already AP weight — must NOT pass
+        # yield_pct in this branch. ingredient_cost's qty /= yield_pct/100
+        # would over-scale into double-counted yield loss.
+        _PIECE_RECIPE_UNITS = {'medium', 'large', 'small', 'ea', 'each'}
+        _PIECE_AP_UNITS = {'each', 'head', 'bunch'}
+        unit_lc = (self.unit or '').strip().lower()
+        if (unit_lc in _PIECE_RECIPE_UNITS
+                and self.yield_ref
+                and self.yield_ref.ap_weight_oz
+                and (self.yield_ref.ap_unit or '').strip().lower() in _PIECE_AP_UNITS):
+            qty_for_calc = Decimal(self.quantity) * Decimal(self.yield_ref.ap_weight_oz)
+            unit_for_calc = 'oz'
+            yield_pct_for_calc = None
+        else:
+            qty_for_calc = self.quantity
+            unit_for_calc = self.unit
+            yield_pct_for_calc = self.effective_yield_pct
+
         # Try each parseable case_size candidate in priority order; first
         # one that produces a non-None cost wins. Important when the literal
         # case_size parses to a unit incompatible with the recipe (e.g. AP
@@ -395,17 +420,17 @@ class RecipeIngredient(models.Model):
         )
         if not candidates:
             return ingredient_cost(
-                self.quantity, self.unit, self.name_raw,
+                qty_for_calc, unit_for_calc, self.name_raw,
                 latest.unit_price, latest.case_size or '',
-                yield_pct=self.effective_yield_pct,
+                yield_pct=yield_pct_for_calc,
                 ounce_weight_per_cup=density,
             )
         last_result = (None, '')
         for cs in candidates:
             cost, note = ingredient_cost(
-                self.quantity, self.unit, self.name_raw,
+                qty_for_calc, unit_for_calc, self.name_raw,
                 latest.unit_price, cs,
-                yield_pct=self.effective_yield_pct,
+                yield_pct=yield_pct_for_calc,
                 ounce_weight_per_cup=density,
             )
             if cost is not None:

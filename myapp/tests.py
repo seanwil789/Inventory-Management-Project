@@ -2632,6 +2632,106 @@ class RecipeIngredientCostTryAllCandidatesTests(TestCase):
         self.assertAlmostEqual(float(cost), 0.64, places=2)
 
 
+class RecipeIngredientPieceWeightViaYieldRefTests(TestCase):
+    """Phase 6 piece-weight rewrite. When recipe unit is a size word or
+    each, and yield_ref has piece-type ap_unit + ap_weight_oz, estimated_cost
+    rewrites (qty, unit) to AP weight in oz before dispatch."""
+
+    def _setup_carrot(self, ap_weight_oz=Decimal('4.10'), prep_state='whole,medium',
+                       ap_unit='each', yield_pct=Decimal('81.30')):
+        from myapp.models import Vendor, Product, InvoiceLineItem, Recipe, RecipeIngredient, YieldReference
+        from datetime import date
+        v = Vendor.objects.create(name='Farm Art')
+        p = Product.objects.create(canonical_name='Carrot')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            raw_description='Carrot, 50 LB BAG',
+            unit_price=Decimal('32.00'),
+            extended_amount=Decimal('32.00'),
+            case_size='1/50LB',
+            invoice_date=date(2026, 4, 20),
+        )
+        yr = YieldReference.objects.create(
+            ingredient='Carrots', prep_state=prep_state, section='vegetables',
+            ap_unit=ap_unit, ap_weight_oz=ap_weight_oz, yield_pct=yield_pct,
+        )
+        r = Recipe.objects.create(name='TestCarrotDish')
+        return v, p, yr, r
+
+    def test_medium_carrot_prices_via_yield_ref_piece_weight(self):
+        """3 medium Carrot, YR ap_weight_oz=4.10 → 12.30 oz AP.
+        Case 1/50LB = 800 oz. Cost = 32 × 12.30/800 = 0.49."""
+        from myapp.models import RecipeIngredient
+        v, p, yr, r = self._setup_carrot()
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='Carrot', quantity=Decimal('3'), unit='medium',
+            product=p, yield_ref=yr,
+        )
+        cost, note = ri.estimated_cost()
+        self.assertIsNotNone(cost, f'Should price via piece-weight rewrite (got {note!r})')
+        # 3 × 4.10 = 12.30 oz AP; case 800 oz; 32 × 12.30/800 = 0.492 → $0.49
+        self.assertEqual(cost, Decimal('0.49'))
+
+    def test_yield_pct_not_double_applied_in_piece_branch(self):
+        """Critical: ap_weight_oz is AP — yield_pct must NOT divide qty again.
+        If it did, cost would be 0.49 / 0.813 = 0.605 ($0.60 — wrong)."""
+        from myapp.models import RecipeIngredient
+        v, p, yr, r = self._setup_carrot()
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='Carrot', quantity=Decimal('3'), unit='medium',
+            product=p, yield_ref=yr,
+        )
+        cost, _ = ri.estimated_cost()
+        # If yield_pct were double-applied, we'd see $0.60 instead of $0.49.
+        self.assertEqual(cost, Decimal('0.49'))
+
+    def test_pound_ap_unit_does_not_trigger_piece_rewrite(self):
+        """YR row with ap_unit='pound' must NOT be used for piece-weight
+        rewrite — it's a per-pound row, not per-piece. Without explicit
+        piece-unit ap_unit, we fall back to incompat (existing behavior)."""
+        from myapp.models import RecipeIngredient
+        v, p, yr, r = self._setup_carrot(
+            ap_weight_oz=Decimal('16.00'),  # pound-based row
+            prep_state='chopped', ap_unit='pound', yield_pct=Decimal('81.30'),
+        )
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='Carrot', quantity=Decimal('3'), unit='medium',
+            product=p, yield_ref=yr,
+        )
+        cost, note = ri.estimated_cost()
+        # 'medium' against pound-based yield_ref → no rewrite → incompat
+        self.assertIsNone(cost)
+        self.assertIn('incompatible', note)
+
+    def test_ea_unit_also_triggers_rewrite(self):
+        """'Ea' (common recipe shorthand) gets the same treatment as size words."""
+        from myapp.models import RecipeIngredient
+        v, p, yr, r = self._setup_carrot()
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='Carrot', quantity=Decimal('2'), unit='Ea',
+            product=p, yield_ref=yr,
+        )
+        cost, _ = ri.estimated_cost()
+        self.assertIsNotNone(cost)
+        # 2 × 4.10 / 800 × 32 = 0.328 → $0.33
+        self.assertEqual(cost, Decimal('0.33'))
+
+    def test_weight_unit_ignores_piece_rewrite(self):
+        """Recipe unit 'lb' + yield_ref set → piece-rewrite must NOT fire.
+        Normal weight dispatch takes over, yield_pct gets applied normally."""
+        from myapp.models import RecipeIngredient
+        v, p, yr, r = self._setup_carrot()
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='Carrot', quantity=Decimal('1'), unit='lb',
+            product=p, yield_ref=yr,  # yield_pct=81.30 flows through normally
+        )
+        cost, _ = ri.estimated_cost()
+        self.assertIsNotNone(cost)
+        # 1 lb / 0.813 = 1.23 lb AP needed; case 50 lb = $32
+        # Cost = 32 × 1.23/50 = $0.787 → $0.79
+        self.assertAlmostEqual(float(cost), 0.79, places=2)
+
+
 class RecipeIngredientCostUnlockTests(TestCase):
     """Integration test for the Phase 2A wiring. Confirms that
     `RecipeIngredient.estimated_cost` now succeeds for the Sysco-Butter
