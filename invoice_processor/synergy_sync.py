@@ -181,15 +181,36 @@ def calc_iup(unit_price: float, case_size: str) -> float | None:
 
 
 def calc_price_per_lb(unit_price: float, case_size: str,
-                      unit_col: str = "") -> float | None:
+                      unit_col: str = "",
+                      stored_price_per_lb=None) -> float | None:
     """
     Compute Price per Pound = unit_price / total_weight_in_lbs.
+
+    When `stored_price_per_lb` is provided (from the parser's direct
+    computation on Sysco catch-weight / Exceptional rows, persisted as
+    InvoiceLineItem.price_per_pound), it takes priority over any
+    reverse-engineering from unit_price + case_size. The stored value is
+    immune to case_size OCR drift — if the parser already knew $/lb at
+    write time, that's the authoritative answer.
+
+    Falls back to unit_price / total_weight when the stored field is null
+    (the 4 of 6 vendors whose parsers don't emit it, plus pre-Track-B
+    rows that haven't been backfilled).
 
     Uses case size to derive total weight. If case size is a bare number
     and the unit column is "#" (pounds), treats the number as total pounds.
 
     Returns None if weight cannot be determined or item isn't sold by weight.
     """
+    # Parser's direct value — when present, it's authoritative.
+    if stored_price_per_lb is not None:
+        try:
+            val = float(stored_price_per_lb)
+            if val > 0:
+                return round(val, 4)
+        except (TypeError, ValueError):
+            pass
+
     # First try extracting weight from case size string with unit suffix
     weight = parse_total_weight_lbs(case_size)
     if weight and weight > 0:
@@ -395,6 +416,11 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
                 "category":              ili.product.category,
                 "primary_descriptor":    ili.product.primary_descriptor,
                 "secondary_descriptor":  ili.product.secondary_descriptor,
+                # Parser's direct $/lb — used by calc_price_per_lb in
+                # preference over reverse-engineering.
+                "price_per_pound":       (float(ili.price_per_pound)
+                                          if ili.price_per_pound is not None
+                                          else None),
             }
 
     return list(seen.values())
@@ -525,6 +551,7 @@ def _sync_prices_core(
         vendor_name = item.get("vendor_name", "")
         unit_price  = item.get("unit_price")
         case_size   = item.get("case_size_raw", "")
+        stored_ppp  = item.get("price_per_pound")
 
         # Step 1: find all sheet rows whose product name fuzzy-matches
         all_matches = process.extract(
@@ -623,7 +650,8 @@ def _sync_prices_core(
                 continue
 
             iup = calc_iup(unit_price, effective_case_size)
-            pplb = calc_price_per_lb(unit_price, effective_case_size, sheet_unit)
+            pplb = calc_price_per_lb(unit_price, effective_case_size, sheet_unit,
+                                     stored_price_per_lb=stored_ppp)
 
             batch_data.append({
                 "range": f"'{tab}'!E{row_num}",
@@ -1190,7 +1218,8 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
         })
 
         iup = calc_iup(unit_price, case_size)
-        pplb = calc_price_per_lb(unit_price, case_size, sheet_unit)
+        pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
+                                 stored_price_per_lb=latest.price_per_pound)
 
         if iup is not None:
             batch_data.append({
@@ -1329,7 +1358,8 @@ def refresh_stale_carryover(sheet_tab: str = None, dry_run: bool = False) -> dic
         case_size = latest.case_size or entry.get("case_size", "")
         latest_vendor = latest.vendor.name if latest.vendor else "?"
         iup = calc_iup(unit_price, case_size)
-        pplb = calc_price_per_lb(unit_price, case_size, sheet_unit)
+        pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
+                                 stored_price_per_lb=latest.price_per_pound)
 
         if dry_run:
             print(f"   [DRY RUN] row {row_num}: '{product_name}' → ${unit_price:.2f} "

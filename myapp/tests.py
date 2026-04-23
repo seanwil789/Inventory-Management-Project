@@ -1155,6 +1155,57 @@ class BackfillPricePerPoundTests(TestCase):
         self.assertIn('No matching caches found', out.getvalue())
 
 
+class SynergySyncPricePerLbTests(TestCase):
+    """`calc_price_per_lb` — Track B consumer wiring.
+
+    Verifies the new `stored_price_per_lb` kwarg: when the caller passes
+    the parser's direct $/lb (from InvoiceLineItem.price_per_pound), that
+    value short-circuits the reverse-engineering fallback. Reverse path
+    still runs when the stored value is null/zero/invalid."""
+
+    def _calc(self, *args, **kwargs):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from synergy_sync import calc_price_per_lb
+        return calc_price_per_lb(*args, **kwargs)
+
+    def test_stored_value_wins_over_reverse_engineering(self):
+        """Parser knew $/lb directly → return that, don't re-derive."""
+        # Reverse-engineering from case='10.0LB' at unit=$66.45 gives $6.645/lb.
+        # If the stored value says something different, stored wins.
+        result = self._calc(66.45, '10.0LB', '', stored_price_per_lb=7.00)
+        self.assertEqual(result, 7.0)
+
+    def test_falls_back_when_stored_is_none(self):
+        """Field is null → reverse-engineer from unit_price / weight."""
+        result = self._calc(66.45, '10.0LB', '', stored_price_per_lb=None)
+        self.assertAlmostEqual(result, 6.645, places=3)
+
+    def test_falls_back_when_stored_is_zero(self):
+        """Stored 0 is not a real price — fall back."""
+        result = self._calc(66.45, '10.0LB', '', stored_price_per_lb=0)
+        self.assertAlmostEqual(result, 6.645, places=3)
+
+    def test_stored_invalid_type_falls_back(self):
+        """Garbage stored value → fall back silently."""
+        result = self._calc(66.45, '10.0LB', '', stored_price_per_lb='junk')
+        self.assertAlmostEqual(result, 6.645, places=3)
+
+    def test_stored_saves_us_when_case_size_is_unparseable(self):
+        """The key win — case_size drift/emptiness doesn't break $/lb
+        output when the stored value is present."""
+        # Case size is ambiguous bare-number → reverse-engineering returns None.
+        # But stored_price_per_lb supplies the answer.
+        self.assertIsNone(self._calc(66.45, '1', ''))  # no stored → None
+        self.assertEqual(
+            self._calc(66.45, '1', '', stored_price_per_lb=6.645),
+            6.645,
+        )
+
+
 class AuditSemanticMismatchesTests(TestCase):
     """`audit_semantic_mismatches` — flags ILI rows whose section_hint
     disagrees with the linked product's category."""
