@@ -566,6 +566,22 @@ def ingredient_cost(
         cost = case_price * (recipe_floz / total_case_floz)
         return cost.quantize(Decimal('0.01')), f'weight→volume via density {density} oz/c'
 
+    # Container-unit ↔ weight/volume case: recipe asks for a specific
+    # container (bag, bottle, jar, can, pack) and the case describes its
+    # SIZE in weight or volume. The case's pack_count IS the container
+    # count — recipe qty maps to that directly.
+    #   '0.5 bag Mozzarella' case='12/4OZ' (12 bags × 4oz) → 0.5/12 × case
+    #   '1 bag Yellow Onion' case='1/50LB' (1 bag × 50lb)  → 1/1  × case
+    # Does NOT fire for generic count units like 'each'/'ea'/'ct' — those
+    # are ambiguous ("1 ea carrot" can't be resolved this way).
+    _container_units = {'bag', 'bags', 'bottle', 'bottles', 'jar', 'jars',
+                        'can', 'cans', 'pack', 'packs'}
+    if (normalize_unit(recipe_unit) in _container_units
+            and c_kind in ('weight', 'volume')
+            and case_info.pack_count >= 1):
+        cost = case_price * (qty / Decimal(case_info.pack_count))
+        return cost.quantize(Decimal('0.01')), f'container↔case (1 of {case_info.pack_count})'
+
     # Count vs something else — only works when matched exactly,
     # OR when recipe is a small integer with empty unit AND case is count
     # (the canonical "6 eggs" pattern: recipe says "6" with no unit,

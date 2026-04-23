@@ -2883,6 +2883,60 @@ class CostUtilsUnitKindTests(TestCase):
         self.assertEqual(unit_kind("  LB  "), 'weight')
 
 
+class ContainerUnitCostTests(TestCase):
+    """Container-unit → weight/volume case dispatch.
+
+    Recipe asks for '0.5 bag' or '1 pack' or similar; case describes the
+    SIZE of each container (12/4OZ = 12 bags of 4oz, 1/50LB = 1 bag of
+    50 lb). pack_count IS the container count — cost maps to qty / pack_count.
+    """
+
+    def test_half_bag_of_twelve(self):
+        """0.5 bag × 12-bag case → 0.5/12 of case_price."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal('0.5'), recipe_unit='bag',
+            ingredient_name='Mozzarella',
+            case_price=Decimal('24.00'), case_size_str='12/4OZ',
+        )
+        # 24 × 0.5/12 = 1.00
+        self.assertEqual(cost, Decimal('1.00'))
+        self.assertIn('container', note)
+
+    def test_one_bag_of_one(self):
+        """1 bag × 1-bag case → full case price."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal('1'), recipe_unit='bag',
+            ingredient_name='Yellow Onion',
+            case_price=Decimal('32.50'), case_size_str='1/50LB',
+        )
+        self.assertEqual(cost, Decimal('32.50'))
+
+    def test_pack_plural(self):
+        """'packs' plural still triggers container branch."""
+        from myapp.cost_utils import ingredient_cost
+        cost, _ = ingredient_cost(
+            recipe_qty=Decimal('2'), recipe_unit='packs',
+            ingredient_name='Swiss',
+            case_price=Decimal('40.00'), case_size_str='10/8OZ',
+        )
+        # 40 × 2/10 = 8.00
+        self.assertEqual(cost, Decimal('8.00'))
+
+    def test_generic_count_unit_does_not_trigger(self):
+        """'each' should NOT trigger container branch — too ambiguous.
+        Falls through to standard count↔count or fails."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal('2'), recipe_unit='each',
+            ingredient_name='Carrot',
+            case_price=Decimal('30.00'), case_size_str='1/50LB',
+        )
+        # Should NOT match container branch (each is not a container)
+        self.assertNotIn('container', (note or ''))
+
+
 class CostUtilsUnitSynonymTests(TestCase):
     """Synonyms added from production-data audit: pound symbol, plural
     forms of weight/volume/count units. Each entry here unblocks specific
