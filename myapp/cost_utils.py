@@ -643,34 +643,52 @@ def ingredient_cost(
     case_size_str: str | None,
     yield_pct: Decimal | None = None,
     ounce_weight_per_cup: Decimal | None = None,
+    price_per_pound: Decimal | None = None,
 ) -> tuple[Optional[Decimal], str]:
     """
     Compute the estimated dollar cost of an ingredient line.
 
     Returns (cost_or_None, reason_note). `reason_note` explains why cost is None
     (for UI debugging) or describes any assumption made.
+
+    When `price_per_pound` is provided (parser's direct $/lb, persisted on
+    InvoiceLineItem.price_per_pound for Sysco catch-weight + Exceptional
+    rows), the weight-unit recipe dispatch uses it directly instead of
+    parsing case_size. This is the accuracy-load-bearing path for protein
+    ingredients — avoids the entire case_size → pack_count × pack_size
+    chain and produces a cost from a single multiplication.
     """
     if recipe_qty is None:
         return None, 'no quantity'
-    if case_price is None:
+    if case_price is None and price_per_pound is None:
         return None, 'no recent invoice price'
 
-    case_info = parse_case_size(case_size_str)
-    if case_info is None:
-        return None, f'unparseable case_size: {case_size_str!r}'
-
-    # Optionally scale qty up for yield loss (AP needed)
+    # Apply yield + piece-weight transforms first so they're available to
+    # both the direct $/lb path and the case_size dispatch below.
     qty = Decimal(recipe_qty)
     if yield_pct:
         qty = qty / (yield_pct / Decimal('100'))
 
-    # Ingredient-specific piece weights — rewrite (qty, unit) as weight in oz
-    # for known pairings like (garlic, clove). Must run BEFORE unit_kind
-    # classification below.
     piece_oz = _piece_weight_oz_for(ingredient_name, recipe_unit)
     if piece_oz is not None:
         qty = qty * piece_oz
         recipe_unit = 'oz'
+
+    # Direct $/lb path. Parser emits price_per_pound for Sysco catch-weight
+    # and Exceptional — both are per-lb billed. When the recipe asks in a
+    # weight unit, a single multiplication ends the work; no case_size
+    # dependency, no case_info parsing, no pack-count arithmetic.
+    if price_per_pound is not None:
+        if unit_kind(recipe_unit) == 'weight':
+            oz_result = to_base_unit(qty, recipe_unit)
+            if oz_result is not None:
+                lb_value = oz_result[0] / Decimal('16')
+                cost = Decimal(str(price_per_pound)) * lb_value
+                return cost.quantize(Decimal('0.01')), 'direct $/lb'
+
+    case_info = parse_case_size(case_size_str)
+    if case_info is None:
+        return None, f'unparseable case_size: {case_size_str!r}'
 
     r_kind = unit_kind(recipe_unit)
     c_kind = unit_kind(case_info.pack_unit)

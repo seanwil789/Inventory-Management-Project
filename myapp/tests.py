@@ -1206,6 +1206,99 @@ class SynergySyncPricePerLbTests(TestCase):
         )
 
 
+class CostUtilsPricePerPoundTests(TestCase):
+    """`ingredient_cost` — Track B direct $/lb path.
+
+    When the caller passes price_per_pound (from
+    InvoiceLineItem.price_per_pound), the weight-unit dispatch bypasses
+    case_size parsing entirely and computes cost from a single
+    multiplication: qty_in_lb × price_per_pound. This is the primary
+    accuracy win for protein recipe costs."""
+
+    def _cost(self, *args, **kwargs):
+        from myapp.cost_utils import ingredient_cost
+        return ingredient_cost(*args, **kwargs)
+
+    def test_direct_path_lb_recipe(self):
+        """1 lb of beef @ $10.98/lb → $10.98 cost, no case_size needed."""
+        from decimal import Decimal
+        cost, note = self._cost(
+            Decimal('1'), 'lb', 'Beef Chuck Flap',
+            case_price=Decimal('197.53'),
+            case_size_str='17.99LB',
+            price_per_pound=Decimal('10.98'),
+        )
+        self.assertEqual(cost, Decimal('10.98'))
+        self.assertEqual(note, 'direct $/lb')
+
+    def test_direct_path_oz_recipe(self):
+        """8 oz of beef @ $10.98/lb → $5.49 cost (half a pound)."""
+        from decimal import Decimal
+        cost, note = self._cost(
+            Decimal('8'), 'oz', 'Beef Chuck Flap',
+            case_price=Decimal('197.53'),
+            case_size_str='17.99LB',
+            price_per_pound=Decimal('10.98'),
+        )
+        self.assertEqual(cost, Decimal('5.49'))
+        self.assertEqual(note, 'direct $/lb')
+
+    def test_direct_path_unlocks_when_case_size_unparseable(self):
+        """case_size='1' (bare qty, would normally fail to parse) +
+        price_per_pound set → direct path saves us. THIS is Track B's
+        primary accuracy unlock."""
+        from decimal import Decimal
+        cost, note = self._cost(
+            Decimal('2'), 'lb', 'Beef',
+            case_price=Decimal('50'),
+            case_size_str='1',  # unparseable
+            price_per_pound=Decimal('5.00'),
+        )
+        self.assertEqual(cost, Decimal('10.00'))
+        self.assertEqual(note, 'direct $/lb')
+
+    def test_falls_through_when_price_per_pound_none(self):
+        """No stored $/lb → original weight↔weight dispatch runs,
+        preserves zero-regression guarantee on existing rows."""
+        from decimal import Decimal
+        cost, note = self._cost(
+            Decimal('1'), 'lb', 'Beef Chuck Flap',
+            case_price=Decimal('197.53'),
+            case_size_str='17.99LB',
+            price_per_pound=None,  # no stored value
+        )
+        # Falls through to weight↔weight: 16oz / (17.99*16 oz) * $197.53
+        self.assertAlmostEqual(float(cost), 197.53 / 17.99, places=2)
+        self.assertEqual(note, 'weight↔weight')
+
+    def test_direct_path_not_used_for_volume_recipes(self):
+        """price_per_pound set but recipe asks in cups → fall through
+        (no direct $/lb path for volume units; needs density)."""
+        from decimal import Decimal
+        cost, note = self._cost(
+            Decimal('1'), 'cup', 'Oil',
+            case_price=Decimal('40'),
+            case_size_str='6/1GAL',
+            price_per_pound=Decimal('5.00'),  # set but ignored for volume
+        )
+        # Should go through volume↔volume dispatch, not direct
+        self.assertNotEqual(note, 'direct $/lb')
+
+    def test_yield_adjustment_scales_up_before_direct_path(self):
+        """Recipe asks 1 lb EP (edible), yield=50%. AP needed = 2 lb.
+        Cost = 2 × $10/lb = $20."""
+        from decimal import Decimal
+        cost, note = self._cost(
+            Decimal('1'), 'lb', 'Beef',
+            case_price=Decimal('50'),
+            case_size_str='10LB',
+            yield_pct=Decimal('50'),
+            price_per_pound=Decimal('10.00'),
+        )
+        self.assertEqual(cost, Decimal('20.00'))
+        self.assertEqual(note, 'direct $/lb')
+
+
 class AuditSemanticMismatchesTests(TestCase):
     """`audit_semantic_mismatches` — flags ILI rows whose section_hint
     disagrees with the linked product's category."""

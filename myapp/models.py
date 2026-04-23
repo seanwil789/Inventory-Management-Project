@@ -408,6 +408,7 @@ class RecipeIngredient(models.Model):
                     latest.unit_price, cs,
                     yield_pct=yield_pct,
                     ounce_weight_per_cup=density,
+                    price_per_pound=latest.price_per_pound,
                 )
                 if cost is not None:
                     return cost, note
