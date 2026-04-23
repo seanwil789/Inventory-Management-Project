@@ -383,11 +383,42 @@ class RecipeIngredient(models.Model):
                    if self.yield_ref and self.yield_ref.ounce_weight_per_cup
                    else None)
 
-        # Piece-weight rewrite: when recipe asks for a size-word or each
-        # (medium/large/small/ea/each) AND yield_ref is linked with a
-        # piece-type ap_unit (each/head/bunch) + ap_weight_oz populated,
-        # rewrite (qty, unit) to AP weight in oz. This is the Phase 6
-        # unlock for piece-unit RIs.
+        candidates = case_size_candidates_for_cost(
+            latest.case_size,
+            latest.raw_description,
+            product_default=self.product.default_case_size,
+            product_name=self.product.canonical_name,
+        )
+        # Ensure at least one attempt even when no candidate parses
+        attempt_cases = candidates or [latest.case_size or '']
+
+        def _try(qty, unit, yield_pct):
+            last = (None, '')
+            for cs in attempt_cases:
+                cost, note = ingredient_cost(
+                    qty, unit, self.name_raw,
+                    latest.unit_price, cs,
+                    yield_pct=yield_pct,
+                    ounce_weight_per_cup=density,
+                )
+                if cost is not None:
+                    return cost, note
+                last = (cost, note)
+            return last
+
+        # Pass 1: normal dispatch. If the recipe unit is already
+        # compatible with any candidate case_size (e.g. 'each' recipe vs
+        # 'doz' case → count↔count), this succeeds and we stop.
+        cost, note = _try(self.quantity, self.unit, self.effective_yield_pct)
+        if cost is not None:
+            return cost, note
+
+        # Pass 2: piece-weight rewrite fallback. When recipe asks for a
+        # size-word or each (medium/large/small/ea/each) AND yield_ref is
+        # linked with a piece-type ap_unit (each/head/bunch) + ap_weight_oz
+        # populated, rewrite (qty, unit) to AP weight in oz and retry.
+        # Unlocks piece-unit RIs against weight/volume cases
+        # (e.g. Carrot '4 each' vs '1/50LB' → 4 × 4.1oz = 16.4oz).
         #
         # Critical: ap_weight_oz IS already AP weight — must NOT pass
         # yield_pct in this branch. ingredient_cost's qty /= yield_pct/100
@@ -399,45 +430,12 @@ class RecipeIngredient(models.Model):
                 and self.yield_ref
                 and self.yield_ref.ap_weight_oz
                 and (self.yield_ref.ap_unit or '').strip().lower() in _PIECE_AP_UNITS):
-            qty_for_calc = Decimal(self.quantity) * Decimal(self.yield_ref.ap_weight_oz)
-            unit_for_calc = 'oz'
-            yield_pct_for_calc = None
-        else:
-            qty_for_calc = self.quantity
-            unit_for_calc = self.unit
-            yield_pct_for_calc = self.effective_yield_pct
+            qty_in_oz = Decimal(self.quantity) * Decimal(self.yield_ref.ap_weight_oz)
+            pw_cost, pw_note = _try(qty_in_oz, 'oz', None)
+            if pw_cost is not None:
+                return pw_cost, pw_note
 
-        # Try each parseable case_size candidate in priority order; first
-        # one that produces a non-None cost wins. Important when the literal
-        # case_size parses to a unit incompatible with the recipe (e.g. AP
-        # Flour invoice cs='30/85CT' parses as count, but the product is
-        # 50-lb bag and recipes ask cups — Product.default_case_size='1/50LB'
-        # is the right fallback there).
-        candidates = case_size_candidates_for_cost(
-            latest.case_size,
-            latest.raw_description,
-            product_default=self.product.default_case_size,
-            product_name=self.product.canonical_name,
-        )
-        if not candidates:
-            return ingredient_cost(
-                qty_for_calc, unit_for_calc, self.name_raw,
-                latest.unit_price, latest.case_size or '',
-                yield_pct=yield_pct_for_calc,
-                ounce_weight_per_cup=density,
-            )
-        last_result = (None, '')
-        for cs in candidates:
-            cost, note = ingredient_cost(
-                qty_for_calc, unit_for_calc, self.name_raw,
-                latest.unit_price, cs,
-                yield_pct=yield_pct_for_calc,
-                ounce_weight_per_cup=density,
-            )
-            if cost is not None:
-                return cost, note
-            last_result = (cost, note)
-        return last_result
+        return cost, note
 
 
 class Menu(models.Model):
