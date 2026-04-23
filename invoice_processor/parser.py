@@ -578,10 +578,34 @@ def _parse_sysco(text: str) -> list[dict]:
     # For codes NOT in the known code_map, tag them so pairing applies
     # stricter proximity (2 lines). Real unmapped SUPCs usually have a price
     # very close; barcode fragments in OCR noise rarely align that tightly.
+    # Orphan-collection footer cutoff. Sysco invoices have a summary
+    # region after the items where stray 7-digit OCR artifacts look like
+    # SUPCs (e.g. 3974320 appearing under 'ORDER SUMMARY' or after 'CHGS
+    # FOR FUEL SURCHARGE'). Self-contained pre-scan — can't rely on the
+    # later block_end calc, which depends on anchors this loop populates.
+    #
+    # Only these markers (no 'INVOICE ADJUSTMENTS' which is a column
+    # HEADER that appears early). And the cutoff must be at least 30
+    # lines in — early hits are usually legalese/headers, not the
+    # post-item footer.
+    _EARLY_FOOTER = re.compile(
+        r'^\s*(ORDER\s+SUMMARY|MISC\s+CHARGES?|CHGS?\s+FOR\s+FUEL)',
+        re.IGNORECASE,
+    )
+    orphan_cutoff = len(lines)
+    for j, line in enumerate(lines):
+        if j < 30:
+            continue
+        if _EARLY_FOOTER.match(line):
+            orphan_cutoff = j
+            break
+
     orphan_code_lines = []   # (line_idx, normalized_code, raw_code, is_known, inline_prefix)
     standalone_price_lines = []  # (line_idx, price)
     for i, line in enumerate(lines):
         if i in anchor_lines or i in group_total_lines or i in used_as_split_price:
+            continue
+        if i >= orphan_cutoff:
             continue
         stripped = line.strip()
         cm = _STANDALONE_CODE_RE.match(stripped)
@@ -923,23 +947,50 @@ def _parse_sysco(text: str) -> list[dict]:
             anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
 
     # ── Step B: handle unknown-code anchors ───────────────────────────────
-    # Match remaining descriptions to remaining anchors in order.
+    # Two passes: proximity-first (like Step A), then ordered-iterator fallback.
+    # Previously this was ordered-iterator only, which caused unknown anchors
+    # late in the file to get placeholder descriptions when earlier unknowns
+    # had consumed all available descs in order — even when a clearly-nearby
+    # unclaimed description existed. Proximity matching now wins when distance
+    # is small, falling back to ordered iteration for anchors with no close
+    # unclaimed desc.
     unknown_anchors = [ai for ai in range(len(anchors)) if ai not in known_anchor_indices]
-    remaining_descs = [(di, de) for di, de in enumerate(desc_entries) if di not in used_descs]
-    remaining_descs.sort(key=lambda x: x[1]["line"])
 
-    desc_iter = iter(remaining_descs)
+    # Proximity pass — each unknown anchor tries to claim its nearest
+    # unclaimed description within a 20-line window.
     for ai in unknown_anchors:
         line_idx, item_code, price, prefix = anchors[ai]
 
-        # Check inline description first
+        # Check inline description first (caller's embedded desc wins)
         inline_desc = _clean_description(prefix)
         if inline_desc and len(inline_desc) >= 5 and re.search(r'[A-Za-z]{3,}', inline_desc):
             cs = _extract_pack_size(prefix) or _extract_case_size(prefix)
             anchor_matches[ai] = (inline_desc, cs, None)
             continue
 
-        # Consume next remaining description
+        best_di = None
+        best_dist = 21  # one more than the 20-line window
+        for di, de in enumerate(desc_entries):
+            if di in used_descs:
+                continue
+            dist = abs(de["line"] - line_idx)
+            if dist < best_dist:
+                best_dist = dist
+                best_di = di
+
+        if best_di is not None and best_dist <= 20:
+            used_descs.add(best_di)
+            de = desc_entries[best_di]
+            anchor_matches[ai] = (de["description"], de["case_size"], de.get("catch_weight"))
+
+    # Ordered fallback for unknown anchors that didn't find a nearby desc.
+    remaining_descs = [(di, de) for di, de in enumerate(desc_entries) if di not in used_descs]
+    remaining_descs.sort(key=lambda x: x[1]["line"])
+    desc_iter = iter(remaining_descs)
+
+    for ai in unknown_anchors:
+        if anchor_matches[ai] is not None:
+            continue
         pair = next(desc_iter, None)
         if pair:
             di, de = pair
