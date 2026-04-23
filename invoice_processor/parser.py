@@ -578,7 +578,7 @@ def _parse_sysco(text: str) -> list[dict]:
     # For codes NOT in the known code_map, tag them so pairing applies
     # stricter proximity (2 lines). Real unmapped SUPCs usually have a price
     # very close; barcode fragments in OCR noise rarely align that tightly.
-    orphan_code_lines = []   # (line_idx, normalized_code, raw_code, is_known)
+    orphan_code_lines = []   # (line_idx, normalized_code, raw_code, is_known, inline_prefix)
     standalone_price_lines = []  # (line_idx, price)
     for i, line in enumerate(lines):
         if i in anchor_lines or i in group_total_lines or i in used_as_split_price:
@@ -586,6 +586,7 @@ def _parse_sysco(text: str) -> list[dict]:
         stripped = line.strip()
         cm = _STANDALONE_CODE_RE.match(stripped)
         raw_code = None
+        inline_prefix = ''
         if cm:
             raw_code = cm.group(1)
         else:
@@ -593,6 +594,13 @@ def _parse_sysco(text: str) -> list[dict]:
             tcm = _TRAILING_CODE_RE.search(stripped)
             if tcm and re.search(r'[A-Za-z]', stripped):  # require non-digit content before
                 raw_code = tcm.group(1)
+                # Capture the text BEFORE the code as the inline prefix — this
+                # is the item's description when the OCR emits the pattern
+                # 'SANITIZER OASIS 146 MULTI QU 6100536' (description + trailing
+                # code). Without this, the orphan-pairing path feeds an empty
+                # prefix to Step B, which then pulls a random unclaimed
+                # description from the iterator and mis-pairs.
+                inline_prefix = stripped[:tcm.start(1)].rstrip()
         if raw_code:
             norm = _normalize_code(raw_code)
             if norm in found_codes:
@@ -603,7 +611,7 @@ def _parse_sysco(text: str) -> list[dict]:
             # out barcode fragments and stray numeric runs in OCR text.
             is_known = bool(_split_code_map and norm in _split_code_map) \
                        or not _split_code_map  # empty map = test fixture, accept all
-            orphan_code_lines.append((i, norm, raw_code, is_known))
+            orphan_code_lines.append((i, norm, raw_code, is_known, inline_prefix))
             continue
         pm = _STANDALONE_PRICE_RE.match(stripped)
         if pm:
@@ -619,7 +627,7 @@ def _parse_sysco(text: str) -> list[dict]:
     # carries more barcode false-positive risk, and the _split_code_map
     # membership acts as a safety gate.
     used_prices = set()
-    for i, norm_code, raw_code, is_known in orphan_code_lines:
+    for i, norm_code, raw_code, is_known, inline_prefix in orphan_code_lines:
         best = None
         # Forward window: 6 lines for everyone (catches column-dump blocks)
         for pi, (pline, price) in enumerate(standalone_price_lines):
@@ -640,7 +648,10 @@ def _parse_sysco(text: str) -> list[dict]:
                     best = pi
         if best is not None:
             pline, price = standalone_price_lines[best]
-            anchors.append((i, norm_code, price, ""))
+            # Carry inline_prefix into the anchor tuple so Step B's inline-desc
+            # path picks it up (the description was RIGHT THERE on the code
+            # line, no need to consume a random unclaimed desc from the queue).
+            anchors.append((i, norm_code, price, inline_prefix))
             anchor_lines.add(i)
             used_as_split_price.add(pline)
             used_prices.add(best)

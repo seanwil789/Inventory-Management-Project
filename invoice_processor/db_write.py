@@ -175,19 +175,26 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 **common_fields,
             )
 
-        # Track C orphan cleanup: when this item carries a sysco_item_code AND
-        # we've now resolved it to a Product, a pre-existing placeholder row
-        # from when the code was unmapped (raw_description='[Sysco #NNN]',
-        # product=None) is a duplicate of the same line item. Clean it up at
-        # write time rather than leaving it as an orphan contaminating
-        # category spend, cost-coverage, and reconciliation metrics.
+        # Track C orphan cleanup: a pre-existing placeholder row
+        # '[Sysco #NNN]' for the same (vendor, date, SUPC) is superseded
+        # whenever the current write produces either:
+        #   (a) a mapped row (product resolved), OR
+        #   (b) a row with a real raw_description (not the placeholder form)
+        # In both cases the new row carries strictly more information than
+        # the placeholder. Deleting the placeholder prevents double-counting
+        # in category spend, cost-coverage, and reconciliation metrics.
+        #
+        # Triggered by parser extraction improvements (e.g. inline-prefix
+        # capture, catch-weight column-dump pass) that produce rows with
+        # real descriptions on SUPCs that were previously only seen as
+        # placeholders.
         supc = item.get('sysco_item_code', '')
-        if product and supc and parsed_date:
+        is_placeholder_write = (raw_desc == f'[Sysco #{supc}]')
+        if supc and parsed_date and not is_placeholder_write:
             placeholder_desc = f'[Sysco #{supc}]'
             InvoiceLineItem.objects.filter(
                 vendor=vendor,
                 invoice_date=parsed_date,
-                product__isnull=True,
                 raw_description=placeholder_desc,
             ).delete()
 

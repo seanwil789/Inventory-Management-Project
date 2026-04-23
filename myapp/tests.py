@@ -2004,6 +2004,36 @@ TOTAL
         # Derived weight = 824.78 / 12.65 ≈ 65.2
         self.assertIn('65.2', cw_item['case_size_raw'])
 
+    def test_orphan_code_preserves_inline_description_prefix(self):
+        """When a code appears at the END of a description line (e.g.
+        'SANITIZER OASIS 146 MULTI QU 6100536'), the parser's orphan-
+        pairing path must preserve the text BEFORE the code as the
+        item's inline description. Previously, prefix was hardcoded to
+        '' and Step B fell back to consuming a random unclaimed desc
+        from the queue, producing wrong raw_descriptions for codes
+        that had their description right there on the same line."""
+        parser = self._import_parser()
+        text = """**** CHEMICAL & JANITORIAL ***
+1 CS
+12.5GALECOLAB
+SANITIZER OASIS 146 MULTI QU 6100536
+GROUP TOTAL****
+7006331 155.91 12.47
+155.91
+155.91
+LAST PAGE
+INVOICE
+TOTAL
+"""
+        result = parser.parse_invoice(text, vendor='Sysco')
+        codes = {i.get('sysco_item_code'): i for i in result['items']}
+        self.assertIn('6100536', codes)
+        item = codes['6100536']
+        # Description should come from the code line's prefix, not a random
+        # pulled-from-the-queue neighboring description.
+        self.assertIn('SANITIZER', item['raw_description'].upper())
+        self.assertIn('OASIS', item['raw_description'].upper())
+
     def test_inline_description_code_perlb_with_weight_next_line(self):
         """Second variant of catch-weight: description + code + per-lb on
         ONE line, weight on next line, no adjacent extended. Parser
