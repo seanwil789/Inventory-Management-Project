@@ -112,6 +112,17 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         if extended is None and unit_price is not None:
             extended = unit_price
 
+        # Parser emits price_per_unit as $/lb for Sysco catch-weight
+        # (parser.py:891) and Exceptional per-lb lines (parser.py:1313).
+        # Other vendors don't populate it; field stays null.
+        price_per_pound = None
+        ppp_raw = item.get('price_per_unit')
+        if ppp_raw not in (None, ''):
+            try:
+                price_per_pound = Decimal(str(ppp_raw))
+            except InvalidOperation:
+                pass
+
         confidence = item.get('confidence', '')
         score = item.get('score')
         match_score = int(score) if score is not None else None
@@ -127,6 +138,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         common_fields = dict(
             unit_price=unit_price,
             extended_amount=extended,
+            price_per_pound=price_per_pound,
             case_size=item.get('case_size_raw', ''),
             source_file=source_file,
             product=product,

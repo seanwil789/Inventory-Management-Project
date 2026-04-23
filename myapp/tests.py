@@ -948,6 +948,98 @@ class ManagementCommandSmokeTests(TestCase):
         self.assertIn('0 unique', out)
 
 
+class DBWritePricePerPoundTests(TestCase):
+    """`write_invoice_to_db` — Track B field wiring.
+
+    Parser emits `price_per_unit` for Sysco catch-weight + Exceptional per-lb
+    rows. The writer stores it in InvoiceLineItem.price_per_pound so
+    downstream consumers can read the parser's $/lb directly instead of
+    reverse-engineering from unit_price + case_size."""
+
+    def _import_db_write(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import db_write
+        return db_write
+
+    def test_price_per_unit_persists_as_price_per_pound(self):
+        """Parser's `price_per_unit` in item dict → ILI.price_per_pound populated."""
+        from decimal import Decimal
+        dbw = self._import_db_write()
+
+        items = [{
+            'raw_description': 'Beef Chuck Flap Short Rib Boneless',
+            'canonical': None,
+            'unit_price': 197.53,
+            'extended_amount': 197.53,
+            'case_size_raw': '17.99LB',
+            'price_per_unit': 10.98,
+            'confidence': 'unmatched',
+        }]
+        written = dbw.write_invoice_to_db('Exceptional Foods', '2026-04-20', items,
+                                           source_file='test.jpg')
+        self.assertEqual(written, 1)
+
+        ili = InvoiceLineItem.objects.get(raw_description__startswith='Beef Chuck Flap')
+        self.assertEqual(ili.price_per_pound, Decimal('10.9800'))
+
+    def test_null_when_parser_didnt_emit_it(self):
+        """Farm Art / PBM / Delaware never emit price_per_unit → field stays null."""
+        dbw = self._import_db_write()
+
+        items = [{
+            'raw_description': 'BROCCOLI, CROWNS, 20 LB',
+            'canonical': None,
+            'unit_price': 3.40,
+            'extended_amount': 13.46,
+            'case_size_raw': '',
+            'confidence': 'unmatched',
+        }]
+        dbw.write_invoice_to_db('Farm Art', '2026-04-18', items,
+                                 source_file='test.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description__startswith='BROCCOLI')
+        self.assertIsNone(ili.price_per_pound)
+
+    def test_upsert_updates_price_per_pound(self):
+        """Reprocessing the same invoice overwrites price_per_pound in place."""
+        from decimal import Decimal
+        dbw = self._import_db_write()
+
+        # Seed a product so lookup keys on (vendor, product, date)
+        p = Product.objects.create(canonical_name='Beef Chuck Flap Test')
+        items_v1 = [{
+            'raw_description': 'Beef Chuck Flap',
+            'canonical': p.canonical_name,
+            'unit_price': 197.53,
+            'case_size_raw': '17.99LB',
+            'price_per_unit': 10.98,
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Exceptional Foods', '2026-04-20', items_v1,
+                                 source_file='test.jpg')
+
+        # Re-run with a corrected per-lb price
+        items_v2 = [{
+            'raw_description': 'Beef Chuck Flap',
+            'canonical': p.canonical_name,
+            'unit_price': 197.53,
+            'case_size_raw': '17.99LB',
+            'price_per_unit': 11.25,  # corrected
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Exceptional Foods', '2026-04-20', items_v2,
+                                 source_file='test.jpg')
+
+        # One row, updated value
+        self.assertEqual(InvoiceLineItem.objects.filter(product=p).count(), 1)
+        ili = InvoiceLineItem.objects.get(product=p)
+        self.assertEqual(ili.price_per_pound, Decimal('11.2500'))
+
+
 class AuditSemanticMismatchesTests(TestCase):
     """`audit_semantic_mismatches` — flags ILI rows whose section_hint
     disagrees with the linked product's category."""
