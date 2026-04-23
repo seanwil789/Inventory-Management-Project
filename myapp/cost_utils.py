@@ -601,8 +601,33 @@ def _normalize_name(name: str) -> str:
 # the unit is unambiguous for that ingredient (e.g. "cloves" means peeled
 # garlic cloves at ~5g, not the spice).
 _INGREDIENT_PIECE_OZ: dict[tuple[str, str], Decimal] = {
-    ('garlic', 'clove'):  Decimal('0.18'),  # peeled, USDA ≈ 5g
-    ('garlic', 'cloves'): Decimal('0.18'),
+    # Garlic cloves: USDA ≈ 5g peeled
+    ('garlic', 'clove'):           Decimal('0.18'),
+    ('garlic', 'cloves'):          Decimal('0.18'),
+    ('garlic', 'ea cloves'):       Decimal('0.18'),  # "8 ea cloves" recipe unit
+    # Celery: rib/stalk ~1.4 oz (USDA). These units only fit celery.
+    ('celery', 'rib'):    Decimal('1.4'),
+    ('celery', 'ribs'):   Decimal('1.4'),
+    ('celery', 'stalk'):  Decimal('1.4'),
+    ('celery', 'stalks'): Decimal('1.4'),
+    # Fresh herbs — sprig/stick: these units don't fit standard dispatch
+    ('basil', 'sprig'):         Decimal('0.2'),
+    ('basil', 'large sprig'):   Decimal('0.3'),
+    ('basil', 'large sprigs'):  Decimal('0.3'),
+    ('basil', '-4 large sprigs'): Decimal('0.3'),
+    ('basil', '-10 ea'):        Decimal('0.3'),
+    ('rosemary', 'sprig'):      Decimal('0.15'),
+    ('rosemary', 'stick'):      Decimal('0.15'),
+    ('rosemary', 'sticks'):     Decimal('0.15'),
+    ('thyme', 'sprig'):         Decimal('0.05'),
+    ('thyme', 'sprigs'):        Decimal('0.05'),
+    # Bay leaves ~0.02 oz each (dried). Disambiguates from 'medium'/'each'
+    # piece weights which are covered by YieldReference rows.
+    ('whole_bay_leaves', '–10 ea'):   Decimal('0.02'),
+    ('whole_bay_leaves', '-10 ea'):   Decimal('0.02'),
+    # Lemon grass bulb stick ~2 oz each
+    ('lemon_grass', 'stick'):   Decimal('2.0'),
+    ('lemon_grass', 'sticks'):  Decimal('2.0'),
 }
 
 
