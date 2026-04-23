@@ -468,6 +468,35 @@ def _normalize_name(name: str) -> str:
     return name.strip().lower().replace('-', '_').replace(' ', '_').replace(',', '')
 
 
+# Per-piece weights for ingredients whose recipe unit names pieces rather
+# than a standard unit. Keys are (normalized_ingredient_name, recipe_unit);
+# value is oz-per-piece. Applied BEFORE the main dispatch in ingredient_cost
+# — the qty+unit get rewritten to an equivalent weight in oz, and standard
+# weight↔anything dispatch takes over from there.
+#
+# Curated from Book of Yields / USDA; each entry is specific enough that
+# the unit is unambiguous for that ingredient (e.g. "cloves" means peeled
+# garlic cloves at ~5g, not the spice).
+_INGREDIENT_PIECE_OZ: dict[tuple[str, str], Decimal] = {
+    ('garlic', 'clove'):  Decimal('0.18'),  # peeled, USDA ≈ 5g
+    ('garlic', 'cloves'): Decimal('0.18'),
+}
+
+
+def _piece_weight_oz_for(ingredient_name: str, recipe_unit: str) -> Optional[Decimal]:
+    """If (ingredient, unit) is in the piece-weight table, return oz-per-piece.
+
+    Exact-match only. Does NOT fall back to last-token matching the way
+    cup_weight_oz_for does — because modifier words ('Roasted Garlic',
+    'Pickled Ginger') usually indicate a prep that's itself a sub-recipe
+    (garlic + oil roasted together, ginger + brine, etc.), and naively
+    using the base ingredient's piece weight would hide the missing
+    sub_recipe link and under-cost the line. Better to return None and
+    surface the data gap than silently approximate."""
+    key = (_normalize_name(ingredient_name), normalize_unit(recipe_unit))
+    return _INGREDIENT_PIECE_OZ.get(key)
+
+
 def cup_weight_oz_for(ingredient_name: str) -> Optional[Decimal]:
     """Fallback density lookup. Returns oz per cup, or None if unknown."""
     n = _normalize_name(ingredient_name)
@@ -511,6 +540,14 @@ def ingredient_cost(
     qty = Decimal(recipe_qty)
     if yield_pct:
         qty = qty / (yield_pct / Decimal('100'))
+
+    # Ingredient-specific piece weights — rewrite (qty, unit) as weight in oz
+    # for known pairings like (garlic, clove). Must run BEFORE unit_kind
+    # classification below.
+    piece_oz = _piece_weight_oz_for(ingredient_name, recipe_unit)
+    if piece_oz is not None:
+        qty = qty * piece_oz
+        recipe_unit = 'oz'
 
     r_kind = unit_kind(recipe_unit)
     c_kind = unit_kind(case_info.pack_unit)

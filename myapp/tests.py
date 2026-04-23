@@ -2883,6 +2883,59 @@ class CostUtilsUnitKindTests(TestCase):
         self.assertEqual(unit_kind("  LB  "), 'weight')
 
 
+class IngredientPieceWeightTests(TestCase):
+    """Per-ingredient piece weights: (garlic, clove) etc."""
+
+    def test_garlic_cloves_unlocks_cost(self):
+        """'8 cloves Garlic' case=4/1GAL should price via piece-weight → weight→volume."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal('8'), recipe_unit='cloves',
+            ingredient_name='Garlic',
+            case_price=Decimal('40.00'), case_size_str='4/1GAL',
+        )
+        # 8 cloves × 0.18 oz = 1.44 oz
+        # garlic density 4.8 oz/cup → 1.44/4.8 = 0.3 cup → 2.4 fl_oz
+        # case 4 × 128 = 512 fl_oz · cost = 40 × 2.4/512 = 0.1875 → 0.19
+        self.assertIsNotNone(cost)
+        self.assertEqual(cost, Decimal('0.19'))
+        self.assertIn('density', note)
+
+    def test_singular_clove_also_works(self):
+        from myapp.cost_utils import ingredient_cost
+        cost, _ = ingredient_cost(
+            recipe_qty=Decimal('1'), recipe_unit='clove',
+            ingredient_name='Garlic',
+            case_price=Decimal('40.00'), case_size_str='4/1GAL',
+        )
+        self.assertIsNotNone(cost)
+
+    def test_modifier_prep_names_do_not_match(self):
+        """'Roasted Garlic' should NOT be treated as raw garlic — it's a
+        sub-recipe (garlic + oil roasted) that needs its own cost path.
+        Returning None here surfaces the missing sub_recipe link rather
+        than under-costing by ignoring the prep."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal('8'), recipe_unit='cloves',
+            ingredient_name='Roasted Garlic',
+            case_price=Decimal('40.00'), case_size_str='4/1GAL',
+        )
+        self.assertIsNone(cost)
+
+    def test_cloves_for_non_garlic_falls_through(self):
+        """'cloves' for another ingredient should NOT get the piece-weight
+        treatment — the table is ingredient-specific."""
+        from myapp.cost_utils import ingredient_cost
+        cost, note = ingredient_cost(
+            recipe_qty=Decimal('8'), recipe_unit='cloves',
+            ingredient_name='Onion',  # not in piece-weight table
+            case_price=Decimal('40.00'), case_size_str='4/1GAL',
+        )
+        # 'cloves' isn't a count unit → r_kind='unknown' → incompatible
+        self.assertIsNone(cost)
+
+
 class ContainerUnitCostTests(TestCase):
     """Container-unit → weight/volume case dispatch.
 
