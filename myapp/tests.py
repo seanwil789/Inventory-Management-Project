@@ -1040,6 +1040,121 @@ class DBWritePricePerPoundTests(TestCase):
         self.assertEqual(ili.price_per_pound, Decimal('11.2500'))
 
 
+class BackfillPricePerPoundTests(TestCase):
+    """`backfill_price_per_pound` — Track B's one-shot retroactive filler.
+
+    The command replays OCR cache through the parser and updates existing
+    ILI rows' price_per_pound field. Tests the match_and_update helper
+    directly — cache-file I/O is tested separately via the command smoke test."""
+
+    def setUp(self):
+        from datetime import date
+        self.v = Vendor.objects.create(name='Exceptional Foods')
+        self.date = date(2026, 4, 20)
+
+    def _make_ili(self, raw_desc, unit_price, price_per_pound=None):
+        from decimal import Decimal
+        return InvoiceLineItem.objects.create(
+            vendor=self.v,
+            invoice_date=self.date,
+            raw_description=raw_desc,
+            unit_price=Decimal(str(unit_price)),
+            price_per_pound=(Decimal(str(price_per_pound))
+                             if price_per_pound is not None else None),
+        )
+
+    def _run_helper(self, items, dry_run=False):
+        from myapp.management.commands.backfill_price_per_pound import _match_and_update
+        return _match_and_update(items, 'Exceptional Foods', self.date, dry_run=dry_run)
+
+    def test_apply_updates_null_row(self):
+        """ILI.price_per_pound is null, parser emits a value → field gets set."""
+        from decimal import Decimal
+        ili = self._make_ili('Beef Chuck Flap', 197.53)
+        self.assertIsNone(ili.price_per_pound)
+
+        items = [{
+            'raw_description': 'Beef Chuck Flap',
+            'unit_price': 197.53,
+            'price_per_unit': 10.98,
+        }]
+        u, n, a, s = self._run_helper(items, dry_run=False)
+        self.assertEqual((u, n, a, s), (1, 0, 0, 0))
+
+        ili.refresh_from_db()
+        self.assertEqual(ili.price_per_pound, Decimal('10.9800'))
+
+    def test_dry_run_does_not_write(self):
+        """Dry-run counts the change but doesn't touch the DB."""
+        ili = self._make_ili('Beef Chuck Flap', 197.53)
+
+        items = [{
+            'raw_description': 'Beef Chuck Flap',
+            'unit_price': 197.53,
+            'price_per_unit': 10.98,
+        }]
+        u, n, a, s = self._run_helper(items, dry_run=True)
+        self.assertEqual(u, 1)  # counted
+
+        ili.refresh_from_db()
+        self.assertIsNone(ili.price_per_pound)  # but not written
+
+    def test_skips_row_with_existing_price_per_pound(self):
+        """Idempotent: re-running on a populated row does not overwrite."""
+        from decimal import Decimal
+        ili = self._make_ili('Beef Chuck Flap', 197.53, price_per_pound=10.98)
+
+        items = [{
+            'raw_description': 'Beef Chuck Flap',
+            'unit_price': 197.53,
+            'price_per_unit': 99.99,  # drift — must NOT be applied
+        }]
+        u, n, a, s = self._run_helper(items, dry_run=False)
+        self.assertEqual(s, 1)  # tallied as already-set
+        self.assertEqual(u, 0)
+
+        ili.refresh_from_db()
+        self.assertEqual(ili.price_per_pound, Decimal('10.9800'))  # unchanged
+
+    def test_no_match_counted_and_skipped(self):
+        """Parsed item that doesn't correspond to any DB row → tallied, not updated."""
+        self._make_ili('Beef Chuck Flap', 197.53)
+
+        items = [{
+            'raw_description': 'Pork Loin Boneless',  # does not exist in DB
+            'unit_price': 48.08,
+            'price_per_unit': 5.40,
+        }]
+        u, n, a, s = self._run_helper(items, dry_run=False)
+        self.assertEqual((u, n, a, s), (0, 1, 0, 0))
+
+    def test_ambiguous_match_counted_and_skipped(self):
+        """Multiple DB rows match (vendor, date, raw_desc, unit_price) → skip."""
+        self._make_ili('Beef Chuck Flap', 197.53)
+        self._make_ili('Beef Chuck Flap', 197.53)  # duplicate setup
+
+        items = [{
+            'raw_description': 'Beef Chuck Flap',
+            'unit_price': 197.53,
+            'price_per_unit': 10.98,
+        }]
+        u, n, a, s = self._run_helper(items, dry_run=False)
+        self.assertEqual((u, n, a, s), (0, 0, 1, 0))
+
+        for ili in InvoiceLineItem.objects.all():
+            self.assertIsNone(ili.price_per_pound)
+
+    def test_command_empty_cache_dir(self):
+        """Command short-circuits cleanly when cache dir has no matching files."""
+        from django.core.management import call_command
+        from io import StringIO
+        import tempfile
+        out = StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            call_command('backfill_price_per_pound', cache_dir=td, stdout=out)
+        self.assertIn('No matching caches found', out.getvalue())
+
+
 class AuditSemanticMismatchesTests(TestCase):
     """`audit_semantic_mismatches` — flags ILI rows whose section_hint
     disagrees with the linked product's category."""
