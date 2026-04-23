@@ -272,6 +272,12 @@ _VOLUME_TO_FL_OZ: dict[str, Decimal] = {
 # Count-type units. Most resolve 1:1 to 'ct' (count). 'doz'/'dozen' is the
 # exception — 1 dozen = 12 ct — handled by `to_base_unit` and is the unlock
 # for products like Eggs sold by '15 DOZ' (= 180 ct).
+# 'bu' is treated as count (bunch/bundle) per Farm Art's vendor convention
+# — observed in Product.default_case_size like '60BU' for Cilantro (60 bunches).
+# Does NOT mean USDA bushel here. If a vendor ever bills in USDA bushels
+# (lb-based: wheat=60, corn=56, tomatoes=53, etc. — Handbook 28), a
+# separate _BUSHEL_TO_LB lookup will be needed and 'bu' dispatch will
+# have to disambiguate on product.
 _COUNT_UNITS = {'ct', 'each', 'ea', 'hd', 'head', 'heads', 'bu', 'bunch', 'bunches',
                 'bag', 'bags', 'bottle', 'bottles', 'jar', 'jars', 'can', 'cans',
                 'pack', 'packs', 'bundle', 'bundles',
