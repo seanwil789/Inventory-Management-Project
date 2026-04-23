@@ -458,34 +458,50 @@ _CUP_WEIGHT_OZ: dict[str, Decimal] = {
     'salt_kosher':     Decimal('5'),  # canonical-name variant ("Salt, Kosher")
     'baking_powder':   Decimal('8'),
     'baking_soda':     Decimal('8'),
-    # Spices (mostly ground, ~4 oz/cup) — Phase 2E unlock for no_density bucket
-    'paprika':         Decimal('4.5'),
-    'cinnamon':        Decimal('4.5'),
-    'cinnamon_ground': Decimal('4.5'),
-    'ground_cinnamon': Decimal('4.5'),
-    'nutmeg':          Decimal('4'),
-    'ground_nutmeg':   Decimal('4'),
-    'black_pepper':    Decimal('4'),       # ground
-    'pepper':          Decimal('4'),
-    'white_pepper':    Decimal('4'),
-    'whole_black_pepper': Decimal('4.5'),  # whole peppercorns
-    'black_pepper_whole': Decimal('4.5'),
-    'cumin':           Decimal('4'),
-    'ground_cumin':    Decimal('4'),
-    'whole_cumin':     Decimal('4'),
-    'chili_powder':    Decimal('4.5'),
-    'curry_powder':    Decimal('3.5'),
-    'garlic_powder':   Decimal('5'),
-    'onion_powder':    Decimal('5'),
-    'allspice':        Decimal('4'),
-    'ground_allspice': Decimal('4'),
-    'cloves':          Decimal('3.5'),
-    'whole_cloves':    Decimal('3.5'),
-    'ginger':          Decimal('4'),
-    'ground_ginger':   Decimal('4'),
-    'turmeric':        Decimal('5'),
-    'mustard_powder':  Decimal('3.5'),
-    'cayenne':         Decimal('4'),
+    # Spices — ground powders and whole seeds.
+    #
+    # Values realigned 2026-04-23 to Book of Yields 8e p.10-13. Previous
+    # values were USDA/"standard baking reference" rounded up to convenient
+    # numbers, which systematically over-weighted ground powders by 15-35%.
+    # BoY values are empirical and more granular; Sean (butcher/kitchen
+    # experience) sense-checked the direction — ground powders run lighter
+    # than the old hardcoded suggested.
+    #
+    # Pattern from the full BoY herbs_spices section:
+    #   - Dried leafy herbs:  1.0-1.8 oz/cup (median 1.45) → hardcoded 1.5 ✓
+    #   - Ground powders:     2.7-4.1 oz/cup (median 3.72) → was 4.0-5.0 ✗
+    #   - Whole seeds:        3.0-4.0 oz/cup (median 3.56) → ~right, minor adj
+    #   - Salt: brand-dependent; Diamond Crystal kosher = 4.70, hardcoded 5
+    #
+    # Ground powders
+    'paprika':         Decimal('3.9'),   # BoY p.12
+    'cinnamon':        Decimal('4.0'),   # BoY ground p.10
+    'cinnamon_ground': Decimal('4.0'),
+    'ground_cinnamon': Decimal('4.0'),
+    'nutmeg':          Decimal('3.8'),   # BoY ground 3.76 p.11
+    'ground_nutmeg':   Decimal('3.8'),
+    'black_pepper':    Decimal('3.8'),   # BoY table grind 3.81 p.12
+    'pepper':          Decimal('3.8'),
+    'white_pepper':    Decimal('4.5'),   # BoY white ground 4.51 — denser than black
+    'cumin':           Decimal('3.3'),   # BoY ground 3.33 p.10
+    'ground_cumin':    Decimal('3.3'),
+    'chili_powder':    Decimal('3.8'),   # BoY 3.76 p.10
+    'curry_powder':    Decimal('3.6'),   # BoY 3.56 p.10
+    'garlic_powder':   Decimal('3.7'),   # BoY 3.70 p.11 (was 5.0 — biggest fix)
+    'onion_powder':    Decimal('3.7'),   # BoY 3.70 p.12 (was 5.0 — biggest fix)
+    'allspice':        Decimal('3.7'),   # no specific BoY; ground-powder median
+    'ground_allspice': Decimal('3.7'),
+    'cloves':          Decimal('3.7'),   # BoY ground 3.72 p.10
+    'ginger':          Decimal('3.8'),   # BoY ground 3.81 p.11
+    'ground_ginger':   Decimal('3.8'),
+    'turmeric':        Decimal('4.3'),   # BoY 0.27 × 16 (parser-error corrected; real ~4.3)
+    'mustard_powder':  Decimal('3.1'),   # BoY ground 3.10 p.11
+    'cayenne':         Decimal('3.8'),   # no BoY cayenne; ground-powder median
+    # Whole seed spices
+    'whole_black_pepper': Decimal('4.0'),  # BoY whole 4.00 p.12
+    'black_pepper_whole': Decimal('4.0'),
+    'whole_cumin':        Decimal('3.4'),  # BoY cumin seed whole 3.39 p.10
+    'whole_cloves':       Decimal('3.0'),  # BoY cloves whole 3.00 p.10
     # Dried herbs — much lighter (~1.5 oz/cup)
     'oregano':         Decimal('1.5'),
     'basil':           Decimal('1.5'),
