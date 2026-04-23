@@ -2632,6 +2632,94 @@ class RecipeIngredientCostTryAllCandidatesTests(TestCase):
         self.assertAlmostEqual(float(cost), 0.64, places=2)
 
 
+class BushelExtractionTests(TestCase):
+    """Bushel-fraction → synthetic case_size extraction (Phase 6 Farm Art
+    unlock). Description carries the container size ('1-1/9 BUSHEL'),
+    case_size column only carries bare-qty; this recovers the missing
+    weight via USDA PACA lb/bushel lookups."""
+
+    def test_fraction_prefix_pattern(self):
+        from myapp.cost_utils import extract_bushel_fraction
+        self.assertEqual(
+            extract_bushel_fraction('CUCUMBERS, 1-1/9 BUSHEL'),
+            Decimal('1') + Decimal('1') / Decimal('9'),
+        )
+        self.assertEqual(
+            extract_bushel_fraction('ZUCCHINI, FANCY/MEDIUM, 1/2 BUSHEL'),
+            Decimal('0.5'),
+        )
+        # hyphen vs space separator between whole + fraction
+        self.assertEqual(
+            extract_bushel_fraction('EGGPLANT, FANCY, 1 1/9 BUSHEL'),
+            Decimal('1') + Decimal('1') / Decimal('9'),
+        )
+
+    def test_fraction_postfix_pattern(self):
+        """Farm Art also writes 'BUSHEL 1-1/9' with fraction after the word."""
+        from myapp.cost_utils import extract_bushel_fraction
+        self.assertEqual(
+            extract_bushel_fraction('PEPPERS, JALAPENO, BUSHEL 1-1/9'),
+            Decimal('1') + Decimal('1') / Decimal('9'),
+        )
+
+    def test_bare_bushel_word_means_one(self):
+        from myapp.cost_utils import extract_bushel_fraction
+        self.assertEqual(
+            extract_bushel_fraction('TROPICAL, TOMATILLOS, BUSHEL'),
+            Decimal('1'),
+        )
+
+    def test_bare_bu_without_fraction_is_not_bushel(self):
+        """'60 BU' for herbs is bunch count, not bushel. Must not match."""
+        from myapp.cost_utils import extract_bushel_fraction
+        self.assertIsNone(extract_bushel_fraction('HERB, CILANTRO, 60 BU'))
+        self.assertIsNone(extract_bushel_fraction('HERB, DILL, 24 BU'))
+        self.assertIsNone(extract_bushel_fraction('LEEKS, "GOURMET", 12 BU'))
+
+    def test_case_size_synthesis_cucumber(self):
+        """'1-1/9 BUSHEL' cucumber × 48 lb/bu = 53.3 lb carton."""
+        from myapp.cost_utils import extract_bushel_case_size
+        self.assertEqual(
+            extract_bushel_case_size('CUCUMBERS, 1-1/9 BUSHEL', 'Cucumber'),
+            '53.3LB',
+        )
+
+    def test_case_size_synthesis_jalapeno_postfix(self):
+        """Jalapeno @ 25 lb/bu × 1-1/9 = 27.8 lb."""
+        from myapp.cost_utils import extract_bushel_case_size
+        cs = extract_bushel_case_size('PEPPERS, JALAPENO, BUSHEL 1-1/9', 'Pepper, Jalapeno')
+        self.assertEqual(cs, '27.8LB')
+
+    def test_case_size_synthesis_half_bushel_zucchini(self):
+        """Zucchini @ 44 lb/bu × 1/2 = 22.0 lb."""
+        from myapp.cost_utils import extract_bushel_case_size
+        cs = extract_bushel_case_size('ZUCCHINI, FANCY/MEDIUM, 1/2 BUSHEL', 'Squash, Zucchini')
+        self.assertEqual(cs, '22.0LB')
+
+    def test_case_size_synthesis_full_bushel_tomatillo(self):
+        """'BUSHEL' alone = 1 full bushel. Tomatillos @ 52 lb."""
+        from myapp.cost_utils import extract_bushel_case_size
+        cs = extract_bushel_case_size('TROPICAL, TOMATILLOS, BUSHEL', 'Tomatillos')
+        self.assertEqual(cs, '52.0LB')
+
+    def test_unknown_product_returns_none(self):
+        """Product not in _BUSHEL_TO_LB → no conversion possible."""
+        from myapp.cost_utils import extract_bushel_case_size
+        self.assertIsNone(
+            extract_bushel_case_size('WIDGETS, 1 BUSHEL', 'Random Widget'),
+        )
+
+    def test_candidate_list_includes_bushel_synthesis(self):
+        """Integration: case_size_candidates_for_cost surfaces bushel weight."""
+        from myapp.cost_utils import case_size_candidates_for_cost
+        cands = case_size_candidates_for_cost(
+            case_size='1',   # bare qty — won't parse
+            raw_description='CUCUMBERS, 1-1/9 BUSHEL',
+            product_name='Cucumber',
+        )
+        self.assertIn('53.3LB', cands)
+
+
 class RecipeIngredientPieceWeightViaYieldRefTests(TestCase):
     """Phase 6 piece-weight rewrite. When recipe unit is a size word or
     each, and yield_ref has piece-type ap_unit + ap_weight_oz, estimated_cost

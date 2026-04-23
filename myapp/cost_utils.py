@@ -117,6 +117,100 @@ _BARE_NM_MIN_LBS = Decimal('0.5')
 _BARE_NM_MAX_LBS = Decimal('200')
 
 
+# ---- Bushel-fraction extraction (Phase 6) ----
+#
+# Farm Art (and other produce vendors) express the container as a bushel
+# fraction in the description, e.g. "CUCUMBERS, 1-1/9 BUSHEL". The case_size
+# column only captures the bare quantity purchased ('1', '2', etc.), so the
+# container weight must be recovered from the description. USDA PACA
+# Handbook 28 publishes lb-per-bushel standards for commodity grains;
+# AMS publishes conventional weights for produce. Values below are PACA
+# container-net-weight minimums — vendors have no incentive to overfill.
+_BUSHEL_TO_LB: dict[str, Decimal] = {
+    # Produce (AMS conventional; lb/bushel)
+    'cucumber':   Decimal('48'),
+    'cucumbers':  Decimal('48'),
+    'pepper':     Decimal('25'),   # bell, jalapeño, poblano — 1 1/9 bu ≈ 28 lb carton
+    'peppers':    Decimal('25'),
+    'eggplant':   Decimal('35'),
+    'squash':     Decimal('44'),   # summer / zucchini
+    'tomatillo':  Decimal('52'),
+    'tomatillos': Decimal('52'),
+    'tomato':     Decimal('53'),
+    'tomatoes':   Decimal('53'),
+    'collard':    Decimal('23'),
+    'collards':   Decimal('23'),
+    'greens':     Decimal('23'),   # generic leafy greens
+    'bean':       Decimal('30'),   # green beans
+    'beans':      Decimal('30'),
+    'apple':      Decimal('42'),
+    'apples':     Decimal('42'),
+    'peach':      Decimal('48'),
+    'peaches':    Decimal('48'),
+}
+
+# "1 1/9 BUSHEL", "1-1/9 BUSHEL", "1/2 BUSHEL" — fraction before BU/BUSHEL
+_BUSHEL_FRAC_PREFIX = re.compile(
+    r'(?:(\d+)[\s\-]+)?(\d+)\s*/\s*(\d+)\s*(?:BU|BUSHEL)\b',
+    re.IGNORECASE,
+)
+# "BUSHEL 1-1/9" — fraction after BUSHEL keyword
+_BUSHEL_FRAC_POSTFIX = re.compile(
+    r'\b(?:BU|BUSHEL)\s+(?:(\d+)[\s\-]+)?(\d+)\s*/\s*(\d+)',
+    re.IGNORECASE,
+)
+# Plain "BUSHEL" (spelled out) with no fraction — interpreted as 1 bushel.
+# Critical: does NOT match bare "BU" to avoid colliding with bunch-count
+# notation ("60 BU" = 60 bunches for cilantro/parsley/etc).
+_BARE_BUSHEL = re.compile(r'\bBUSHEL\b', re.IGNORECASE)
+
+
+def extract_bushel_fraction(desc: str | None) -> Optional[Decimal]:
+    """Parse a bushel fraction from a raw invoice description.
+    '1-1/9 BUSHEL' → 10/9 ≈ 1.111
+    '1/2 BUSHEL'   → 0.5
+    'BUSHEL'       → 1.0    (bare — spelled out, not 'BU')
+    'HERB, CILANTRO, 60 BU' → None  (bunch-count, not bushel container)
+    Returns None when no bushel notation is present.
+    """
+    if not desc:
+        return None
+    m = _BUSHEL_FRAC_PREFIX.search(desc) or _BUSHEL_FRAC_POSTFIX.search(desc)
+    if m:
+        whole = Decimal(m.group(1) or '0')
+        num = Decimal(m.group(2))
+        den = Decimal(m.group(3))
+        if den == 0:
+            return None
+        return whole + num / den
+    if _BARE_BUSHEL.search(desc):
+        return Decimal('1')
+    return None
+
+
+def extract_bushel_case_size(desc: str | None, product_name: str | None) -> Optional[str]:
+    """Convert a description-embedded bushel-fraction to a synthetic
+    case_size string (e.g. '53LB' for 1-1/9 bushel cucumber @ 48 lb/bu).
+    Returns None when description lacks bushel notation, or the product
+    has no _BUSHEL_TO_LB entry."""
+    if not desc or not product_name:
+        return None
+    fraction = extract_bushel_fraction(desc)
+    if fraction is None:
+        return None
+    n = _normalize_name(product_name)
+    lb_per_bu = _BUSHEL_TO_LB.get(n)
+    if lb_per_bu is None:
+        for part in reversed(n.split('_')):
+            if part in _BUSHEL_TO_LB:
+                lb_per_bu = _BUSHEL_TO_LB[part]
+                break
+    if lb_per_bu is None:
+        return None
+    total_lb = (fraction * lb_per_bu).quantize(Decimal('0.1'))
+    return f'{total_lb}LB'
+
+
 def effective_case_size_for_cost(case_size: str | None,
                                   raw_description: str | None,
                                   product_default: str | None = None) -> str:
@@ -168,7 +262,8 @@ def effective_case_size_for_cost(case_size: str | None,
 
 def case_size_candidates_for_cost(case_size: str | None,
                                    raw_description: str | None,
-                                   product_default: str | None = None) -> list[str]:
+                                   product_default: str | None = None,
+                                   product_name: str | None = None) -> list[str]:
     """Return all parseable case_size candidates in preference order.
 
     Unlike `effective_case_size_for_cost` which returns one string,
@@ -182,8 +277,10 @@ def case_size_candidates_for_cost(case_size: str | None,
     Order:
       1. Literal `case_size` (most invoice-specific)
       2. Description-extracted weight ('5# BAG', '36/1#')
-      3. Product.default_case_size (inferred canonical pack)
-      4. Bare 'N/M' treated as 'N/MLB' (last-resort heuristic)
+      3. Bushel-fraction in description × product's lb/bushel
+         ('1-1/9 BUSHEL' cucumber → '53.3LB'). Phase 6 Farm Art unlock.
+      4. Product.default_case_size (inferred canonical pack)
+      5. Bare 'N/M' treated as 'N/MLB' (last-resort heuristic)
 
     Caller iterates and returns the first candidate that produces a
     non-None cost from `ingredient_cost`.
@@ -206,6 +303,10 @@ def case_size_candidates_for_cost(case_size: str | None,
 
     desc_w = extract_weight_from_description(raw_description)
     _add(desc_w)
+
+    # Bushel-fraction extraction (Farm Art produce cartons)
+    bushel_w = extract_bushel_case_size(raw_description, product_name)
+    _add(bushel_w)
 
     _add((product_default or '').strip())
 

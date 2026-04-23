@@ -417,6 +417,7 @@ class RecipeIngredient(models.Model):
             latest.case_size,
             latest.raw_description,
             product_default=self.product.default_case_size,
+            product_name=self.product.canonical_name,
         )
         if not candidates:
             return ingredient_cost(
