@@ -2006,17 +2006,21 @@ TOTAL
 
     def test_orphan_code_preserves_inline_description_prefix(self):
         """When a code appears at the END of a description line (e.g.
-        'SANITIZER OASIS 146 MULTI QU 6100536'), the parser's orphan-
+        'SANITIZER OASIS 146 MULTI QU 9999999'), the parser's orphan-
         pairing path must preserve the text BEFORE the code as the
         item's inline description. Previously, prefix was hardcoded to
         '' and Step B fell back to consuming a random unclaimed desc
         from the queue, producing wrong raw_descriptions for codes
-        that had their description right there on the same line."""
+        that had their description right there on the same line.
+
+        Uses a synthetic 7-digit code (9999999) that will NEVER appear
+        in a real code_map, so this test exercises the orphan/unknown
+        code path regardless of how code_map evolves over time."""
         parser = self._import_parser()
         text = """**** CHEMICAL & JANITORIAL ***
 1 CS
 12.5GALECOLAB
-SANITIZER OASIS 146 MULTI QU 6100536
+SANITIZER OASIS 146 MULTI QU 9999999
 GROUP TOTAL****
 7006331 155.91 12.47
 155.91
@@ -2027,8 +2031,8 @@ TOTAL
 """
         result = parser.parse_invoice(text, vendor='Sysco')
         codes = {i.get('sysco_item_code'): i for i in result['items']}
-        self.assertIn('6100536', codes)
-        item = codes['6100536']
+        self.assertIn('9999999', codes)
+        item = codes['9999999']
         # Description should come from the code line's prefix, not a random
         # pulled-from-the-queue neighboring description.
         self.assertIn('SANITIZER', item['raw_description'].upper())

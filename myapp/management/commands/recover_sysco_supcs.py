@@ -230,8 +230,21 @@ class Command(BaseCommand):
                     f'  ${d:>7.2f} #{code} [{src}] → {canon!r} ({score:.0f})  ctx: {ctx[:50]}'
                 )
 
+        # No-context SUPCs also go to the review tab when --write-review is
+        # active: even without a cross-invoice description hint, the SUPC
+        # code itself is enough for Sean to look up on the Sysco portal
+        # and type the canonical directly. The apply_approved col G
+        # extraction (from Notes 'code=NNN') carries the SUPC into Item
+        # Mapping so future invoices resolve via code-tier match.
+        no_context_supcs_for_review = []
+        if opts['write_review'] and no_context:
+            for code in no_context:
+                dollars = placeholder_info[code]['dollars']
+                no_context_supcs_for_review.append((code, dollars))
+            no_context_supcs_for_review.sort(key=lambda x: -x[1])
+
         # Medium-confidence → Mapping Review tab (independent of --apply)
-        if opts['write_review'] and medium_conf:
+        if opts['write_review'] and (medium_conf or no_context_supcs_for_review):
             try:
                 from sheets import get_sheets_client, get_sheet_values  # noqa: E402
                 from config import SPREADSHEET_ID  # noqa: E402
@@ -267,6 +280,24 @@ class Command(BaseCommand):
                         1,                         # E: Count
                         '',                        # F: Approve? (Y/N) — blank, Sean reviews
                         f'${d:.2f}',               # G: Avg Price
+                        '',                        # H: Times Seen
+                        notes,                     # I: Notes
+                    ])
+                # No-context SUPCs — col C blank, Sean looks up code on Sysco portal
+                for code, dollars in no_context_supcs_for_review:
+                    raw_desc = f'[Sysco #{code}] (no OCR context)'
+                    if ('Sysco', raw_desc) in existing_keys:
+                        continue
+                    notes = (f'SUPC recovery · source=no-context · code={code} · '
+                             f'$={dollars:.2f}/row · LOOK UP ON SYSCO PORTAL')
+                    rows.append([
+                        'Sysco',                   # A: Vendor
+                        raw_desc,                  # B: Raw Description
+                        '',                        # C: Suggested Product — BLANK, Sean fills
+                        '',                        # D: Score
+                        1,                         # E: Count
+                        '',                        # F: Approve? (Y/N)
+                        f'${dollars:.2f}',         # G: Avg Price
                         '',                        # H: Times Seen
                         notes,                     # I: Notes
                     ])
