@@ -601,30 +601,41 @@ def _normalize_name(name: str) -> str:
 # the unit is unambiguous for that ingredient (e.g. "cloves" means peeled
 # garlic cloves at ~5g, not the spice).
 _INGREDIENT_PIECE_OZ: dict[tuple[str, str], Decimal] = {
+    # Keys use the OUTPUT of normalize_unit — lowercased, spaces → underscores,
+    # dots stripped. A recipe unit "Large Sprigs" is keyed 'large_sprigs'.
+    #
     # Garlic cloves: USDA ≈ 5g peeled
     ('garlic', 'clove'):           Decimal('0.18'),
     ('garlic', 'cloves'):          Decimal('0.18'),
-    ('garlic', 'ea cloves'):       Decimal('0.18'),  # "8 ea cloves" recipe unit
+    ('garlic', 'ea_cloves'):       Decimal('0.18'),  # "8 ea cloves"
+    ('garlic', '-10_ea'):          Decimal('0.18'),
+    ('garlic', '–10_ea'):          Decimal('0.18'),  # en-dash variant
     # Celery: rib/stalk ~1.4 oz (USDA). These units only fit celery.
     ('celery', 'rib'):    Decimal('1.4'),
     ('celery', 'ribs'):   Decimal('1.4'),
     ('celery', 'stalk'):  Decimal('1.4'),
     ('celery', 'stalks'): Decimal('1.4'),
     # Fresh herbs — sprig/stick: these units don't fit standard dispatch
-    ('basil', 'sprig'):         Decimal('0.2'),
-    ('basil', 'large sprig'):   Decimal('0.3'),
-    ('basil', 'large sprigs'):  Decimal('0.3'),
-    ('basil', '-4 large sprigs'): Decimal('0.3'),
-    ('basil', '-10 ea'):        Decimal('0.3'),
+    ('basil', 'sprig'):           Decimal('0.2'),
+    ('basil', 'sprigs'):          Decimal('0.2'),
+    ('basil', 'large_sprig'):     Decimal('0.3'),
+    ('basil', 'large_sprigs'):    Decimal('0.3'),
+    ('basil', '-4_large_sprigs'): Decimal('0.3'),
+    ('basil', '–4_large_sprigs'): Decimal('0.3'),
+    ('basil', '-10_ea'):          Decimal('0.3'),
+    ('basil', '–10_ea'):          Decimal('0.3'),
     ('rosemary', 'sprig'):      Decimal('0.15'),
     ('rosemary', 'stick'):      Decimal('0.15'),
     ('rosemary', 'sticks'):     Decimal('0.15'),
     ('thyme', 'sprig'):         Decimal('0.05'),
     ('thyme', 'sprigs'):        Decimal('0.05'),
-    # Bay leaves ~0.02 oz each (dried). Disambiguates from 'medium'/'each'
-    # piece weights which are covered by YieldReference rows.
-    ('whole_bay_leaves', '–10 ea'):   Decimal('0.02'),
-    ('whole_bay_leaves', '-10 ea'):   Decimal('0.02'),
+    # Bay leaves ~0.02 oz each (dried)
+    ('whole_bay_leaves', '–10_ea'):   Decimal('0.02'),
+    ('whole_bay_leaves', '-10_ea'):   Decimal('0.02'),
+    ('whole_bay_leaves', 'ea'):       Decimal('0.02'),
+    ('whole_bay_leaves', 'each'):     Decimal('0.02'),
+    ('bay_leaves', 'each'):           Decimal('0.02'),
+    ('bay_leaves', 'ea'):             Decimal('0.02'),
     # Lemon grass bulb stick ~2 oz each
     ('lemon_grass', 'stick'):   Decimal('2.0'),
     ('lemon_grass', 'sticks'):  Decimal('2.0'),
