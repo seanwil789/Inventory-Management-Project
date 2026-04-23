@@ -116,9 +116,13 @@ def _extract_row_item(row: list[dict], anchor: dict,
     None if the row is structurally invalid (no price, garbage desc)."""
     # Description = text tokens left of the anchor, right of the qty column.
     # Filter:
-    #   - drop standalone qty/marker tokens ("D", "1 CS", "2 CS", etc.)
-    #   - drop bare integers 1-9 (quantity counts)
     #   - drop price-shaped and SUPC-shaped tokens
+    #   - drop standalone qty/marker tokens ("D", "1 CS", "2 CS") ONLY when
+    #     they sit in the quantity x-band (x < _PACK_X_MIN). Further right
+    #     they are part of the pack column or product name ("1 CS" brand
+    #     prefix in a merged column) and must be preserved for pack-size
+    #     extraction (e.g. "6 1 GAL" for a 6×1-gallon olive oil pack).
+    _PACK_X_MIN = 0.17  # tokens at x>=0.17 belong to pack/desc columns
     desc_tokens = []
     for t in row:
         if t["x_min"] < _DESC_X_MIN or t["x_min"] >= anchor["x_min"]:
@@ -126,10 +130,12 @@ def _extract_row_item(row: list[dict], anchor: dict,
         tx = t["text"]
         if _PRICE_RE.fullmatch(tx) or _SUPC_RE.fullmatch(tx):
             continue
-        if tx in _QTY_TOKENS:
-            continue
-        if re.fullmatch(r'\d{1,2}', tx):
-            continue
+        if t["x_min"] < _PACK_X_MIN:
+            # Qty column — drop marker/qty tokens so they don't pollute desc
+            if tx in _QTY_TOKENS:
+                continue
+            if re.fullmatch(r'\d{1,2}', tx):
+                continue
         desc_tokens.append(t)
     description = " ".join(t["text"] for t in desc_tokens).strip()
 
@@ -168,9 +174,16 @@ def _extract_row_item(row: list[dict], anchor: dict,
     # Then pass the raw hit through parser's _normalize_pack_size which
     # knows how to split "1216OZ" → "12/16OZ", "124OZ" → "12/4OZ", etc.
     case_size = ""
+    # Normalize ONLY-prefixed and #-prefixed patterns before regex match:
+    # "ONLY5 LB" → "5 LB", "ONLY 2 KILO" → "2 KG", "6 # 10 CAN" → "6/10CAN".
+    norm_desc = description
+    norm_desc = re.sub(r'\bONLY\s*(\d+(?:\.\d+)?)\s*', r'\1 ', norm_desc, flags=re.IGNORECASE)
+    norm_desc = re.sub(r'\bKILO\b', 'KG', norm_desc, flags=re.IGNORECASE)
+    norm_desc = re.sub(r'\b(\d+)\s*#\s*(\d+)\b', r'\1/\2CAN', norm_desc)
+
     m = re.search(
         r'\b(\d+(?:\.\d+)?)\s*(?:([O0]Z|LB|GAL|CT|EA|KG|ML|QT|GM|#\d+)|(L)\b)',
-        description, re.IGNORECASE)
+        norm_desc, re.IGNORECASE)
     if m:
         num = m.group(1)
         unit = (m.group(2) or m.group(3) or "").upper().replace("0Z", "OZ")
@@ -180,11 +193,11 @@ def _extract_row_item(row: list[dict], anchor: dict,
             case_size = _normalize_pack_size(raw)
         except Exception:
             case_size = raw
-    # Fallback: slash-format like "4/50OZ", "24/12 OZ", "1/22LB"
+    # Fallback: slash-format like "4/50OZ", "24/12 OZ", "1/22LB", "6/10CAN"
     if not case_size:
         m = re.search(
-            r'\b(\d+\s*/\s*\d+\s*(?:OZ|LB|GAL|CT|EA|KG|ML|L|#10|QT|GM|KT))\b',
-            description, re.IGNORECASE)
+            r'\b(\d+\s*/\s*\d+\s*(?:OZ|LB|GAL|CT|EA|KG|ML|L|#10|QT|GM|KT|CAN))\b',
+            norm_desc, re.IGNORECASE)
         if m:
             case_size = re.sub(r'\s+', '', m.group(1)).upper()
 
