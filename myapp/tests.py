@@ -2293,6 +2293,289 @@ Total
             result = parser_mod.parse_invoice(raw, vendor='Sysco')
         self.assertEqual(result['invoice_date'], '2026-04-15')
 
+    def test_unknown_anchor_keeps_adjacent_desc(self):
+        """Known anchors must not steal descriptions that are strictly
+        closer to an unknown anchor.
+
+        Regression: before the Step A unknown-guard + Step B.1 reorder,
+        Step A's proximity-first pass plus Step A2's ordered fallback
+        would consume every unclaimed description before unknown anchors
+        got their proximity pass. Result: items whose code wasn't in
+        code_map came out as '[Sysco #NNNNNNN]' placeholders even though
+        their OCR description sat on the adjacent line.
+
+        This synthetic OCR places an unknown-code anchor (9999998) one
+        line below its description, and two known-code anchors far
+        enough away that they should prefer descriptions closer to them
+        than to the unknown. With the fix, the unknown's raw_description
+        pulls from the adjacent line."""
+        parser_mod, _ = self._import_parser()
+        raw = """**** DAIRY ****
+D
+1 CS
+450 OZ CEREAL OAT CRUNCH CINNAMON
+9999998 60.95
+60.95
+D
+1 CS
+MILK WHOLE GAL
+1111111 15.00
+D
+1 CS
+BUTTER SALTED BLOCK
+2222222 22.00
+GROUP TOTAL
+97.95
+LAST PAGE
+Total
+97.95
+"""
+        code_map = {'1111111': 'Milk, Whole', '2222222': 'Butter, Salted'}
+        with self._stub_mappings(code_map=code_map):
+            result = parser_mod.parse_invoice(raw, vendor='Sysco')
+        items = {it['sysco_item_code']: it for it in result['items']}
+        # Unknown code must NOT be a placeholder — desc came from line above
+        self.assertIn('9999998', items)
+        unk = items['9999998']
+        self.assertNotIn('[Sysco #', unk['raw_description'])
+        self.assertIn('CEREAL', unk['raw_description'].upper())
+        # Known anchors still get their canonical from code_map
+        self.assertEqual(items['1111111']['raw_description'], 'Milk, Whole')
+        self.assertEqual(items['2222222']['raw_description'], 'Butter, Salted')
+
+
+class MapperNonProductClassifierTests(TestCase):
+    """Invoice lines that represent surcharges, fees, credits, or footer
+    noise shouldn't go through product mapping. Tagging them with
+    confidence='non_product' keeps them out of recipe-costing flows while
+    preserving the dollar value for budget tracking."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import mapper
+        return mapper
+
+    def _empty_mappings(self):
+        return {"code_map": {}, "desc_map": {},
+                "vendor_desc_map": {}, "category_map": {}}
+
+    def test_fuel_surcharge_tagged_non_product(self):
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "CHGS FOR FUEL SURCHARGE",
+             "sysco_item_code": "3974320"},
+            self._empty_mappings(), vendor="Sysco")
+        self.assertEqual(r["confidence"], "non_product")
+        self.assertIsNone(r["canonical"])
+
+    def test_delivery_fee_tagged_non_product(self):
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "DELIVERY FEE", "sysco_item_code": ""},
+            self._empty_mappings(), vendor="Sysco")
+        self.assertEqual(r["confidence"], "non_product")
+
+    def test_credit_memo_tagged_non_product(self):
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "CREDIT MEMO INV# 12345", "sysco_item_code": ""},
+            self._empty_mappings(), vendor="Sysco")
+        self.assertEqual(r["confidence"], "non_product")
+
+    def test_real_product_not_tagged_non_product(self):
+        """Ordinary product descriptions must not accidentally trip the
+        non-product filter (would cost mapping rate)."""
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "MILK WHOLE GAL", "sysco_item_code": "1234567"},
+            self._empty_mappings(), vendor="Sysco")
+        self.assertNotEqual(r["confidence"], "non_product")
+
+    def test_non_product_takes_priority_over_code_match(self):
+        """Even if somehow a SUPC ends up in code_map for a fuel line,
+        the non-product classifier should still short-circuit — it
+        prevents downstream double-counting in recipe-costing."""
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "CHGS FOR FUEL SURCHARGE",
+             "sysco_item_code": "3974320"},
+            {"code_map": {"3974320": "Fake Product"}, "desc_map": {},
+             "vendor_desc_map": {}, "category_map": {}},
+            vendor="Sysco")
+        self.assertEqual(r["confidence"], "non_product")
+        self.assertIsNone(r["canonical"])
+
+
+class SpatialMatcherTests(TestCase):
+    """Validates the 2D bounding-box matcher that replaces the 1D
+    line-proximity heuristics for Sysco. Synthetic page fixtures so
+    tests don't depend on DocAI calls or real invoice images."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import spatial_matcher as sm
+        import parser as p
+        return sm, p
+
+    def _tok(self, text, x, y, w=0.04, h=0.015):
+        """Build a token dict with the shape the matcher expects."""
+        return {
+            "text": text,
+            "x_min": x, "x_max": x + w,
+            "y_min": y, "y_max": y + h,
+            "char_start": 0, "char_end": 0,
+        }
+
+    def _build_row(self, y, tokens_xt):
+        """Build a horizontal row of tokens. tokens_xt = [(text, x), ...]."""
+        return [self._tok(text, x, y) for text, x in tokens_xt]
+
+    def test_row_clustering_separates_adjacent_lines(self):
+        sm, _ = self._import()
+        row1 = self._build_row(0.10, [("1", 0.13), ("CS", 0.15),
+                                        ("PITA", 0.25), ("7881455", 0.57),
+                                        ("18.49", 0.64)])
+        row2 = self._build_row(0.13, [("1", 0.13), ("CS", 0.15),
+                                        ("CHIPS", 0.25), ("1977754", 0.57),
+                                        ("10.95", 0.64)])
+        rows = sm._group_rows(row1 + row2)
+        self.assertEqual(len(rows), 2)
+
+    def test_unknown_code_pairs_with_same_row_desc(self):
+        """Regression for today's placeholder bug: an unknown-code anchor
+        adjacent to a known-code anchor must get its own row's desc,
+        regardless of line order in raw_text."""
+        sm, _ = self._import()
+        tokens = []
+        tokens += self._build_row(0.10, [
+            ("1", 0.13), ("CS", 0.15),
+            ("450", 0.18), ("OZ", 0.22),
+            ("CEREAL", 0.28), ("GRANOLA", 0.36),
+            ("9999998", 0.57), ("60.95", 0.64),
+        ])
+        tokens += self._build_row(0.13, [
+            ("1", 0.13), ("CS", 0.15),
+            ("MILK", 0.28), ("WHOLE", 0.35),
+            ("GAL", 0.42), ("1111111", 0.57),
+            ("15.00", 0.64),
+        ])
+        items = sm.match_sysco_spatial([{"page_number": 1, "tokens": tokens}])
+        by_code = {it["sysco_item_code"]: it for it in items}
+        self.assertIn("9999998", by_code)
+        self.assertIn("1111111", by_code)
+        # The unknown-code item must have its desc from its own row —
+        # NOT bleed from the known-code row below it.
+        self.assertIn("CEREAL", by_code["9999998"]["raw_description"].upper())
+        self.assertNotIn("MILK", by_code["9999998"]["raw_description"].upper())
+        self.assertIn("MILK", by_code["1111111"]["raw_description"].upper())
+        self.assertEqual(by_code["9999998"]["unit_price"], 60.95)
+        self.assertEqual(by_code["1111111"]["unit_price"], 15.00)
+
+    def test_invoice_number_in_header_is_not_claimed_as_anchor(self):
+        """Invoice-number tokens sit in the far-right column (x≈0.72),
+        outside the SUPC-code column (x≈0.57). The x-range filter must
+        reject them so they don't appear as line items."""
+        sm, _ = self._import()
+        # Invoice header row: far-right 7-digit
+        header = self._build_row(0.05, [
+            ("INVOICE", 0.50), ("NUMBER", 0.60),
+            ("7777777", 0.72),  # at x=0.72, outside SUPC band [0.40, 0.68]
+        ])
+        items = sm.match_sysco_spatial([{"page_number": 1, "tokens": header}])
+        codes = [it["sysco_item_code"] for it in items]
+        self.assertNotIn("7777777", codes)
+
+    def test_parse_invoice_without_pages_uses_heuristic(self):
+        """Back-compat: callers that don't pass pages=... still get the
+        raw_text-based parser. No crash, no missing items."""
+        _, p = self._import()
+        # Stub out the Sysco parser's mapper dep
+        from unittest.mock import patch
+        import mapper
+        raw = """**** DAIRY ****
+MILK WHOLE GAL
+1111111 15.00
+GROUP TOTAL
+15.00
+LAST PAGE
+Total
+15.00
+"""
+        with patch.object(mapper, 'load_mappings', return_value={
+            'code_map': {'1111111': 'Milk, Whole'},
+            'desc_map': {}, 'vendor_desc_map': {}, 'category_map': {},
+        }):
+            result = p.parse_invoice(raw, vendor='Sysco')  # no pages kwarg
+        self.assertEqual(len(result['items']), 1)
+        self.assertEqual(result['items'][0]['sysco_item_code'], '1111111')
+
+    def test_parse_invoice_with_pages_prefers_spatial(self):
+        """When pages=[...] is passed and spatial extraction finds ≥3
+        items, the spatial path wins over the 1D heuristic path."""
+        _, p = self._import()
+        # Build a synthetic page with 3 items
+        sm, _ = self._import()
+        tokens = []
+        for i, (code, y) in enumerate([("2222222", 0.10),
+                                         ("3333333", 0.13),
+                                         ("4444444", 0.16)]):
+            tokens += self._build_row(y, [
+                ("ITEM", 0.20), (f"N{i}", 0.30),
+                (code, 0.57), (f"{10+i}.00", 0.64),
+            ])
+        pages = [{"page_number": 1, "tokens": tokens}]
+        # raw text unused by spatial path, but parse_invoice needs
+        # something for detect_vendor / extract_date fallbacks.
+        raw = "SYSCO PHILADELPHIA\nDELV. DATE\n4/15/2026\n"
+        from unittest.mock import patch
+        import mapper
+        with patch.object(mapper, 'load_mappings', return_value={
+            'code_map': {}, 'desc_map': {},
+            'vendor_desc_map': {}, 'category_map': {},
+        }):
+            result = p.parse_invoice(raw, vendor='Sysco', pages=pages)
+        codes = sorted(it['sysco_item_code'] for it in result['items'])
+        self.assertEqual(codes, ['2222222', '3333333', '4444444'])
+
+    def test_parse_invoice_spatial_falls_back_when_too_few_items(self):
+        """Spatial extraction returning <3 items means layout is
+        degenerate (footer-only page, header, etc.). Fall back to the
+        heuristic parser rather than emit a stub result."""
+        _, p = self._import()
+        # Only 2 items in spatial layout; below the min-3 threshold
+        tokens = []
+        for i, code in enumerate(["5555555", "6666666"]):
+            tokens += self._build_row(0.10 + i*0.03, [
+                ("X", 0.20), (code, 0.57), (f"{20+i}.00", 0.64),
+            ])
+        pages = [{"page_number": 1, "tokens": tokens}]
+        raw = """**** DAIRY ****
+MILK
+1111111 15.00
+LAST PAGE
+Total
+15.00
+"""
+        from unittest.mock import patch
+        import mapper
+        with patch.object(mapper, 'load_mappings', return_value={
+            'code_map': {}, 'desc_map': {},
+            'vendor_desc_map': {}, 'category_map': {},
+        }):
+            result = p.parse_invoice(raw, vendor='Sysco', pages=pages)
+        # Heuristic extracted 1111111 from raw, NOT 5555555/6666666 from pages
+        codes = [it['sysco_item_code'] for it in result['items']]
+        self.assertIn('1111111', codes)
+        self.assertNotIn('5555555', codes)
+
 
 class ParserPipelineIntegrationTest(TestCase):
     """T4: full parse → map → write_invoice_to_db round-trip. Verifies the

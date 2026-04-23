@@ -104,7 +104,8 @@ def main():
             else:
                 vendor = docai_ocr["vendor"]
                 if vendor == "Sysco":
-                    parsed = parse_invoice(docai_ocr["raw_text"], vendor=vendor)
+                    parsed = parse_invoice(docai_ocr["raw_text"], vendor=vendor,
+                                           pages=docai_ocr.get("pages"))
                     if docai_ocr["vendor"] != "Unknown":
                         parsed["vendor"] = docai_ocr["vendor"]
                     if docai_ocr["invoice_date"]:

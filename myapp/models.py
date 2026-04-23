@@ -57,6 +57,7 @@ class InvoiceLineItem(models.Model):
         ('stripped_fuzzy', 'Stripped Prefix Fuzzy'),
         ('keyword_batch', 'Keyword Batch (Human)'),
         ('manual_review', 'Manual Review (Human)'),
+        ('non_product', 'Non-Product (surcharge/fee/credit)'),
         ('unmatched', 'Unmatched'),
     ]
 

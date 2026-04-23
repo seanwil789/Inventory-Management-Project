@@ -893,6 +893,22 @@ def _parse_sysco(text: str) -> list[dict]:
             canonical = _code_map.get(anchors[ai][1])
             anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
 
+    # Precompute nearest-unknown-anchor line for each desc, so Step A's
+    # proximity matching can yield descs to unknown anchors that need them
+    # more. Known codes already have raw_description from code_map canonical
+    # — they only need the desc for case_size / catch_weight info. Unknown
+    # codes NEED the desc for raw_description. Without this guard, known
+    # codes steal descriptions that should pair with adjacent unknowns,
+    # producing '[Sysco #NNN]' placeholders even when the real OCR
+    # description sits right next to the unknown code line.
+    unknown_anchor_lines = [anchors[ai][0] for ai in range(len(anchors))
+                             if anchors[ai][1] not in _code_map]
+
+    def _nearest_unknown_dist(desc_line: int) -> int:
+        if not unknown_anchor_lines:
+            return 999
+        return min(abs(desc_line - ul) for ul in unknown_anchor_lines)
+
     for ai, (line_idx, item_code, price, prefix) in enumerate(anchors):
         canonical = _code_map.get(item_code)
         if not canonical:
@@ -902,7 +918,9 @@ def _parse_sysco(text: str) -> list[dict]:
 
         known_anchor_indices.add(ai)
 
-        # Find the nearest unclaimed description to any occurrence of this code
+        # Find the nearest unclaimed description to any occurrence of this code.
+        # Skip descs that are strictly closer to an unknown code — the unknown
+        # needs the desc for raw_description, the known has canonical already.
         code_lines = code_positions.get(item_code, [line_idx])
         best_di = None
         best_dist = 999
@@ -910,8 +928,11 @@ def _parse_sysco(text: str) -> list[dict]:
         for di, de in enumerate(desc_entries):
             if di in used_descs:
                 continue
+            unk_dist = _nearest_unknown_dist(de["line"])
             for cl in code_lines:
                 dist = abs(de["line"] - cl)
+                if unk_dist < dist:
+                    continue  # desc belongs to a closer unknown anchor
                 if dist < best_dist:
                     best_dist = dist
                     best_di = di
@@ -925,35 +946,14 @@ def _parse_sysco(text: str) -> list[dict]:
             # Mark for ordered fallback — will try in step A2
             anchor_matches[ai] = (canonical, "", None)
 
-    # ── Step A2: ordered fallback for known-code anchors without a match ──
-    # When proximity fails (clustered anchors far from descriptions),
-    # consume unclaimed descriptions in order — the OCR reads descriptions
-    # top-to-bottom, and anchors top-to-bottom, so the ordering is preserved.
-    unmatched_known = [ai for ai in range(len(anchors))
-                       if ai in known_anchor_indices
-                       and anchor_matches[ai] is not None
-                       and anchor_matches[ai][1] == ""]
-    remaining_for_known = [(di, de) for di, de in enumerate(desc_entries)
-                           if di not in used_descs]
-    remaining_for_known.sort(key=lambda x: x[1]["line"])
-
-    known_desc_iter = iter(remaining_for_known)
-    for ai in sorted(unmatched_known, key=lambda x: anchors[x][0]):
-        pair = next(known_desc_iter, None)
-        if pair:
-            di, de = pair
-            used_descs.add(di)
-            canonical = anchor_matches[ai][0]
-            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
-
-    # ── Step B: handle unknown-code anchors ───────────────────────────────
-    # Two passes: proximity-first (like Step A), then ordered-iterator fallback.
-    # Previously this was ordered-iterator only, which caused unknown anchors
-    # late in the file to get placeholder descriptions when earlier unknowns
-    # had consumed all available descs in order — even when a clearly-nearby
-    # unclaimed description existed. Proximity matching now wins when distance
-    # is small, falling back to ordered iteration for anchors with no close
-    # unclaimed desc.
+    # ── Step B.1: proximity pass for unknown-code anchors ────────────────
+    # Run BEFORE Step A2's ordered fallback. Known anchors already have their
+    # canonical from code_map — they only need desc for case_size info (and
+    # Product.default_case_size is available as a further fallback downstream).
+    # Unknown anchors NEED the desc for raw_description. If ordered fallback
+    # for known runs first, it greedily consumes descs that belong to nearby
+    # unknown anchors, leaving those unknowns as '[Sysco #NNN]' placeholders
+    # even though their description is right next to them in the OCR.
     unknown_anchors = [ai for ai in range(len(anchors)) if ai not in known_anchor_indices]
 
     # Proximity pass — each unknown anchor tries to claim its nearest
@@ -983,7 +983,28 @@ def _parse_sysco(text: str) -> list[dict]:
             de = desc_entries[best_di]
             anchor_matches[ai] = (de["description"], de["case_size"], de.get("catch_weight"))
 
-    # Ordered fallback for unknown anchors that didn't find a nearby desc.
+    # ── Step A2: ordered fallback for known-code anchors without a match ──
+    # When proximity fails (clustered anchors far from descriptions),
+    # consume unclaimed descriptions in order — the OCR reads descriptions
+    # top-to-bottom, and anchors top-to-bottom, so the ordering is preserved.
+    unmatched_known = [ai for ai in range(len(anchors))
+                       if ai in known_anchor_indices
+                       and anchor_matches[ai] is not None
+                       and anchor_matches[ai][1] == ""]
+    remaining_for_known = [(di, de) for di, de in enumerate(desc_entries)
+                           if di not in used_descs]
+    remaining_for_known.sort(key=lambda x: x[1]["line"])
+
+    known_desc_iter = iter(remaining_for_known)
+    for ai in sorted(unmatched_known, key=lambda x: anchors[x][0]):
+        pair = next(known_desc_iter, None)
+        if pair:
+            di, de = pair
+            used_descs.add(di)
+            canonical = anchor_matches[ai][0]
+            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
+
+    # ── Step B.2: ordered fallback for unknown anchors still unmatched ────
     remaining_descs = [(di, de) for di, de in enumerate(desc_entries) if di not in used_descs]
     remaining_descs.sort(key=lambda x: x[1]["line"])
     desc_iter = iter(remaining_descs)
@@ -2354,7 +2375,33 @@ def _fallback_parse(text: str) -> list[dict]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def parse_invoice(text: str, vendor: str = None) -> dict:
+def _try_spatial_sysco(pages: list[dict] | None, text: str) -> list[dict] | None:
+    """When DocAI layout data (pages[].tokens[]) is present, extract Sysco
+    items via physical-row matching rather than 1D line-proximity heuristics.
+
+    Returns the spatial items if extraction yields a plausible count
+    (≥3 items, to filter page-1-only partial dumps and misc headers).
+    Returns None otherwise — caller falls back to the raw_text-based
+    heuristic parser, which has vendor-wide coverage for invoices whose
+    cache hasn't been refreshed with layout data yet."""
+    if not pages:
+        return None
+    try:
+        from spatial_matcher import match_sysco_spatial
+    except Exception:
+        return None
+    items = match_sysco_spatial(pages)
+    if len(items) < 3:
+        return None
+    return items
+
+
+def parse_invoice(text: str, vendor: str = None,
+                  pages: list[dict] | None = None) -> dict:
+    """Parse invoice OCR. Optional `pages` is DocAI layout data
+    (pages[].tokens[] with bounding boxes) — when present for Sysco we
+    use spatial row-matching for more reliable anchor/desc pairing.
+    Other vendors still use text-based parsing."""
     vendor = vendor or detect_vendor(text)
     date   = extract_date(text)
 
@@ -2370,15 +2417,31 @@ def parse_invoice(text: str, vendor: str = None) -> dict:
         "Delaware County Linen": _parse_delaware_linen,
     }
 
-    parser_fn = parsers.get(vendor, _fallback_parse)
-    result = parser_fn(text)
-
-    # Parsers that return (items, invoice_total) tuple
+    # Sysco spatial path — try first, fall back to heuristics on any gap.
     invoice_total = None
-    if isinstance(result, tuple):
-        items, invoice_total = result
+    spatial_items = None
+    if vendor == "Sysco":
+        spatial_items = _try_spatial_sysco(pages, text)
+
+    if spatial_items is not None:
+        items = spatial_items
+        # Invoice totals live in the footer, which is text-based — run the
+        # heuristic parser just to harvest invoice_total; discard its
+        # items (spatial already has them). Cheap insurance for the
+        # total-reconciliation step in batch.py / budget_sync.py.
+        try:
+            heur_result = _parse_sysco(text)
+            if isinstance(heur_result, tuple) and len(heur_result) >= 2:
+                invoice_total = heur_result[1]
+        except Exception:
+            pass
     else:
-        items = result
+        parser_fn = parsers.get(vendor, _fallback_parse)
+        result = parser_fn(text)
+        if isinstance(result, tuple):
+            items, invoice_total = result
+        else:
+            items = result
 
     if vendor not in parsers:
         for item in items:

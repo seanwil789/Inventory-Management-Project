@@ -160,6 +160,14 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             existing = InvoiceLineItem.objects.filter(**lookup).first()
             if existing:
                 for field, value in common_fields.items():
+                    # Preserve price_per_pound when the incoming row
+                    # doesn't have one. Backfill-populated PPP values are
+                    # load-bearing for recipe cost accuracy and shouldn't
+                    # be clobbered by parsers that only emit per_lb for
+                    # catch-weight rows.
+                    if field == 'price_per_pound' and value is None \
+                            and existing.price_per_pound is not None:
+                        continue
                     setattr(existing, field, value)
                 existing.save()
             else:
@@ -184,10 +192,11 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         # the placeholder. Deleting the placeholder prevents double-counting
         # in category spend, cost-coverage, and reconciliation metrics.
         #
-        # Triggered by parser extraction improvements (e.g. inline-prefix
-        # capture, catch-weight column-dump pass) that produce rows with
-        # real descriptions on SUPCs that were previously only seen as
-        # placeholders.
+        # Known limitation: when the OLD row has a non-placeholder but
+        # wrong raw_description (e.g. parser stole an adjacent desc), and
+        # the NEW row carries a correct desc, both survive. The SUPC isn't
+        # stored as its own ILI column, so we can't dedup by SUPC at DB
+        # level. Post-reprocess cleanup handles those cases.
         supc = item.get('sysco_item_code', '')
         is_placeholder_write = (raw_desc == f'[Sysco #{supc}]')
         if supc and parsed_date and not is_placeholder_write:

@@ -305,11 +305,47 @@ def load_mappings(force_refresh: bool = False) -> dict:
     return cache
 
 
+# Non-product line patterns — surcharges, fees, credits, page-summary noise
+# that appear in invoice OCR as line items but aren't recipe-costing material.
+# Matched by substring in the raw_description (uppercase-compared). Tagged
+# with confidence='non_product' so they don't pollute the mapping % metric
+# and don't clutter Mapping Review. Still retain dollar value for budget
+# tracking — we just route them out of the product-catalog flow.
+_NON_PRODUCT_PATTERNS = (
+    "CHGS FOR FUEL",
+    "FUEL SURCHARGE",
+    "DELIVERY FEE",
+    "DELIVERY CHG",
+    "CREDIT MEMO",
+    "ORDER SUMMARY",
+    "MISC CHARGES",
+    "MISC CHARGE",
+    "ADMIN FEE",
+    "SERVICE CHARGE",
+    "ENV CHARGE",
+    "ENVIRONMENTAL FEE",
+    "SURCHARGE",
+)
+
+
+def _is_non_product(raw_desc: str) -> bool:
+    """True when the raw description looks like a vendor surcharge, fee,
+    credit, or invoice-footer noise — none of which should go through the
+    product-mapping flow."""
+    if not raw_desc:
+        return False
+    upper = raw_desc.upper()
+    return any(p in upper for p in _NON_PRODUCT_PATTERNS)
+
+
 def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
     """
     Attempt to map a line item to a canonical name.
 
     Matching priority:
+      0. Non-product classifier (surcharges, fees, credits) — short-circuit
+         out of product mapping entirely; these don't belong to the recipe
+         catalog and shouldn't count against mapping metrics.
       1. Sysco item code (most reliable — only Sysco invoices carry SUPC codes)
       2. Vendor-scoped exact description match
       3. Vendor-scoped fuzzy description match
@@ -321,7 +357,8 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
       canonical             — resolved name or None
       confidence            — "code" | "vendor_exact" | "vendor_fuzzy" |
                               "exact" | "fuzzy" | "stripped_fuzzy" |
-                              "keyword_batch" | "manual_review" | "unmatched"
+                              "keyword_batch" | "manual_review" |
+                              "non_product" | "unmatched"
       score                 — 0-100
       category              — top-level category (e.g. "Produce") or ""
       primary_descriptor    — mid-level grouping (e.g. "Leaf") or ""
@@ -340,6 +377,15 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
     if not raw_desc and not item_code:
         return {**item, "canonical": None, "confidence": "unmatched", "score": 0,
                 "category": "", "primary_descriptor": "", "secondary_descriptor": ""}
+
+    # Priority 0: non-product classifier. Fuel surcharges, delivery fees,
+    # credit memos, and invoice-footer noise shouldn't run through the
+    # product catalog. Tag and return with empty canonical so budget tools
+    # can still count the dollar value while recipe/mapping tools skip it.
+    if _is_non_product(raw_desc):
+        return {**item, "canonical": None, "confidence": "non_product",
+                "score": 100, "category": "", "primary_descriptor": "",
+                "secondary_descriptor": ""}
 
     vendor_map = vendor_desc_map.get(vendor.upper(), {}) if vendor else {}
 

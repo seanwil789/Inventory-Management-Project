@@ -322,7 +322,8 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
                     # These vendors have structured column layouts that our parsers
                     # handle better than DocAI entity extraction
                     raw_text = docai_ocr["raw_text"]
-                    parsed = parse_invoice(raw_text, vendor=vendor)
+                    parsed = parse_invoice(raw_text, vendor=vendor,
+                                           pages=docai_ocr.get("pages"))
                     parse_method = f"DocAI OCR + {vendor} parser"
                     # Use DocAI's vendor/date detection
                     if docai_ocr["vendor"] != "Unknown":

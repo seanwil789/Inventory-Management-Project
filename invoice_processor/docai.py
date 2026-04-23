@@ -633,10 +633,53 @@ def _merge_results(results: list[dict]) -> dict:
 
 # ── OCR-only entry point ───────────────────────────────────────────────────
 
+def _extract_page_layout(document) -> list[dict]:
+    """Strip the DocAI document down to per-page, per-token spatial records.
+    Powers 2D spatial matching (see spatial_matcher.py) — each token has
+    normalized x/y bounds plus char-offsets into document.text so downstream
+    code can cross-reference spatial and textual views.
+
+    Returns [{page_number, tokens: [{text, x_min, x_max, y_min, y_max,
+    char_start, char_end}]}]. Empty list if layout data is missing."""
+    raw_text = document.text or ""
+    pages_out = []
+    for page in document.pages:
+        tokens = []
+        for tok in page.tokens:
+            layout = tok.layout
+            ts_list = list(layout.text_anchor.text_segments)
+            if not ts_list:
+                continue
+            ts = ts_list[0]
+            start = int(ts.start_index) if ts.start_index else 0
+            end = int(ts.end_index) if ts.end_index else 0
+            text = raw_text[start:end].strip()
+            vertices = list(layout.bounding_poly.normalized_vertices)
+            if not vertices or not text:
+                continue
+            xs = [v.x for v in vertices]
+            ys = [v.y for v in vertices]
+            tokens.append({
+                "text": text,
+                "x_min": min(xs), "x_max": max(xs),
+                "y_min": min(ys), "y_max": max(ys),
+                "char_start": start, "char_end": end,
+            })
+        pages_out.append({
+            "page_number": page.page_number,
+            "tokens": tokens,
+        })
+    return pages_out
+
+
 def _ocr_single_document(file_content: bytes, mime_type: str,
                           client, processor_name: str) -> dict | None:
     """Use DocAI for OCR only — extract raw text, vendor, and date.
-    No line item entity extraction (that's handled by vendor-specific parsers)."""
+    No line item entity extraction (that's handled by vendor-specific parsers).
+
+    Also preserves per-token bounding-box layout (pages[].tokens[]) so the
+    spatial matcher can pair anchors with descriptions by physical row,
+    bypassing the column-read-order ambiguity of raw_text-based parsing."""
     result = _docai_call_with_retry(client, processor_name,
                                      file_content, mime_type)
     document = result.document
@@ -666,6 +709,7 @@ def _ocr_single_document(file_content: bytes, mime_type: str,
         "vendor": vendor,
         "invoice_date": invoice_date,
         "raw_text": raw_text,
+        "pages": _extract_page_layout(document),
     }
 
 
@@ -683,9 +727,13 @@ def ocr_with_docai(file_path: str) -> dict | None:
     """
     import ocr_cache
     cached = ocr_cache.get(file_path, "docai_ocr")
-    if cached is not None:
+    if cached is not None and cached.get("pages"):
         print(f"   [DocAI OCR] Cache hit — skipping API call")
         return cached
+    if cached is not None and not cached.get("pages"):
+        # Pre-spatial cache entry — layout data absent. Re-OCR to populate
+        # pages[], so Sysco spatial matching has what it needs.
+        print(f"   [DocAI OCR] Cache hit missing layout data — re-OCR'ing")
 
     if not DOCAI_PROJECT_ID or not DOCAI_PROCESSOR_ID:
         return None
@@ -723,8 +771,10 @@ def ocr_with_docai(file_path: str) -> dict | None:
                 page_paths = _split_pdf_pages(file_path)
                 print(f"   [DocAI OCR] Processing {len(page_paths)} pages individually...")
                 all_text = []
+                all_pages = []
                 vendor = "Unknown"
                 invoice_date = ""
+                char_offset = 0
                 for i, pp in enumerate(page_paths):
                     try:
                         with open(pp, "rb") as f:
@@ -732,8 +782,26 @@ def ocr_with_docai(file_path: str) -> dict | None:
                         r = _ocr_single_document(page_content, "application/pdf",
                                                   client, processor_name)
                         if r:
-                            if r.get("raw_text"):
-                                all_text.append(r["raw_text"])
+                            page_text = r.get("raw_text", "")
+                            if page_text:
+                                all_text.append(page_text)
+                            # Carry forward per-page layout, renumbering pages
+                            # and shifting char offsets so they index into the
+                            # merged raw_text ("\n".join(all_text)).
+                            for pg in r.get("pages", []) or []:
+                                shifted_tokens = []
+                                for tok in pg.get("tokens", []):
+                                    shifted_tokens.append({
+                                        **tok,
+                                        "char_start": tok["char_start"] + char_offset,
+                                        "char_end": tok["char_end"] + char_offset,
+                                    })
+                                all_pages.append({
+                                    "page_number": len(all_pages) + 1,
+                                    "tokens": shifted_tokens,
+                                })
+                            # Account for the "\n" separator added by join
+                            char_offset += len(page_text) + (1 if page_text else 0)
                             if r["vendor"] != "Unknown" and vendor == "Unknown":
                                 vendor = r["vendor"]
                             if r["invoice_date"] and not invoice_date:
@@ -744,6 +812,7 @@ def ocr_with_docai(file_path: str) -> dict | None:
                     "vendor": vendor,
                     "invoice_date": invoice_date,
                     "raw_text": "\n".join(all_text),
+                    "pages": all_pages,
                 }
                 ocr_cache.put(file_path, "docai_ocr", merged_result)
                 return merged_result
