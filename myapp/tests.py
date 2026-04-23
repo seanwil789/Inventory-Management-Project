@@ -2883,6 +2883,42 @@ class CostUtilsUnitKindTests(TestCase):
         self.assertEqual(unit_kind("  LB  "), 'weight')
 
 
+class CostUtilsUnitSynonymTests(TestCase):
+    """Synonyms added from production-data audit: pound symbol, plural
+    forms of weight/volume/count units. Each entry here unblocks specific
+    incompat RIs surfaced in the 2026-04-22 Phase 6 audit."""
+
+    def test_pound_symbol_is_weight(self):
+        from myapp.cost_utils import unit_kind, to_base_unit
+        self.assertEqual(unit_kind('#'), 'weight')
+        qty, base = to_base_unit(Decimal('5'), '#')
+        self.assertEqual(qty, Decimal('80'))  # 5 lb → 80 oz
+        self.assertEqual(base, 'oz')
+
+    def test_lbs_plural_is_weight(self):
+        from myapp.cost_utils import unit_kind, to_base_unit
+        self.assertEqual(unit_kind('lbs'), 'weight')
+        self.assertEqual(unit_kind('LBS'), 'weight')
+        qty, _ = to_base_unit(Decimal('10'), 'lbs')
+        self.assertEqual(qty, Decimal('160'))  # 10 lbs → 160 oz
+
+    def test_volume_plurals(self):
+        from myapp.cost_utils import unit_kind, to_base_unit
+        for u in ('quarts', 'pints', 'gallons', 'liters', 'tsps', 'tbsps'):
+            self.assertEqual(unit_kind(u), 'volume', f"{u!r} should be volume")
+        # spot-check math
+        qty, _ = to_base_unit(Decimal('2'), 'quarts')
+        self.assertEqual(qty, Decimal('64'))  # 2 qt → 64 fl_oz
+        qty, _ = to_base_unit(Decimal('3'), 'pints')
+        self.assertEqual(qty, Decimal('48'))  # 3 pt → 48 fl_oz
+
+    def test_count_plurals(self):
+        from myapp.cost_utils import unit_kind
+        for u in ('bags', 'bottles', 'jars', 'cans', 'bunches', 'heads',
+                  'packs', 'pack', 'bundles', 'bundle'):
+            self.assertEqual(unit_kind(u), 'count', f"{u!r} should be count")
+
+
 class CostUtilsToBaseUnitTests(TestCase):
     """`to_base_unit` conversion math."""
 

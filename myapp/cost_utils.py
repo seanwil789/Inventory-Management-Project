@@ -226,6 +226,8 @@ def case_size_candidates_for_cost(case_size: str | None,
 _WEIGHT_TO_OZ: dict[str, Decimal] = {
     'oz':  Decimal('1'),
     'lb':  Decimal('16'),
+    'lbs': Decimal('16'),       # recipe plural
+    '#':   Decimal('16'),       # pound symbol — common shorthand in recipe quantity columns
     'g':   Decimal('0.03527396195'),
     'kg':  Decimal('35.27396195'),
     'pound':  Decimal('16'),
@@ -241,19 +243,25 @@ _VOLUME_TO_FL_OZ: dict[str, Decimal] = {
     'fl_oz':  Decimal('1'),
     'floz':   Decimal('1'),
     'tsp':    Decimal('1') / Decimal('6'),
+    'tsps':   Decimal('1') / Decimal('6'),
     'tbsp':   Decimal('0.5'),
+    'tbsps':  Decimal('0.5'),
     'cup':    Decimal('8'),
     'cups':   Decimal('8'),
     'c':      Decimal('8'),
     'pt':     Decimal('16'),
     'pint':   Decimal('16'),
+    'pints':  Decimal('16'),
     'qt':     Decimal('32'),
     'quart':  Decimal('32'),
+    'quarts': Decimal('32'),
     'gal':    Decimal('128'),
     'gallon': Decimal('128'),
+    'gallons':Decimal('128'),
     'ml':     Decimal('0.033814'),
     'l':      Decimal('33.814'),
     'liter':  Decimal('33.814'),
+    'liters': Decimal('33.814'),
     # #10 can — standard food-service can size, ~13.625 cups = 109 fl_oz.
     # Recipes write '#10 Can' as the unit; case is "6/10CAN" pack.
     '#10_can': Decimal('109'),
@@ -264,8 +272,10 @@ _VOLUME_TO_FL_OZ: dict[str, Decimal] = {
 # Count-type units. Most resolve 1:1 to 'ct' (count). 'doz'/'dozen' is the
 # exception — 1 dozen = 12 ct — handled by `to_base_unit` and is the unlock
 # for products like Eggs sold by '15 DOZ' (= 180 ct).
-_COUNT_UNITS = {'ct', 'each', 'ea', 'hd', 'head', 'bu', 'bunch', 'bag',
-                'bottle', 'jar', 'can', 'doz', 'dozen', 'dz'}
+_COUNT_UNITS = {'ct', 'each', 'ea', 'hd', 'head', 'heads', 'bu', 'bunch', 'bunches',
+                'bag', 'bags', 'bottle', 'bottles', 'jar', 'jars', 'can', 'cans',
+                'pack', 'packs', 'bundle', 'bundles',
+                'doz', 'dozen', 'dz'}
 _COUNT_TO_CT: dict[str, Decimal] = {
     'doz':    Decimal('12'),
     'dozen':  Decimal('12'),
