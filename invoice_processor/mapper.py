@@ -556,10 +556,38 @@ _JUNK_RE = re.compile(
 )
 
 
+_PLACEHOLDER_DESC_RE = re.compile(r'^\[Sysco\s*#\d+\]$')
+
+
 def _is_junk_item(item: dict) -> bool:
-    """Return True if the item is a non-product line (surcharge, header, etc.)."""
+    """Return True if the item is a non-product line (surcharge, header, etc.).
+
+    Exception: items whose description is the '[Sysco #NNN]' placeholder —
+    emitted by the parser when a real anchor has no inline OCR description
+    (common on column-dump catch-weight items) — AND that carry a valid
+    sysco_item_code + non-trivial price ARE real products, just unmapped.
+    They should surface in the unmapped-review queue so a human or SUPC
+    CSV import can assign a canonical name. Without this guard, ~$800+
+    catch-weight items silently vanish between parser and DB.
+
+    Narrow scope: this exception ONLY bypasses the placeholder pattern.
+    Other junk patterns (FUEL SURCHARGE, section headers, etc.) still
+    filter normally even when a spurious code gets attached to them.
+    """
     desc = item.get("raw_description", "")
-    return bool(_JUNK_RE.search(desc))
+    if not _JUNK_RE.search(desc):
+        return False
+
+    # If the junk match is specifically the placeholder AND the item has
+    # a real code + price, override to keep it.
+    code = item.get("sysco_item_code", "")
+    price = item.get("unit_price") or 0
+    if (_PLACEHOLDER_DESC_RE.match(desc)
+            and code and len(str(code)) >= 6
+            and price > 5):
+        return False
+
+    return True
 
 
 def map_items(parsed_items: list[dict], force_refresh: bool = False,
