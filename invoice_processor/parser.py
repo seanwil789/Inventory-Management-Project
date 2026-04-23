@@ -445,17 +445,28 @@ def _parse_sysco(text: str) -> list[dict]:
             anchors.append((i, m.group(1), float(m.group(2)), prefix))
             anchor_lines.add(i)
 
-    # ── Catch-weight column-dump pass ─────────────────────────────────────
-    # Sysco catch-weight (MEATS/POULTRY/SEAFOOD) items in column-dump OCR
-    # print as a three-line pattern:
-    #   weight:    65.200          (bare 3-decimal weight in lbs)
-    #   anchor:    3124662 12.650  (code + 3-decimal per-lb price)
-    #   extended:  824.78          (bare 2-decimal line total)
-    # The main _PRICE_ANCHOR rejects the 3-decimal per-lb, so these items
-    # are invisible to the normal extraction. This second pass picks them
-    # up by cross-validating weight × per_lb ≈ extended before extracting.
-    # Records per_lb + weight in catch_weight_info for later item build.
-    _CATCH_WEIGHT_ANCHOR = re.compile(r'^(\d{6,7})\s+(\d+\.\d{3,4})\s*$')
+    # ── Catch-weight (3-decimal per-lb) anchor pass ───────────────────────
+    # Sysco catch-weight (MEATS/POULTRY/SEAFOOD) items print per-lb prices
+    # with 3 decimals, which the main _PRICE_ANCHOR (2-decimal-only)
+    # rejects. Two OCR layout variants recovered here:
+    #
+    # Column-dump (code on its own line, prefix empty):
+    #   Line N-1: 65.200              weight in lbs (3-decimal bare)
+    #   Line N:   3124662 12.650      code + per-lb
+    #   Line N+1: 824.78              extended (2-decimal bare)
+    #
+    # Inline-description (code+per-lb at END of a description line,
+    # weight on next line, no adjacent extended):
+    #   Line N:   BCH BLK PORK TENDER 1.5 DN FRESH 25140 5812534 3.299
+    #   Line N+1: 15.100              weight in lbs
+    #   Line N+2: T/WT= (or other non-numeric)
+    # In this variant the extended lands further downstream in a price
+    # stack; we derive extended = weight × per_lb from the adjacent weight.
+    #
+    # Either variant: cross-validate with weight before extracting so we
+    # don't fabricate items from coincidental digit patterns.
+    # Code+per-lb must be at end of line (^...$ or trailing position).
+    _CATCH_WEIGHT_ANCHOR = re.compile(r'(?:^|\s)(\d{6,7})\s+(\d+\.\d{3,4})\s*$')
     _BARE_2DEC = re.compile(r'^(\d+\.\d{2})\s*$')
     _BARE_3DEC = re.compile(r'^(\d+\.\d{3,4})\s*$')
 
@@ -463,51 +474,65 @@ def _parse_sysco(text: str) -> list[dict]:
     for i, line in enumerate(lines):
         if i in anchor_lines or i in group_total_lines:
             continue
-        m = _CATCH_WEIGHT_ANCHOR.match(line.strip())
+        m = _CATCH_WEIGHT_ANCHOR.search(line.strip())
         if not m:
             continue
         code = m.group(1)
         per_lb = float(m.group(2))
 
-        # Find extended on the next 1-2 lines (2-decimal standalone)
-        extended = None
+        # Extract prefix (inline description text before the code+per-lb pair)
+        prefix = line.strip()[:m.start()].rstrip()
+
+        # Scan nearby lines for candidate extended (2-decimal) and weight
+        # (3-4 decimal). Collect BOTH if present — we use them as
+        # corroborating signals, not alternatives.
+        ext_candidate = None
         ext_line_idx = None
         for j in range(i + 1, min(i + 3, len(lines))):
             if j in group_total_lines:
                 continue
             em = _BARE_2DEC.match(lines[j].strip())
             if em:
-                candidate = float(em.group(1))
-                # Extended should be much larger than per-lb (typical weight 1-50 lbs)
-                if candidate > per_lb * 1.5:
-                    extended = candidate
-                    ext_line_idx = j
-                    break
+                ext_candidate = float(em.group(1))
+                ext_line_idx = j
+                break
 
-        if extended is None:
-            continue  # no plausible extended — don't risk a wrong item
-
-        # Find weight within 2 lines before or 3 after (3-4 decimal bare)
-        weight_lbs = None
+        wt_candidate = None
         search_range = list(range(max(0, i - 2), i)) + list(range(i + 1, min(i + 4, len(lines))))
         for j in search_range:
             if j in (ext_line_idx, i) or j in group_total_lines:
                 continue
             wm = _BARE_3DEC.match(lines[j].strip())
             if wm:
-                candidate = float(wm.group(1))
-                # Sanity: weight × per_lb should match extended within $1
-                if 0.1 <= candidate <= 1000 and abs(candidate * per_lb - extended) <= 1.0:
-                    weight_lbs = candidate
+                c = float(wm.group(1))
+                if 0.1 <= c <= 1000:
+                    wt_candidate = c
                     break
 
-        # Even without an exact weight match, the (code, extended) pair is
-        # trustworthy enough to extract — per_lb × ?? = extended lets us
-        # derive weight = extended / per_lb as fallback.
-        if weight_lbs is None and per_lb > 0:
-            weight_lbs = round(extended / per_lb, 3)
+        # Decision rules — extract only when the data corroborates:
+        #   (both present + reconcile)                → accept
+        #   (extended only, plausible vs per_lb)      → accept, derive weight
+        #   (weight only, no extended candidate)      → accept, derive extended
+        #   (both present but conflict)               → REJECT (safety)
+        #   (neither)                                 → REJECT
+        extended = None
+        weight_lbs = None
+        if ext_candidate is not None and wt_candidate is not None:
+            if abs(wt_candidate * per_lb - ext_candidate) <= 1.0:
+                extended = ext_candidate
+                weight_lbs = wt_candidate
+            # else: reconciliation failed — skip rather than guess
+        elif ext_candidate is not None and wt_candidate is None:
+            if ext_candidate > per_lb * 1.5:  # extended must exceed per-lb by plausible weight
+                extended = ext_candidate
+                weight_lbs = round(extended / per_lb, 3) if per_lb > 0 else None
+        elif wt_candidate is not None and ext_candidate is None:
+            weight_lbs = wt_candidate
+            extended = round(weight_lbs * per_lb, 2)
 
-        prefix = ""  # column-dump has no inline description on the anchor line
+        if extended is None:
+            continue
+
         anchors.append((i, code, extended, prefix))
         anchor_lines.add(i)
         catch_weight_info[i] = {

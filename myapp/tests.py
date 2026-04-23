@@ -1959,6 +1959,29 @@ TOTAL
         # Derived weight = 824.78 / 12.65 ≈ 65.2
         self.assertIn('65.2', cw_item['case_size_raw'])
 
+    def test_inline_description_code_perlb_with_weight_next_line(self):
+        """Second variant of catch-weight: description + code + per-lb on
+        ONE line, weight on next line, no adjacent extended. Parser
+        derives extended = weight × per_lb and extracts the item with
+        the inline description as the description prefix."""
+        parser = self._import_parser()
+        text = """**** MEATS ****
+BCH BLK PORK TENDERLOIN 1.5 DN FRESH 25140 5812534 3.299
+15.100
+T/WT=
+LAST PAGE
+INVOICE
+TOTAL
+"""
+        result = parser.parse_invoice(text, vendor='Sysco')
+        codes = [i.get('sysco_item_code') for i in result['items']]
+        self.assertIn('5812534', codes)
+        item = next(i for i in result['items'] if i['sysco_item_code'] == '5812534')
+        # weight × per_lb = 15.1 × 3.299 ≈ 49.82
+        self.assertAlmostEqual(item['unit_price'], 49.82, places=1)
+        self.assertAlmostEqual(item['price_per_unit'], 3.299, places=3)
+        self.assertEqual(item['case_size_raw'], '15.1LB')
+
 
 class ParserSyscoIntegrationTests(TestCase):
     """Sysco parser is parser.py's largest + most complex format: 5-pass
