@@ -236,7 +236,7 @@ class Command(BaseCommand):
                 from sheets import get_sheets_client, get_sheet_values  # noqa: E402
                 from config import SPREADSHEET_ID  # noqa: E402
                 from invoice_processor.discover_unmapped import (
-                    REVIEW_TAB, _ensure_review_tab_exists, _load_negative_matches,
+                    REVIEW_TAB, _ensure_review_tab_exists, _get_review_sheet_id,
                 )
             except ImportError as e:
                 self.stderr.write(f'Could not import for review write: {e}')
@@ -271,16 +271,49 @@ class Command(BaseCommand):
                         notes,                     # I: Notes
                     ])
                 if rows:
-                    client.values().append(
-                        spreadsheetId=SPREADSHEET_ID,
-                        range=f"'{REVIEW_TAB}'!A:I",
-                        valueInputOption='USER_ENTERED',
-                        insertDataOption='INSERT_ROWS',
-                        body={'values': rows},
-                    ).execute()
+                    # Insert new rows at the TOP (row 2, right below header) so
+                    # fresh suggestions don't require scrolling to the bottom of
+                    # a growing queue. Uses insertDimension + values.update
+                    # rather than append() for the reorder semantics.
+                    sheet_id = _get_review_sheet_id(client)
+                    if sheet_id is None:
+                        self.stderr.write(
+                            f'Could not resolve sheetId for "{REVIEW_TAB}"; '
+                            f'falling back to append.')
+                        client.values().append(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"'{REVIEW_TAB}'!A:I",
+                            valueInputOption='USER_ENTERED',
+                            insertDataOption='INSERT_ROWS',
+                            body={'values': rows},
+                        ).execute()
+                    else:
+                        # Step 1: insert N blank rows at position 2 (0-indexed=1)
+                        client.batchUpdate(
+                            spreadsheetId=SPREADSHEET_ID,
+                            body={'requests': [{
+                                'insertDimension': {
+                                    'range': {
+                                        'sheetId': sheet_id,
+                                        'dimension': 'ROWS',
+                                        'startIndex': 1,
+                                        'endIndex': 1 + len(rows),
+                                    },
+                                    'inheritFromBefore': False,
+                                }
+                            }]},
+                        ).execute()
+                        # Step 2: write new values into the freshly-inserted rows
+                        end_row = 1 + len(rows)
+                        client.values().update(
+                            spreadsheetId=SPREADSHEET_ID,
+                            range=f"'{REVIEW_TAB}'!A2:I{end_row}",
+                            valueInputOption='USER_ENTERED',
+                            body={'values': rows},
+                        ).execute()
                     self.stdout.write(self.style.SUCCESS(
-                        f'\n✔ Wrote {len(rows)} medium-confidence SUPC suggestions '
-                        f'to "{REVIEW_TAB}" tab for review.'))
+                        f'\n✔ Inserted {len(rows)} medium-confidence SUPC suggestions '
+                        f'at the TOP of "{REVIEW_TAB}" (newest first, no scroll).'))
                 else:
                     self.stdout.write(self.style.WARNING(
                         '\nNo new medium-confidence rows to write (all already in review tab).'))
