@@ -174,6 +174,23 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 invoice_date=parsed_date,
                 **common_fields,
             )
+
+        # Track C orphan cleanup: when this item carries a sysco_item_code AND
+        # we've now resolved it to a Product, a pre-existing placeholder row
+        # from when the code was unmapped (raw_description='[Sysco #NNN]',
+        # product=None) is a duplicate of the same line item. Clean it up at
+        # write time rather than leaving it as an orphan contaminating
+        # category spend, cost-coverage, and reconciliation metrics.
+        supc = item.get('sysco_item_code', '')
+        if product and supc and parsed_date:
+            placeholder_desc = f'[Sysco #{supc}]'
+            InvoiceLineItem.objects.filter(
+                vendor=vendor,
+                invoice_date=parsed_date,
+                product__isnull=True,
+                raw_description=placeholder_desc,
+            ).delete()
+
         written += 1
 
     return written

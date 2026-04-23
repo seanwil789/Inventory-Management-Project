@@ -1004,6 +1004,51 @@ class DBWritePricePerPoundTests(TestCase):
         ili = InvoiceLineItem.objects.get(raw_description__startswith='BROCCOLI')
         self.assertIsNone(ili.price_per_pound)
 
+    def test_track_c_placeholder_orphan_cleanup(self):
+        """Track C: when a write resolves a SUPC to a Product, any
+        pre-existing placeholder row '[Sysco #NNN]' for the same SUPC on
+        the same (vendor, date) is deleted — it's a duplicate of the now-
+        mapped row.
+
+        Scenario: an earlier parse wrote row A with
+        raw_description='[Sysco #5822441]', product=None because the code
+        wasn't in code_map. Later the SUPC is recovered + code_map
+        updated. A new parse writes row B with product=Salmon. Without
+        Track C, both rows coexist (double-counted). With Track C, row A
+        is removed at write time.
+        """
+        from decimal import Decimal
+        dbw = self._import_db_write()
+        vendor = Vendor.objects.create(name='Sysco')
+        salmon = Product.objects.create(canonical_name='Salmon')
+
+        # Seed the pre-existing orphan placeholder
+        InvoiceLineItem.objects.create(
+            vendor=vendor, invoice_date='2026-01-13',
+            raw_description='[Sysco #5822441]',
+            product=None,
+            unit_price=Decimal('159.85'),
+        )
+        self.assertEqual(InvoiceLineItem.objects.count(), 1)
+
+        # Now write the same item with the SUPC mapped to Salmon
+        items = [{
+            'raw_description': 'Salmon',
+            'canonical': salmon.canonical_name,
+            'unit_price': 159.85,
+            'case_size_raw': '25LB',
+            'sysco_item_code': '5822441',
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Sysco', '2026-01-13', items,
+                                 source_file='test.jpg')
+
+        # Only the mapped row should remain; placeholder deleted.
+        all_rows = list(InvoiceLineItem.objects.all())
+        self.assertEqual(len(all_rows), 1)
+        self.assertEqual(all_rows[0].product, salmon)
+        self.assertFalse(all_rows[0].raw_description.startswith('[Sysco #'))
+
     def test_upsert_updates_price_per_pound(self):
         """Reprocessing the same invoice overwrites price_per_pound in place."""
         from decimal import Decimal
