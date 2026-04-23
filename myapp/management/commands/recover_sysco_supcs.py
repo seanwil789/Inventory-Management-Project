@@ -283,7 +283,7 @@ class Command(BaseCommand):
                         client.values().append(
                             spreadsheetId=SPREADSHEET_ID,
                             range=f"'{REVIEW_TAB}'!A:I",
-                            valueInputOption='USER_ENTERED',
+                            valueInputOption='RAW',
                             insertDataOption='INSERT_ROWS',
                             body={'values': rows},
                         ).execute()
@@ -303,12 +303,18 @@ class Command(BaseCommand):
                                 }
                             }]},
                         ).execute()
-                        # Step 2: write new values into the freshly-inserted rows
+                        # Step 2: write new values into the freshly-inserted rows.
+                        # valueInputOption='RAW' (not USER_ENTERED) because the
+                        # raw_description column carries '[Sysco #NNN]' strings
+                        # that Sheets occasionally (and unpredictably) parses
+                        # as reference-like expressions, returning empty/space.
+                        # RAW stores exactly as given. Numeric columns read back
+                        # as strings but that's what discover_unmapped expects.
                         end_row = 1 + len(rows)
                         client.values().update(
                             spreadsheetId=SPREADSHEET_ID,
                             range=f"'{REVIEW_TAB}'!A2:I{end_row}",
-                            valueInputOption='USER_ENTERED',
+                            valueInputOption='RAW',
                             body={'values': rows},
                         ).execute()
                     self.stdout.write(self.style.SUCCESS(
