@@ -445,6 +445,77 @@ def _parse_sysco(text: str) -> list[dict]:
             anchors.append((i, m.group(1), float(m.group(2)), prefix))
             anchor_lines.add(i)
 
+    # ── Catch-weight column-dump pass ─────────────────────────────────────
+    # Sysco catch-weight (MEATS/POULTRY/SEAFOOD) items in column-dump OCR
+    # print as a three-line pattern:
+    #   weight:    65.200          (bare 3-decimal weight in lbs)
+    #   anchor:    3124662 12.650  (code + 3-decimal per-lb price)
+    #   extended:  824.78          (bare 2-decimal line total)
+    # The main _PRICE_ANCHOR rejects the 3-decimal per-lb, so these items
+    # are invisible to the normal extraction. This second pass picks them
+    # up by cross-validating weight × per_lb ≈ extended before extracting.
+    # Records per_lb + weight in catch_weight_info for later item build.
+    _CATCH_WEIGHT_ANCHOR = re.compile(r'^(\d{6,7})\s+(\d+\.\d{3,4})\s*$')
+    _BARE_2DEC = re.compile(r'^(\d+\.\d{2})\s*$')
+    _BARE_3DEC = re.compile(r'^(\d+\.\d{3,4})\s*$')
+
+    catch_weight_info: dict[int, dict] = {}   # line_idx → {per_lb, weight_lbs, extended}
+    for i, line in enumerate(lines):
+        if i in anchor_lines or i in group_total_lines:
+            continue
+        m = _CATCH_WEIGHT_ANCHOR.match(line.strip())
+        if not m:
+            continue
+        code = m.group(1)
+        per_lb = float(m.group(2))
+
+        # Find extended on the next 1-2 lines (2-decimal standalone)
+        extended = None
+        ext_line_idx = None
+        for j in range(i + 1, min(i + 3, len(lines))):
+            if j in group_total_lines:
+                continue
+            em = _BARE_2DEC.match(lines[j].strip())
+            if em:
+                candidate = float(em.group(1))
+                # Extended should be much larger than per-lb (typical weight 1-50 lbs)
+                if candidate > per_lb * 1.5:
+                    extended = candidate
+                    ext_line_idx = j
+                    break
+
+        if extended is None:
+            continue  # no plausible extended — don't risk a wrong item
+
+        # Find weight within 2 lines before or 3 after (3-4 decimal bare)
+        weight_lbs = None
+        search_range = list(range(max(0, i - 2), i)) + list(range(i + 1, min(i + 4, len(lines))))
+        for j in search_range:
+            if j in (ext_line_idx, i) or j in group_total_lines:
+                continue
+            wm = _BARE_3DEC.match(lines[j].strip())
+            if wm:
+                candidate = float(wm.group(1))
+                # Sanity: weight × per_lb should match extended within $1
+                if 0.1 <= candidate <= 1000 and abs(candidate * per_lb - extended) <= 1.0:
+                    weight_lbs = candidate
+                    break
+
+        # Even without an exact weight match, the (code, extended) pair is
+        # trustworthy enough to extract — per_lb × ?? = extended lets us
+        # derive weight = extended / per_lb as fallback.
+        if weight_lbs is None and per_lb > 0:
+            weight_lbs = round(extended / per_lb, 3)
+
+        prefix = ""  # column-dump has no inline description on the anchor line
+        anchors.append((i, code, extended, prefix))
+        anchor_lines.add(i)
+        catch_weight_info[i] = {
+            "per_lb": per_lb,
+            "weight_lbs": weight_lbs,
+            "extended": extended,
+        }
+
     # Now find split anchors: standalone item-code line paired with a nearby price.
     # Codes may be 6-8 digits (OCR sometimes merges a leading digit with the code,
     # e.g. "12273758" is really item 2273758). A price must be a line whose only
@@ -875,18 +946,30 @@ def _parse_sysco(text: str) -> list[dict]:
         if not section_name and sections:
             section_name = sections[-1]["name"]
 
+        # Column-dump catch-weight info takes priority when present — the
+        # second pass cross-validated weight × per_lb ≈ extended, so it's
+        # stronger than description-line regex extraction.
+        cw_info = catch_weight_info.get(line_idx)
+        if cw_info:
+            effective_case_size = f"{cw_info['weight_lbs']}LB"
+        else:
+            effective_case_size = case_size
+
         item = {
             "raw_description": description,
             "sysco_item_code": item_code,
             "unit_price":      price,
             "extended_amount": price,  # Sysco prices are per-line totals (qty usually 1)
-            "case_size_raw":   case_size,
+            "case_size_raw":   effective_case_size,
             "section":         re.sub(r'[*\s]+', ' ', section_name).strip(),
         }
 
         # For catch-weight items, the price on the invoice is the TOTAL
         # (weight × price_per_lb). Calculate the per-lb price.
-        if catch_wt and catch_wt.get("weight_lbs") and catch_wt["weight_lbs"] > 0:
+        if cw_info:
+            item["unit_of_measure"] = "LB"
+            item["price_per_unit"] = cw_info["per_lb"]
+        elif catch_wt and catch_wt.get("weight_lbs") and catch_wt["weight_lbs"] > 0:
             item["unit_of_measure"] = "LB"
             item["price_per_unit"] = round(price / catch_wt["weight_lbs"], 4)
 

@@ -1871,6 +1871,95 @@ Balance Due
         self.assertAlmostEqual(items[0]['price_per_unit'], 19.99, places=2)
 
 
+class ParserSyscoCatchWeightColumnDumpTests(TestCase):
+    """Parser — catch-weight column-dump extractor.
+
+    Sysco catch-weight items (MEATS/POULTRY/SEAFOOD) in column-dump OCR
+    print as a 3-line pattern:
+      weight:    65.200            (bare 3-decimal weight in lbs)
+      anchor:    3124662 12.650    (code + 3-decimal per-lb price)
+      extended:  824.78            (bare 2-decimal line total)
+
+    The main _PRICE_ANCHOR rejects 3-decimal per-lb prices, so without
+    the second-pass extractor, these items are silently dropped.
+    Historical data shows ~$1,000 of line items per invoice disappearing
+    this way on the worst invoices."""
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        return p
+
+    def test_extracts_catch_weight_from_column_dump(self):
+        """The 3-line pattern yields an item with extended as price and
+        per-lb as price_per_unit."""
+        parser = self._import_parser()
+        text = """**** MEATS ****
+COOPR BEEF CHUCK FLAP SHORT RIB BNLS
+CHOICE
+01-31830
+65.200
+3124662 12.650
+824.78
+1 CS
+EXTENDED
+PRICE
+LAST PAGE
+INVOICE
+TOTAL
+"""
+        result = parser.parse_invoice(text, vendor='Sysco')
+        codes = [i.get('sysco_item_code') for i in result['items']]
+        self.assertIn('3124662', codes)
+
+        cw_item = next(i for i in result['items'] if i['sysco_item_code'] == '3124662')
+        self.assertAlmostEqual(cw_item['unit_price'], 824.78, places=2)
+        self.assertAlmostEqual(cw_item['price_per_unit'], 12.65, places=3)
+        self.assertEqual(cw_item['case_size_raw'], '65.2LB')
+
+    def test_skips_when_extended_implausible(self):
+        """If the 2-decimal on the next line doesn't reconcile with
+        weight × per_lb, parser skips the catch-weight path rather than
+        creating a wrong item."""
+        parser = self._import_parser()
+        text = """**** MEATS ****
+01-31830
+65.200
+3124662 12.650
+0.02
+LAST PAGE
+INVOICE
+TOTAL
+"""
+        # 0.02 is not > per_lb × 1.5, so the catch-weight pass rejects.
+        result = parser.parse_invoice(text, vendor='Sysco')
+        codes = [i.get('sysco_item_code') for i in result['items']]
+        self.assertNotIn('3124662', codes)
+
+    def test_falls_back_to_derived_weight_when_none_adjacent(self):
+        """When no 3-decimal weight appears nearby, parser derives
+        weight = extended / per_lb and still extracts the item."""
+        parser = self._import_parser()
+        text = """**** MEATS ****
+3124662 12.650
+824.78
+LAST PAGE
+INVOICE
+TOTAL
+"""
+        result = parser.parse_invoice(text, vendor='Sysco')
+        codes = [i.get('sysco_item_code') for i in result['items']]
+        self.assertIn('3124662', codes)
+        cw_item = next(i for i in result['items'] if i['sysco_item_code'] == '3124662')
+        self.assertAlmostEqual(cw_item['unit_price'], 824.78, places=2)
+        # Derived weight = 824.78 / 12.65 ≈ 65.2
+        self.assertIn('65.2', cw_item['case_size_raw'])
+
+
 class ParserSyscoIntegrationTests(TestCase):
     """Sysco parser is parser.py's largest + most complex format: 5-pass
     anchor/description matching, catch-weight handling, pack-size extraction,
