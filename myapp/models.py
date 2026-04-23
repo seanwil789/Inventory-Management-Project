@@ -375,18 +375,43 @@ class RecipeIngredient(models.Model):
         return self.quantity / (eff / 100)
 
     def estimated_cost(self):
-        """Latest-price $ cost for this ingredient line. Returns (cost_or_None, note)."""
+        """Latest-price $ cost for this ingredient line. Returns (cost_or_None, note).
+
+        When the absolute-latest ILI has no parseable case_size (common for
+        Sysco known-code rows where the parser couldn't extract a pack size
+        from the canonical description), walks backward up to 5 ILI rows
+        looking for the first one that either has a parseable case_size OR
+        has price_per_pound populated (both are sufficient for costing).
+        This is freshness-preserving: we still use the most-recent usable
+        invoice price, not the oldest one.
+        """
         from decimal import Decimal
-        from .cost_utils import ingredient_cost, case_size_candidates_for_cost
+        from .cost_utils import ingredient_cost, case_size_candidates_for_cost, parse_case_size
         from .models import InvoiceLineItem   # self-import ok — called at runtime
         if not self.product or self.quantity is None:
             return None, 'missing product or quantity'
-        latest = (InvoiceLineItem.objects
-                  .filter(product=self.product)
-                  .order_by('-invoice_date')
-                  .first())
-        if not latest:
+
+        # Walk ILI rows newest-first. Prefer the newest row that has EITHER
+        # a parseable case_size OR a populated price_per_pound. If neither
+        # is reachable within the top 5, fall back to the absolute newest.
+        ili_candidates = list(InvoiceLineItem.objects
+                              .filter(product=self.product)
+                              .order_by('-invoice_date')[:5])
+        if not ili_candidates:
             return None, 'no invoice history'
+
+        latest = None
+        fallback = ili_candidates[0]
+        for ili in ili_candidates:
+            # Product.default_case_size is the last-ditch fallback; try
+            # parsing either the row's case_size OR the product default.
+            has_case = bool(parse_case_size(ili.case_size or self.product.default_case_size or ''))
+            has_ppp = ili.price_per_pound is not None
+            if has_case or has_ppp:
+                latest = ili
+                break
+        if latest is None:
+            latest = fallback
         density = (self.yield_ref.ounce_weight_per_cup
                    if self.yield_ref and self.yield_ref.ounce_weight_per_cup
                    else None)
