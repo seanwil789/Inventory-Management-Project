@@ -102,6 +102,22 @@ def _ensure_monthly_tab():
         if expected_tab not in existing:
             print(f"[auto] Creating new monthly tab '{expected_tab}'...")
             create_month_sheet(today.year, today.month)
+            # Immediately populate the fresh tab with latest-known prices
+            # for every product that has ANY invoice history. The tab was
+            # duplicated from last month with prices+on-hand cleared, so
+            # without this step most rows show blank until a matching
+            # current-month invoice arrives — and some products are
+            # ordered only every few months. Carryover fills those gaps
+            # on day one. Prices remain static thereafter unless a
+            # current-month invoice refreshes them via sync_prices_from_items.
+            print(f"[auto] Populating '{expected_tab}' with latest-known prices...")
+            try:
+                from synergy_sync import refresh_stale_carryover
+                summary = refresh_stale_carryover(sheet_tab=expected_tab)
+                print(f"[auto] Carryover: refreshed {summary['refreshed']}, "
+                      f"no history {summary['skipped_no_history']}.")
+            except Exception as e:
+                print(f"[!] Carryover refresh skipped: {e}")
             print()
         # else: tab already exists, nothing to do
     except Exception as e:
