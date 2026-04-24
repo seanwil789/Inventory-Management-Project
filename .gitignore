@@ -15,7 +15,12 @@ invoice_processor/*_report.txt
 # Runtime caches & logs
 logs/
 .ocr_cache/
+.ocr_cache.pre-*/
 .invoice_totals/
+
+# Transient session backups (DB snapshots + intermediate PDFs)
+db.sqlite3.pre-*
+EnterpriseInvoice-*.pdf
 
 # Sensitive / proprietary operational data — sync externally
 .kitchen_ops/
