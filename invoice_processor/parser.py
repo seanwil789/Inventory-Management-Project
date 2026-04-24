@@ -305,6 +305,32 @@ def _normalize_pack_size(pack: str) -> str:
                     if size and int(size) <= 5:
                         return f"{pack_count}/{size}GAL"
 
+    # Check for PT packs (half-pints are common Sysco berry/produce):
+    # "121PT" = PACK(12) + SIZE(1 PT), "62PT" = PACK(6) + SIZE(2 PT).
+    m = re.match(r'^(\d+)\s*PT$', pack, re.IGNORECASE)
+    if m:
+        val_str = m.group(1)
+        if len(val_str) >= 2:
+            for pack_count in _COMMON_PACKS:
+                pc_str = str(pack_count)
+                if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
+                    size = val_str[len(pc_str):]
+                    if size and 1 <= int(size) <= 32:
+                        return f"{pack_count}/{size}PT"
+
+    # Check for DZ packs (eggs mostly): "115DZ" = PACK(1) + SIZE(15 DZ),
+    # "130DZ" = PACK(1) + SIZE(30 DZ).
+    m = re.match(r'^(\d+)\s*DZ$', pack, re.IGNORECASE)
+    if m:
+        val_str = m.group(1)
+        if len(val_str) >= 2:
+            for pack_count in _COMMON_PACKS:
+                pc_str = str(pack_count)
+                if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
+                    size = val_str[len(pc_str):]
+                    if size and 1 <= int(size) <= 48:
+                        return f"{pack_count}/{size}DZ"
+
     return pack
 
 
@@ -890,8 +916,13 @@ def _parse_sysco(text: str) -> list[dict]:
             used_descs.add(di)
             known_anchor_indices.add(ai)
             de = desc_entries[di]
-            canonical = _code_map.get(anchors[ai][1])
-            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
+            # Preserve OCR description instead of substituting the code_map
+            # canonical. Canonical flows through via sysco_item_code → mapper
+            # → Product FK separately; the raw_description column keeps its
+            # audit value (real OCR text) and case_size extraction works
+            # against real pack info like "241.5 OZSTACYS CHIP PITA" instead
+            # of a short canonical like "Pita".
+            anchor_matches[ai] = (de["description"], de["case_size"], de.get("catch_weight"))
 
     # Precompute nearest-unknown-anchor line for each desc, so Step A's
     # proximity matching can yield descs to unknown anchors that need them
@@ -938,12 +969,19 @@ def _parse_sysco(text: str) -> list[dict]:
                     best_di = di
 
         if best_di is not None and best_dist <= 40:
-            # Found nearby description — use its case_size and catch_weight
+            # Found nearby OCR description — prefer it over canonical. Real
+            # OCR text carries pack info ("241.5 OZSTACYS CHIP PITA") that
+            # canonical ("Pita") loses, so case_size extraction works and
+            # audits retain what the vendor actually printed. Canonical
+            # still flows to Product FK via sysco_item_code downstream.
             used_descs.add(best_di)
             de = desc_entries[best_di]
-            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
+            anchor_matches[ai] = (de["description"], de["case_size"], de.get("catch_weight"))
         else:
-            # Mark for ordered fallback — will try in step A2
+            # No proximity match — stash canonical as a backup raw_description
+            # (better than placeholder since the SUPC maps to a known Product).
+            # Step A2 still tries ordered-fallback and overrides if it finds a
+            # better desc.
             anchor_matches[ai] = (canonical, "", None)
 
     # ── Step B.1: proximity pass for unknown-code anchors ────────────────
@@ -987,10 +1025,13 @@ def _parse_sysco(text: str) -> list[dict]:
     # When proximity fails (clustered anchors far from descriptions),
     # consume unclaimed descriptions in order — the OCR reads descriptions
     # top-to-bottom, and anchors top-to-bottom, so the ordering is preserved.
+    # Eligible iff the anchor still carries its canonical-name backup rather
+    # than a real OCR desc (Step A2 shouldn't override descs Step A found).
+    _canonical_set = {_code_map.get(anchors[ai][1]) for ai in known_anchor_indices}
     unmatched_known = [ai for ai in range(len(anchors))
                        if ai in known_anchor_indices
                        and anchor_matches[ai] is not None
-                       and anchor_matches[ai][1] == ""]
+                       and anchor_matches[ai][0] in _canonical_set]
     remaining_for_known = [(di, de) for di, de in enumerate(desc_entries)
                            if di not in used_descs]
     remaining_for_known.sort(key=lambda x: x[1]["line"])
@@ -1001,8 +1042,10 @@ def _parse_sysco(text: str) -> list[dict]:
         if pair:
             di, de = pair
             used_descs.add(di)
-            canonical = anchor_matches[ai][0]
-            anchor_matches[ai] = (canonical, de["case_size"], de.get("catch_weight"))
+            # Use the OCR description (not the placeholder the earlier loop
+            # stashed) so raw_description carries real text. Product FK
+            # still resolves from sysco_item_code downstream.
+            anchor_matches[ai] = (de["description"], de["case_size"], de.get("catch_weight"))
 
     # ── Step B.2: ordered fallback for unknown anchors still unmatched ────
     remaining_descs = [(di, de) for di, de in enumerate(desc_entries) if di not in used_descs]

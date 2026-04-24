@@ -2126,9 +2126,13 @@ Total
         codes = sorted(it['sysco_item_code'] for it in items)
         self.assertEqual(codes, ['1234567', '2345678'])
 
-    def test_known_code_uses_canonical_as_description(self):
-        """When code is in code_map, raw_description becomes the canonical
-        name (more reliable than OCR text). Sysco parser design choice."""
+    def test_known_code_preserves_ocr_description(self):
+        """When code is in code_map, raw_description preserves the OCR text
+        (the canonical still flows to Product FK via sysco_item_code, but
+        the audit trail + case_size extraction benefit from real OCR text
+        like '1 GAL WHLFCLS MILK WHOLE' rather than short canonical 'Milk,
+        Whole Gallon'). Changed 2026-04-23 when spatial matching made OCR
+        text reliably clean across the corpus."""
         parser_mod, _ = self._import_parser()
         raw = """**** DAIRY ****
 MILK WHOLE GAL
@@ -2145,8 +2149,11 @@ Total
             result = parser_mod.parse_invoice(raw, vendor='Sysco')
         items = result['items']
         self.assertEqual(len(items), 1)
-        # Known canonical preferred over OCR desc
-        self.assertEqual(items[0]['raw_description'], 'Milk, Whole Gallon')
+        # OCR text preserved (fuzzy: contains 'MILK' and 'WHOLE'); canonical
+        # still resolves via sysco_item_code downstream.
+        self.assertEqual(items[0]['sysco_item_code'], '1234567')
+        self.assertIn('MILK', items[0]['raw_description'].upper())
+        self.assertIn('WHOLE', items[0]['raw_description'].upper())
 
     def test_group_total_not_treated_as_item(self):
         """GROUP TOTAL + its amount must NOT show up as an extra line item."""
@@ -2339,9 +2346,10 @@ Total
         unk = items['9999998']
         self.assertNotIn('[Sysco #', unk['raw_description'])
         self.assertIn('CEREAL', unk['raw_description'].upper())
-        # Known anchors still get their canonical from code_map
-        self.assertEqual(items['1111111']['raw_description'], 'Milk, Whole')
-        self.assertEqual(items['2222222']['raw_description'], 'Butter, Salted')
+        # Known anchors preserve OCR text (canonical resolves via
+        # sysco_item_code). Both expected to contain real invoice text.
+        self.assertIn('MILK', items['1111111']['raw_description'].upper())
+        self.assertIn('BUTTER', items['2222222']['raw_description'].upper())
 
 
 class MapperNonProductClassifierTests(TestCase):

@@ -132,6 +132,17 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         if product and unit_price and unit_price > 0:
             price_flagged = _check_price_anomaly(product, vendor, unit_price)
 
+        # Case size: parser/spatial extracts from the invoice's pack column.
+        # When that extraction fails (OCR artifacts, non-standard units,
+        # short canonical names with no pack token) fall back to the
+        # Product's curated default_case_size. This keeps ILI rows usable
+        # for IUP/P# math instead of leaving them blank. Parser quality
+        # is still honestly measurable via the subset where inheritance
+        # wasn't needed.
+        incoming_cs = item.get('case_size_raw', '') or ''
+        if not incoming_cs and product is not None and product.default_case_size:
+            incoming_cs = product.default_case_size
+
         # Upsert: if a record for the same (vendor, date, product/description)
         # already exists, update it rather than creating a duplicate.
         # This makes re-processing invoices safe — prices get refreshed in place.
@@ -139,7 +150,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             unit_price=unit_price,
             extended_amount=extended,
             price_per_pound=price_per_pound,
-            case_size=item.get('case_size_raw', ''),
+            case_size=incoming_cs,
             source_file=source_file,
             product=product,
             raw_description=raw_desc,

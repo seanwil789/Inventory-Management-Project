@@ -178,32 +178,97 @@ def _extract_row_item(row: list[dict], anchor: dict,
     # Then pass the raw hit through parser's _normalize_pack_size which
     # knows how to split "1216OZ" → "12/16OZ", "124OZ" → "12/4OZ", etc.
     case_size = ""
-    # Normalize ONLY-prefixed and #-prefixed patterns before regex match:
-    # "ONLY5 LB" → "5 LB", "ONLY 2 KILO" → "2 KG", "6 # 10 CAN" → "6/10CAN".
+    # Pre-normalize OCR artifacts and format variants before regex match:
+    #   Ω / Ο / Ρ prefix (DocAI misreads "D" or similar glyphs) — strip
+    #   "ONLY5 LB"    → "5 LB"        (bare ONLY prefix)
+    #   "ONLY1 # TIN" → "1 # TIN"     (ONLY + hash — keep the count)
+    #   "KILO"        → "KG"
+    #   "6 # 10 CAN"  → "6/10CAN"
+    #   "PTPACKER"    → "PT PACKER"   (Sysco brand fused to unit)
+    #   "LBIMPFRSH"   → "LB IMPFRSH"  (ditto)
     norm_desc = description
+    norm_desc = re.sub(r'^[ΩΟΡ]\s*', '', norm_desc)
+    norm_desc = re.sub(r'\bONLY(\d+)\s*#', r'\1 # ', norm_desc, flags=re.IGNORECASE)
     norm_desc = re.sub(r'\bONLY\s*(\d+(?:\.\d+)?)\s*', r'\1 ', norm_desc, flags=re.IGNORECASE)
     norm_desc = re.sub(r'\bKILO\b', 'KG', norm_desc, flags=re.IGNORECASE)
     norm_desc = re.sub(r'\b(\d+)\s*#\s*(\d+)\b', r'\1/\2CAN', norm_desc)
+    # Split fused unit+brand: Sysco brands are 3+ uppercase letters, and
+    # no real English word starts with PT/LB/OZ/GAL/DZ/CT/PC followed by
+    # 3+ uppercase letters. Restricting the right side to uppercase
+    # avoids matching lowercase words like "ozone". Also handles the
+    # OCR variant "0Z" (letter O read as zero — common DocAI artifact).
+    norm_desc = re.sub(r'\b(PT|LB|OZ|GAL|DZ|CT|PC)([A-Z]{3,})\b', r'\1 \2', norm_desc)
+    norm_desc = re.sub(r'(\d)(0Z)([A-Z]{3,})\b', r'\1\2 \3', norm_desc)
+    # "C LB IMPFRSH", "F LB SYS CLS", "T LB JTM" — the leading single
+    # letter is a Sysco container/marker token (C=case, F=freight-bill,
+    # T=tare-weight); it replaces the pack-count that would normally
+    # occupy that position. Treat as implicit "1 <unit>" so
+    # case_size populates (single-pack items).
+    norm_desc = re.sub(
+        r'^([A-Z])\s+(GAL|LB|OZ|PT|DZ|CT|EA|GM|QT|BAG|BCH|PC)\b',
+        r'1 \2', norm_desc)
 
+    # Try slash-format FIRST so we don't accidentally pick up the trailing
+    # number of a pack like "6 1/2 PT" (OCR'd as "61/2 PT") as if it were a
+    # standalone "2 PT". Slash-format also covers standard Sysco packs
+    # "4/50OZ", "24/12 OZ", "1/22LB", "6/10CAN".
+    #
+    # Mixed-number heuristic: "61/2 PT" is really "6 1/2 PT" (6 cases x
+    # 0.5 pt each) per Sean's Sysco ordering convention. When the first
+    # digits look too large for a realistic pack count AND the divisor is
+    # a common food-service fraction denominator (2/3/4/8), reinterpret
+    # as "pack × fraction × unit":
+    #   "61/2 PT"   → "6/.5PT"   (6 × half-pint — Sysco berry packs)
+    #   "121/2 PT"  → "12/.5PT"  (12 × half-pint)
+    #   "61/4 LB"   → "6/.25LB"  (6 × quarter-lb)
     m = re.search(
-        r'\b(\d+(?:\.\d+)?)\s*(?:([O0]Z|LB|GAL|CT|EA|KG|ML|QT|GM|#\d+)|(L)\b)',
+        r'\b(\d+)\s*/\s*(\d+)\s*(OZ|LB|GAL|CT|EA|KG|ML|L|#10|QT|GM|KT|CAN|PT|DZ|PC)\b',
         norm_desc, re.IGNORECASE)
     if m:
-        num = m.group(1)
-        unit = (m.group(2) or m.group(3) or "").upper().replace("0Z", "OZ")
-        raw = f"{num}{unit}"
-        try:
-            from parser import _normalize_pack_size
-            case_size = _normalize_pack_size(raw)
-        except Exception:
-            case_size = raw
-    # Fallback: slash-format like "4/50OZ", "24/12 OZ", "1/22LB", "6/10CAN"
+        num1, num2, unit = m.group(1), m.group(2), m.group(3).upper()
+        # Try to reinterpret as mixed number if divisor is a common
+        # food-service fraction denominator. For multi-digit num1, try
+        # each possible split point: pack=num1[:k], frac=num1[k:].
+        # Pick the FIRST split where pack is 1-12 AND frac/denom < 1.
+        if len(num1) >= 2 and num2 in ("2", "3", "4", "8"):
+            denom = int(num2)
+            for split_k in (1, 2):
+                if split_k >= len(num1):
+                    break
+                pack_str = num1[:split_k]
+                frac_str = num1[split_k:]
+                if not (pack_str and frac_str):
+                    continue
+                pack = int(pack_str)
+                frac_num = int(frac_str)
+                if 1 <= pack <= 12 and 1 <= frac_num < denom:
+                    size = frac_num / denom
+                    size_str = f"{size:g}".lstrip("0") or "0"
+                    case_size = f"{pack}/{size_str}{unit}"
+                    break
+        if not case_size:
+            case_size = f"{num1}/{num2}{unit}".upper().replace(" ", "")
+
+    # Primary pack-size match (no slash). Unit list is INTENTIONALLY broader
+    # than parser._extract_pack_size's — spatial row text includes Sysco's
+    # full pack-column tokens (PT pints, DZ dozen, PC pieces, BU bushel,
+    # etc.) that the 1D parser doesn't always see because it anchors on
+    # start-of-line patterns.
     if not case_size:
         m = re.search(
-            r'\b(\d+\s*/\s*\d+\s*(?:OZ|LB|GAL|CT|EA|KG|ML|L|#10|QT|GM|KT|CAN))\b',
+            r'\b(\d+(?:\.\d+)?)\s*(?:'
+            r'([O0]Z|LB|GAL|CT|EA|KG|ML|QT|GM|DZ|PT|BAG|BU|BCH|BTL|PC|ROLL|#\d+)'
+            r'|(L)\b)',
             norm_desc, re.IGNORECASE)
         if m:
-            case_size = re.sub(r'\s+', '', m.group(1)).upper()
+            num = m.group(1)
+            unit = (m.group(2) or m.group(3) or "").upper().replace("0Z", "OZ")
+            raw = f"{num}{unit}"
+            try:
+                from parser import _normalize_pack_size
+                case_size = _normalize_pack_size(raw)
+            except Exception:
+                case_size = raw
 
     item = {
         "raw_description":  description or f"[Sysco #{anchor['text']}]",
