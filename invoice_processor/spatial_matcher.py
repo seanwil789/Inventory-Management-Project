@@ -50,15 +50,19 @@ def _y_mid(tok: dict) -> float:
     return (tok["y_min"] + tok["y_max"]) / 2
 
 
-def _group_rows(tokens: list[dict]) -> list[list[dict]]:
+def _group_rows(tokens: list[dict], tol: float | None = None) -> list[list[dict]]:
     """Cluster tokens into rows by y-midpoint. Each row is a list of tokens
     sorted left-to-right by x_min.
 
-    Row boundaries are determined by running mean: a token joins the
-    current row if its y-center is within _ROW_Y_TOL of the row's mean
-    y-center so far. This avoids anchoring to an outlier first token
-    (e.g. a footer-wrap token with an unusual y) that would cause the
-    row to truncate early and drop its description tail."""
+    A token joins the current row if its y-center is within `tol` of the
+    row's running-mean y-center. Mean-based clustering avoids truncating
+    a row early when its first token has an outlier y (e.g. subscript).
+
+    `tol` defaults to _ROW_Y_TOL (0.012, tuned for Sysco portrait layout).
+    Denser vendors may need a tighter tol — PBM squeezes consecutive
+    items only ~0.013 apart, so its matcher passes tol=0.006."""
+    if tol is None:
+        tol = _ROW_Y_TOL
     if not tokens:
         return []
     sorted_toks = sorted(tokens, key=_y_mid)
@@ -68,7 +72,7 @@ def _group_rows(tokens: list[dict]) -> list[list[dict]]:
     for t in sorted_toks[1:]:
         y = _y_mid(t)
         mean = current_sum / len(current)
-        if abs(y - mean) <= _ROW_Y_TOL:
+        if abs(y - mean) <= tol:
             current.append(t)
             current_sum += y
         else:
@@ -244,4 +248,379 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
             item = _extract_row_item(row, anchor, sec_clean)
             if item:
                 items.append(item)
+    return items
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# PBM (Philadelphia Bakery Merchants) — Format 2 (digital invoices)
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Observed layout from 2026-04-02 invoice:
+#   x=0.08  item code (H106, L7408, R1012, or 4-digit like "0290")
+#   x=0.24  qty (decimal, e.g. "2.00")
+#   x=0.41  U/M (DZ, EA)
+#   x=0.46-0.65  description tokens (Wheat / Brioche / Pita / Buns)
+#   x=0.78  unit price (decimal)
+#   x=0.85  extended amount (decimal)
+# Item rows sit at y=0.38-0.75 typically; headers above, totals below.
+
+_PBM_ITEM_CODE_RE = re.compile(r'^[A-Z]?\d{3,5}$')
+_PBM_UM_RE = re.compile(r'^(DZ|EA|LB|CS|OZ|PK|BG|CTN)$', re.IGNORECASE)
+_PBM_PRICE_RE = re.compile(r'^\$?\d+\.\d{2}$')
+
+_PBM_CODE_X_RANGE  = (0.05, 0.15)
+_PBM_QTY_X_RANGE   = (0.20, 0.32)
+_PBM_UM_X_RANGE    = (0.38, 0.44)
+_PBM_DESC_X_RANGE  = (0.44, 0.72)
+_PBM_UNIT_X_RANGE  = (0.72, 0.82)
+_PBM_EXT_X_RANGE   = (0.82, 0.95)
+
+
+def _in_x(tok: dict, band: tuple[float, float]) -> bool:
+    return band[0] <= tok["x_min"] < band[1]
+
+
+def match_pbm_spatial(pages: list[dict]) -> list[dict]:
+    """Extract PBM invoice items from per-token bounding-box layout.
+
+    PBM's 1D parser struggles with wrap/split rows that interleave codes,
+    qtys, U/M, and descriptions across multiple raw_text lines. The
+    spatial matcher reconstructs the true row by y-cluster and partitions
+    tokens into the fixed column grid.
+
+    Each item carries the parser output schema (raw_description, unit_price,
+    extended_amount, case_size_raw, sysco_item_code). sysco_item_code is
+    empty for PBM — PBM has its own item codes which we keep in the
+    raw_description prefix until the mapper learns them."""
+    items: list[dict] = []
+    for page in pages or []:
+        tokens = page.get("tokens") or []
+        if not tokens:
+            continue
+        # PBM rows are ~0.013 apart — tighter tol than Sysco so consecutive
+        # line items don't get merged into one row.
+        rows = _group_rows(tokens, tol=0.006)
+        for row in rows:
+            # Row must have an item-code-looking token in the far-left band
+            code_toks = [t for t in row if _in_x(t, _PBM_CODE_X_RANGE)
+                         and _PBM_ITEM_CODE_RE.fullmatch(t["text"])]
+            if not code_toks:
+                continue
+            # Plus at least one price-shaped token in the ext-amount band
+            ext_toks = [t for t in row if _in_x(t, _PBM_EXT_X_RANGE)
+                        and _PBM_PRICE_RE.fullmatch(t["text"])]
+            if not ext_toks:
+                continue
+
+            code = code_toks[0]["text"]
+            extended = float(ext_toks[0]["text"].lstrip("$"))
+            unit_toks = [t for t in row if _in_x(t, _PBM_UNIT_X_RANGE)
+                         and _PBM_PRICE_RE.fullmatch(t["text"])]
+            unit_price = float(unit_toks[0]["text"].lstrip("$")) if unit_toks else extended
+
+            qty_toks = [t for t in row if _in_x(t, _PBM_QTY_X_RANGE)
+                        and _PBM_PRICE_RE.fullmatch(t["text"])]
+            qty = float(qty_toks[0]["text"]) if qty_toks else None
+
+            um_toks = [t for t in row if _in_x(t, _PBM_UM_X_RANGE)
+                       and _PBM_UM_RE.fullmatch(t["text"])]
+            um = um_toks[0]["text"].upper() if um_toks else ""
+
+            desc_toks = [t for t in row if _in_x(t, _PBM_DESC_X_RANGE)
+                         and not _PBM_PRICE_RE.fullmatch(t["text"])
+                         and not _PBM_UM_RE.fullmatch(t["text"])]
+            description = " ".join(t["text"] for t in desc_toks).strip()
+
+            if not description:
+                description = f"[PBM #{code}]"
+
+            item = {
+                "raw_description": description,
+                "sysco_item_code": "",   # PBM doesn't use SUPC
+                "unit_price": unit_price,
+                "extended_amount": extended,
+                "case_size_raw": um or "",  # pack info for PBM is the UM (DZ, EA)
+                "section": "",
+            }
+            if qty is not None:
+                item["quantity"] = qty
+            items.append(item)
+    return items
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Exceptional Foods
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Observed layout from 2026-04-16 invoice:
+#   x=0.06  item code (32425, c1215, 61565, 0150, p1768)
+#   x=0.22  qty ordered (decimal)
+#   x=0.27  U/M (EA, CS, LB)
+#   x=0.30-0.62  description tokens
+#   x=0.70  qty shipped (decimal — for catch-weight rows this is the weight)
+#   x=0.79  unit price (decimal) — may be $/lb for catch-weight
+#   x=0.85  per-unit U/M (LB for catch-weight)
+#   x=0.92  extended amount (decimal)
+
+_EXC_ITEM_CODE_RE = re.compile(r'^[a-zA-Z]?\d{4,5}$')
+_EXC_UM_RE = re.compile(r'^(EA|CS|LB|DZ|OZ|PK|BG|CTN)$', re.IGNORECASE)
+_EXC_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,3}$')
+
+_EXC_CODE_X_RANGE    = (0.04, 0.14)
+_EXC_QTY_X_RANGE     = (0.20, 0.26)
+_EXC_UM_X_RANGE      = (0.26, 0.30)
+_EXC_DESC_X_RANGE    = (0.28, 0.68)
+_EXC_QTY_SHIP_X      = (0.68, 0.78)
+_EXC_UNIT_X_RANGE    = (0.78, 0.85)
+_EXC_PER_UM_X_RANGE  = (0.84, 0.90)
+_EXC_EXT_X_RANGE     = (0.90, 0.98)
+
+
+def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
+    """Extract Exceptional Foods items from bounding-box layout.
+
+    Exceptional has the cleanest printed invoice structure of all vendors
+    — single-row items, well-separated columns. Spatial matching mainly
+    helps catch-weight rows where weight/per-lb/extended sit in three
+    distinct x-bands that 1D text flattens together."""
+    items: list[dict] = []
+    for page in pages or []:
+        tokens = page.get("tokens") or []
+        if not tokens:
+            continue
+        # Exceptional items span ~0.010 of y-space (code sits below its row's
+        # extended amount). 0.012 keeps them together without merging into
+        # neighbor items (~0.029 spacing).
+        rows = _group_rows(tokens, tol=0.012)
+        for row in rows:
+            code_toks = [t for t in row if _in_x(t, _EXC_CODE_X_RANGE)
+                         and _EXC_ITEM_CODE_RE.fullmatch(t["text"])]
+            if not code_toks:
+                continue
+            ext_toks = [t for t in row if _in_x(t, _EXC_EXT_X_RANGE)
+                        and _EXC_PRICE_RE.fullmatch(t["text"])]
+            if not ext_toks:
+                continue
+
+            code = code_toks[0]["text"]
+            extended = float(ext_toks[0]["text"].lstrip("$"))
+            unit_toks = [t for t in row if _in_x(t, _EXC_UNIT_X_RANGE)
+                         and _EXC_PRICE_RE.fullmatch(t["text"])]
+            unit_price = float(unit_toks[0]["text"].lstrip("$")) if unit_toks else extended
+
+            per_um_toks = [t for t in row if _in_x(t, _EXC_PER_UM_X_RANGE)
+                           and _EXC_UM_RE.fullmatch(t["text"])]
+            per_um = per_um_toks[0]["text"].upper() if per_um_toks else ""
+
+            qty_ship_toks = [t for t in row if _in_x(t, _EXC_QTY_SHIP_X)
+                             and _EXC_PRICE_RE.fullmatch(t["text"])]
+            qty_shipped = float(qty_ship_toks[0]["text"]) if qty_ship_toks else None
+
+            um_toks = [t for t in row if _in_x(t, _EXC_UM_X_RANGE)
+                       and _EXC_UM_RE.fullmatch(t["text"])]
+            um = um_toks[0]["text"].upper() if um_toks else ""
+
+            desc_toks = [t for t in row if _in_x(t, _EXC_DESC_X_RANGE)
+                         and not _EXC_PRICE_RE.fullmatch(t["text"])
+                         and not _EXC_UM_RE.fullmatch(t["text"])
+                         and not _EXC_ITEM_CODE_RE.fullmatch(t["text"])]
+            description = " ".join(t["text"] for t in desc_toks).strip()
+            if not description:
+                description = f"[Exceptional #{code}]"
+
+            item = {
+                "raw_description": description,
+                "sysco_item_code": "",
+                "unit_price": extended,  # Exceptional "unit_price" is per-line total
+                "extended_amount": extended,
+                "case_size_raw": um or "",
+                "section": "",
+            }
+            # Catch-weight: per-unit U/M is "LB" and unit_price is $/lb.
+            # Promote it to price_per_unit; the line total stays as
+            # unit_price/extended_amount so DB dollar totals balance.
+            if per_um == "LB" and qty_shipped is not None:
+                item["unit_of_measure"] = "LB"
+                item["price_per_unit"] = unit_price
+                item["case_size_raw"] = f"{qty_shipped}LB"
+            items.append(item)
+    return items
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Delaware County Linen
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Observed layout from 2026-04-15 invoice:
+#   x=0.11  qty (3-digit integer)
+#   x=0.16  item code (MOPS, BAPSWT — 3-6 letters)
+#   x=0.24-0.40  description tokens
+#   x=0.66  unit price (decimal)
+#   x=0.76  amount (decimal, possibly with 'T' suffix for taxable)
+
+_DEL_ITEM_CODE_RE = re.compile(r'^[A-Z]{3,8}$')
+_DEL_QTY_RE = re.compile(r'^\d{1,4}$')
+_DEL_PRICE_RE = re.compile(r'^\$?\d+\.\d{2}T?$')  # T suffix = taxable
+
+_DEL_QTY_X_RANGE  = (0.08, 0.15)
+_DEL_CODE_X_RANGE = (0.14, 0.22)
+_DEL_DESC_X_RANGE = (0.20, 0.55)
+_DEL_UNIT_X_RANGE = (0.60, 0.72)
+_DEL_AMT_X_RANGE  = (0.72, 0.90)
+
+
+def match_delaware_spatial(pages: list[dict]) -> list[dict]:
+    """Extract Delaware County Linen items from bounding-box layout.
+
+    Small-volume vendor (~5-10 items per invoice). Layout is simple but
+    1D parsing sometimes misses when OCR splits rows unpredictably."""
+    items: list[dict] = []
+    for page in pages or []:
+        tokens = page.get("tokens") or []
+        if not tokens:
+            continue
+        rows = _group_rows(tokens, tol=0.008)
+        for row in rows:
+            # Anchor: integer qty in left band
+            qty_toks = [t for t in row if _in_x(t, _DEL_QTY_X_RANGE)
+                        and _DEL_QTY_RE.fullmatch(t["text"])]
+            if not qty_toks:
+                continue
+            # And a price-shaped token in the amount band
+            amt_toks = [t for t in row if _in_x(t, _DEL_AMT_X_RANGE)
+                        and _DEL_PRICE_RE.fullmatch(t["text"])]
+            if not amt_toks:
+                continue
+
+            qty = int(qty_toks[0]["text"])
+            amt_text = amt_toks[0]["text"].rstrip("T").lstrip("$")
+            amount = float(amt_text)
+
+            code_toks = [t for t in row if _in_x(t, _DEL_CODE_X_RANGE)
+                         and _DEL_ITEM_CODE_RE.fullmatch(t["text"])]
+            code = code_toks[0]["text"] if code_toks else ""
+
+            unit_toks = [t for t in row if _in_x(t, _DEL_UNIT_X_RANGE)
+                         and _DEL_PRICE_RE.fullmatch(t["text"])]
+            unit_price = float(unit_toks[0]["text"].rstrip("T").lstrip("$")) \
+                         if unit_toks else (amount / qty if qty else amount)
+
+            desc_toks = [t for t in row if _in_x(t, _DEL_DESC_X_RANGE)
+                         and not _DEL_PRICE_RE.fullmatch(t["text"])
+                         and not _DEL_ITEM_CODE_RE.fullmatch(t["text"])
+                         and not _DEL_QTY_RE.fullmatch(t["text"])]
+            description = " ".join(t["text"] for t in desc_toks).strip()
+            if not description and code:
+                description = code
+            if not description:
+                continue  # Row with no desc and no code — probably fee row
+
+            items.append({
+                "raw_description": description,
+                "sysco_item_code": "",
+                "unit_price": unit_price,
+                "extended_amount": amount,
+                "case_size_raw": "",
+                "section": "",
+                "quantity": qty,
+            })
+    return items
+
+
+# ═══════════════════════════════════════════════════════════════════════════
+# Farm Art
+# ═══════════════════════════════════════════════════════════════════════════
+
+# Observed layout from 2026-04-02 invoice:
+#   x=0.07  qty ordered (decimal "1.000")
+#   x=0.12  qty shipped (decimal "1.000")
+#   x=0.16  U/M (EACH, CASE, LB)
+#   x=0.20  item code (CRESC, EGG, GRR, JUIOJCG — 3-8 letters)
+#   x=0.27-0.55  description + pack tokens
+#   x=0.70  COOL (country of origin, e.g. "United States") — skip for desc
+#   x=0.83  unit price
+#   x=0.90  extended amount
+
+_FARM_ITEM_CODE_RE = re.compile(r'^[A-Z]{2,10}\d?$')
+_FARM_UM_RE = re.compile(r'^(EACH|CASE|LB|EA|DZ|OZ|PK|BG|CTN)$', re.IGNORECASE)
+_FARM_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,4}$')
+_FARM_DEC_RE = re.compile(r'^\d+\.\d{3}$')  # qty format "1.000"
+
+_FARM_QTY_ORD_X   = (0.04, 0.11)
+_FARM_QTY_SHP_X   = (0.10, 0.16)
+_FARM_UM_X        = (0.14, 0.20)
+_FARM_CODE_X      = (0.18, 0.28)
+_FARM_DESC_X      = (0.26, 0.68)
+_FARM_COOL_X      = (0.68, 0.80)
+_FARM_UNIT_X      = (0.80, 0.88)
+_FARM_EXT_X       = (0.88, 0.96)
+
+
+def match_farmart_spatial(pages: list[dict]) -> list[dict]:
+    """Extract Farm Art (FarmArt) invoice items from bounding-box layout.
+
+    Per Sean: Farm Art invoices are fully PRINTED, not handwritten — parse
+    gaps are layout-structural (broken-case items, unusual multi-line
+    wraps) rather than OCR-quality. Spatial should bring Farm Art to
+    parity with Sysco on parse accuracy.
+
+    Farm Art has no SUPC code; its per-product identifiers are short
+    2-8 letter codes (CRESC, EGG, GRR, JUIOJCG). We keep these as
+    raw_description prefix — the mapper fuzzy-matches against existing
+    desc_map entries."""
+    items: list[dict] = []
+    for page in pages or []:
+        tokens = page.get("tokens") or []
+        if not tokens:
+            continue
+        rows = _group_rows(tokens, tol=0.010)
+        for row in rows:
+            # Farm Art items have qty ORDERED at far-left and a price at
+            # far-right. Both are required to qualify as an item row.
+            qty_ord_toks = [t for t in row if _in_x(t, _FARM_QTY_ORD_X)
+                            and _FARM_DEC_RE.fullmatch(t["text"])]
+            if not qty_ord_toks:
+                continue
+            ext_toks = [t for t in row if _in_x(t, _FARM_EXT_X)
+                        and _FARM_PRICE_RE.fullmatch(t["text"])]
+            if not ext_toks:
+                continue
+
+            extended = float(ext_toks[0]["text"].lstrip("$"))
+            unit_toks = [t for t in row if _in_x(t, _FARM_UNIT_X)
+                         and _FARM_PRICE_RE.fullmatch(t["text"])]
+            unit_price = float(unit_toks[0]["text"].lstrip("$")) \
+                         if unit_toks else extended
+
+            qty_ord = float(qty_ord_toks[0]["text"])
+            qty_shp_toks = [t for t in row if _in_x(t, _FARM_QTY_SHP_X)
+                            and _FARM_DEC_RE.fullmatch(t["text"])
+                            and t != qty_ord_toks[0]]
+            qty_shipped = float(qty_shp_toks[0]["text"]) if qty_shp_toks else qty_ord
+
+            um_toks = [t for t in row if _in_x(t, _FARM_UM_X)
+                       and _FARM_UM_RE.fullmatch(t["text"])]
+            um = um_toks[0]["text"].upper() if um_toks else ""
+
+            # Description: everything in the desc x-band that isn't COOL
+            # (country name) or a recognizable numeric/UM token.
+            desc_toks = [t for t in row if _in_x(t, _FARM_DESC_X)
+                         and not _FARM_PRICE_RE.fullmatch(t["text"])
+                         and not _FARM_DEC_RE.fullmatch(t["text"])
+                         and not _FARM_UM_RE.fullmatch(t["text"])]
+            description = " ".join(t["text"] for t in desc_toks).strip()
+            # Strip leading comma if desc starts with one (OCR noise)
+            description = re.sub(r'^,\s*', '', description)
+            if not description:
+                continue
+
+            items.append({
+                "raw_description": description,
+                "sysco_item_code": "",
+                "unit_price": extended,
+                "extended_amount": extended,
+                "case_size_raw": um or "",
+                "section": "",
+                "quantity": qty_shipped,
+            })
     return items

@@ -2375,25 +2375,51 @@ def _fallback_parse(text: str) -> list[dict]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
-def _try_spatial_sysco(pages: list[dict] | None, text: str) -> list[dict] | None:
-    """When DocAI layout data (pages[].tokens[]) is present, extract Sysco
-    items via physical-row matching rather than 1D line-proximity heuristics.
+def _try_spatial(vendor: str, pages: list[dict] | None,
+                 min_items: int | None = None) -> list[dict] | None:
+    """When DocAI layout data (pages[].tokens[]) is present, dispatch to
+    the per-vendor spatial matcher. Returns extracted items if the count
+    is plausible, else None so callers fall back to the 1D heuristic
+    parser.
 
-    Returns the spatial items if extraction yields a plausible count
-    (≥3 items, to filter page-1-only partial dumps and misc headers).
-    Returns None otherwise — caller falls back to the raw_text-based
-    heuristic parser, which has vendor-wide coverage for invoices whose
-    cache hasn't been refreshed with layout data yet."""
+    Per-vendor `min_items` defaults: Sysco/Exceptional/Farm Art/PBM use 3
+    (filters page-1-only partial dumps and header-only layouts); Delaware
+    Linen uses 1 (small-volume vendor, 2-5 items per invoice)."""
     if not pages:
         return None
     try:
-        from spatial_matcher import match_sysco_spatial
+        from spatial_matcher import (
+            match_sysco_spatial, match_pbm_spatial,
+            match_exceptional_spatial, match_farmart_spatial,
+            match_delaware_spatial,
+        )
     except Exception:
         return None
-    items = match_sysco_spatial(pages)
-    if len(items) < 3:
+    dispatch = {
+        "Sysco": match_sysco_spatial,
+        "Philadelphia Bakery Merchants": match_pbm_spatial,
+        "PBM": match_pbm_spatial,
+        "Exceptional Foods": match_exceptional_spatial,
+        "Exceptional": match_exceptional_spatial,
+        "Farm Art": match_farmart_spatial,
+        "FarmArt": match_farmart_spatial,
+        "Delaware County Linen": match_delaware_spatial,
+    }
+    fn = dispatch.get(vendor)
+    if not fn:
+        return None
+    if min_items is None:
+        # Delaware Linen invoices are 2-5 items each; other vendors 3+.
+        min_items = 1 if vendor == "Delaware County Linen" else 3
+    items = fn(pages)
+    if len(items) < min_items:
         return None
     return items
+
+
+def _try_spatial_sysco(pages: list[dict] | None, text: str) -> list[dict] | None:
+    """Back-compat shim — existing callers keep working."""
+    return _try_spatial("Sysco", pages)
 
 
 def parse_invoice(text: str, vendor: str = None,
@@ -2417,24 +2443,25 @@ def parse_invoice(text: str, vendor: str = None,
         "Delaware County Linen": _parse_delaware_linen,
     }
 
-    # Sysco spatial path — try first, fall back to heuristics on any gap.
+    # Spatial path — try first for vendors with a matcher, fall back to
+    # heuristics on any gap.
     invoice_total = None
-    spatial_items = None
-    if vendor == "Sysco":
-        spatial_items = _try_spatial_sysco(pages, text)
+    spatial_items = _try_spatial(vendor, pages)
 
     if spatial_items is not None:
         items = spatial_items
         # Invoice totals live in the footer, which is text-based — run the
-        # heuristic parser just to harvest invoice_total; discard its
-        # items (spatial already has them). Cheap insurance for the
+        # vendor's heuristic parser just to harvest invoice_total; discard
+        # its items (spatial already has them). Cheap insurance for the
         # total-reconciliation step in batch.py / budget_sync.py.
-        try:
-            heur_result = _parse_sysco(text)
-            if isinstance(heur_result, tuple) and len(heur_result) >= 2:
-                invoice_total = heur_result[1]
-        except Exception:
-            pass
+        parser_fn = parsers.get(vendor)
+        if parser_fn is not None:
+            try:
+                heur_result = parser_fn(text)
+                if isinstance(heur_result, tuple) and len(heur_result) >= 2:
+                    invoice_total = heur_result[1]
+            except Exception:
+                pass
     else:
         parser_fn = parsers.get(vendor, _fallback_parse)
         result = parser_fn(text)

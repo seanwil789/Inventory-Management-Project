@@ -2577,6 +2577,156 @@ Total
         self.assertNotIn('5555555', codes)
 
 
+class SpatialMatcherOtherVendorsTests(TestCase):
+    """Per-vendor spatial matchers (PBM, Exceptional, Farm Art, Delaware).
+    Synthetic token-layout fixtures so tests don't depend on DocAI calls."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import spatial_matcher as sm
+        return sm
+
+    def _tok(self, text, x, y, w=0.04, h=0.015):
+        return {"text": text, "x_min": x, "x_max": x + w,
+                "y_min": y, "y_max": y + h,
+                "char_start": 0, "char_end": 0}
+
+    def _row(self, y, items):
+        return [self._tok(text, x, y) for text, x in items]
+
+    # ── PBM ────────────────────────────────────────────────────────────
+    def test_pbm_extracts_items_from_grid(self):
+        sm = self._import()
+        tokens = []
+        tokens += self._row(0.38, [("H106", 0.08), ("2.00", 0.24),
+                                     ("DZ", 0.41), ("Wheat", 0.46),
+                                     ("Pita", 0.50), ("5.25", 0.78),
+                                     ("10.50", 0.85)])
+        tokens += self._row(0.40, [("L7408", 0.08), ("3.00", 0.24),
+                                     ("DZ", 0.41), ("Brioche", 0.46),
+                                     ("Buns", 0.51), ("9.37", 0.78),
+                                     ("28.11", 0.85)])
+        items = sm.match_pbm_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 2)
+        by_desc = {i["raw_description"]: i for i in items}
+        self.assertIn("Wheat Pita", by_desc)
+        self.assertEqual(by_desc["Wheat Pita"]["unit_price"], 5.25)
+        self.assertEqual(by_desc["Wheat Pita"]["extended_amount"], 10.50)
+        self.assertEqual(by_desc["Wheat Pita"]["case_size_raw"], "DZ")
+
+    def test_pbm_rejects_rows_without_code_or_price(self):
+        """Header rows, address rows, footer total rows should not
+        accidentally surface as line items."""
+        sm = self._import()
+        tokens = self._row(0.10, [("Invoice", 0.55), ("Number", 0.60),
+                                    ("1234", 0.67)])
+        items = sm.match_pbm_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(items, [])
+
+    # ── Exceptional ────────────────────────────────────────────────────
+    def test_exceptional_catch_weight_extracts_weight_and_per_lb(self):
+        """Catch-weight rows have weight (8.5), per-lb ($5.19), LB unit,
+        and total ($44.12). Spatial should separate these into
+        case_size_raw (weight), price_per_unit ($/lb), extended (total)."""
+        sm = self._import()
+        tokens = []
+        # Turkey: qty 1.00 EA, weight 8.50, per-lb 5.19, LB, ext 44.12
+        tokens += self._row(0.30, [
+            ("32425", 0.06), ("1.00", 0.22), ("EA", 0.27),
+            ("Turkey", 0.30), ("Brst", 0.36),
+            ("8.50", 0.71), ("5.19", 0.80), ("LB", 0.85),
+            ("44.12", 0.92),
+        ])
+        items = sm.match_exceptional_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 1)
+        item = items[0]
+        self.assertEqual(item["extended_amount"], 44.12)
+        self.assertEqual(item["case_size_raw"], "8.5LB")
+        self.assertEqual(item["unit_of_measure"], "LB")
+        self.assertEqual(item["price_per_unit"], 5.19)
+        self.assertIn("Turkey", item["raw_description"])
+
+    def test_exceptional_non_catch_weight_no_price_per_unit(self):
+        """Regular CS/EA items don't have per-lb tokens — shouldn't
+        accidentally promote the unit_price as price_per_unit."""
+        sm = self._import()
+        tokens = self._row(0.30, [
+            ("12345", 0.06), ("2.00", 0.22), ("CS", 0.27),
+            ("Cheese", 0.30), ("Block", 0.38),
+            ("30.00", 0.92),  # extended only, no per-lb anchor
+        ])
+        items = sm.match_exceptional_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 1)
+        self.assertNotIn("price_per_unit", items[0])
+        self.assertEqual(items[0]["extended_amount"], 30.00)
+
+    # ── Farm Art ───────────────────────────────────────────────────────
+    def test_farmart_extracts_items_ignoring_cool_column(self):
+        """COOL (country of origin) tokens like 'United States' sit between
+        desc and price columns; they should be filtered out of desc."""
+        sm = self._import()
+        tokens = self._row(0.41, [
+            ("1.000", 0.07), ("1.000", 0.12), ("EACH", 0.16),
+            ("CRESC", 0.20),
+            ("DAIRY", 0.27), ("SOUR", 0.31), ("CREAM", 0.35),
+            ("United", 0.70), ("States", 0.74),
+            ("9.90", 0.83), ("9.80", 0.90),
+        ])
+        items = sm.match_farmart_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 1)
+        desc = items[0]["raw_description"]
+        self.assertIn("SOUR", desc.upper())
+        self.assertIn("CREAM", desc.upper())
+        self.assertNotIn("United", desc)  # COOL filtered out
+        self.assertEqual(items[0]["extended_amount"], 9.80)
+        self.assertEqual(items[0]["case_size_raw"], "EACH")
+
+    # ── Delaware ───────────────────────────────────────────────────────
+    def test_delaware_small_volume_extraction(self):
+        sm = self._import()
+        tokens = self._row(0.39, [
+            ("300", 0.11), ("MOPS", 0.16),
+            ("Bar", 0.24), ("Mops", 0.26),
+            ("0.22", 0.66), ("66.00", 0.76),
+        ])
+        items = sm.match_delaware_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["quantity"], 300)
+        self.assertEqual(items[0]["unit_price"], 0.22)
+        self.assertEqual(items[0]["extended_amount"], 66.00)
+        self.assertIn("Bar Mops", items[0]["raw_description"])
+
+    # ── Dispatcher ────────────────────────────────────────────────────
+    def test_parse_invoice_dispatches_pbm_to_spatial(self):
+        """parse_invoice should route PBM through its spatial matcher
+        when pages are provided."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        tokens = []
+        for y, (code, desc, price, ext) in zip(
+            [0.38, 0.40, 0.42, 0.44],
+            [("H106", "Bread A", "5.25", "10.50"),
+             ("L7408", "Bread B", "9.37", "28.11"),
+             ("R1012", "Bread C", "10.00", "20.00"),
+             ("0290", "Bread D", "14.92", "29.84")]):
+            tokens += self._row(y, [(code, 0.08), ("2.00", 0.24),
+                                      ("DZ", 0.41), *[(w, 0.46 + i*0.06) for i, w in enumerate(desc.split())],
+                                      (price, 0.78), (ext, 0.85)])
+        pages = [{"page_number": 1, "tokens": tokens}]
+        raw = "INVOICE\nTotal: 88.45"  # dummy — spatial won't use it
+        result = p.parse_invoice(raw, vendor='Philadelphia Bakery Merchants',
+                                 pages=pages)
+        self.assertEqual(len(result['items']), 4)
+
+
 class ParserPipelineIntegrationTest(TestCase):
     """T4: full parse → map → write_invoice_to_db round-trip. Verifies the
     three layers cooperate — parser finds items, mapper links canonical
