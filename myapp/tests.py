@@ -5097,3 +5097,182 @@ class SynergySyncCalcPricePerLbTests(TestCase):
             msg="'10/14' parses as Oct 14 — must NOT be 10×14=140 lbs")
         self.assertIsNone(calc(20.00, '04/06', '#'),
             msg="'04/06' is Apr 6 — leading-zero pattern always a date")
+
+
+class ConsumptionEngineTests(TestCase):
+    """`consumption_utils.compute_consumption` — date-range inventory depletion math.
+
+    Foundation for perpetual inventory + variance reporting. Each menu
+    in range × census × recipe → per-Product physical-unit totals.
+    Mirrors the cost calc dispatch but emits qty consumed instead of $.
+    """
+
+    def _setup_basic(self, ri_qty=Decimal('5'), ri_unit='lb', headcount=30,
+                     yield_servings=40, yield_pct=None):
+        """One Vendor + Product + Recipe + RecipeIngredient + Census + Menu."""
+        v = Vendor.objects.create(name='V')
+        p = Product.objects.create(canonical_name='Test Beef')
+        r = Recipe.objects.create(name='Test Beef Dish', yield_servings=yield_servings)
+        ri = RecipeIngredient.objects.create(
+            recipe=r, name_raw='beef', product=p, quantity=ri_qty, unit=ri_unit,
+            yield_pct=yield_pct,
+        )
+        Census.objects.create(date=date(2026, 5, 10), headcount=headcount)
+        m = Menu.objects.create(date=date(2026, 5, 10), meal_slot='dinner', recipe=r)
+        return v, p, r, ri, m
+
+    def test_empty_range_returns_empty_structure(self):
+        from myapp.consumption_utils import compute_consumption
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(result['by_product'], {})
+        self.assertEqual(result['caveats'], [])
+        self.assertEqual(result['menus_processed'], 0)
+        self.assertEqual(result['menus_unlinked'], 0)
+
+    def test_single_recipe_consumption_scales_to_headcount(self):
+        """Recipe yields 40, ingredient is 5 lb, headcount is 30 → 3.75 lb."""
+        from myapp.consumption_utils import compute_consumption
+        v, p, r, ri, m = self._setup_basic(
+            ri_qty=Decimal('5'), ri_unit='lb', headcount=30, yield_servings=40)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(result['menus_processed'], 1)
+        self.assertEqual(result['menus_unlinked'], 0)
+        # 5 lb × (30/40) = 3.75 lb = 60 oz
+        self.assertEqual(result['by_product'][p.id]['oz'], Decimal('60.00'))
+
+    def test_yield_pct_increases_ap_consumption(self):
+        """Recipe asks 1 lb edible carrot at 80% yield → AP consumed = 1.25 lb = 20 oz."""
+        from myapp.consumption_utils import compute_consumption
+        v, p, r, ri, m = self._setup_basic(
+            ri_qty=Decimal('1'), ri_unit='lb', headcount=40,  # full yield, no scaling
+            yield_servings=40, yield_pct=Decimal('80'))
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        # 1 lb / 0.80 = 1.25 lb = 20 oz
+        self.assertAlmostEqual(float(result['by_product'][p.id]['oz']), 20.0, places=2)
+
+    def test_unlinked_menu_contributes_nothing(self):
+        """Freetext menus (no recipe FK) are counted in menus_unlinked, no consumption."""
+        from myapp.consumption_utils import compute_consumption
+        Menu.objects.create(date=date(2026, 5, 10), meal_slot='dinner',
+                            dish_freetext='Some freetext dish')
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(result['by_product'], {})
+        self.assertEqual(result['menus_unlinked'], 1)
+        self.assertEqual(result['menus_processed'], 0)
+
+    def test_null_qty_ri_skipped_with_caveat(self):
+        from myapp.consumption_utils import compute_consumption
+        v = Vendor.objects.create(name='V')
+        p = Product.objects.create(canonical_name='Test Onion')
+        r = Recipe.objects.create(name='Test Soup', yield_servings=40)
+        RecipeIngredient.objects.create(
+            recipe=r, name_raw='onion', product=p, quantity=None, unit='lb')
+        Census.objects.create(date=date(2026, 5, 10), headcount=30)
+        Menu.objects.create(date=date(2026, 5, 10), meal_slot='dinner', recipe=r)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(result['by_product'], {})  # null qty → skipped
+        self.assertEqual(len(result['caveats']), 1)
+        self.assertIn('null qty', result['caveats'][0])
+
+    def test_no_product_link_skipped_with_caveat(self):
+        from myapp.consumption_utils import compute_consumption
+        r = Recipe.objects.create(name='Test', yield_servings=40)
+        RecipeIngredient.objects.create(
+            recipe=r, name_raw='unmapped ingredient',
+            product=None, quantity=Decimal('1'), unit='lb')
+        Census.objects.create(date=date(2026, 5, 10), headcount=30)
+        Menu.objects.create(date=date(2026, 5, 10), meal_slot='dinner', recipe=r)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(result['by_product'], {})
+        self.assertEqual(len(result['caveats']), 1)
+        self.assertIn('no product link', result['caveats'][0])
+
+    def test_census_fallback_when_no_row(self):
+        """Date with no Census row uses census_default arg (or 30 fallback)."""
+        from myapp.consumption_utils import compute_consumption
+        v = Vendor.objects.create(name='V')
+        p = Product.objects.create(canonical_name='Test Flour')
+        r = Recipe.objects.create(name='Test', yield_servings=40)
+        RecipeIngredient.objects.create(
+            recipe=r, name_raw='flour', product=p,
+            quantity=Decimal('4'), unit='lb')
+        # No Census row created — should fall back
+        Menu.objects.create(date=date(2026, 5, 10), meal_slot='dinner', recipe=r)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31),
+                                      census_default=20)
+        # 4 lb × 20/40 = 2 lb = 32 oz
+        self.assertEqual(result['by_product'][p.id]['oz'], Decimal('32.00'))
+
+    def test_multiple_menus_aggregate(self):
+        """Same product across multiple menus accumulates."""
+        from myapp.consumption_utils import compute_consumption
+        v, p, r, ri, m1 = self._setup_basic(
+            ri_qty=Decimal('5'), ri_unit='lb', headcount=40, yield_servings=40)
+        # Add two more days
+        Menu.objects.create(date=date(2026, 5, 11), meal_slot='dinner', recipe=r)
+        Census.objects.create(date=date(2026, 5, 11), headcount=40)
+        Menu.objects.create(date=date(2026, 5, 12), meal_slot='dinner', recipe=r)
+        Census.objects.create(date=date(2026, 5, 12), headcount=40)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        # 3 menus × 5 lb each = 15 lb = 240 oz
+        self.assertEqual(result['by_product'][p.id]['oz'], Decimal('240.00'))
+        self.assertEqual(result['menus_processed'], 3)
+
+    def test_additional_recipes_consumed(self):
+        """Menu's additional_recipes m2m also contribute consumption."""
+        from myapp.consumption_utils import compute_consumption
+        v = Vendor.objects.create(name='V')
+        p_main = Product.objects.create(canonical_name='Main P')
+        p_side = Product.objects.create(canonical_name='Side P')
+        main = Recipe.objects.create(name='Main', yield_servings=40)
+        side = Recipe.objects.create(name='Side', yield_servings=40)
+        RecipeIngredient.objects.create(
+            recipe=main, name_raw='m', product=p_main,
+            quantity=Decimal('10'), unit='lb')
+        RecipeIngredient.objects.create(
+            recipe=side, name_raw='s', product=p_side,
+            quantity=Decimal('2'), unit='lb')
+        Census.objects.create(date=date(2026, 5, 10), headcount=40)
+        m = Menu.objects.create(date=date(2026, 5, 10), meal_slot='dinner',
+                                recipe=main)
+        m.additional_recipes.add(side)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        self.assertEqual(result['by_product'][p_main.id]['oz'], Decimal('160.00'))
+        self.assertEqual(result['by_product'][p_side.id]['oz'], Decimal('32.00'))
+
+    def test_sub_recipe_recurses(self):
+        """Recipe with sub_recipe RI consumes the sub_recipe's ingredients scaled."""
+        from myapp.consumption_utils import compute_consumption
+        v = Vendor.objects.create(name='V')
+        p_tom = Product.objects.create(canonical_name='Tomato')
+        # Sub-recipe Marinara: 8 servings, uses 4 lb tomato
+        marinara = Recipe.objects.create(name='Marinara', yield_servings=8)
+        RecipeIngredient.objects.create(
+            recipe=marinara, name_raw='tomato', product=p_tom,
+            quantity=Decimal('4'), unit='lb')
+        # Parent Meatballs: 40 servings, uses 2 batches of Marinara
+        meatballs = Recipe.objects.create(name='Meatballs', yield_servings=40)
+        RecipeIngredient.objects.create(
+            recipe=meatballs, name_raw='Marinara', sub_recipe=marinara,
+            quantity=Decimal('2'), unit='batch')
+        Census.objects.create(date=date(2026, 5, 10), headcount=40)
+        Menu.objects.create(date=date(2026, 5, 10), meal_slot='dinner',
+                            recipe=meatballs)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        # 2 batches × 8 servings/batch = 16 servings of marinara at 40/40 scale
+        # → 16 servings worth of marinara × 4 lb / 8 servings = 8 lb of tomato
+        self.assertEqual(result['by_product'][p_tom.id]['oz'], Decimal('128.00'))
+
+    def test_date_range_excludes_outside_dates(self):
+        """Menus outside [start, end] are not counted."""
+        from myapp.consumption_utils import compute_consumption
+        v, p, r, ri, _ = self._setup_basic(
+            ri_qty=Decimal('5'), ri_unit='lb', headcount=40, yield_servings=40)
+        # Add menu in April (outside May range)
+        Menu.objects.create(date=date(2026, 4, 30), meal_slot='dinner', recipe=r)
+        Census.objects.create(date=date(2026, 4, 30), headcount=40)
+        result = compute_consumption(date(2026, 5, 1), date(2026, 5, 31))
+        # Only the May 10 menu, not April 30
+        self.assertEqual(result['menus_processed'], 1)
+        # 5 lb = 80 oz (one menu, full yield)
+        self.assertEqual(result['by_product'][p.id]['oz'], Decimal('80.00'))
