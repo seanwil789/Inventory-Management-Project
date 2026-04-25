@@ -1,0 +1,37 @@
+[Unit]
+# Django runserver as a systemd service.
+# Pre-staged for Pi migration — see docs/pi-migration-runbook.md step 8a.
+#
+# Install:
+#   sudo cp django.service /etc/systemd/system/
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now django.service
+#   sudo systemctl status django.service
+#
+# When ready to swap to gunicorn (production-shaped), update the
+# ExecStart line to use the gunicorn config at
+# docs/pi-systemd/gunicorn.conf.py.
+
+Description=Django dev server (my-saas)
+After=network-online.target tailscaled.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=sean
+Group=sean
+WorkingDirectory=/home/sean/my-saas
+EnvironmentFile=/home/sean/my-saas/.env
+ExecStart=/home/sean/my-saas/.venv/bin/python manage.py runserver 0.0.0.0:8000
+Restart=on-failure
+RestartSec=5
+StandardOutput=append:/home/sean/my-saas/logs/django.log
+StandardError=append:/home/sean/my-saas/logs/django.log
+
+# Don't auto-restart faster than every 30s if it keeps crashing — gives
+# you time to ssh in and fix things instead of hammering the disk.
+StartLimitIntervalSec=120
+StartLimitBurst=3
+
+[Install]
+WantedBy=multi-user.target
