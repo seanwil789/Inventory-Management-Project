@@ -19,7 +19,7 @@
 | **240GB M.2 SATA SSD** (Crucial MX500, Samsung 870 EVO, or WD Blue SA510) | Boots the OS + holds db.sqlite3 + .ocr_cache. M.2 *SATA* (not NVMe) — Pi 4 can't do NVMe; the Argon ONE M.2 V2 has a SATA-to-USB3 bridge built in. | ~$25 |
 | **32GB microSD** (SanDisk Ultra or similar) | One-time use for initial OS imaging, before SSD-clone. | ~$8 |
 | **Official Raspberry Pi 15.3W USB-C PSU** | Critical: random USB-C bricks cause undervoltage faults that look like software bugs. Use the official one. | ~$10 |
-| **Cat6 ethernet cable** (10ft+ depending on basement layout) | Hardwired beats wifi in a dusty basement. Wifi signal in basements is unreliable; ethernet is also dust-immune. | ~$8 |
+| ~~Cat6 ethernet cable~~ | ~~Hardwired beats wifi~~ — Sean opted for WiFi (see "Pre-flight WiFi check" in section 2d). Pi 4 has onboard 2.4 + 5 GHz dual-band. Skip unless WiFi signal at install spot is too weak. | ~$0 |
 
 ### Why not a Pi 5
 Pi 5 is faster but pulls 25W under load (vs 6W for Pi 4), runs hotter, needs the bigger 27W PSU, and the Argon ONE V3 case for Pi 5 is newer / less battle-tested. For your workload (Django runserver + 7 cron jobs + Tailscale daemon + sqlite) the Pi 4 is genuinely sufficient.
@@ -64,7 +64,18 @@ In the Tailscale admin console (`https://login.tailscale.com/admin/settings/keys
 - Tag: `tag:server`
 - Copy the `tskey-auth-...` value — you'll paste it into the Pi during step 5
 
-### 2c. Inventory current state (already done — see end of doc)
+### 2c. Pre-flight WiFi check at the install spot
+
+Before committing to WiFi-only deployment, verify the basement install spot has workable signal:
+
+1. Stand at the planned install location with your phone connected to the Wentworth WiFi.
+2. Run a speed test (fast.com or speedtest.net). Target: **≥10 Mbps down, ≥2 Mbps up**, latency under 100ms.
+3. Stream a video for 60 seconds — no stutters = good enough for the Pi.
+4. If signal is marginal/dropping: add a mesh extender ($30-50) placed at the basement door, OR fall back to ethernet (Cat6 cable, ~$8).
+
+The Pi will tolerate brief WiFi drops (Tailscale auto-reconnects, hourly cron catches up next run), but persistent <50% signal causes operational pain.
+
+### 2d. Inventory current state (already done — see end of doc)
 
 The state to copy is:
 - `~/my-saas/.env` (10 environment variables)
@@ -105,14 +116,16 @@ Use **Raspberry Pi Imager** on your Chromebook (Linux app) or any other machine:
   - Username: `sean`
   - Paste your SSH public key (from `~/.ssh/id_ed25519.pub` on Chromebook — or generate one)
   - Locale: `America/New_York`
-  - Wifi: skip (we're using ethernet)
+  - **Wifi: configure with the Wentworth SSID + password** (verified workable in section 2c). The Pi 4 has onboard 2.4 + 5 GHz dual-band — pick the band that tested cleanest at the install spot. (If you opted for ethernet instead, leave Wifi blank and plug in the cable on first boot.)
 
 ### 4b. First boot
 
-1. Insert microSD into Pi, plug in ethernet, plug in USB-C power.
-2. Wait 90 seconds. The Pi boots, runs first-time config, joins the LAN.
-3. Find the Pi's local IP: log into your router admin page, look for `wentworth-kitchen`. Or scan: `nmap -sn 192.168.1.0/24` from another machine.
+1. Insert microSD into Pi, plug in USB-C power. (Plug in ethernet only if you opted out of WiFi in section 2c.)
+2. Wait 90-120 seconds. The Pi boots, runs first-time config, joins the WiFi network.
+3. Find the Pi's local IP: log into your router admin page, look for `wentworth-kitchen`. Or scan: `nmap -sn 192.168.1.0/24` from another machine on the same WiFi.
 4. SSH in: `ssh sean@<pi-ip>`. You're in.
+
+**Troubleshooting if Pi doesn't appear on the network:** WiFi config typo is the common culprit. Re-image the SD card with corrected SSID/password (Raspberry Pi Imager re-flash is 5 min). If WiFi works at boot but drops persistently, fall back to ethernet — symptoms point to signal too weak for sustained operation.
 
 ### 4c. Update OS and install system packages
 
