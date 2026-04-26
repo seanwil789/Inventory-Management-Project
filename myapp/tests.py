@@ -5746,6 +5746,30 @@ class MapperLoadFromDBTests(TestCase):
         # Valid PM included
         self.assertIn('WHLFCLS ROMAINE HEARTS 3CT', cache['desc_map'])
 
+    def test_mapping_health_view_renders(self):
+        """`/mapping-health/` smoke test — renders 200 with empty DB."""
+        u = User.objects.create_user(username='healthtest', password='x')
+        self.client.force_login(u)
+        r = self.client.get('/mapping-health/')
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'Mapping Health')
+
+    def test_mapping_health_surfaces_drift_count(self):
+        """When unmatched_drift rows exist, dashboard shows them prominently."""
+        u = User.objects.create_user(username='drifttest', password='x')
+        self.client.force_login(u)
+        v = Vendor.objects.create(name='Sysco')
+        # Seed a drift-tagged row
+        InvoiceLineItem.objects.create(
+            vendor=v, raw_description='BBRLCLS CHEESE AMER 160 SLI WHT',
+            match_confidence='unmatched_drift', product=None,
+            invoice_date=date(2026, 4, 20),
+        )
+        r = self.client.get('/mapping-health/')
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'Sheet/DB Drift')
+        self.assertContains(r, 'BBRLCLS CHEESE AMER')
+
     def test_load_mappings_falls_back_to_sheet_when_db_empty(self):
         """Catastrophe protection: if ProductMapping is empty (pre-backfill,
         fresh install), load_mappings falls back to sheet so the pipeline

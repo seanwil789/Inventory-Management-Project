@@ -1,0 +1,234 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Mapping Health{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Mapping Health</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Live mapper-quality dashboard. Surfaces sheet/DB drift, fuzzy false-positives,
+      and the unmapped queue. Cheap — refresh anytime.
+    </p>
+  </div>
+
+  <!-- Verdict banner -->
+  <div class="rounded-lg border-2 p-4 flex items-center justify-between
+    {% if verdict == 'green' %}border-emerald-300 bg-emerald-50
+    {% elif verdict == 'amber' %}border-amber-300 bg-amber-50
+    {% else %}border-red-300 bg-red-50{% endif %}">
+    <div>
+      <div class="text-xs uppercase tracking-wide
+        {% if verdict == 'green' %}text-emerald-800
+        {% elif verdict == 'amber' %}text-amber-800
+        {% else %}text-red-800{% endif %}">Verdict</div>
+      <div class="text-2xl font-bold mt-0.5
+        {% if verdict == 'green' %}text-emerald-900
+        {% elif verdict == 'amber' %}text-amber-900
+        {% else %}text-red-900{% endif %}">{{ verdict_text }}</div>
+    </div>
+    <div class="text-right text-sm">
+      {% if last_batch %}
+        <div class="text-slate-700">Last batch: {{ last_batch.minutes_ago }} min ago</div>
+      {% endif %}
+      {% if cache_age_min %}
+        <div class="text-slate-500">Mapping cache: {{ cache_age_min }} min old, source: {{ cache_source }}</div>
+      {% endif %}
+    </div>
+  </div>
+
+  <!-- KPI row -->
+  <div class="grid grid-cols-2 sm:grid-cols-4 gap-3">
+    <div class="rounded-lg border border-slate-200 bg-white p-3">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">All-time mapped</div>
+      <div class="text-2xl font-bold text-slate-900">{{ mapped_pct }}%</div>
+      <div class="text-xs text-slate-500">{{ mapped }} / {{ total_ili }}</div>
+    </div>
+    <div class="rounded-lg border
+      {% if last_24h_pct == None %}border-slate-200 bg-white
+      {% elif last_24h_pct >= 90 %}border-emerald-200 bg-emerald-50
+      {% elif last_24h_pct >= 75 %}border-amber-200 bg-amber-50
+      {% else %}border-red-200 bg-red-50{% endif %} p-3">
+      <div class="text-xs uppercase tracking-wide
+        {% if last_24h_pct == None %}text-slate-500
+        {% elif last_24h_pct >= 90 %}text-emerald-800
+        {% elif last_24h_pct >= 75 %}text-amber-800
+        {% else %}text-red-800{% endif %}">Last 24h</div>
+      {% if last_24h_pct == None %}
+        <div class="text-2xl font-bold text-slate-400">—</div>
+        <div class="text-xs text-slate-400">No imports</div>
+      {% else %}
+        <div class="text-2xl font-bold">{{ last_24h_pct }}%</div>
+        <div class="text-xs">{{ last_24h_mapped }} / {{ last_24h_total }}</div>
+      {% endif %}
+    </div>
+    <div class="rounded-lg border
+      {% if drift_count == 0 %}border-slate-200 bg-white
+      {% else %}border-red-300 bg-red-50{% endif %} p-3">
+      <div class="text-xs uppercase tracking-wide
+        {% if drift_count == 0 %}text-slate-500{% else %}text-red-800{% endif %}">Drift rows</div>
+      <div class="text-2xl font-bold">{{ drift_count }}</div>
+      <div class="text-xs {% if drift_count == 0 %}text-slate-500{% else %}text-red-700{% endif %}">
+        {% if drift_count == 0 %}none{% else %}sheet/DB mismatch{% endif %}
+      </div>
+    </div>
+    <div class="rounded-lg border
+      {% if suspect_pct < 5 %}border-slate-200 bg-white
+      {% elif suspect_pct < 15 %}border-amber-200 bg-amber-50
+      {% else %}border-red-200 bg-red-50{% endif %} p-3">
+      <div class="text-xs uppercase tracking-wide
+        {% if suspect_pct < 5 %}text-slate-500
+        {% elif suspect_pct < 15 %}text-amber-800
+        {% else %}text-red-800{% endif %}">Suspect mappings</div>
+      <div class="text-2xl font-bold">{{ suspect_pct }}%</div>
+      <div class="text-xs">{{ suspect_count }} of {{ mapped }}</div>
+    </div>
+  </div>
+
+  <!-- Match confidence breakdown -->
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-3">Match Confidence Distribution</h2>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2">Tier</th>
+          <th class="text-right py-2">Count</th>
+          <th class="text-right py-2 pl-4">%</th>
+          <th class="text-left py-2 pl-4">Auto-commit</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in confidence_rows %}
+          <tr class="border-b border-slate-100
+            {% if row.is_drift %}bg-red-50
+            {% elif row.is_unmatched %}bg-amber-50/50{% endif %}">
+            <td class="py-2 font-mono text-xs
+              {% if row.is_drift %}text-red-900 font-semibold{% endif %}">
+              {{ row.label }}
+            </td>
+            <td class="py-2 text-right tabular-nums">{{ row.n }}</td>
+            <td class="py-2 text-right tabular-nums pl-4 text-slate-600">{{ row.pct }}%</td>
+            <td class="py-2 pl-4">
+              {% if row.is_auto_commit %}
+                <span class="text-xs text-emerald-700">✓ FK on commit</span>
+              {% elif row.is_drift %}
+                <span class="text-xs text-red-700">✗ drift detected</span>
+              {% elif row.is_unmatched %}
+                <span class="text-xs text-amber-700">— no FK</span>
+              {% else %}
+                <span class="text-xs text-slate-500">fuzzy / curated</span>
+              {% endif %}
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <!-- Drift queue (only if non-zero) -->
+  {% if drift_count %}
+  <div class="rounded-lg bg-red-50 border border-red-200 p-5">
+    <h2 class="text-lg font-semibold text-red-900 mb-2">⚠ Sheet/DB Drift — {{ drift_count }} row{{ drift_count|pluralize }}</h2>
+    <p class="text-sm text-red-800 mb-3">
+      Mapper returned a canonical that doesn't exist in the Product table.
+      Run <code class="bg-red-100 px-1 rounded">manage.py sync_item_mapping_from_sheet --apply</code>
+      to refresh DB mappings, or update sheet col F to match the new canonical names.
+    </p>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-red-700 tracking-wide">
+        <tr class="border-b border-red-200">
+          <th class="text-left py-1">Vendor</th>
+          <th class="text-left py-1">Raw description</th>
+          <th class="text-left py-1">Imported</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ili in recent_drift %}
+          <tr class="border-b border-red-100">
+            <td class="py-1 text-xs">{{ ili.vendor.name|default:"—" }}</td>
+            <td class="py-1 font-mono text-xs">{{ ili.raw_description|truncatechars:60 }}</td>
+            <td class="py-1 text-xs text-red-700">{{ ili.imported_at|date:"M j H:i" }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <!-- Suspect mappings sample -->
+  {% if sample_suspects %}
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-2">Suspect mappings sample (8 of {{ suspect_count }})</h2>
+    <p class="text-sm text-slate-600 mb-3">
+      ILI rows where the mapped canonical shares zero stemmed content tokens with the raw description.
+      Most are pre-existing; new ones surfacing here may indicate a fuzzy-tier escape.
+    </p>
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-1">Vendor</th>
+          <th class="text-left py-1">Raw description</th>
+          <th class="text-left py-1">→ Canonical</th>
+          <th class="text-left py-1">Tier</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for s in sample_suspects %}
+          <tr class="border-b border-slate-100">
+            <td class="py-1 text-xs">{{ s.vendor }}</td>
+            <td class="py-1 font-mono text-xs">{{ s.raw }}</td>
+            <td class="py-1 text-xs text-slate-700">{{ s.canonical }}</td>
+            <td class="py-1 font-mono text-xs text-slate-500">{{ s.confidence }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% endif %}
+
+  <!-- Recent unmapped queue -->
+  <div class="rounded-lg bg-white border border-slate-200 p-5">
+    <h2 class="text-lg font-semibold text-slate-900 mb-2">Recent unmapped queue (last 10)</h2>
+    <p class="text-sm text-slate-600 mb-3">
+      ILI rows with no Product FK. Surface in
+      <a href="{% url 'bridge_review' %}" class="text-indigo-600 hover:underline">Mapping Review</a>
+      via cron, or <code class="bg-slate-100 px-1 rounded">manage.py sync_item_mapping_from_sheet --apply</code>
+      after fixing the sheet.
+    </p>
+    {% if recent_unmapped %}
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-1">Vendor</th>
+          <th class="text-left py-1">Raw description</th>
+          <th class="text-left py-1">Tier</th>
+          <th class="text-left py-1">Imported</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for ili in recent_unmapped %}
+          <tr class="border-b border-slate-100">
+            <td class="py-1 text-xs">{{ ili.vendor.name|default:"—" }}</td>
+            <td class="py-1 font-mono text-xs">{{ ili.raw_description|truncatechars:60 }}</td>
+            <td class="py-1 font-mono text-xs text-slate-500">{{ ili.match_confidence|default:"(blank)" }}</td>
+            <td class="py-1 text-xs text-slate-500">{{ ili.imported_at|date:"M j H:i" }}</td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+    {% else %}
+      <p class="text-sm text-emerald-700">No unmapped rows. 🎉</p>
+    {% endif %}
+  </div>
+
+  <p class="text-xs text-slate-400">
+    Refreshed {{ today|date:"D M j, Y" }}. See also:
+    <a href="{% url 'pipeline_health' %}" class="hover:underline">Pipeline Health</a>
+    ·
+    <a href="{% url 'cost_coverage' %}" class="hover:underline">Cost Coverage</a>
+    ·
+    <a href="{% url 'price_alerts' %}" class="hover:underline">Price Alerts</a>
+  </p>
+
+</div>
+{% endblock %}

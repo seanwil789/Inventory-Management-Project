@@ -2384,6 +2384,171 @@ def pipeline_health(request):
     })
 
 
+# ---- Mapper health dashboard (Step 2 of sheet→DB migration follow-up) ----
+
+def mapping_health(request):
+    """Live mapper-quality dashboard — answers 'is mapping working today?'
+    in 30 seconds.
+
+    Complements `pipeline_health` (broad cron + cache + recipe coverage)
+    by focusing exclusively on the mapper FK chain. Surfaces the two
+    silent-failure classes the mapper hardening was designed to catch:
+    sheet/DB drift (`unmatched_drift` confidence tier) and fuzzy false
+    positives (token-overlap zero rows in the mapped set).
+
+    Cheap to render — pure DB aggregates + one filesystem stat. Safe to
+    hit on every page load."""
+    from collections import Counter
+    from datetime import datetime as _datetime, timedelta
+    from django.db.models import Count
+    from pathlib import Path
+    from django.conf import settings as _settings
+    import os, re, time
+
+    today = date.today()
+    last_24h = _datetime.now() - timedelta(hours=24)
+    last_7d = today - timedelta(days=7)
+
+    # --- Coverage KPIs ---
+    total_ili = InvoiceLineItem.objects.count()
+    mapped = InvoiceLineItem.objects.filter(product__isnull=False).count()
+    mapped_pct = round(mapped / total_ili * 100, 1) if total_ili else 0
+
+    # Last-24h activity (uses imported_at — when the row landed in DB)
+    last_24h_total = InvoiceLineItem.objects.filter(imported_at__gte=last_24h).count()
+    last_24h_mapped = InvoiceLineItem.objects.filter(
+        imported_at__gte=last_24h, product__isnull=False
+    ).count()
+    last_24h_pct = (round(last_24h_mapped / last_24h_total * 100, 1)
+                    if last_24h_total else None)
+
+    # --- Drift counter (Phase 0 signal) ---
+    drift_count = InvoiceLineItem.objects.filter(
+        match_confidence='unmatched_drift'
+    ).count()
+
+    # --- Recent unmapped queue (last 10 by imported_at) ---
+    recent_unmapped = list(InvoiceLineItem.objects.filter(
+        product__isnull=True,
+        match_confidence__in=['unmatched', 'unmatched_drift', ''],
+    ).select_related('vendor').order_by('-imported_at')[:10])
+
+    # --- Recent drift queue ---
+    recent_drift = list(InvoiceLineItem.objects.filter(
+        match_confidence='unmatched_drift'
+    ).select_related('vendor').order_by('-imported_at')[:10])
+
+    # --- Live suspect-mappings count (zero token overlap among mapped) ---
+    # Replicate audit_suspect_mappings logic: tokens from raw_description
+    # that share at least one 3+letter content word with canonical_name.
+    word_re = re.compile(r'[A-Za-z]{3,}')
+    def _stem(s):
+        out = []
+        for t in word_re.findall(s or ''):
+            low = t.lower()
+            if len(low) >= 4 and low.endswith('s') and not low.endswith('ss'):
+                low = low[:-1]
+            out.append(low)
+        return set(out)
+
+    suspect_count = 0
+    sample_suspects = []
+    mapped_qs = (InvoiceLineItem.objects
+                 .filter(product__isnull=False)
+                 .select_related('product', 'vendor')
+                 .only('id', 'raw_description', 'vendor__name',
+                       'product__canonical_name', 'match_confidence'))
+    for ili in mapped_qs.iterator():
+        if not ili.raw_description or not ili.product:
+            continue
+        if not (_stem(ili.raw_description) & _stem(ili.product.canonical_name)):
+            suspect_count += 1
+            if len(sample_suspects) < 8:
+                sample_suspects.append({
+                    'id': ili.id,
+                    'vendor': ili.vendor.name if ili.vendor else '',
+                    'raw': (ili.raw_description or '')[:60],
+                    'canonical': ili.product.canonical_name,
+                    'confidence': ili.match_confidence,
+                })
+
+    suspect_pct = round(suspect_count / mapped * 100, 1) if mapped else 0
+
+    # --- Match confidence breakdown (live) ---
+    conf_rows_qs = (InvoiceLineItem.objects
+                    .values('match_confidence')
+                    .annotate(n=Count('id'))
+                    .order_by('-n'))
+    confidence_rows = []
+    AUTO_COMMIT = {'code', 'vendor_exact', 'exact', 'non_product'}
+    for r in conf_rows_qs:
+        conf = r['match_confidence'] or '(blank)'
+        confidence_rows.append({
+            'label': conf,
+            'n': r['n'],
+            'pct': round(r['n'] / total_ili * 100, 1) if total_ili else 0,
+            'is_auto_commit': conf in AUTO_COMMIT,
+            'is_drift': conf == 'unmatched_drift',
+            'is_unmatched': conf in ('unmatched', '', '(blank)'),
+        })
+
+    # --- Cache freshness ---
+    cache_path = Path(_settings.BASE_DIR) / 'invoice_processor' / 'mappings' / 'item_mappings.json'
+    cache_age_min = None
+    cache_source = 'unknown'
+    if cache_path.exists():
+        cache_age_min = round((time.time() - cache_path.stat().st_mtime) / 60, 1)
+        # Source: post-Step-2, refreshes from DB. Sheet fallback only when DB empty.
+        from myapp.models import ProductMapping
+        cache_source = 'DB' if ProductMapping.objects.exists() else 'sheet (fallback)'
+
+    # --- Last batch run ---
+    log_dir = Path(_settings.BASE_DIR) / 'logs'
+    last_batch = None
+    if log_dir.exists():
+        batch_logs = sorted(log_dir.glob('invoice_batch_*.log'),
+                            key=lambda p: p.stat().st_mtime, reverse=True)
+        if batch_logs:
+            last_batch_mtime = batch_logs[0].stat().st_mtime
+            last_batch = {
+                'name': batch_logs[0].name,
+                'minutes_ago': round((time.time() - last_batch_mtime) / 60),
+            }
+
+    # --- Health verdict (traffic light) ---
+    if mapped_pct >= 90 and drift_count == 0 and suspect_pct < 5:
+        verdict = 'green'
+        verdict_text = 'Healthy'
+    elif mapped_pct >= 75 and drift_count < 10 and suspect_pct < 15:
+        verdict = 'amber'
+        verdict_text = 'Watch'
+    else:
+        verdict = 'red'
+        verdict_text = 'Attention needed'
+
+    return render(request, 'myapp/mapping_health.html', {
+        'today': today,
+        'verdict': verdict,
+        'verdict_text': verdict_text,
+        'total_ili': total_ili,
+        'mapped': mapped,
+        'mapped_pct': mapped_pct,
+        'last_24h_total': last_24h_total,
+        'last_24h_mapped': last_24h_mapped,
+        'last_24h_pct': last_24h_pct,
+        'drift_count': drift_count,
+        'suspect_count': suspect_count,
+        'suspect_pct': suspect_pct,
+        'sample_suspects': sample_suspects,
+        'recent_unmapped': recent_unmapped,
+        'recent_drift': recent_drift,
+        'confidence_rows': confidence_rows,
+        'cache_age_min': cache_age_min,
+        'cache_source': cache_source,
+        'last_batch': last_batch,
+    })
+
+
 # ---- Recipe cost-coverage dashboard (Phase 5 of cost-accuracy push) ----
 
 def cost_coverage(request):
