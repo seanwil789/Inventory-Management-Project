@@ -2581,10 +2581,18 @@ def mapping_review_create_and_approve(request, proposal_id: int):
     category = (request.POST.get('category') or '').strip()
     primary = (request.POST.get('primary_descriptor') or '').strip()
     secondary = (request.POST.get('secondary_descriptor') or '').strip()
+    # Auto-derived suggestion the reviewer was offered (may be empty when
+    # derivation bailed). Captured for suggestion-vs-final analysis.
+    suggested_text = (request.POST.get('suggested_canonical_text') or '').strip()
 
     if not canonical:
         messages.error(request, 'canonical_name is required.')
         return redirect('mapping_review')
+
+    # Capture the suggestion-vs-final diff on the proposal row before approval
+    proposal.suggested_canonical_text = suggested_text
+    proposal.final_canonical_text = canonical
+    proposal.save(update_fields=['suggested_canonical_text', 'final_canonical_text'])
 
     # Check for collision — don't double-create
     existing = Product.objects.filter(canonical_name=canonical).first()

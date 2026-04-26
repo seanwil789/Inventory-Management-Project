@@ -171,6 +171,8 @@
               <form method="post" action="{% url 'mapping_review_create_and_approve' p.id %}"
                     class="space-y-2">
                 {% csrf_token %}
+                <input type="hidden" name="suggested_canonical_text"
+                       value="{{ row.suggested_canonical|default:'' }}">
                 <div class="text-xs font-semibold text-indigo-900">Create new Product + approve this mapping</div>
                 <div class="text-xs text-indigo-700">
                   Pre-filled from inference. Confidence shown per field

@@ -100,6 +100,18 @@ class ProductMappingProposal(models.Model):
         'auth.User', null=True, blank=True, on_delete=models.SET_NULL,
         related_name='mapping_proposals_reviewed',
     )
+    # Suggestion-vs-final tracking — populated only on the create_and_approve
+    # flow, where derive_canonical_suggestion offers an auto-cleaned starting
+    # point. Comparing the two over time lets us refine the derivation logic
+    # from the corpus of human edits.
+    suggested_canonical_text = models.CharField(
+        max_length=200, blank=True,
+        help_text="Auto-derived canonical name suggestion shown in the create form.",
+    )
+    final_canonical_text     = models.CharField(
+        max_length=200, blank=True,
+        help_text="Canonical name the reviewer actually saved (may differ from suggested).",
+    )
 
     class Meta:
         unique_together = [('vendor', 'raw_description')]

@@ -6410,6 +6410,67 @@ class TaxonomyInferenceTests(TestCase):
         self.assertEqual(r['primary'], (None, 'unknown'))
 
 
+class ConventionDriftAuditTests(TestCase):
+    """`audit_convention_drift` — surfaces canonical-name pattern drift
+    within (category, primary) groups."""
+
+    def _classify(self, name):
+        from myapp.management.commands.audit_convention_drift import _classify
+        return _classify(name)
+
+    def test_classify_comma_prefix(self):
+        self.assertEqual(self._classify('Pasta, Bowtie'), ('comma-prefix', 'Pasta'))
+        self.assertEqual(self._classify('Pasta, Whole Wheat'), ('comma-prefix', 'Pasta'))
+
+    def test_classify_comma_suffix(self):
+        # First segment has multiple words → falls to suffix bucket
+        self.assertEqual(self._classify('Whole Wheat Bread, Sliced'), ('comma-suffix', 'Sliced'))
+
+    def test_classify_single_word(self):
+        self.assertEqual(self._classify('Penne'), ('single-word', 'Penne'))
+        self.assertEqual(self._classify('Spaghetti'), ('single-word', 'Spaghetti'))
+
+    def test_classify_multi_word_no_comma(self):
+        self.assertEqual(self._classify('Plum Tomatoes Whole'), ('multi-word', None))
+
+    def test_command_flags_drifted_group(self):
+        """Build a group where 'Pasta, X' dominates but outliers exist;
+        the command should emit DRIFT for that group."""
+        from io import StringIO
+        from django.core.management import call_command
+        # Set up a Pastas-like group
+        Product.objects.create(canonical_name='Pasta, Bowtie', category='Test', primary_descriptor='Pastas')
+        Product.objects.create(canonical_name='Pasta, Linguine', category='Test', primary_descriptor='Pastas')
+        Product.objects.create(canonical_name='Pasta, Penne', category='Test', primary_descriptor='Pastas')
+        Product.objects.create(canonical_name='Pasta, Spaghetti', category='Test', primary_descriptor='Pastas')
+        Product.objects.create(canonical_name='Spaghetti', category='Test', primary_descriptor='Pastas')  # outlier
+        Product.objects.create(canonical_name='Cavatappi, Macaroni', category='Test', primary_descriptor='Pastas')  # outlier
+        out = StringIO()
+        call_command('audit_convention_drift', stdout=out, min_group=4)
+        s = out.getvalue()
+        self.assertIn('DRIFT', s)
+        self.assertIn('Test/Pastas', s)
+        self.assertIn("'Pasta', X", s)
+        self.assertIn('Spaghetti', s)
+        self.assertIn('Cavatappi, Macaroni', s)
+
+    def test_command_skips_uniform_group_unless_verbose(self):
+        """Uniform groups are silent by default."""
+        from io import StringIO
+        from django.core.management import call_command
+        Product.objects.create(canonical_name='Pasta, Bowtie', category='UniformCat', primary_descriptor='UniformPri')
+        Product.objects.create(canonical_name='Pasta, Linguine', category='UniformCat', primary_descriptor='UniformPri')
+        Product.objects.create(canonical_name='Pasta, Penne', category='UniformCat', primary_descriptor='UniformPri')
+        Product.objects.create(canonical_name='Pasta, Ziti', category='UniformCat', primary_descriptor='UniformPri')
+        out = StringIO()
+        call_command('audit_convention_drift', stdout=out, min_group=4)
+        self.assertNotIn('UniformCat', out.getvalue())
+        # With --verbose, the OK line shows
+        out2 = StringIO()
+        call_command('audit_convention_drift', stdout=out2, min_group=4, verbose=True)
+        self.assertIn('UniformCat', out2.getvalue())
+
+
 class CanonicalSuggestionTests(TestCase):
     """`derive_canonical_suggestion` — auto-derives a clean canonical name
     starting point for the Mapping Review create form."""
@@ -6507,6 +6568,48 @@ class MappingReviewCreateAndApproveTests(TestCase):
             vendor=self.sysco, raw_description=raw_desc,
             suggested_product=None, source='discover_unmapped', status='pending',
         )
+
+    def test_suggestion_vs_final_diff_captured(self):
+        """When the create form submits, both the auto-derived suggestion
+        and the canonical the reviewer actually saved get persisted on
+        the proposal — the corpus needed to refine derivation later."""
+        p = self._make_proposal('TOMATOES, CHERRY, 12 CONT.')
+        InvoiceLineItem.objects.create(
+            vendor=self.sysco, raw_description=p.raw_description,
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        r = self.client.post(f'/mapping-review/{p.id}/create-and-approve/', {
+            'suggested_canonical_text': 'Tomato, Cherry',  # what the form offered
+            'canonical_name': 'Tomato, Cherry, Organic',   # what Sean edited it to
+            'category': 'Produce', 'primary_descriptor': 'Solanaceae',
+            'secondary_descriptor': 'Tomato',
+        })
+        self.assertEqual(r.status_code, 302)
+        p.refresh_from_db()
+        self.assertEqual(p.suggested_canonical_text, 'Tomato, Cherry')
+        self.assertEqual(p.final_canonical_text, 'Tomato, Cherry, Organic')
+
+    def test_blank_suggestion_persists_as_empty(self):
+        """If derivation bailed (suggestion blank) and Sean typed from
+        scratch, suggested_canonical_text stays empty."""
+        p = self._make_proposal('OZCITVCLS GARBLED 12345')
+        InvoiceLineItem.objects.create(
+            vendor=self.sysco, raw_description=p.raw_description,
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        r = self.client.post(f'/mapping-review/{p.id}/create-and-approve/', {
+            'suggested_canonical_text': '',
+            'canonical_name': 'Coffee, House Blend',
+            'category': 'Coffee/Concessions',
+            'primary_descriptor': 'Coffee Dispenser Station',
+            'secondary_descriptor': '',
+        })
+        self.assertEqual(r.status_code, 302)
+        p.refresh_from_db()
+        self.assertEqual(p.suggested_canonical_text, '')
+        self.assertEqual(p.final_canonical_text, 'Coffee, House Blend')
 
     def test_creates_product_then_approves(self):
         """POST with canonical+category+primary+secondary creates Product
