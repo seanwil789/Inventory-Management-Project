@@ -6214,3 +6214,182 @@ class AttachPlaceholderFKsCommandTests(TestCase):
         call_command('attach_placeholder_fks', '--apply', verbosity=0)
         ili.refresh_from_db()
         self.assertIsNone(ili.product)
+
+
+class TaxonomyInferenceTests(TestCase):
+    """`myapp.taxonomy.infer_taxonomy` — multi-source inference for new
+    Product creation. Tests each signal in isolation + key combined cases."""
+
+    def test_subset_canonical_inheritance_dominates(self):
+        """When subset_canonical is provided + Product exists, its taxonomy
+        wins over all other signals (locked confidence)."""
+        from myapp.taxonomy import infer_taxonomy
+        Product.objects.create(canonical_name='Danish',
+            category='Bakery', primary_descriptor='Pastry', secondary_descriptor='')
+        # Even with vendor=Farm Art (Produce default) + the citrus-token 'Lemon',
+        # subset inheritance wins
+        r = infer_taxonomy('Lemon Danish', vendor='Farm Art', subset_canonical='Danish')
+        self.assertEqual(r['category'][0], 'Bakery')
+        self.assertEqual(r['primary'][0], 'Pastry')
+
+    def test_protein_primal_overrides_existing_products_vote(self):
+        """Encoded butcher knowledge overrides any existing-products vote
+        for protein primary/secondary."""
+        from myapp.taxonomy import infer_taxonomy
+        # Seed an existing Product with 'wrong' primary for the test
+        Product.objects.create(canonical_name='Beef Patties',
+            category='Proteins', primary_descriptor='Patties')
+        r = infer_taxonomy('Beef Brisket Nose Off Choice',
+                           vendor='Exceptional Foods')
+        self.assertEqual(r['category'][0], 'Proteins')
+        self.assertEqual(r['primary'][0], 'Beef')
+        self.assertEqual(r['secondary'][0], 'Brisket')
+
+    def test_cheese_signal_handles_pepper_jack(self):
+        """The token 'pepper' would normally route to Capsicum/Produce,
+        but 'pepperjack' / 'jack' as cheese types should win."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('BBRLIMP CHEESE PEPPER JACK SLI', vendor='Sysco')
+        self.assertEqual(r['category'][0], 'Cheese')
+        self.assertEqual(r['primary'][0], 'Cow')
+        # Either Pepper Jack or Jack matches; both → Semi-Hard or Semi-Soft
+        self.assertIn(r['secondary'][0], ['Semi-Hard', 'Semi-Soft'])
+
+    def test_cheese_signal_correct_milk_source_for_feta(self):
+        """Feta is Sheep traditionally — ensure encoded knowledge fires."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('CHEESE FETA CRUMBLED', vendor='Sysco', section_hint='DAIRY')
+        self.assertEqual(r['category'][0], 'Cheese')
+        self.assertEqual(r['primary'][0], 'Sheep')
+        self.assertEqual(r['secondary'][0], 'Fresh')
+
+    def test_cheese_signal_correct_for_goat(self):
+        """The word 'GOAT' as a cheese type should drive primary='Goat'."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('CHEESE GOAT FRESH 4 OZ', vendor='Farm Art')
+        self.assertEqual(r['category'][0], 'Cheese')
+        self.assertEqual(r['primary'][0], 'Goat')
+
+    def test_bakery_keyword_overrides_ingredient_tokens(self):
+        """'Lemon Danish' has Lemon (Citrus token) but Danish (bakery
+        keyword) — bakery wins. 'Cheese Danish' too."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('Lemon Danish', vendor='Philadelphia Bakery Merchants')
+        self.assertEqual(r['category'][0], 'Bakery')
+        self.assertEqual(r['primary'][0], 'Pastry')
+
+        r2 = infer_taxonomy('Cheese Danish', vendor='Philadelphia Bakery Merchants')
+        self.assertEqual(r2['category'][0], 'Bakery')
+
+    def test_produce_botanical_primary_assignment(self):
+        """Produce category + token 'mango' → primary='Stone Fruit'."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('MANGO, RED, 9CT', vendor='Farm Art')
+        self.assertEqual(r['category'][0], 'Produce')
+        self.assertEqual(r['primary'][0], 'Stone Fruit')
+
+    def test_section_hint_drives_category(self):
+        """Sysco section_hint='SEAFOOD' → category=Proteins."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('SOMETHING UNFAMILIAR', vendor='Sysco', section_hint='SEAFOOD')
+        self.assertEqual(r['category'][0], 'Proteins')
+
+    def test_vendor_default_when_no_other_signal(self):
+        """PBM vendor with unknown raw → Bakery default (medium confidence)."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('xxxx unknown thing yyyy', vendor='Philadelphia Bakery Merchants')
+        self.assertEqual(r['category'][0], 'Bakery')
+
+    def test_unknown_returns_unknowns(self):
+        """No signals match → all fields stay (None, 'unknown')."""
+        from myapp.taxonomy import infer_taxonomy
+        r = infer_taxonomy('asdf qwer zxcv', vendor=None)
+        self.assertEqual(r['category'], (None, 'unknown'))
+        self.assertEqual(r['primary'], (None, 'unknown'))
+
+
+class MappingReviewCreateAndApproveTests(TestCase):
+    """`/mapping-review/<id>/create-and-approve/` — creates Product +
+    approves proposal in one shot."""
+
+    def setUp(self):
+        super().setUp()
+        from django.contrib.auth.models import User
+        self.user = User.objects.create_user(username='reviewer2', password='x')
+        self.client.force_login(self.user)
+        self.sysco = Vendor.objects.create(name='Sysco')
+
+    def _make_proposal(self, raw_desc='SOMETHING NEW'):
+        return ProductMappingProposal.objects.create(
+            vendor=self.sysco, raw_description=raw_desc,
+            suggested_product=None, source='discover_unmapped', status='pending',
+        )
+
+    def test_creates_product_then_approves(self):
+        """POST with canonical+category+primary+secondary creates Product
+        and applies the mapping in one transaction."""
+        p = self._make_proposal()
+        # Seed an ILI matching for backfill verification
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.sysco, raw_description=p.raw_description,
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        r = self.client.post(f'/mapping-review/{p.id}/create-and-approve/', {
+            'canonical_name': 'Brand New Item',
+            'category': 'Drystock',
+            'primary_descriptor': 'Spices',
+            'secondary_descriptor': '',
+        })
+        self.assertEqual(r.status_code, 302)
+        # Product was created
+        new_p = Product.objects.get(canonical_name='Brand New Item')
+        self.assertEqual(new_p.category, 'Drystock')
+        self.assertEqual(new_p.primary_descriptor, 'Spices')
+        # Proposal approved
+        p.refresh_from_db()
+        self.assertEqual(p.status, 'approved')
+        # ILI got the FK
+        ili.refresh_from_db()
+        self.assertEqual(ili.product, new_p)
+
+    def test_uses_existing_product_if_canonical_collision(self):
+        """If canonical_name already exists, use existing Product (don't
+        crash on unique constraint)."""
+        existing = Product.objects.create(canonical_name='Already Here',
+            category='Drystock', primary_descriptor='Spices')
+        p = self._make_proposal()
+        r = self.client.post(f'/mapping-review/{p.id}/create-and-approve/', {
+            'canonical_name': 'Already Here',
+            'category': 'Different Category',  # ignored — uses existing
+            'primary_descriptor': 'Different',
+        })
+        self.assertEqual(r.status_code, 302)
+        # No new Product
+        self.assertEqual(Product.objects.filter(canonical_name='Already Here').count(), 1)
+        # Existing Product unchanged
+        existing.refresh_from_db()
+        self.assertEqual(existing.category, 'Drystock')
+
+    def test_missing_canonical_rejected(self):
+        """Empty canonical_name → error message, no Product, no approval."""
+        p = self._make_proposal()
+        before_n = Product.objects.count()
+        r = self.client.post(f'/mapping-review/{p.id}/create-and-approve/', {
+            'canonical_name': '',
+            'category': 'Drystock',
+        })
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(Product.objects.count(), before_n)
+        p.refresh_from_db()
+        self.assertEqual(p.status, 'pending')
+
+    def test_already_processed_proposal_warns(self):
+        p = self._make_proposal(raw_desc='ALREADY')
+        existing = Product.objects.create(canonical_name='X')
+        p.approve(product=existing)
+        r = self.client.post(f'/mapping-review/{p.id}/create-and-approve/', {
+            'canonical_name': 'Brand New',
+            'category': 'Drystock',
+        }, follow=True)
+        self.assertContains(r, 'already approved')

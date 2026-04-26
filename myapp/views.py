@@ -2401,6 +2401,7 @@ def mapping_review(request):
     Cheap to render — paginated, no fancy joins. The approve action
     handles the FK backfill to all matching ILI rows transactionally."""
     from .models import ProductMappingProposal
+    from .taxonomy import infer_taxonomy
     from django.db.models import Count
 
     status_filter = request.GET.get('status', 'pending')
@@ -2417,41 +2418,59 @@ def mapping_review(request):
 
     # Pre-compute ILI counts for ALL (vendor, raw_description) pairs in one
     # aggregate query — avoids a per-proposal SELECT COUNT in the loop.
-    # Counts include ALL ILIs with this raw_desc (mapped or not), which
-    # matches the "rows backfilled on approve" semantic for pending
-    # proposals. For approved/rejected views, the count remains accurate
-    # as the affected-row count.
     ili_counts_qs = (InvoiceLineItem.objects
                      .values('vendor_id', 'raw_description')
                      .annotate(n=Count('id')))
     ili_count_map = {(r['vendor_id'], r['raw_description']): r['n']
                      for r in ili_counts_qs}
 
-    # Fetch all matching proposals (typical scale: 100s), sort in Python,
-    # then slice for render. Pagination can be added when scale demands.
+    # Pre-compute most-recent section_hint per (vendor, raw_description) for
+    # use in taxonomy inference of the inline-create form.
+    ili_hint_qs = (InvoiceLineItem.objects
+                   .filter(section_hint__gt='')
+                   .values('vendor_id', 'raw_description', 'section_hint')
+                   .order_by('-invoice_date'))
+    section_hint_map = {}
+    for r in ili_hint_qs:
+        key = (r['vendor_id'], r['raw_description'])
+        if key not in section_hint_map:
+            section_hint_map[key] = r['section_hint']
+
     proposals = list(qs)
     proposal_rows = []
     for p in proposals:
         n = ili_count_map.get((p.vendor_id, p.raw_description), 0)
-        proposal_rows.append({'p': p, 'ili_count': n})
+        # Pre-compute taxonomy inference for the inline-create form
+        section_hint = section_hint_map.get((p.vendor_id, p.raw_description))
+        subset = p.suggested_product.canonical_name if p.suggested_product else None
+        inferred = infer_taxonomy(
+            p.raw_description,
+            vendor=p.vendor.name if p.vendor else None,
+            section_hint=section_hint,
+            subset_canonical=subset,
+        )
+        proposal_rows.append({
+            'p': p,
+            'ili_count': n,
+            'inferred': inferred,
+        })
 
     if sort_by == 'frequency':
-        # Highest-impact first; tiebreak by recency so newest within a tier wins
         proposal_rows.sort(key=lambda r: (-r['ili_count'], -r['p'].created_at.timestamp()))
-    else:   # 'recent'
+    else:
         proposal_rows.sort(key=lambda r: -r['p'].created_at.timestamp())
 
-    proposal_rows = proposal_rows[:100]   # cap render
+    proposal_rows = proposal_rows[:100]
 
-    # Status counters for the filter chips
     status_counts = dict(
         ProductMappingProposal.objects.values('status').annotate(n=Count('id'))
         .values_list('status', 'n')
     )
     vendors = list(Vendor.objects.order_by('name').values_list('name', flat=True))
-    # Cached list of all canonicals for autocomplete (Product.canonical_name)
     all_canonicals = list(Product.objects.order_by('canonical_name')
                           .values_list('canonical_name', flat=True))
+    # Distinct categories already in DB — for the inline-create form's category dropdown
+    categories = sorted({c for c in Product.objects.values_list('category', flat=True).distinct() if c})
 
     return render(request, 'myapp/mapping_review.html', {
         'proposals': proposal_rows,
@@ -2461,6 +2480,7 @@ def mapping_review(request):
         'status_counts': status_counts,
         'vendors': vendors,
         'all_canonicals': all_canonicals,
+        'categories': categories,
     })
 
 
@@ -2518,6 +2538,60 @@ def mapping_review_reject(request, proposal_id: int):
         notes=notes,
     )
     messages.info(request, f"Rejected proposal #{proposal.id}.")
+    return redirect('mapping_review')
+
+
+@require_POST
+def mapping_review_create_and_approve(request, proposal_id: int):
+    """POST endpoint: CREATE a new Product from inline form fields, then
+    approve the proposal pointing at it. Lets reviewers add new canonicals
+    without leaving the queue.
+
+    Required POST params:
+      canonical_name        — must be unique (rejected if exists)
+      category              — Product.category
+      primary_descriptor    — Product.primary_descriptor
+      secondary_descriptor  — Product.secondary_descriptor (optional)
+    """
+    from .models import ProductMappingProposal
+    proposal = get_object_or_404(ProductMappingProposal, id=proposal_id)
+    if proposal.status != 'pending':
+        messages.warning(request, f"Proposal #{proposal.id} already {proposal.status}.")
+        return redirect('mapping_review')
+
+    canonical = (request.POST.get('canonical_name') or '').strip()
+    category = (request.POST.get('category') or '').strip()
+    primary = (request.POST.get('primary_descriptor') or '').strip()
+    secondary = (request.POST.get('secondary_descriptor') or '').strip()
+
+    if not canonical:
+        messages.error(request, 'canonical_name is required.')
+        return redirect('mapping_review')
+
+    # Check for collision — don't double-create
+    existing = Product.objects.filter(canonical_name=canonical).first()
+    if existing is not None:
+        messages.warning(request,
+            f"Canonical {canonical!r} already exists — using existing Product.")
+        product = existing
+    else:
+        product = Product.objects.create(
+            canonical_name=canonical,
+            category=category,
+            primary_descriptor=primary,
+            secondary_descriptor=secondary,
+        )
+        messages.success(request,
+            f"Created Product {canonical!r} ({category}/{primary}/{secondary}).")
+
+    # Now approve the proposal pointing at the new (or existing) Product
+    result = proposal.approve(
+        product=product,
+        reviewer=request.user if request.user.is_authenticated else None,
+        notes=f'Created via inline form. Inferred fields: {category}/{primary}/{secondary}',
+    )
+    messages.success(request,
+        f"Approved → {canonical!r} | backfilled {result['ili_updated']} ILI rows.")
     return redirect('mapping_review')
 
 

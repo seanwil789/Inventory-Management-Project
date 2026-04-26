@@ -47,6 +47,7 @@ urlpatterns = [
     path('mapping-review/',                 views.mapping_review,      name='mapping_review'),
     path('mapping-review/<int:proposal_id>/approve/', views.mapping_review_approve, name='mapping_review_approve'),
     path('mapping-review/<int:proposal_id>/reject/',  views.mapping_review_reject,  name='mapping_review_reject'),
+    path('mapping-review/<int:proposal_id>/create-and-approve/', views.mapping_review_create_and_approve, name='mapping_review_create_and_approve'),
     path('cost-coverage/',                  views.cost_coverage,       name='cost_coverage'),
     path('historical/',                     views.historical_dishes,   name='historical_dishes'),
     path('popularity/',                     views.popularity_dashboard, name='popularity_dashboard'),

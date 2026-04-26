@@ -138,6 +138,11 @@
                     ✗ Reject
                   </button>
                 </form>
+                <button type="button"
+                        onclick="document.getElementById('create-form-{{ p.id }}').classList.toggle('hidden')"
+                        class="px-2 py-0.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs ml-1">
+                  + Create new
+                </button>
               {% else %}
                 <span class="text-xs text-slate-500">
                   {{ p.get_status_display }}
@@ -151,6 +156,113 @@
           <tr class="bg-slate-50/50 border-t-0">
             <td colspan="6" class="px-3 py-1 text-xs text-slate-600">
               <span class="text-slate-400">Notes:</span> {{ p.notes|linebreaksbr }}
+            </td>
+          </tr>
+          {% endif %}
+          {% if p.status == 'pending' %}
+          <tr id="create-form-{{ p.id }}" class="hidden bg-indigo-50/40 border-t-0">
+            <td colspan="6" class="px-3 py-3">
+              <form method="post" action="{% url 'mapping_review_create_and_approve' p.id %}"
+                    class="space-y-2">
+                {% csrf_token %}
+                <div class="text-xs font-semibold text-indigo-900">Create new Product + approve this mapping</div>
+                <div class="text-xs text-indigo-700">
+                  Pre-filled from inference. Confidence shown per field
+                  (✓=high · ?=medium · ⚠=low · ?=unknown). Edit if wrong.
+                </div>
+                <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                  <label class="block">
+                    <span class="text-xs text-slate-600">Canonical name *</span>
+                    <input type="text" name="canonical_name" required
+                           value="{{ p.raw_description|truncatechars:60 }}"
+                           list="dl-canonicals"
+                           class="border rounded px-2 py-1 text-sm w-full"
+                           autocomplete="off">
+                  </label>
+                  <label class="block">
+                    <span class="text-xs text-slate-600">
+                      Category
+                      {% if row.inferred.category.0 %}
+                        <span class="ml-1
+                          {% if row.inferred.category.1 == 'high' %}text-emerald-700
+                          {% elif row.inferred.category.1 == 'medium' %}text-amber-700
+                          {% else %}text-slate-400{% endif %}">
+                          {% if row.inferred.category.1 == 'high' %}✓
+                          {% elif row.inferred.category.1 == 'medium' %}?
+                          {% elif row.inferred.category.1 == 'low' %}⚠
+                          {% else %}?{% endif %}
+                        </span>
+                      {% endif %}
+                    </span>
+                    <select name="category"
+                            class="border rounded px-2 py-1 text-sm w-full">
+                      <option value="">(none)</option>
+                      {% for c in categories %}
+                        <option value="{{ c }}" {% if c == row.inferred.category.0 %}selected{% endif %}>{{ c }}</option>
+                      {% endfor %}
+                    </select>
+                  </label>
+                  <label class="block">
+                    <span class="text-xs text-slate-600">
+                      Primary descriptor
+                      {% if row.inferred.primary.0 %}
+                        <span class="ml-1
+                          {% if row.inferred.primary.1 == 'high' %}text-emerald-700
+                          {% elif row.inferred.primary.1 == 'medium' %}text-amber-700
+                          {% else %}text-slate-400{% endif %}">
+                          {% if row.inferred.primary.1 == 'high' %}✓
+                          {% elif row.inferred.primary.1 == 'medium' %}?
+                          {% elif row.inferred.primary.1 == 'low' %}⚠
+                          {% else %}?{% endif %}
+                        </span>
+                      {% endif %}
+                    </span>
+                    <input type="text" name="primary_descriptor"
+                           value="{% if row.inferred.primary.0 %}{{ row.inferred.primary.0 }}{% endif %}"
+                           class="border rounded px-2 py-1 text-sm w-full">
+                  </label>
+                  <label class="block">
+                    <span class="text-xs text-slate-600">
+                      Secondary descriptor
+                      {% if row.inferred.secondary.0 %}
+                        <span class="ml-1
+                          {% if row.inferred.secondary.1 == 'high' %}text-emerald-700
+                          {% elif row.inferred.secondary.1 == 'medium' %}text-amber-700
+                          {% else %}text-slate-400{% endif %}">
+                          {% if row.inferred.secondary.1 == 'high' %}✓
+                          {% elif row.inferred.secondary.1 == 'medium' %}?
+                          {% elif row.inferred.secondary.1 == 'low' %}⚠
+                          {% else %}?{% endif %}
+                        </span>
+                      {% endif %}
+                    </span>
+                    <input type="text" name="secondary_descriptor"
+                           value="{% if row.inferred.secondary.0 %}{{ row.inferred.secondary.0 }}{% endif %}"
+                           class="border rounded px-2 py-1 text-sm w-full">
+                  </label>
+                </div>
+                <div class="text-xs text-slate-500">
+                  <span class="font-semibold">Inference reasoning:</span>
+                  <ul class="list-disc list-inside ml-2">
+                    {% for reason in row.inferred.reasoning %}
+                      <li>{{ reason }}</li>
+                    {% empty %}
+                      <li>(no signals matched — fill manually)</li>
+                    {% endfor %}
+                  </ul>
+                </div>
+                <div class="flex gap-2">
+                  <button type="submit"
+                          class="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs">
+                    Create product + approve
+                  </button>
+                  <button type="button"
+                          onclick="document.getElementById('create-form-{{ p.id }}').classList.add('hidden')"
+                          class="px-3 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-xs">
+                    Cancel
+                  </button>
+                </div>
+              </form>
             </td>
           </tr>
           {% endif %}
