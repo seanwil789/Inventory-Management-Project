@@ -4443,6 +4443,53 @@ class MapperNewTiersTests(TestCase):
         self.assertEqual(mapper._stem_text('cs'), '')  # <3 chars rejected
         self.assertEqual(mapper._stem_text(''), '')
 
+    def test_stemmer_food_domain_plurals(self):
+        """Food-domain plural patterns: ies→y, oes→o, ches/shes/xes→ch/sh/x.
+
+        These all surface from real raw vendor descriptions; without
+        suffix-specific stemming they fail to match their singular
+        canonicals at fuzzy tiers."""
+        mapper = self._mapper()
+        s = mapper._stem_text
+        # rries → rry  (the ie→y berry family)
+        self.assertEqual(s('BERRIES'), 'berry')
+        self.assertEqual(s('RASPBERRIES'), 'raspberry')
+        self.assertEqual(s('STRAWBERRIES FRESH'), 'strawberry fresh')
+        self.assertEqual(s('BLUEBERRIES'), 'blueberry')
+        self.assertEqual(s('CHERRIES'), 'cherry')
+        # ovies → ovy  (anchovies → anchovy)
+        self.assertEqual(s('ANCHOVIES'), 'anchovy')
+        # atoes → ato
+        self.assertEqual(s('TOMATOES DICED'), 'tomato diced')
+        self.assertEqual(s('POTATOES'), 'potato')
+        # goes → go
+        self.assertEqual(s('MANGOES'), 'mango')
+        # ches → ch
+        self.assertEqual(s('PEACHES SLICED'), 'peach sliced')
+        # shes → sh
+        self.assertEqual(s('DISHES'), 'dish')
+        # xes → x
+        self.assertEqual(s('BOXES'), 'box')
+
+    def test_stemmer_does_not_overstem(self):
+        """Words that LOOK plural but aren't (cookies, brownies, shoes)
+        must not be over-stemmed. Their singulars end in 'ie' or 'oe',
+        not 'y' or 'o', so the suffix patterns must be tight enough to
+        leave them alone."""
+        mapper = self._mapper()
+        s = mapper._stem_text
+        # 'kies' is NOT in the rries/ovies pattern — falls through to
+        # generic 's' strip, giving 'cookie' (the actual singular).
+        self.assertEqual(s('COOKIES'), 'cookie')
+        self.assertEqual(s('BROWNIES'), 'brownie')
+        # 'shoes' has no goes/atoes prefix — falls to generic 's'.
+        self.assertEqual(s('SHOES'), 'shoe')
+        # 'movies' technically ends in 'ovies' but len(6) < 7 guard,
+        # so falls to generic 's' strip → 'movie'.
+        self.assertEqual(s('MOVIES'), 'movie')
+        # 'mango' (singular, no plural suffix) stays as-is.
+        self.assertEqual(s('MANGO FRESH'), 'mango fresh')
+
     def test_stemmed_fuzzy_catches_plurals(self):
         """PINEAPPLES raw → Pineapple canonical via stemmed tier."""
         mapper = self._mapper()

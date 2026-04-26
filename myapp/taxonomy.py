@@ -367,8 +367,26 @@ def _tokenize(s: str) -> list[str]:
 
 
 def _stem(token: str) -> str:
-    """Crude plural strip — same as mapper._stem_text approach."""
+    """Plural strip — mirrors mapper._stem_text food-domain patterns.
+
+    Handles 'rries'→'rry', 'ovies'→'ovy', 'atoes'→'ato', 'goes'→'go',
+    'ches'→'ch', 'shes'→'sh', 'xes'→'x', and trailing 's' fallback.
+    Suffix-anchored so cookies/brownies/shoes don't over-stem."""
     t = token.lower()
+    if t.endswith('rries') and len(t) >= 6:
+        return t[:-3] + 'y'
+    if t.endswith('ovies') and len(t) >= 7:
+        return t[:-3] + 'y'
+    if t.endswith('atoes') and len(t) >= 6:
+        return t[:-2]
+    if t.endswith('goes') and len(t) >= 5:
+        return t[:-2]
+    if t.endswith('ches') and len(t) >= 5:
+        return t[:-2]
+    if t.endswith('shes') and len(t) >= 5:
+        return t[:-2]
+    if t.endswith('xes') and len(t) >= 4:
+        return t[:-2]
     if len(t) >= 4 and t.endswith('s') and not t.endswith('ss'):
         return t[:-1]
     return t

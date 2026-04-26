@@ -107,11 +107,40 @@ _STEM_TOKEN_RE = re.compile(r'[A-Za-z]{3,}')
 
 def _stem_text(text: str) -> str:
     """Lowercase + strip punctuation + stem plural tokens. Returns a
-    space-joined string of stemmed tokens, suitable for fuzzy comparison."""
+    space-joined string of stemmed tokens, suitable for fuzzy comparison.
+
+    Handles common food-domain plural patterns (longest suffix wins):
+      'rries' → 'rry'  (berries → berry, raspberries → raspberry)
+      'ovies' → 'ovy'  (anchovies → anchovy)
+      'atoes' → 'ato'  (tomatoes → tomato, potatoes → potato)
+      'goes'  → 'go'   (mangoes → mango)
+      'ches'  → 'ch'   (peaches → peach)
+      'shes'  → 'sh'   (dishes → dish)
+      'xes'   → 'x'    (boxes → box)
+      's'     → ''     (fallback — bagels → bagel, apples → apple)
+
+    Patterns are suffix-specific so cookies/brownies/movies (singulars
+    end in 'ie') and shoes (singular ends in 'oe') don't get
+    over-stemmed. Adding new patterns is safe — keep them suffix-anchored
+    and long enough that incidental collisions are unlikely."""
     tokens = []
     for t in _STEM_TOKEN_RE.findall(text or ''):
         low = t.lower()
-        if len(low) >= 4 and low.endswith('s') and not low.endswith('ss'):
+        if low.endswith('rries') and len(low) >= 6:
+            low = low[:-3] + 'y'
+        elif low.endswith('ovies') and len(low) >= 7:
+            low = low[:-3] + 'y'
+        elif low.endswith('atoes') and len(low) >= 6:
+            low = low[:-2]
+        elif low.endswith('goes') and len(low) >= 5:
+            low = low[:-2]
+        elif low.endswith('ches') and len(low) >= 5:
+            low = low[:-2]
+        elif low.endswith('shes') and len(low) >= 5:
+            low = low[:-2]
+        elif low.endswith('xes') and len(low) >= 4:
+            low = low[:-2]
+        elif len(low) >= 4 and low.endswith('s') and not low.endswith('ss'):
             low = low[:-1]
         tokens.append(low)
     return ' '.join(tokens)
