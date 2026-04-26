@@ -180,10 +180,13 @@
                   <label class="block">
                     <span class="text-xs text-slate-600">Canonical name *</span>
                     <input type="text" name="canonical_name" required
-                           value="{{ p.raw_description|truncatechars:60 }}"
+                           placeholder="e.g., Pringles, Original"
                            list="dl-canonicals"
                            class="border rounded px-2 py-1 text-sm w-full"
                            autocomplete="off">
+                    <span class="text-xs text-slate-400 italic">
+                      Type the cleaned canonical, not the vendor raw.
+                    </span>
                   </label>
                   <label class="block">
                     <span class="text-xs text-slate-600">
