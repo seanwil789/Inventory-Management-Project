@@ -17,6 +17,7 @@ import re
 from rapidfuzz import process, fuzz, utils as fuzz_utils
 from sheets import get_sheet_values
 from config import SPREADSHEET_ID, MAPPING_TAB
+from abbreviations import expand_abbreviations
 
 MAPPING_CACHE_PATH = "invoice_processor/mappings/item_mappings.json"
 MAPPING_CACHE_TTL_SECONDS = 3600  # 1 hour
@@ -582,15 +583,31 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
             pools_to_try.append(section_pool)
         pools_to_try.append(canonical_names_full)
 
+        # Expand abbreviations BEFORE fuzzy matching against canonical names —
+        # canonicals are English words ('Chicken Breast', 'Pork Shoulder',
+        # 'Heavy Cream') so expansion bridges the OCR-shorthand gap.
+        # ('BRST CHKN BNLS' → 'Breast Chicken Boneless' now matches
+        # 'Chicken Breast' canonical at high score; previously zero overlap.)
+        # Limited to tier 6 — tiers 2-5 match against sheet entries which
+        # share the same abbreviations as raw input.
         stripped = _strip_sysco_prefix(normalized)
-        stripped_for_stem = stripped if stripped != normalized else normalized
+        expanded = expand_abbreviations(stripped)
+        stripped_for_stem = expanded if expanded != normalized else normalized
         stemmed_desc = _stem_text(stripped_for_stem)
+        # The token-overlap gate also operates on expanded text so post-strip
+        # English words can satisfy the gate without abbreviations defeating it.
+        gate_text = expanded
 
         for canonical_names in pools_to_try:
-            # 6a. Stripped prefix + token_set_ratio (existing behavior)
-            if stripped != normalized:
+            # 6a. Stripped prefix + token_set_ratio.
+            # Use EXPANDED for the fuzzy match (bridges abbreviations) but
+            # STRIPPED (no expansion) for the secondary 75-threshold shape
+            # check — expansion lengthens the string and unfairly trips it.
+            # Token-overlap gate still uses expanded so abbreviations don't
+            # defeat the gate.
+            if expanded != normalized:
                 result = process.extractOne(
-                    stripped,
+                    expanded,
                     canonical_names,
                     scorer=fuzz.token_set_ratio,
                     processor=fuzz_utils.default_process,
@@ -598,7 +615,7 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
                 if result and result[1] >= STRIPPED_FUZZY_THRESHOLD and \
                         fuzz.token_sort_ratio(stripped, result[0],
                                              processor=fuzz_utils.default_process) >= 75 and \
-                        _has_token_overlap(normalized, result[0]):
+                        _has_token_overlap(gate_text, result[0]):
                     return _attach_category({
                         **item,
                         "canonical":  result[0],

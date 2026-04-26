@@ -2436,23 +2436,16 @@ def mapping_review(request):
         if key not in section_hint_map:
             section_hint_map[key] = r['section_hint']
 
+    # Pass 1: build lightweight rows with frequency, sort, slice to display cap
+    # — defer the expensive inference call to only the rows that'll render.
     proposals = list(qs)
     proposal_rows = []
     for p in proposals:
         n = ili_count_map.get((p.vendor_id, p.raw_description), 0)
-        # Pre-compute taxonomy inference for the inline-create form
-        section_hint = section_hint_map.get((p.vendor_id, p.raw_description))
-        subset = p.suggested_product.canonical_name if p.suggested_product else None
-        inferred = infer_taxonomy(
-            p.raw_description,
-            vendor=p.vendor.name if p.vendor else None,
-            section_hint=section_hint,
-            subset_canonical=subset,
-        )
         proposal_rows.append({
             'p': p,
             'ili_count': n,
-            'inferred': inferred,
+            'inferred': None,   # filled below for visible rows only
         })
 
     if sort_by == 'frequency':
@@ -2461,6 +2454,18 @@ def mapping_review(request):
         proposal_rows.sort(key=lambda r: -r['p'].created_at.timestamp())
 
     proposal_rows = proposal_rows[:100]
+
+    # Pass 2: run inference only on the visible 100 (was running on all 270+)
+    for row in proposal_rows:
+        p = row['p']
+        section_hint = section_hint_map.get((p.vendor_id, p.raw_description))
+        subset = p.suggested_product.canonical_name if p.suggested_product else None
+        row['inferred'] = infer_taxonomy(
+            p.raw_description,
+            vendor=p.vendor.name if p.vendor else None,
+            section_hint=section_hint,
+            subset_canonical=subset,
+        )
 
     status_counts = dict(
         ProductMappingProposal.objects.values('status').annotate(n=Count('id'))

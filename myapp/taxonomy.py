@@ -345,9 +345,25 @@ _SYSCO_SECTION_TO_CATEGORY = {
 _TOKEN_RE = re.compile(r'[A-Za-z]{3,}')
 
 
+def _expand_text(s: str) -> str:
+    """Expand vendor abbreviations (BRST→Breast, CHKN→Chicken, SHRD→Shredded)
+    so English-token matching against canonicals + BoY actually finds
+    overlap. Single source-of-truth dict lives in
+    invoice_processor/abbreviations.py."""
+    if not s:
+        return s
+    import sys
+    from django.conf import settings
+    p = str(settings.BASE_DIR / 'invoice_processor')
+    if p not in sys.path:
+        sys.path.insert(0, p)
+    from abbreviations import expand_abbreviations
+    return expand_abbreviations(s)
+
+
 def _tokenize(s: str) -> list[str]:
-    """Lowercase 3+letter tokens for matching."""
-    return [t.lower() for t in _TOKEN_RE.findall(s or '')]
+    """Lowercase 3+letter tokens — vendor abbreviations expanded first."""
+    return [t.lower() for t in _TOKEN_RE.findall(_expand_text(s) or '')]
 
 
 def _stem(token: str) -> str:
@@ -594,7 +610,9 @@ def infer_taxonomy(raw_description, vendor=None, section_hint=None,
     confidence_label is 'high' | 'medium' | 'low' | 'unknown'.
     """
     raw_tokens = _stems(raw_description)
-    raw_lower = (raw_description or '').lower()
+    # Use expanded text everywhere so substring + token signals see English
+    # words rather than vendor abbreviations.
+    raw_lower = _expand_text(raw_description or '').lower()
 
     # Initialize with unknowns
     out = {

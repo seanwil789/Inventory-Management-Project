@@ -6393,3 +6393,64 @@ class MappingReviewCreateAndApproveTests(TestCase):
             'category': 'Drystock',
         }, follow=True)
         self.assertContains(r, 'already approved')
+
+
+class AbbreviationExpansionTests(TestCase):
+    """`invoice_processor/abbreviations.py` — Sysco vendor abbreviation
+    expansion. Used by both mapper.py (tier 6 fuzzy matching) and
+    taxonomy.py (inference for new Product creation)."""
+
+    def _import_abbrev(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'abbreviations' in sys.modules:
+            del sys.modules['abbreviations']
+        import abbreviations
+        return abbreviations
+
+    def test_basic_protein_expansion(self):
+        abbrev = self._import_abbrev()
+        self.assertEqual(
+            abbrev.expand_abbreviations('BRST CHKN BNLS CKD'),
+            'Breast Chicken Boneless Cooked',
+        )
+
+    def test_sliced_shredded_grated(self):
+        abbrev = self._import_abbrev()
+        self.assertIn('Sliced', abbrev.expand_abbreviations('CHEESE PROVOLONE SLI'))
+        self.assertIn('Shredded', abbrev.expand_abbreviations('MOZZARELLA SHRD'))
+        self.assertIn('Grated', abbrev.expand_abbreviations('PARMESAN GRTD'))
+
+    def test_does_not_expand_pure_unit_abbreviations(self):
+        """LB, OZ, GAL, CT, BG, etc. are NOT expanded — they'd add noise
+        tokens that hurt fuzzy-matching against product canonicals."""
+        abbrev = self._import_abbrev()
+        result = abbrev.expand_abbreviations('BG 150 LB PACKER SUGAR GRANULATED')
+        self.assertNotIn('Pound', result)
+        self.assertNotIn('Bag', result)
+        self.assertIn('LB', result)
+        self.assertIn('SUGAR', result)
+
+    def test_word_boundary_no_partial_matches(self):
+        """Abbreviation matches require word boundaries — 'BR' inside
+        'BRSKT' must not partially expand."""
+        abbrev = self._import_abbrev()
+        result = abbrev.expand_abbreviations('BRISKET')
+        self.assertEqual(result, 'BRISKET')   # unchanged
+
+    def test_case_insensitive(self):
+        abbrev = self._import_abbrev()
+        self.assertIn('Boneless', abbrev.expand_abbreviations('chicken bnls 5lb'))
+
+    def test_multi_word_abbreviation(self):
+        """'GRL MRK' → 'Grill Marked' (multi-token abbreviation)."""
+        abbrev = self._import_abbrev()
+        self.assertIn('Grill Marked', abbrev.expand_abbreviations('CHKN BRST GRL MRK'))
+
+    def test_empty_input(self):
+        abbrev = self._import_abbrev()
+        self.assertEqual(abbrev.expand_abbreviations(''), '')
+        self.assertIsNone(abbrev.expand_abbreviations(None))
