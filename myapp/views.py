@@ -2405,25 +2405,43 @@ def mapping_review(request):
 
     status_filter = request.GET.get('status', 'pending')
     vendor_filter = request.GET.get('vendor', '')
+    sort_by = request.GET.get('sort', 'frequency')   # 'frequency' | 'recent'
 
     qs = (ProductMappingProposal.objects
-          .select_related('vendor', 'suggested_product', 'reviewed_by')
-          .order_by('-created_at'))
+          .select_related('vendor', 'suggested_product', 'reviewed_by'))
 
     if status_filter and status_filter != 'all':
         qs = qs.filter(status=status_filter)
     if vendor_filter:
         qs = qs.filter(vendor__name=vendor_filter)
 
-    proposals = list(qs[:100])  # cap render
+    # Pre-compute ILI counts for ALL (vendor, raw_description) pairs in one
+    # aggregate query — avoids a per-proposal SELECT COUNT in the loop.
+    # Counts include ALL ILIs with this raw_desc (mapped or not), which
+    # matches the "rows backfilled on approve" semantic for pending
+    # proposals. For approved/rejected views, the count remains accurate
+    # as the affected-row count.
+    ili_counts_qs = (InvoiceLineItem.objects
+                     .values('vendor_id', 'raw_description')
+                     .annotate(n=Count('id')))
+    ili_count_map = {(r['vendor_id'], r['raw_description']): r['n']
+                     for r in ili_counts_qs}
 
-    # For each proposal, count the ILI rows that would be backfilled on approve
+    # Fetch all matching proposals (typical scale: 100s), sort in Python,
+    # then slice for render. Pagination can be added when scale demands.
+    proposals = list(qs)
     proposal_rows = []
     for p in proposals:
-        ili_count = InvoiceLineItem.objects.filter(
-            vendor=p.vendor, raw_description=p.raw_description,
-        ).count()
-        proposal_rows.append({'p': p, 'ili_count': ili_count})
+        n = ili_count_map.get((p.vendor_id, p.raw_description), 0)
+        proposal_rows.append({'p': p, 'ili_count': n})
+
+    if sort_by == 'frequency':
+        # Highest-impact first; tiebreak by recency so newest within a tier wins
+        proposal_rows.sort(key=lambda r: (-r['ili_count'], -r['p'].created_at.timestamp()))
+    else:   # 'recent'
+        proposal_rows.sort(key=lambda r: -r['p'].created_at.timestamp())
+
+    proposal_rows = proposal_rows[:100]   # cap render
 
     # Status counters for the filter chips
     status_counts = dict(
@@ -2439,6 +2457,7 @@ def mapping_review(request):
         'proposals': proposal_rows,
         'status_filter': status_filter,
         'vendor_filter': vendor_filter,
+        'sort_by': sort_by,
         'status_counts': status_counts,
         'vendors': vendors,
         'all_canonicals': all_canonicals,

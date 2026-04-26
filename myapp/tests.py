@@ -6089,3 +6089,128 @@ class MappingReviewViewTests(TestCase):
         self.client.post(f'/mapping-review/{p.id}/approve/')
         r = self.client.post(f'/mapping-review/{p.id}/approve/', follow=True)
         self.assertContains(r, 'already approved')
+
+    def test_frequency_sort_orders_by_ili_count_desc(self):
+        """Default ?sort=frequency puts the highest-ILI-count proposal first."""
+        # High-frequency item: 5 ILIs share this raw_desc
+        high_p = self._make_proposal(raw_desc='HIGH FREQ')
+        for _ in range(5):
+            InvoiceLineItem.objects.create(
+                vendor=self.sysco, raw_description='HIGH FREQ',
+                product=None, match_confidence='vendor_fuzzy_pending',
+                invoice_date=date(2026, 4, 20),
+            )
+        # Low-frequency: 1 ILI
+        low_p = self._make_proposal(raw_desc='LOW FREQ')
+        InvoiceLineItem.objects.create(
+            vendor=self.sysco, raw_description='LOW FREQ',
+            product=None, match_confidence='vendor_fuzzy_pending',
+            invoice_date=date(2026, 4, 20),
+        )
+        r = self.client.get('/mapping-review/?sort=frequency')
+        self.assertEqual(r.status_code, 200)
+        # high should appear before low in the rendered HTML
+        body = r.content.decode()
+        self.assertLess(body.index('HIGH FREQ'), body.index('LOW FREQ'),
+                        'Frequency sort should put HIGH FREQ before LOW FREQ')
+
+
+class PopulateMappingReviewCommandTests(TestCase):
+    """`populate_mapping_review_from_unmapped` mgmt command — bulk-queues
+    proposals from existing unmapped ILI rows."""
+
+    def test_skips_sysco_placeholders(self):
+        """Sysco placeholder rows are skipped — they need rep CSV not human review."""
+        from django.core.management import call_command
+        v = Vendor.objects.create(name='Sysco')
+        InvoiceLineItem.objects.create(
+            vendor=v, raw_description='[Sysco #1234567]',
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        InvoiceLineItem.objects.create(
+            vendor=v, raw_description='REGULAR UNMAPPED ITEM',
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        call_command('populate_mapping_review_from_unmapped', '--apply', verbosity=0)
+        # Only the regular item gets a proposal; placeholder skipped
+        self.assertEqual(ProductMappingProposal.objects.count(), 1)
+        self.assertEqual(
+            ProductMappingProposal.objects.first().raw_description,
+            'REGULAR UNMAPPED ITEM',
+        )
+
+    def test_skips_existing_proposals(self):
+        """Re-running doesn't duplicate proposals."""
+        from django.core.management import call_command
+        v = Vendor.objects.create(name='Sysco')
+        InvoiceLineItem.objects.create(
+            vendor=v, raw_description='ITEM A',
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        # First run creates 1
+        call_command('populate_mapping_review_from_unmapped', '--apply', verbosity=0)
+        self.assertEqual(ProductMappingProposal.objects.count(), 1)
+        # Second run — no new
+        call_command('populate_mapping_review_from_unmapped', '--apply', verbosity=0)
+        self.assertEqual(ProductMappingProposal.objects.count(), 1)
+
+    def test_skips_non_product_and_drift_tiers(self):
+        """Rows already classified as non_product or unmatched_drift are skipped."""
+        from django.core.management import call_command
+        v = Vendor.objects.create(name='Sysco')
+        InvoiceLineItem.objects.create(
+            vendor=v, raw_description='FUEL SURCHARGE',
+            product=None, match_confidence='non_product',
+            invoice_date=date(2026, 4, 20),
+        )
+        InvoiceLineItem.objects.create(
+            vendor=v, raw_description='DRIFT ITEM',
+            product=None, match_confidence='unmatched_drift',
+            invoice_date=date(2026, 4, 20),
+        )
+        call_command('populate_mapping_review_from_unmapped', '--apply', verbosity=0)
+        self.assertEqual(ProductMappingProposal.objects.count(), 0)
+
+
+class AttachPlaceholderFKsCommandTests(TestCase):
+    """`attach_placeholder_fks` mgmt command — fixes stale-unmapped Sysco
+    placeholder ILI rows whose SUPC is now in code_map."""
+
+    def test_attaches_fk_when_supc_in_product_mapping(self):
+        """Placeholder ILI with SUPC that has a matching ProductMapping row
+        with vendor=Sysco gets the FK attached + match_confidence='code'."""
+        from django.core.management import call_command
+        v = Vendor.objects.create(name='Sysco')
+        ritz = Product.objects.create(canonical_name='Ritz')
+        # Seed the SUPC mapping in DB so mapper.load_mappings sees it
+        ProductMapping.objects.create(
+            vendor=v, description='RITZ CRACKER',
+            supc='1234567', product=ritz,
+        )
+        # Stale placeholder ILI (no FK)
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, raw_description='[Sysco #1234567]',
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        call_command('attach_placeholder_fks', '--apply', verbosity=0)
+        ili.refresh_from_db()
+        self.assertEqual(ili.product, ritz)
+        self.assertEqual(ili.match_confidence, 'code')
+        self.assertEqual(ili.match_score, 100)
+
+    def test_skips_unknown_supcs(self):
+        """Placeholders whose SUPC isn't in code_map stay placeholders."""
+        from django.core.management import call_command
+        v = Vendor.objects.create(name='Sysco')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, raw_description='[Sysco #9999999]',
+            product=None, match_confidence='unmatched',
+            invoice_date=date(2026, 4, 20),
+        )
+        call_command('attach_placeholder_fks', '--apply', verbosity=0)
+        ili.refresh_from_db()
+        self.assertIsNone(ili.product)

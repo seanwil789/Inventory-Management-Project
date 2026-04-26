@@ -52,13 +52,25 @@
     </a>
 
     <span class="text-slate-500 ml-4">Vendor:</span>
-    <select onchange="window.location.href='?status={{ status_filter }}&vendor=' + this.value"
+    <select onchange="window.location.href='?status={{ status_filter }}&sort={{ sort_by }}&vendor=' + this.value"
             class="border rounded px-2 py-1 text-sm">
       <option value="">All vendors</option>
       {% for v in vendors %}
         <option value="{{ v }}" {% if v == vendor_filter %}selected{% endif %}>{{ v }}</option>
       {% endfor %}
     </select>
+
+    <span class="text-slate-500 ml-4">Sort by:</span>
+    <a href="?status={{ status_filter }}&vendor={{ vendor_filter }}&sort=frequency"
+       class="px-3 py-1 rounded-full
+       {% if sort_by == 'frequency' %}bg-indigo-100 text-indigo-900 border border-indigo-300{% else %}bg-slate-100 text-slate-700 hover:bg-slate-200{% endif %}">
+      Frequency ↓
+    </a>
+    <a href="?status={{ status_filter }}&vendor={{ vendor_filter }}&sort=recent"
+       class="px-3 py-1 rounded-full
+       {% if sort_by == 'recent' %}bg-indigo-100 text-indigo-900 border border-indigo-300{% else %}bg-slate-100 text-slate-700 hover:bg-slate-200{% endif %}">
+      Recent
+    </a>
   </div>
 
   <!-- Shared canonicals datalist for autocomplete -->
@@ -97,8 +109,14 @@
             <td class="py-2 px-3 text-right tabular-nums text-xs text-slate-600">
               {% if p.score %}{{ p.score }}{% else %}—{% endif %}
             </td>
-            <td class="py-2 px-3 text-right tabular-nums text-xs text-slate-600">
-              {{ row.ili_count }}
+            <td class="py-2 px-3 text-right tabular-nums text-xs">
+              {% if row.ili_count >= 10 %}
+                <span class="font-bold text-amber-700">{{ row.ili_count }}×</span>
+              {% elif row.ili_count >= 5 %}
+                <span class="font-semibold text-slate-800">{{ row.ili_count }}×</span>
+              {% else %}
+                <span class="text-slate-500">{{ row.ili_count }}</span>
+              {% endif %}
             </td>
             <td class="py-2 px-3">
               {% if p.status == 'pending' %}
