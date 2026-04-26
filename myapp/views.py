@@ -2765,17 +2765,25 @@ def mapping_health(request):
     ).select_related('vendor').order_by('-imported_at')[:10])
 
     # --- Live suspect-mappings count (zero token overlap among mapped) ---
-    # Replicate audit_suspect_mappings logic: tokens from raw_description
-    # that share at least one 3+letter content word with canonical_name.
-    word_re = re.compile(r'[A-Za-z]{3,}')
-    def _stem(s):
-        out = []
-        for t in word_re.findall(s or ''):
-            low = t.lower()
-            if len(low) >= 4 and low.endswith('s') and not low.endswith('ss'):
-                low = low[:-1]
-            out.append(low)
-        return set(out)
+    # Upgraded 2026-04-26 to apply the same normalization the production
+    # mapper uses: vendor abbreviation expansion (BRST→Breast), Sysco
+    # brand prefix stripping (BBRLCLS→drop), and the food-domain stemmer
+    # (atoes→ato, rries→rry, ovies→ovy). Without those, the audit's
+    # naive 's' stripper produces ~5× false positives — TOMATOES vs
+    # Tomato wasn't matching, ANCHOVY vs Anchovies wasn't matching, etc.
+    # SUPC-placeholder raws ([Sysco #...]) are skipped by construction —
+    # they intentionally have no English overlap with their code-tier
+    # canonical.
+    import sys as _sys
+    from django.conf import settings as _audit_settings
+    p = str(_audit_settings.BASE_DIR / 'invoice_processor')
+    if p not in _sys.path:
+        _sys.path.insert(0, p)
+    from mapper import _stem_text, _strip_sysco_prefix
+    from abbreviations import expand_abbreviations
+
+    def _audit_stems(text):
+        return set(_stem_text(text or '').split())
 
     suspect_count = 0
     sample_suspects = []
@@ -2787,12 +2795,22 @@ def mapping_health(request):
     for ili in mapped_qs.iterator():
         if not ili.raw_description or not ili.product:
             continue
-        if not (_stem(ili.raw_description) & _stem(ili.product.canonical_name)):
+        # Skip SUPC placeholders — code-tier matches have no English
+        # content in the raw and aren't legitimately suspect.
+        if ili.raw_description.startswith('[Sysco #'):
+            continue
+        # Normalize the raw before comparing: expand vendor abbrevs +
+        # (Sysco only) strip brand prefix.
+        cleaned = expand_abbreviations(ili.raw_description)
+        vname = ili.vendor.name if ili.vendor else ''
+        if vname and 'sysco' in vname.lower():
+            cleaned = _strip_sysco_prefix(cleaned)
+        if not (_audit_stems(cleaned) & _audit_stems(ili.product.canonical_name)):
             suspect_count += 1
             if len(sample_suspects) < 8:
                 sample_suspects.append({
                     'id': ili.id,
-                    'vendor': ili.vendor.name if ili.vendor else '',
+                    'vendor': vname,
                     'raw': (ili.raw_description or '')[:60],
                     'canonical': ili.product.canonical_name,
                     'confidence': ili.match_confidence,
