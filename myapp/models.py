@@ -181,6 +181,7 @@ class InvoiceLineItem(models.Model):
         ('vendor_fuzzy', 'Vendor-Scoped Fuzzy'),
         ('fuzzy', 'Fuzzy Match'),
         ('stripped_fuzzy', 'Stripped Prefix Fuzzy'),
+        ('subset_match', 'Subset Match (canonical tokens ⊆ raw)'),
         ('keyword_batch', 'Keyword Batch (Human)'),
         ('manual_review', 'Manual Review (Human)'),
         ('non_product', 'Non-Product (surcharge/fee/credit)'),

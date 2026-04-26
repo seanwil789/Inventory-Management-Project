@@ -6454,3 +6454,122 @@ class AbbreviationExpansionTests(TestCase):
         abbrev = self._import_abbrev()
         self.assertEqual(abbrev.expand_abbreviations(''), '')
         self.assertIsNone(abbrev.expand_abbreviations(None))
+
+
+class MapperSubsetMatchTier6dTests(TestCase):
+    """Tier 6d — subset-match: canonical's tokens are ALL contained in
+    raw's stemmed tokens. Promoted from populate_mapping_review command
+    into the production mapper. Routed through quarantine in db_write."""
+
+    def _mapper(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'mapper' in sys.modules:
+            del sys.modules['mapper']
+        import mapper
+        return mapper
+
+    def test_apple_danish_subset_matches_danish(self):
+        """Classic case — 'Apple Danish' raw, 'Danish' canonical exists,
+        'Apple' canonical doesn't → subset-match returns 'Danish'."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Danish': {'category': 'Bakery', 'primary_descriptor': 'Pastry',
+                           'secondary_descriptor': ''},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'Apple Danish'}
+        r = mapper.resolve_item(item, mappings, vendor='Philadelphia Bakery Merchants')
+        self.assertEqual(r['canonical'], 'Danish')
+        self.assertEqual(r['confidence'], 'subset_match')
+
+    def test_ambiguous_returns_none(self):
+        """'Cherry Tomato' raw — both Cherry and Tomato are 1-token
+        canonicals. Subset matches both equally → ambiguous → None."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Cherry': {'category': 'Produce', 'primary_descriptor': 'Stone Fruit',
+                           'secondary_descriptor': ''},
+                'Tomato': {'category': 'Produce', 'primary_descriptor': 'Solanaceae',
+                           'secondary_descriptor': ''},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'Cherry Tomato'}
+        r = mapper.resolve_item(item, mappings, vendor='Farm Art')
+        self.assertNotEqual(r['confidence'], 'subset_match')
+
+    def test_prefers_most_specific_canonical(self):
+        """When 'Pork, Belly' (2 tokens) and 'Pork' (1 token) both subset-
+        match, prefer the longer (more specific) one."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Pork': {'category': 'Proteins', 'primary_descriptor': 'Pork',
+                         'secondary_descriptor': ''},
+                'Pork, Belly': {'category': 'Proteins', 'primary_descriptor': 'Pork',
+                                'secondary_descriptor': 'Belly'},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'Pork Belly Boneless RIND ON'}
+        r = mapper.resolve_item(item, mappings, vendor='Exceptional Foods')
+        self.assertEqual(r['canonical'], 'Pork, Belly')
+        self.assertEqual(r['confidence'], 'subset_match')
+
+    def test_abbreviation_expansion_enables_subset_match(self):
+        """Verify subset-match resolves correctly through the abbreviation
+        expansion path. 'BRST CHKN BNLS' → 'Breast Chicken Boneless' may
+        be caught at an earlier tier (6a stripped_fuzzy) which is also
+        valid — earlier tiers are more authoritative. Either way the
+        canonical resolves correctly."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Chicken Breast': {'category': 'Proteins', 'primary_descriptor': 'Poultry',
+                                   'secondary_descriptor': 'Breast'},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'BRST CHKN BNLS'}
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        self.assertEqual(r['canonical'], 'Chicken Breast')
+        # Either subset_match (6d) or stripped_fuzzy (6a) is acceptable;
+        # both correctly map to the same canonical
+        self.assertIn(r['confidence'], ['subset_match', 'stripped_fuzzy'])
+
+    def test_subset_routed_through_quarantine(self):
+        """When mapper returns 'subset_match', db_write quarantines it —
+        product FK stays NULL, confidence becomes 'subset_match_pending',
+        and a ProductMappingProposal is created."""
+        Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Danish',
+                               category='Bakery', primary_descriptor='Pastry')
+        items = [{
+            'raw_description': 'Apple Danish',
+            'canonical': 'Danish',
+            'unit_price': 5.50,
+            'case_size_raw': '12CT',
+            'confidence': 'subset_match',
+            'score': 95,
+        }]
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import db_write
+        db_write.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='t.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description='Apple Danish')
+        self.assertIsNone(ili.product, 'subset_match must NOT auto-commit FK')
+        self.assertEqual(ili.match_confidence, 'subset_match_pending')
+        self.assertTrue(ProductMappingProposal.objects.filter(
+            raw_description='Apple Danish', status='pending'
+        ).exists())

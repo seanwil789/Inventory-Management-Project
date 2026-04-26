@@ -26,7 +26,12 @@ from django.db.models import Avg
 # Django /mapping-review/ UI surfaces the queue. On approval, the FK is
 # attached and a ProductMapping row is created so future invoices auto-
 # resolve. Tiers below auto-commit deterministically as before.
-_FUZZY_TIERS = {'vendor_fuzzy', 'fuzzy', 'stripped_fuzzy'}
+#
+# subset_match (mapper tier 6d) — canonical tokens are all contained in
+# the raw description. Strong signal but reviewable: 'Apple Cider' could
+# subset-match 'Apple' canonical when there's no Apple Cider canonical
+# yet. Quarantine surfaces the suggestion for Sean to confirm/override.
+_FUZZY_TIERS = {'vendor_fuzzy', 'fuzzy', 'stripped_fuzzy', 'subset_match'}
 
 
 def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:

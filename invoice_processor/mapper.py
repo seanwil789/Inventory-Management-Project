@@ -672,8 +672,50 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
                         "score":      char_result[1],
                     })
 
+            # 6d. Subset-match tier — canonical's tokens are ALL contained
+            # in the (expanded) raw description's stemmed token set. Catches
+            # the 'X Danish' → 'Danish' / 'BRST CHKN BNLS' → 'Chicken Breast'
+            # / 'Apple Cider Vinegar' → 'Apple Cider Vinegar' class that
+            # token_set/sort scorers miss when the raw has many extra
+            # modifier tokens dragging down the ratio. Prefers most-specific
+            # (longest canonical by token count). Returns None if multiple
+            # equally-specific matches (ambiguous → human reviews via the
+            # quarantine queue). Routed through quarantine in db_write — the
+            # match never auto-attaches an FK.
+            subset_canon = _find_subset_canonical_in_pool(
+                gate_text, canonical_names)
+            if subset_canon:
+                return _attach_category({
+                    **item,
+                    "canonical":  subset_canon,
+                    "confidence": "subset_match",
+                    "score":      95,
+                })
+
     return {**item, "canonical": None, "confidence": "unmatched", "score": 0,
             "category": "", "primary_descriptor": "", "secondary_descriptor": ""}
+
+
+def _find_subset_canonical_in_pool(raw: str, canonicals) -> str | None:
+    """Return the most-specific canonical whose stemmed tokens are all
+    contained in raw's stemmed tokens. None if no match or if multiple
+    equally-specific matches (ambiguous)."""
+    raw_tokens = set(_stem_text(raw).split())
+    if not raw_tokens:
+        return None
+    matches = []   # [(canonical, n_tokens)]
+    for canon in canonicals:
+        ctokens = set(_stem_text(canon).split())
+        if not ctokens:
+            continue
+        if ctokens.issubset(raw_tokens):
+            matches.append((canon, len(ctokens)))
+    if not matches:
+        return None
+    matches.sort(key=lambda x: -x[1])
+    top_n = matches[0][1]
+    top = [c for c, n in matches if n == top_n]
+    return top[0] if len(top) == 1 else None
 
 
 _JUNK_RE = re.compile(
