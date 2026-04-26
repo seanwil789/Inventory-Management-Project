@@ -196,6 +196,7 @@ class InvoiceLineItem(models.Model):
         ('subset_match', 'Subset Match (canonical tokens ⊆ raw)'),
         ('keyword_batch', 'Keyword Batch (Human)'),
         ('manual_review', 'Manual Review (Human)'),
+        ('auto_repoint', 'Auto-Repointed (live mapper produced different canonical)'),
         ('non_product', 'Non-Product (surcharge/fee/credit)'),
         ('unmatched', 'Unmatched'),
         ('unmatched_drift', 'Unmatched (Sheet/DB Drift)'),
