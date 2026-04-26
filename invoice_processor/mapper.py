@@ -269,26 +269,80 @@ def _strip_sysco_prefix(text: str) -> str:
     return text
 
 
-def load_mappings(force_refresh: bool = False) -> dict:
-    """
-    Returns four dicts:
-      code_map        — { "9213489": "Udon Noodles", ... }
-      desc_map        — { "NOODLE UDON JAPNSE": "Udon Noodles", ... }  (all vendors)
-      vendor_desc_map — { "FARM ART": { "LETTUCE, ICEBERG, 24 CT": "Lettuce, Iceberg" }, ... }
-      category_map    — { "Udon Noodles": {"category": "Drystock", ...}, ... }
-    Uses local cache unless force_refresh=True.
-    """
+def _bootstrap_django_if_needed():
+    """Ensure Django is configured. Idempotent — no-op if already set up.
+    Mirrors the pattern in db_write.py so mapper can run from either a
+    cron script context (no Django at import time) or a Django mgmt-
+    command context (Django already bootstrapped)."""
+    if not os.environ.get('DJANGO_SETTINGS_MODULE'):
+        import sys as _sys
+        import django as _django
+        os.environ['DJANGO_SETTINGS_MODULE'] = 'myproject.settings'
+        _sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
+        _django.setup()
+
+
+def _load_from_db() -> dict:
+    """Build the 4-dict mapping shape from the ProductMapping DB table.
+
+    After Step 1 of the sheet→DB migration ran, ProductMapping is the
+    canonical source of truth (~1,445 rows mirroring the Item Mapping
+    sheet). This eliminates the sheet-read on every cron cycle and the
+    forward-looking damage class from upstream Product renames.
+
+    Same return shape as the legacy sheet path so resolve_item is
+    unchanged."""
+    _bootstrap_django_if_needed()
+    from myapp.models import ProductMapping
+
     cache = {"code_map": {}, "desc_map": {}, "vendor_desc_map": {}, "category_map": {}}
 
-    if not force_refresh and os.path.exists(MAPPING_CACHE_PATH):
-        # Check cache age — refresh if older than TTL
-        import time
-        cache_age = time.time() - os.path.getmtime(MAPPING_CACHE_PATH)
-        if cache_age < MAPPING_CACHE_TTL_SECONDS:
-            with open(MAPPING_CACHE_PATH) as f:
-                return json.load(f)
-        else:
-            print(f"  Mapping cache is {cache_age/60:.0f}m old — refreshing from Sheet...")
+    rows = (ProductMapping.objects
+            .select_related('vendor', 'product')
+            .filter(product__isnull=False)
+            .values('description', 'supc',
+                    'vendor__name',
+                    'product__canonical_name',
+                    'product__category',
+                    'product__primary_descriptor',
+                    'product__secondary_descriptor'))
+
+    for r in rows:
+        canonical = r['product__canonical_name']
+        if not canonical:
+            continue
+        # Normalize description the same way the sheet path did, so
+        # vendor_exact / fuzzy keys remain comparable.
+        raw_desc = re.sub(r'\s+', ' ',
+                          re.sub(r'[/\\]', ' ', (r['description'] or '').strip())).upper()
+        supc = (r['supc'] or '').strip()
+        vendor_name = (r['vendor__name'] or '').strip()
+
+        if supc:
+            cache["code_map"][supc] = canonical
+        if raw_desc:
+            cache["desc_map"][raw_desc] = canonical
+            if vendor_name:
+                cache["vendor_desc_map"].setdefault(vendor_name.upper(), {})[raw_desc] = canonical
+
+        # category_map keyed by canonical — Product table is the source of truth
+        # after the convention migration. Each canonical has exactly one
+        # taxonomy triple (no row-level ambiguity like the sheet had).
+        cache["category_map"][canonical] = {
+            "category":             r['product__category'] or '',
+            "primary_descriptor":   r['product__primary_descriptor'] or '',
+            "secondary_descriptor": r['product__secondary_descriptor'] or '',
+        }
+
+    return cache
+
+
+def _load_from_sheet() -> dict:
+    """Legacy sheet-loading path. Kept as a fallback for the rare case
+    where the DB ProductMapping table is empty (pre-backfill, fresh
+    install, or DB corruption). After Step 1 of the sheet→DB migration
+    this path is not the default — _load_from_db is."""
+    cache = {"code_map": {}, "desc_map": {}, "vendor_desc_map": {}, "category_map": {}}
 
     try:
         rows = get_sheet_values(SPREADSHEET_ID, f"{MAPPING_TAB}!A:G")
@@ -296,16 +350,15 @@ def load_mappings(force_refresh: bool = False) -> dict:
         rows = []
 
     for row in rows[1:]:  # skip header row
-        # Pad row to 7 columns
         while len(row) < 7:
             row.append("")
-        vendor     = row[0].strip()          # A: vendor
-        raw_desc   = re.sub(r'\s+', ' ', re.sub(r'[/\\]', ' ', row[1].strip())).upper()  # B: item_description (normalized)
-        category   = row[2].strip()          # C: category
-        primary    = row[3].strip()          # D: primary_descriptor
-        secondary  = row[4].strip()          # E: secondary_descriptor
-        canonical  = row[5].strip()          # F: canonical_name
-        item_code  = row[6].strip()          # G: sysco_item_code
+        vendor     = row[0].strip()
+        raw_desc   = re.sub(r'\s+', ' ', re.sub(r'[/\\]', ' ', row[1].strip())).upper()
+        category   = row[2].strip()
+        primary    = row[3].strip()
+        secondary  = row[4].strip()
+        canonical  = row[5].strip()
+        item_code  = row[6].strip()
 
         if not canonical:
             continue
@@ -313,17 +366,52 @@ def load_mappings(force_refresh: bool = False) -> dict:
             cache["code_map"][item_code] = canonical
         if raw_desc:
             cache["desc_map"][raw_desc] = canonical
-            # Also store under vendor-scoped map
             if vendor:
                 vendor_key = vendor.upper()
                 cache["vendor_desc_map"].setdefault(vendor_key, {})[raw_desc] = canonical
-        # Build category lookup keyed by canonical name
         if category:
             cache.setdefault("category_map", {})[canonical] = {
                 "category":            category,
                 "primary_descriptor":  primary,
                 "secondary_descriptor": secondary,
             }
+
+    return cache
+
+
+def load_mappings(force_refresh: bool = False) -> dict:
+    """
+    Returns four dicts:
+      code_map        — { "9213489": "Udon Noodles", ... }
+      desc_map        — { "NOODLE UDON JAPNSE": "Udon Noodles", ... }  (all vendors)
+      vendor_desc_map — { "FARM ART": { "LETTUCE, ICEBERG, 24 CT": "Lettuce, Iceberg" }, ... }
+      category_map    — { "Udon Noodles": {"category": "Drystock", ...}, ... }
+
+    Source of truth: DB ProductMapping table (after Step 1 backfill).
+    Sheet path is a fallback when ProductMapping is empty.
+
+    Uses local file cache unless force_refresh=True. The on-disk JSON
+    cache remains useful for non-Django scripts and for hot-reload speed
+    in the cron path; TTL is the same as before (1 hour).
+    """
+    if not force_refresh and os.path.exists(MAPPING_CACHE_PATH):
+        import time
+        cache_age = time.time() - os.path.getmtime(MAPPING_CACHE_PATH)
+        if cache_age < MAPPING_CACHE_TTL_SECONDS:
+            with open(MAPPING_CACHE_PATH) as f:
+                return json.load(f)
+        else:
+            print(f"  Mapping cache is {cache_age/60:.0f}m old — refreshing from DB...")
+
+    cache = _load_from_db()
+
+    # Catastrophe fallback: ProductMapping empty (pre-backfill or fresh
+    # install). Read from sheet so the pipeline doesn't go dark while
+    # someone runs sync_item_mapping_from_sheet.
+    if not cache["desc_map"] and not cache["code_map"]:
+        print("  [!] ProductMapping empty — falling back to sheet read. "
+              "Run `manage.py sync_item_mapping_from_sheet --apply` to populate.")
+        cache = _load_from_sheet()
 
     os.makedirs(os.path.dirname(MAPPING_CACHE_PATH), exist_ok=True)
     with open(MAPPING_CACHE_PATH, "w") as f:

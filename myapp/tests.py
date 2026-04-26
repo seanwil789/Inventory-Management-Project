@@ -5665,3 +5665,107 @@ class SyncItemMappingFromSheetTests(TestCase):
             call_command('sync_item_mapping_from_sheet', '--apply', verbosity=0)
         # Only Romaine created; empty-canonical row skipped
         self.assertEqual(ProductMapping.objects.count(), 1)
+
+
+class MapperLoadFromDBTests(TestCase):
+    """`mapper._load_from_db` — Step 2 of the sheet→DB migration.
+
+    Mapper now reads ProductMapping table instead of the sheet. Returns
+    the same 4-dict shape (code_map, desc_map, vendor_desc_map,
+    category_map) so resolve_item is unchanged. Eliminates the
+    forward-looking damage class from upstream Product renames per
+    `feedback_upstream_downstream_planning.md`."""
+
+    def _import_mapper(self):
+        # Reset module to clear any cached state from prior tests
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        # Force reimport so module-level state is fresh
+        if 'mapper' in sys.modules:
+            del sys.modules['mapper']
+        import mapper
+        return mapper
+
+    def test_db_path_builds_full_4dict_shape(self):
+        """ProductMapping rows → all 4 dicts populated correctly."""
+        sysco = Vendor.objects.create(name='Sysco')
+        farmart = Vendor.objects.create(name='Farm Art')
+        romaine = Product.objects.create(
+            canonical_name='Romaine', category='Produce',
+            primary_descriptor='Leaf', secondary_descriptor='',
+        )
+        ProductMapping.objects.create(
+            vendor=sysco, description='WHLFCLS ROMAINE HEARTS 3CT',
+            supc='1234567', product=romaine,
+        )
+        ProductMapping.objects.create(
+            vendor=farmart, description='LETTUCE, ROMAINE, 24CT',
+            supc='', product=romaine,
+        )
+        mapper = self._import_mapper()
+        cache = mapper._load_from_db()
+
+        # code_map
+        self.assertEqual(cache['code_map'].get('1234567'), 'Romaine')
+        # desc_map (normalized to uppercase, slashes → spaces)
+        self.assertEqual(cache['desc_map'].get('WHLFCLS ROMAINE HEARTS 3CT'), 'Romaine')
+        self.assertEqual(cache['desc_map'].get('LETTUCE, ROMAINE, 24CT'), 'Romaine')
+        # vendor_desc_map
+        self.assertEqual(cache['vendor_desc_map']['SYSCO']['WHLFCLS ROMAINE HEARTS 3CT'], 'Romaine')
+        self.assertEqual(cache['vendor_desc_map']['FARM ART']['LETTUCE, ROMAINE, 24CT'], 'Romaine')
+        # category_map sourced from Product table (DB-as-truth)
+        self.assertEqual(cache['category_map']['Romaine'], {
+            'category': 'Produce',
+            'primary_descriptor': 'Leaf',
+            'secondary_descriptor': '',
+        })
+
+    def test_db_path_skips_pms_without_product_fk(self):
+        """ProductMapping with product=NULL is excluded — those are orphan
+        mappings (sheet col F was empty, or the Product was deleted)."""
+        sysco = Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Romaine')
+        # Orphan mapping — no product attached
+        ProductMapping.objects.create(
+            vendor=sysco, description='UNKNOWN ITEM', supc='', product=None,
+        )
+        # Valid mapping
+        romaine = Product.objects.get(canonical_name='Romaine')
+        ProductMapping.objects.create(
+            vendor=sysco, description='WHLFCLS ROMAINE HEARTS 3CT',
+            supc='1234567', product=romaine,
+        )
+        mapper = self._import_mapper()
+        cache = mapper._load_from_db()
+
+        # Orphan PM excluded
+        self.assertNotIn('UNKNOWN ITEM', cache['desc_map'])
+        # Valid PM included
+        self.assertIn('WHLFCLS ROMAINE HEARTS 3CT', cache['desc_map'])
+
+    def test_load_mappings_falls_back_to_sheet_when_db_empty(self):
+        """Catastrophe protection: if ProductMapping is empty (pre-backfill,
+        fresh install), load_mappings falls back to sheet so the pipeline
+        doesn't go dark waiting for someone to run sync_item_mapping."""
+        from unittest.mock import patch
+        # Empty DB ProductMapping
+        self.assertEqual(ProductMapping.objects.count(), 0)
+        mapper = self._import_mapper()
+        # Patch the sheet path to return one row
+        sentinel_rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['Sysco', 'TESTROW', 'Drystock', '', '', 'TestCanonical', '999'],
+        ]
+        # Also patch the cache file path so we don't read a stale cache
+        import os, tempfile
+        with tempfile.TemporaryDirectory() as tmpdir:
+            cache_path = os.path.join(tmpdir, 'item_mappings.json')
+            with patch.object(mapper, 'MAPPING_CACHE_PATH', cache_path), \
+                 patch.object(mapper, 'get_sheet_values', return_value=sentinel_rows):
+                cache = mapper.load_mappings(force_refresh=True)
+        # Should have fallen back to sheet
+        self.assertEqual(cache['desc_map'].get('TESTROW'), 'TestCanonical')
+        self.assertEqual(cache['code_map'].get('999'), 'TestCanonical')
