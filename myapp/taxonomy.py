@@ -453,27 +453,37 @@ def _signal_subset_canonical(subset_canonical):
     }
 
 
-def _signal_existing_products(raw_tokens):
+def _signal_existing_products(raw_tokens, index=None):
     """Find existing Products that share tokens with the raw description.
-    Vote on (category, primary) — if multiple Products agree, that's signal."""
+    Vote on (category, primary) — if multiple Products agree, that's signal.
+
+    When `index` is supplied (a list of pre-stemmed Product tuples from
+    `build_inference_index`), the per-call DB query + stemming is skipped.
+    Used by the mapping-review page to avoid an N×M blow-up across the
+    visible 100 rows."""
     if not raw_tokens:
         return None
-    from myapp.models import Product
-    # Pull all products + their stemmed tokens. Could be cached.
     cat_votes = Counter()
     pri_votes = Counter()
     sec_votes = Counter()
     voters = []
-    for p in Product.objects.all().only('canonical_name', 'category',
-                                          'primary_descriptor', 'secondary_descriptor'):
-        ptokens = _stems(p.canonical_name)
+    if index is not None:
+        rows = index
+    else:
+        from myapp.models import Product
+        rows = [(p.canonical_name, _stems(p.canonical_name), p.category,
+                 p.primary_descriptor, p.secondary_descriptor)
+                for p in Product.objects.all().only(
+                    'canonical_name', 'category',
+                    'primary_descriptor', 'secondary_descriptor')]
+    for canonical, ptokens, cat, pri, sec in rows:
         if raw_tokens & ptokens:
-            cat_votes[p.category] += 1
-            if p.primary_descriptor:
-                pri_votes[p.primary_descriptor] += 1
-            if p.secondary_descriptor:
-                sec_votes[p.secondary_descriptor] += 1
-            voters.append(p.canonical_name)
+            cat_votes[cat] += 1
+            if pri:
+                pri_votes[pri] += 1
+            if sec:
+                sec_votes[sec] += 1
+            voters.append(canonical)
     if not cat_votes:
         return None
     best_cat, cat_n = cat_votes.most_common(1)[0]
@@ -490,20 +500,26 @@ def _signal_existing_products(raw_tokens):
     return out
 
 
-def _signal_boy_yieldreference(raw_tokens):
+def _signal_boy_yieldreference(raw_tokens, index=None):
     """Find BoY YieldReference rows whose ingredient shares tokens with raw.
     Returns the section + derived (category, primary) from
-    _BOY_SECTION_TO_TAXONOMY."""
+    _BOY_SECTION_TO_TAXONOMY.
+
+    Accepts pre-stemmed `index` for batch use (see _signal_existing_products)."""
     if not raw_tokens:
         return None
-    from myapp.models import YieldReference
     section_votes = Counter()
     voters = []
-    for yr in YieldReference.objects.all().only('ingredient', 'section'):
-        ytokens = _stems(yr.ingredient)
+    if index is not None:
+        rows = index
+    else:
+        from myapp.models import YieldReference
+        rows = [(yr.ingredient, _stems(yr.ingredient), yr.section)
+                for yr in YieldReference.objects.all().only('ingredient', 'section')]
+    for ingredient, ytokens, section in rows:
         if raw_tokens & ytokens:
-            section_votes[yr.section] += 1
-            voters.append(f"{yr.ingredient} ({yr.section})")
+            section_votes[section] += 1
+            voters.append(f"{ingredient} ({section})")
     if not section_votes:
         return None
     best_section, _ = section_votes.most_common(1)[0]
@@ -650,8 +666,35 @@ def _signal_protein_primal(raw_lower, current_category):
 
 # ---- Main inference entry point ----
 
+def build_inference_index():
+    """Pre-stem all Products + YieldReferences for batch inference calls.
+
+    Returns:
+      {'products': [(canonical, stems_set, category, primary, secondary), ...],
+       'boy':      [(ingredient, stems_set, section), ...]}
+
+    Pass the result as the `index` kwarg to `infer_taxonomy` to amortize
+    the stemming + DB load across many calls (e.g. rendering 100 rows on
+    the Mapping Review page). Without this, each call re-queries and
+    re-stems all 544+ Products and 1119 YieldReferences.
+    """
+    from myapp.models import Product, YieldReference
+    products = [
+        (p.canonical_name, _stems(p.canonical_name), p.category,
+         p.primary_descriptor, p.secondary_descriptor)
+        for p in Product.objects.all().only(
+            'canonical_name', 'category',
+            'primary_descriptor', 'secondary_descriptor')
+    ]
+    boy = [
+        (yr.ingredient, _stems(yr.ingredient), yr.section)
+        for yr in YieldReference.objects.all().only('ingredient', 'section')
+    ]
+    return {'products': products, 'boy': boy}
+
+
 def infer_taxonomy(raw_description, vendor=None, section_hint=None,
-                   subset_canonical=None):
+                   subset_canonical=None, index=None):
     """Infer (category, primary, secondary) for a new Product.
 
     Returns dict shape:
@@ -706,8 +749,10 @@ def infer_taxonomy(raw_description, vendor=None, section_hint=None,
     # truth. subset_canonical inheriting from already-classified Product is gold.
     _absorb(_signal_vendor(vendor))
     _absorb(_signal_section_hint(section_hint))
-    _absorb(_signal_boy_yieldreference(raw_tokens))
-    _absorb(_signal_existing_products(raw_tokens))
+    _absorb(_signal_boy_yieldreference(raw_tokens,
+                                        index=index['boy'] if index else None))
+    _absorb(_signal_existing_products(raw_tokens,
+                                       index=index['products'] if index else None))
     # High-confidence keyword detectors fire BEFORE produce_botanical /
     # protein_primal so they set category authoritatively. Stops things
     # like 'Lemon Danish' (Lemon→Citrus→Produce) and 'Pepper Jack'

@@ -2401,7 +2401,7 @@ def mapping_review(request):
     Cheap to render — paginated, no fancy joins. The approve action
     handles the FK backfill to all matching ILI rows transactionally."""
     from .models import ProductMappingProposal
-    from .taxonomy import infer_taxonomy
+    from .taxonomy import infer_taxonomy, build_inference_index
     from django.db.models import Count
 
     status_filter = request.GET.get('status', 'pending')
@@ -2455,7 +2455,11 @@ def mapping_review(request):
 
     proposal_rows = proposal_rows[:100]
 
-    # Pass 2: run inference only on the visible 100 (was running on all 270+)
+    # Pass 2: run inference only on the visible 100 (was running on all 270+).
+    # Build the inference index ONCE — without it, infer_taxonomy re-queries
+    # and re-stems all 540+ Products and 1100+ YieldReferences per call,
+    # producing a ~166k-iteration N×M blow-up across the visible rows.
+    inference_index = build_inference_index()
     for row in proposal_rows:
         p = row['p']
         section_hint = section_hint_map.get((p.vendor_id, p.raw_description))
@@ -2465,6 +2469,7 @@ def mapping_review(request):
             vendor=p.vendor.name if p.vendor else None,
             section_hint=section_hint,
             subset_canonical=subset,
+            index=inference_index,
         )
 
     status_counts = dict(
