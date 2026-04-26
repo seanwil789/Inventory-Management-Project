@@ -5276,3 +5276,103 @@ class ConsumptionEngineTests(TestCase):
         self.assertEqual(result['menus_processed'], 1)
         # 5 lb = 80 oz (one menu, full yield)
         self.assertEqual(result['by_product'][p.id]['oz'], Decimal('80.00'))
+
+
+class DBWriteDriftDetectionTests(TestCase):
+    """`write_invoice_to_db` strict mode for sheet/DB drift.
+
+    When the mapper returns a canonical_name that doesn't exist in the
+    Product table (forward-looking damage from an upstream rename per
+    `feedback_upstream_downstream_planning.md`), db_write must NOT
+    silently create a ghost Product and must NOT bake the wrong-FK row
+    as a regular 'unmatched'. Tag the row 'unmatched_drift' so it
+    surfaces distinctly in audits."""
+
+    def _import_db_write(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import db_write
+        return db_write
+
+    def test_drift_canonical_lands_as_unmatched_drift(self):
+        """Mapper returns canonical='Cheese, American' but only 'American' exists in DB
+        → ILI lands with product=None and confidence='unmatched_drift'."""
+        Product.objects.create(canonical_name='American')   # post-rename name only
+
+        items = [{
+            'raw_description': 'BBRLCLS CHEESE AMER 160 SLI WHT',
+            'canonical': 'Cheese, American',                # pre-rename name still in sheet
+            'unit_price': 12.34,
+            'case_size_raw': '6/5LB',
+            'confidence': 'vendor_exact',
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='drift.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description='BBRLCLS CHEESE AMER 160 SLI WHT')
+        self.assertIsNone(ili.product, 'Drift case must NOT attach a wrong FK')
+        self.assertEqual(ili.match_confidence, 'unmatched_drift',
+                         'Drift case must be tagged distinctly from regular unmatched')
+
+    def test_drift_does_not_create_ghost_product(self):
+        """db_write must never create a Product from mapper output —
+        Product creation is reserved for the curation flow."""
+        Product.objects.create(canonical_name='American')
+        before = Product.objects.count()
+
+        items = [{
+            'raw_description': 'BBRLCLS CHEESE AMER 160 SLI WHT',
+            'canonical': 'Cheese, American',                # not in DB
+            'unit_price': 12.34,
+            'case_size_raw': '',
+            'confidence': 'vendor_exact',
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='drift.jpg')
+
+        after = Product.objects.count()
+        self.assertEqual(after, before,
+                         'No new Product should be created on drift')
+        self.assertFalse(Product.objects.filter(canonical_name='Cheese, American').exists(),
+                         'Stale-named ghost Product must not appear in DB')
+
+    def test_normal_match_unaffected_by_drift_logic(self):
+        """When the canonical exists in DB, db_write attaches the FK as before
+        and does NOT re-tag the confidence."""
+        p = Product.objects.create(canonical_name='Tomato Sauce')
+
+        items = [{
+            'raw_description': 'TOMATO SAUCE 6/10CAN',
+            'canonical': 'Tomato Sauce',
+            'unit_price': 24.50,
+            'case_size_raw': '6/10CAN',
+            'confidence': 'vendor_exact',
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='ok.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description='TOMATO SAUCE 6/10CAN')
+        self.assertEqual(ili.product, p)
+        self.assertEqual(ili.match_confidence, 'vendor_exact',
+                         'Confidence must not be re-tagged when product is found')
+
+    def test_no_canonical_no_drift_tag(self):
+        """Mapper returning canonical=None (genuine unmatched) is NOT drift —
+        confidence stays 'unmatched', not 'unmatched_drift'."""
+        items = [{
+            'raw_description': 'COMPLETELY NEW PRODUCT 4OZ',
+            'canonical': None,
+            'unit_price': 9.99,
+            'case_size_raw': '',
+            'confidence': 'unmatched',
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='novel.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description='COMPLETELY NEW PRODUCT 4OZ')
+        self.assertIsNone(ili.product)
+        self.assertEqual(ili.match_confidence, 'unmatched',
+                         'Genuine unmatched must NOT be re-tagged as drift')

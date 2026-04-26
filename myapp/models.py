@@ -59,6 +59,7 @@ class InvoiceLineItem(models.Model):
         ('manual_review', 'Manual Review (Human)'),
         ('non_product', 'Non-Product (surcharge/fee/credit)'),
         ('unmatched', 'Unmatched'),
+        ('unmatched_drift', 'Unmatched (Sheet/DB Drift)'),
     ]
 
     vendor          = models.ForeignKey(Vendor, null=True, blank=True, on_delete=models.SET_NULL)

@@ -88,6 +88,23 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         canonical = item.get('canonical')
         product   = Product.objects.filter(canonical_name=canonical).first() if canonical else None
 
+        # Sheet/DB drift detection: the mapper returned a canonical string
+        # but no Product with that canonical_name exists in the DB. This
+        # happens when sheet col F references a Product that was renamed
+        # or merged in the DB without a corresponding sheet update — the
+        # forward-looking damage class from upstream renames per
+        # `feedback_upstream_downstream_planning.md`. Re-tag the row's
+        # confidence to surface it loudly in audits + discover_unmapped
+        # rather than letting it silently land as a regular 'unmatched'
+        # mixed in with truly-novel items. The product FK stays None —
+        # db_write never creates Products from mapper output (Product
+        # creation is reserved for the curation flow).
+        if canonical and product is None:
+            print(f"  [!] Sheet/DB drift: canonical {canonical!r} "
+                  f"returned by mapper has no Product in DB — "
+                  f"tagging row as 'unmatched_drift'")
+            item = {**item, 'confidence': 'unmatched_drift'}
+
         # Always preserve the raw description — it's the original invoice text
         # and is critical for auditing, even when the item is mapped to a product.
         raw_desc = item.get('raw_description', '')
