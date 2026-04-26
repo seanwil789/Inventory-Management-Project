@@ -8,7 +8,8 @@ from django.core.management.base import BaseCommand, CommandError
 from myapp.models import Menu
 
 
-# Block layout inside each week table:
+# NEW format (April 2026+): each block has explicit day name in row 0,
+# 'Menu'/'Ingredients' subheaders in row 1.
 #   row 0       → day name header (e.g., "Monday")
 #   row 1       → "Menu" / "Ingredients" sub-headers
 #   row 2       → 8:00  (cold breakfast)
@@ -29,6 +30,32 @@ DAY_OFFSET = {
     'thursday':  3,
     'friday':    4,
 }
+
+# OLD format (Jan-Mar 2026): row 0 = "Week of M/D-M/D", days are implicit
+# by block index, two days per block in cols 2-3 and 5-6.
+#   row 0       → "Week of 1/12-1/18" header
+#   block 0 (rows 2-13): Mon/Tue
+#   block 1 (rows 14-25): Wed/Thu
+#   block 2 (rows 26-37): Fri/Sat
+# Within each block:
+#   offset 0    → "Itinerary"/"Notes" sub-header
+#   offset 1    → cold_breakfast
+#   offset 3    → hot_breakfast
+#   offset 5    → lunch
+#   offset 10   → dinner
+OLD_BLOCK_SIZE = 12
+OLD_MEAL_ROWS = {
+    1:  'cold_breakfast',
+    3:  'hot_breakfast',
+    5:  'lunch',
+    10: 'dinner',
+}
+OLD_MENU_COLS = [2, 5]   # menu text columns within each block
+OLD_DAY_PAIRS = [
+    ('monday',    'tuesday'),
+    ('wednesday', 'thursday'),
+    ('friday',    'saturday'),
+]
 MEAL_PREFIX_RE = re.compile(
     r'^\s*(cold breakfast|hot breakfast|lunch|dinner)\s*:\s*(.*)$',
     re.IGNORECASE,
@@ -64,6 +91,49 @@ def cell_text(cells, idx: int) -> str:
     if idx >= len(cells):
         return ''
     return cells[idx].text.strip()
+
+
+def detect_format(table) -> str:
+    """Return 'new' or 'old' based on row 0 content."""
+    if not table.rows:
+        return 'new'
+    row0_text = ' '.join(c.text for c in table.rows[0].cells).lower()
+    if 'week of' in row0_text:
+        return 'old'
+    return 'new'
+
+
+def parse_block_old(table, block_start: int, block_idx: int, week_start: date) -> list[dict]:
+    """Parse one OLD-format block. block_idx 0/1/2 → Mon-Tue / Wed-Thu / Fri-Sat."""
+    if block_idx >= len(OLD_DAY_PAIRS):
+        return []
+    day_pair = OLD_DAY_PAIRS[block_idx]
+    out = []
+    for col_idx, day_name in zip(OLD_MENU_COLS, day_pair):
+        if not day_name or day_name not in DAY_OFFSET:
+            continue
+        day_date = week_start + timedelta(days=DAY_OFFSET[day_name])
+        for row_offset, default_slot in OLD_MEAL_ROWS.items():
+            row_n = block_start + row_offset
+            if row_n >= len(table.rows):
+                continue
+            row = table.rows[row_n].cells
+            menu_text = cell_text(row, col_idx)
+            if not menu_text:
+                continue
+            slot, dish = strip_meal_prefix(menu_text, default_slot)
+            if not dish or dish.lower() in ('n/a', 'none', ''):
+                continue
+            # OLD format has Notes (cook name) in col_idx+1; keep as ingredients
+            # so it shows up somewhere — these old docs didn't list ingredients.
+            ingredients = cell_text(row, col_idx + 1)
+            out.append({
+                'date':            day_date,
+                'meal_slot':       slot,
+                'dish_freetext':   dish[:200],
+                'ingredients_raw': ingredients,
+            })
+    return out
 
 
 def parse_block(table, block_start: int, week_start: date) -> list[dict]:
@@ -123,10 +193,20 @@ class Command(BaseCommand):
         rows: list[dict] = []
         for week_idx, week_start in enumerate([week1_start, week2_start]):
             table = doc.tables[week_idx]
-            for block_start in (0, BLOCK_SIZE, BLOCK_SIZE * 2):
-                if block_start + BLOCK_SIZE > len(table.rows):
-                    continue
-                rows.extend(parse_block(table, block_start, week_start))
+            fmt = detect_format(table)
+            if fmt == 'old':
+                # Old format: 3 blocks per table (Mon-Tue, Wed-Thu, Fri-Sat),
+                # each 12 rows starting at row 2.
+                for block_idx, block_start in enumerate((2, 14, 26)):
+                    if block_start + OLD_BLOCK_SIZE > len(table.rows):
+                        continue
+                    rows.extend(parse_block_old(table, block_start, block_idx, week_start))
+            else:
+                # New format: blocks at 0, 12, 24
+                for block_start in (0, BLOCK_SIZE, BLOCK_SIZE * 2):
+                    if block_start + BLOCK_SIZE > len(table.rows):
+                        continue
+                    rows.extend(parse_block(table, block_start, week_start))
 
         self.stdout.write(f"Parsed {len(rows)} menu entries")
 
