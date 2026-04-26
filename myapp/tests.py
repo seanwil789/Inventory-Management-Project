@@ -4443,6 +4443,37 @@ class MapperNewTiersTests(TestCase):
         self.assertEqual(mapper._stem_text('cs'), '')  # <3 chars rejected
         self.assertEqual(mapper._stem_text(''), '')
 
+    def test_ocr_cleanup_digit_0z(self):
+        """'9620Z' → '962 OZ' — OCR zero-vs-O misread before Z unit."""
+        mapper = self._mapper()
+        c = mapper._ocr_cleanup
+        self.assertEqual(c('9620Z'), '962 OZ')
+        self.assertEqual(c('16810Z'), '1681 OZ')
+        self.assertEqual(c('ONLY180Z MCCLNRY SPICE'), 'ONLY18 OZ MCCLNRY SPICE')
+        # Already-correct strings unchanged
+        self.assertEqual(c('962 OZ COFFEE'), '962 OZ COFFEE')
+        self.assertEqual(c(''), '')
+
+    def test_ocr_cleanup_unit_prefix_split(self):
+        """'OZCITVCLS' → 'OZ CITVCLS' — unit prefix glued to brand code."""
+        mapper = self._mapper()
+        c = mapper._ocr_cleanup
+        self.assertEqual(c('961.5 OZCITVCLS COFFEE GRND'),
+                         '961.5 OZ CITVCLS COFFEE GRND')
+        self.assertEqual(c('LBSYSCO BEEF'), 'LB SYSCO BEEF')
+        # Words with too-short tail after unit-prefix stay intact:
+        # OZONE → OZ + ONE (only 3 caps) → pattern requires {4,} → no split
+        self.assertEqual(c('OZONE WATER'), 'OZONE WATER')
+        self.assertEqual(c('OZARK SPRING'), 'OZARK SPRING')
+
+    def test_ocr_cleanup_idempotent(self):
+        """Running cleanup twice yields the same result."""
+        mapper = self._mapper()
+        c = mapper._ocr_cleanup
+        once  = c('9620Z OZCITVCLS COFFEE')
+        twice = c(once)
+        self.assertEqual(once, twice)
+
     def test_stemmer_food_domain_plurals(self):
         """Food-domain plural patterns: ies→y, oes→o, ches/shes/xes→ch/sh/x.
 

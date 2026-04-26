@@ -265,6 +265,31 @@ _TRAILING_NOISE_RE = re.compile(
 )
 
 
+# OCR concatenation patterns common in Sysco invoice descriptions, where
+# the OCR pass loses spacing between numeric quantities and unit codes
+# or unit codes and brand-prefix letters. Cleaned BEFORE the mapper
+# tokenizes/fuzzy-matches so the noise tokens become separable.
+#
+# Patterns (longest applied first within each step):
+#   1. '<digits>0Z'  → '<digits> OZ'   — '0Z' is the OCR misread of 'OZ'
+#                                        when zero-vs-O confusion happens
+#                                        (9620Z → 962 OZ, 16810Z → 1681 OZ,
+#                                         ONLY180Z → ONLY18 OZ)
+#   2. 'OZCITVCLS'-style — known unit prefix flowing into 4+ caps run
+#      (Sysco brand prefix). Conservative whitelist of 2-3-letter units.
+_OCR_0Z_RE = re.compile(r'(\d+)0Z\b')
+_OCR_UNIT_PREFIX_RE = re.compile(r'\b(OZ|LB|GAL|CT|CS|DZ|EA|KG|ML)([A-Z]{4,})')
+
+
+def _ocr_cleanup(text: str) -> str:
+    """Insert spaces at OCR concatenation boundaries. Idempotent."""
+    if not text:
+        return text
+    text = _OCR_0Z_RE.sub(r'\1 OZ', text)
+    text = _OCR_UNIT_PREFIX_RE.sub(r'\1 \2', text)
+    return text
+
+
 def _strip_sysco_prefix(text: str) -> str:
     """
     Remove Sysco brand-code prefix (and optional trailing quantity codes) from
@@ -612,6 +637,14 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
             pools_to_try.append(section_pool)
         pools_to_try.append(canonical_names_full)
 
+        # OCR cleanup (9620Z → 962 OZ, OZCITVCLS → OZ CITVCLS) is scoped
+        # to tier 6 ONLY — tiers 2-5 lookup against sheet-curated keys
+        # that include the original OCR garble; cleaning the input here
+        # would break those exact-match dictionaries. At tier 6 we're
+        # matching against English canonical names, so cleanup is a net
+        # win — it exposes 'OZ' and other unit/word boundaries that the
+        # tokenizer was missing. Surfaced from 2026-04-25 audit.
+        ocr_cleaned = _ocr_cleanup(normalized)
         # Expand abbreviations BEFORE fuzzy matching against canonical names —
         # canonicals are English words ('Chicken Breast', 'Pork Shoulder',
         # 'Heavy Cream') so expansion bridges the OCR-shorthand gap.
@@ -619,7 +652,7 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
         # 'Chicken Breast' canonical at high score; previously zero overlap.)
         # Limited to tier 6 — tiers 2-5 match against sheet entries which
         # share the same abbreviations as raw input.
-        stripped = _strip_sysco_prefix(normalized)
+        stripped = _strip_sysco_prefix(ocr_cleaned)
         expanded = expand_abbreviations(stripped)
         stripped_for_stem = expanded if expanded != normalized else normalized
         stemmed_desc = _stem_text(stripped_for_stem)
