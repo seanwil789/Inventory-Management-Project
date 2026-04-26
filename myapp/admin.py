@@ -1,10 +1,21 @@
 from django.contrib import admin
 from .models import (
-    Vendor, Product, ProductMapping, InvoiceLineItem,
+    Vendor, Product, ProductMapping, ProductMappingProposal, InvoiceLineItem,
     Recipe, RecipeIngredient, Menu, PrepTask, Census,
     IngredientSkipNote, YieldReference, StandardPortionReference,
     MealService,
 )
+
+
+@admin.register(ProductMappingProposal)
+class ProductMappingProposalAdmin(admin.ModelAdmin):
+    list_display   = ('vendor', 'raw_description', 'suggested_product',
+                      'score', 'status', 'source', 'created_at')
+    list_filter    = ('status', 'source', 'vendor', 'confidence_tier')
+    search_fields  = ('raw_description', 'suggested_product__canonical_name')
+    autocomplete_fields = ('vendor', 'suggested_product', 'reviewed_by')
+    readonly_fields = ('created_at',)
+    date_hierarchy = 'created_at'
 
 
 @admin.register(MealService)

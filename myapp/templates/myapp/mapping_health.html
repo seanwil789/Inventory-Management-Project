@@ -223,6 +223,8 @@
 
   <p class="text-xs text-slate-400">
     Refreshed {{ today|date:"D M j, Y" }}. See also:
+    <a href="{% url 'mapping_review' %}" class="text-indigo-600 hover:underline">Mapping Review queue →</a>
+    ·
     <a href="{% url 'pipeline_health' %}" class="hover:underline">Pipeline Health</a>
     ·
     <a href="{% url 'cost_coverage' %}" class="hover:underline">Cost Coverage</a>

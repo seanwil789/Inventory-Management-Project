@@ -5991,3 +5991,101 @@ class FuzzyQuarantineTests(TestCase):
         # ILI still unmapped
         ili = InvoiceLineItem.objects.get(raw_description='BOGUS FUZZY MATCH')
         self.assertIsNone(ili.product)
+
+
+class MappingReviewViewTests(TestCase):
+    """`/mapping-review/` Django view + approve/reject endpoints —
+    Phase 2B replacement for the Sheets workflow."""
+
+    def setUp(self):
+        super().setUp()
+        from django.contrib.auth.models import User
+        self.user = User.objects.create_user(username='reviewer', password='x')
+        self.client.force_login(self.user)
+        self.sysco = Vendor.objects.create(name='Sysco')
+        self.romaine = Product.objects.create(canonical_name='Romaine')
+
+    def _make_proposal(self, raw_desc='WHLFCLS ROMAINE HEART 3CT', status='pending'):
+        return ProductMappingProposal.objects.create(
+            vendor=self.sysco, raw_description=raw_desc,
+            suggested_product=self.romaine,
+            score=90, confidence_tier='vendor_fuzzy',
+            source='mapper_quarantine', status=status,
+        )
+
+    def test_list_view_renders_with_pending_only_by_default(self):
+        self._make_proposal(raw_desc='PENDING ROW', status='pending')
+        self._make_proposal(raw_desc='APPROVED ROW', status='approved')
+        r = self.client.get('/mapping-review/')
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'PENDING ROW')
+        self.assertNotContains(r, 'APPROVED ROW')
+
+    def test_list_view_filter_status(self):
+        self._make_proposal(raw_desc='APPROVED ROW', status='approved')
+        r = self.client.get('/mapping-review/?status=approved')
+        self.assertContains(r, 'APPROVED ROW')
+
+    def test_approve_action_attaches_fk_and_creates_mapping(self):
+        p = self._make_proposal()
+        # Seed an ILI matching the (vendor, raw_desc)
+        InvoiceLineItem.objects.create(
+            vendor=self.sysco, raw_description=p.raw_description,
+            product=None, match_confidence='vendor_fuzzy_pending',
+            invoice_date=date(2026, 4, 20),
+        )
+        r = self.client.post(f'/mapping-review/{p.id}/approve/')
+        self.assertEqual(r.status_code, 302)
+        p.refresh_from_db()
+        self.assertEqual(p.status, 'approved')
+        self.assertEqual(p.reviewed_by, self.user)
+        ili = InvoiceLineItem.objects.get(raw_description=p.raw_description)
+        self.assertEqual(ili.product, self.romaine)
+        self.assertEqual(ili.match_confidence, 'manual_review')
+        self.assertTrue(ProductMapping.objects.filter(
+            vendor=self.sysco, description=p.raw_description, product=self.romaine,
+        ).exists())
+
+    def test_approve_with_override_canonical(self):
+        actual = Product.objects.create(canonical_name='Iceberg')
+        p = self._make_proposal()
+        r = self.client.post(f'/mapping-review/{p.id}/approve/',
+                             {'override_canonical': 'Iceberg'})
+        self.assertEqual(r.status_code, 302)
+        p.refresh_from_db()
+        self.assertEqual(p.suggested_product, actual)
+        # Check ProductMapping reflects override
+        pm = ProductMapping.objects.get(vendor=self.sysco, description=p.raw_description)
+        self.assertEqual(pm.product, actual)
+
+    def test_approve_with_unknown_override_rejected(self):
+        """Override pointing to a non-existent canonical is refused
+        gracefully — no PM written, error message shown."""
+        p = self._make_proposal()
+        r = self.client.post(f'/mapping-review/{p.id}/approve/',
+                             {'override_canonical': 'NotARealProduct'},
+                             follow=True)
+        # Stays pending
+        p.refresh_from_db()
+        self.assertEqual(p.status, 'pending')
+        self.assertContains(r, 'doesn&#x27;t exist')
+
+    def test_reject_action(self):
+        p = self._make_proposal()
+        r = self.client.post(f'/mapping-review/{p.id}/reject/',
+                             {'notes': 'wrong product'})
+        self.assertEqual(r.status_code, 302)
+        p.refresh_from_db()
+        self.assertEqual(p.status, 'rejected')
+        self.assertIn('wrong product', p.notes)
+        # No PM created
+        self.assertFalse(ProductMapping.objects.filter(
+            vendor=self.sysco, description=p.raw_description
+        ).exists())
+
+    def test_double_approve_idempotent_warning(self):
+        """Re-approving an already-approved proposal warns instead of crashing."""
+        p = self._make_proposal()
+        self.client.post(f'/mapping-review/{p.id}/approve/')
+        r = self.client.post(f'/mapping-review/{p.id}/approve/', follow=True)
+        self.assertContains(r, 'already approved')

@@ -1,0 +1,167 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Mapping Review{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Mapping Review Queue</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Pending fuzzy-match suggestions held by the mapper quarantine.
+      Approve to attach the FK to all matching ILI rows + write a permanent ProductMapping.
+      Reject to suppress re-suggestion of this <code>(vendor, raw_description)</code>.
+    </p>
+  </div>
+
+  {% if messages %}
+    <div class="space-y-2">
+      {% for message in messages %}
+        <div class="rounded-lg border p-3 text-sm
+          {% if message.tags == 'success' %}border-emerald-200 bg-emerald-50 text-emerald-900
+          {% elif message.tags == 'warning' %}border-amber-200 bg-amber-50 text-amber-900
+          {% elif message.tags == 'error' %}border-red-200 bg-red-50 text-red-900
+          {% else %}border-slate-200 bg-slate-50 text-slate-900{% endif %}">
+          {{ message }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <!-- Filter chips -->
+  <div class="flex flex-wrap gap-2 items-center text-sm">
+    <span class="text-slate-500">Status:</span>
+    <a href="?status=pending"
+       class="px-3 py-1 rounded-full
+       {% if status_filter == 'pending' %}bg-amber-100 text-amber-900 border border-amber-300{% else %}bg-slate-100 text-slate-700 hover:bg-slate-200{% endif %}">
+      Pending ({{ status_counts.pending|default:0 }})
+    </a>
+    <a href="?status=approved"
+       class="px-3 py-1 rounded-full
+       {% if status_filter == 'approved' %}bg-emerald-100 text-emerald-900 border border-emerald-300{% else %}bg-slate-100 text-slate-700 hover:bg-slate-200{% endif %}">
+      Approved ({{ status_counts.approved|default:0 }})
+    </a>
+    <a href="?status=rejected"
+       class="px-3 py-1 rounded-full
+       {% if status_filter == 'rejected' %}bg-red-100 text-red-900 border border-red-300{% else %}bg-slate-100 text-slate-700 hover:bg-slate-200{% endif %}">
+      Rejected ({{ status_counts.rejected|default:0 }})
+    </a>
+    <a href="?status=all"
+       class="px-3 py-1 rounded-full
+       {% if status_filter == 'all' %}bg-indigo-100 text-indigo-900 border border-indigo-300{% else %}bg-slate-100 text-slate-700 hover:bg-slate-200{% endif %}">
+      All
+    </a>
+
+    <span class="text-slate-500 ml-4">Vendor:</span>
+    <select onchange="window.location.href='?status={{ status_filter }}&vendor=' + this.value"
+            class="border rounded px-2 py-1 text-sm">
+      <option value="">All vendors</option>
+      {% for v in vendors %}
+        <option value="{{ v }}" {% if v == vendor_filter %}selected{% endif %}>{{ v }}</option>
+      {% endfor %}
+    </select>
+  </div>
+
+  <!-- Shared canonicals datalist for autocomplete -->
+  <datalist id="dl-canonicals">
+    {% for c in all_canonicals %}<option value="{{ c }}">{% endfor %}
+  </datalist>
+
+  {% if proposals %}
+  <div class="rounded-lg bg-white border border-slate-200 overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide bg-slate-50">
+        <tr>
+          <th class="text-left py-2 px-3">Vendor</th>
+          <th class="text-left py-2 px-3">Raw Description</th>
+          <th class="text-left py-2 px-3">Suggested Canonical</th>
+          <th class="text-right py-2 px-3">Score</th>
+          <th class="text-right py-2 px-3">ILIs Affected</th>
+          <th class="text-left py-2 px-3">Action</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in proposals %}
+          {% with p=row.p %}
+          <tr class="border-t border-slate-100
+            {% if p.status == 'approved' %}bg-emerald-50/30
+            {% elif p.status == 'rejected' %}bg-red-50/30{% endif %}">
+            <td class="py-2 px-3 text-xs">{{ p.vendor.name }}</td>
+            <td class="py-2 px-3 font-mono text-xs">{{ p.raw_description|truncatechars:60 }}</td>
+            <td class="py-2 px-3 text-xs">
+              {% if p.suggested_product %}
+                {{ p.suggested_product.canonical_name }}
+              {% else %}
+                <span class="text-slate-400">(none)</span>
+              {% endif %}
+            </td>
+            <td class="py-2 px-3 text-right tabular-nums text-xs text-slate-600">
+              {% if p.score %}{{ p.score }}{% else %}—{% endif %}
+            </td>
+            <td class="py-2 px-3 text-right tabular-nums text-xs text-slate-600">
+              {{ row.ili_count }}
+            </td>
+            <td class="py-2 px-3">
+              {% if p.status == 'pending' %}
+                <form method="post" action="{% url 'mapping_review_approve' p.id %}" class="inline-flex items-center gap-1">
+                  {% csrf_token %}
+                  <input type="text" name="override_canonical"
+                         list="dl-canonicals" placeholder="(use suggested)"
+                         class="border rounded px-2 py-0.5 text-xs w-40"
+                         autocomplete="off">
+                  <button type="submit"
+                          class="px-2 py-0.5 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-xs">
+                    ✓ Approve
+                  </button>
+                </form>
+                <form method="post" action="{% url 'mapping_review_reject' p.id %}" class="inline">
+                  {% csrf_token %}
+                  <button type="submit"
+                          class="px-2 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-xs ml-1">
+                    ✗ Reject
+                  </button>
+                </form>
+              {% else %}
+                <span class="text-xs text-slate-500">
+                  {{ p.get_status_display }}
+                  {% if p.reviewed_by %} by {{ p.reviewed_by.username }}{% endif %}
+                  {% if p.reviewed_at %}<br>{{ p.reviewed_at|date:"M j H:i" }}{% endif %}
+                </span>
+              {% endif %}
+            </td>
+          </tr>
+          {% if p.notes %}
+          <tr class="bg-slate-50/50 border-t-0">
+            <td colspan="6" class="px-3 py-1 text-xs text-slate-600">
+              <span class="text-slate-400">Notes:</span> {{ p.notes|linebreaksbr }}
+            </td>
+          </tr>
+          {% endif %}
+          {% endwith %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <p class="text-xs text-slate-400">Showing first 100. Use filters to narrow.</p>
+  {% else %}
+    <div class="rounded-lg bg-white border border-slate-200 p-8 text-center">
+      <p class="text-slate-600">
+        {% if status_filter == 'pending' %}
+          No pending proposals. 🎉 The queue is clear.
+        {% else %}
+          No proposals match this filter.
+        {% endif %}
+      </p>
+    </div>
+  {% endif %}
+
+  <p class="text-xs text-slate-400">
+    Pipeline visibility:
+    <a href="{% url 'mapping_health' %}" class="hover:underline">Mapping Health</a>
+    ·
+    <a href="{% url 'pipeline_health' %}" class="hover:underline">Pipeline Health</a>
+    ·
+    <a href="{% url 'bridge_review' %}" class="hover:underline">RecipeIngredient Bridge</a>
+  </p>
+
+</div>
+{% endblock %}

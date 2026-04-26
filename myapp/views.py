@@ -2384,6 +2384,124 @@ def pipeline_health(request):
     })
 
 
+# ---- Mapping Review queue (Phase 2B — Django UI replacing Sheets workflow) ----
+
+def mapping_review(request):
+    """List view of pending ProductMappingProposal rows.
+
+    Replaces the Sheets-based Mapping Review tab. Each pending row shows:
+    vendor + raw_description + suggested canonical + score, with three
+    actions per row:
+      - Approve (uses suggested canonical, or override via dropdown)
+      - Reject (suppresses re-suggestion of same vendor+desc)
+      - Skip (leaves pending; review later)
+
+    Filters: vendor, status, source. Sort: score desc, recency desc.
+
+    Cheap to render — paginated, no fancy joins. The approve action
+    handles the FK backfill to all matching ILI rows transactionally."""
+    from .models import ProductMappingProposal
+    from django.db.models import Count
+
+    status_filter = request.GET.get('status', 'pending')
+    vendor_filter = request.GET.get('vendor', '')
+
+    qs = (ProductMappingProposal.objects
+          .select_related('vendor', 'suggested_product', 'reviewed_by')
+          .order_by('-created_at'))
+
+    if status_filter and status_filter != 'all':
+        qs = qs.filter(status=status_filter)
+    if vendor_filter:
+        qs = qs.filter(vendor__name=vendor_filter)
+
+    proposals = list(qs[:100])  # cap render
+
+    # For each proposal, count the ILI rows that would be backfilled on approve
+    proposal_rows = []
+    for p in proposals:
+        ili_count = InvoiceLineItem.objects.filter(
+            vendor=p.vendor, raw_description=p.raw_description,
+        ).count()
+        proposal_rows.append({'p': p, 'ili_count': ili_count})
+
+    # Status counters for the filter chips
+    status_counts = dict(
+        ProductMappingProposal.objects.values('status').annotate(n=Count('id'))
+        .values_list('status', 'n')
+    )
+    vendors = list(Vendor.objects.order_by('name').values_list('name', flat=True))
+    # Cached list of all canonicals for autocomplete (Product.canonical_name)
+    all_canonicals = list(Product.objects.order_by('canonical_name')
+                          .values_list('canonical_name', flat=True))
+
+    return render(request, 'myapp/mapping_review.html', {
+        'proposals': proposal_rows,
+        'status_filter': status_filter,
+        'vendor_filter': vendor_filter,
+        'status_counts': status_counts,
+        'vendors': vendors,
+        'all_canonicals': all_canonicals,
+    })
+
+
+@require_POST
+def mapping_review_approve(request, proposal_id: int):
+    """POST endpoint: approve a proposal. Optional 'override_canonical'
+    POST param to pick a different Product than the suggestion."""
+    from .models import ProductMappingProposal
+    proposal = get_object_or_404(ProductMappingProposal, id=proposal_id)
+    if proposal.status != 'pending':
+        messages.warning(request, f"Proposal #{proposal.id} already {proposal.status}.")
+        return redirect('mapping_review')
+
+    override_name = (request.POST.get('override_canonical') or '').strip()
+    notes = (request.POST.get('notes') or '').strip()
+    final_product = None
+    if override_name:
+        final_product = Product.objects.filter(canonical_name=override_name).first()
+        if final_product is None:
+            messages.error(request,
+                f"Canonical {override_name!r} doesn't exist as a Product. "
+                f"Create it first via /admin/myapp/product/add/ then re-approve.")
+            return redirect('mapping_review')
+    else:
+        final_product = proposal.suggested_product
+
+    if final_product is None:
+        messages.error(request,
+            f"Proposal #{proposal.id} has no suggested product and no override given.")
+        return redirect('mapping_review')
+
+    result = proposal.approve(
+        product=final_product,
+        reviewer=request.user if request.user.is_authenticated else None,
+        notes=notes,
+    )
+    messages.success(request,
+        f"Approved → {final_product.canonical_name!r} | "
+        f"backfilled {result['ili_updated']} ILI rows | "
+        f"ProductMapping {('updated' if result['product_mapping']._state.adding is False else 'created')}.")
+    return redirect('mapping_review')
+
+
+@require_POST
+def mapping_review_reject(request, proposal_id: int):
+    """POST endpoint: reject a proposal. Optional 'notes' POST param."""
+    from .models import ProductMappingProposal
+    proposal = get_object_or_404(ProductMappingProposal, id=proposal_id)
+    if proposal.status != 'pending':
+        messages.warning(request, f"Proposal #{proposal.id} already {proposal.status}.")
+        return redirect('mapping_review')
+    notes = (request.POST.get('notes') or '').strip()
+    proposal.reject(
+        reviewer=request.user if request.user.is_authenticated else None,
+        notes=notes,
+    )
+    messages.info(request, f"Rejected proposal #{proposal.id}.")
+    return redirect('mapping_review')
+
+
 # ---- Mapper health dashboard (Step 2 of sheet→DB migration follow-up) ----
 
 def mapping_health(request):
