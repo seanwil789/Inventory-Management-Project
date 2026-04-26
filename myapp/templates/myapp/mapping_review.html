@@ -178,14 +178,20 @@
                 </div>
                 <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
                   <label class="block">
-                    <span class="text-xs text-slate-600">Canonical name *</span>
+                    <span class="text-xs text-slate-600">
+                      Canonical name *
+                      {% if row.suggested_canonical %}
+                        <span class="text-emerald-600 ml-1" title="Auto-derived from raw — review and edit if needed">⚙ suggested</span>
+                      {% endif %}
+                    </span>
                     <input type="text" name="canonical_name" required
+                           value="{{ row.suggested_canonical|default:'' }}"
                            placeholder="e.g., Pringles, Original"
                            list="dl-canonicals"
                            class="border rounded px-2 py-1 text-sm w-full"
                            autocomplete="off">
                     <span class="text-xs text-slate-400 italic">
-                      Type the cleaned canonical, not the vendor raw.
+                      {% if row.suggested_canonical %}Review the auto-derived suggestion; edit if convention placement is off.{% else %}Type the cleaned canonical, not the vendor raw.{% endif %}
                     </span>
                   </label>
                   <label class="block">

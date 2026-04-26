@@ -2401,7 +2401,7 @@ def mapping_review(request):
     Cheap to render — paginated, no fancy joins. The approve action
     handles the FK backfill to all matching ILI rows transactionally."""
     from .models import ProductMappingProposal
-    from .taxonomy import infer_taxonomy, build_inference_index
+    from .taxonomy import infer_taxonomy, build_inference_index, derive_canonical_suggestion
     from django.db.models import Count
 
     status_filter = request.GET.get('status', 'pending')
@@ -2464,12 +2464,20 @@ def mapping_review(request):
         p = row['p']
         section_hint = section_hint_map.get((p.vendor_id, p.raw_description))
         subset = p.suggested_product.canonical_name if p.suggested_product else None
+        vendor_name = p.vendor.name if p.vendor else None
         row['inferred'] = infer_taxonomy(
             p.raw_description,
-            vendor=p.vendor.name if p.vendor else None,
+            vendor=vendor_name,
             section_hint=section_hint,
             subset_canonical=subset,
             index=inference_index,
+        )
+        # Auto-derived canonical name suggestion — pre-fills the create
+        # form's canonical_name field when derivation produces something
+        # safe. None when the raw is too garbled (form stays blank,
+        # reviewer types).
+        row['suggested_canonical'] = derive_canonical_suggestion(
+            p.raw_description, vendor=vendor_name, subset_canonical=subset,
         )
 
     status_counts = dict(

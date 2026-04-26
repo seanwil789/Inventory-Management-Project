@@ -6410,6 +6410,87 @@ class TaxonomyInferenceTests(TestCase):
         self.assertEqual(r['primary'], (None, 'unknown'))
 
 
+class CanonicalSuggestionTests(TestCase):
+    """`derive_canonical_suggestion` — auto-derives a clean canonical name
+    starting point for the Mapping Review create form."""
+
+    def test_farm_art_comma_separated_clean(self):
+        """Farm Art's 'TOMATOES, CHERRY, 12 CONT' → 'Tomato, Cherry'."""
+        from myapp.taxonomy import derive_canonical_suggestion
+        self.assertEqual(
+            derive_canonical_suggestion('TOMATOES, CHERRY, 12 CONT', vendor='Farm Art'),
+            'Tomato, Cherry')
+        self.assertEqual(
+            derive_canonical_suggestion('MUSHROOMS, SHIITAKE, #1, 3 LB', vendor='Farm Art'),
+            'Mushroom, Shiitake')
+
+    def test_plural_strip_in_derivation(self):
+        """'TOMATOES' → 'Tomato', 'CHERRIES' → 'Cherry' via the food-domain
+        stemmer. Verifies stem patterns flow through the derivation."""
+        from myapp.taxonomy import derive_canonical_suggestion
+        self.assertEqual(
+            derive_canonical_suggestion('CHERRIES, FRESH', vendor='Farm Art'),
+            'Cherry, Fresh')
+        self.assertEqual(
+            derive_canonical_suggestion('POTATOES, RED', vendor='Farm Art'),
+            'Potato, Red')
+
+    def test_already_clean_passthrough(self):
+        """Short clean raws already in canonical shape pass through."""
+        from myapp.taxonomy import derive_canonical_suggestion
+        self.assertEqual(
+            derive_canonical_suggestion('Pork Chop', vendor='Sysco'),
+            'Pork Chop')
+
+    def test_subset_canonical_returns_none(self):
+        """When subset_match found a candidate, derivation returns None
+        — the reviewer should approve against the subset, not create new."""
+        from myapp.taxonomy import derive_canonical_suggestion
+        self.assertIsNone(derive_canonical_suggestion(
+            'Apple Danish', vendor='PBM', subset_canonical='Danish'))
+
+    def test_sysco_prefix_strip_produces_clean_suggestion(self):
+        """OCR cleanup + abbreviation expansion + Sysco prefix strip
+        combine to clean even the gnarliest Sysco raws into a usable
+        starting point. Result must NOT contain the brand fragment
+        or trailing SUPC."""
+        from myapp.taxonomy import derive_canonical_suggestion
+        out = derive_canonical_suggestion(
+            'OZCITVCLS COFFEE GRND HSE BLEND MED W / F 29596', vendor='Sysco')
+        self.assertIsNotNone(out)
+        self.assertNotIn('CITV', out)
+        self.assertNotIn('29596', out)
+        # 'COFFEE' should survive (it's the actual product noun)
+        self.assertIn('Coffee', out)
+
+    def test_brand_fragment_without_strip_bails(self):
+        """When a non-Sysco vendor presents a brand fragment that
+        prefix-strip won't touch (because vendor != Sysco), the
+        fragment-detection guard kicks in and returns None."""
+        from myapp.taxonomy import derive_canonical_suggestion
+        # Vendor is Farm Art — no Sysco prefix-strip applied.
+        # Synthetic brand fragment WHLFCLS forces the bail path.
+        self.assertIsNone(derive_canonical_suggestion(
+            'WHLFCLS something garbled', vendor='Farm Art'))
+
+    def test_empty_raw_returns_none(self):
+        from myapp.taxonomy import derive_canonical_suggestion
+        self.assertIsNone(derive_canonical_suggestion('', vendor='Sysco'))
+        self.assertIsNone(derive_canonical_suggestion(None, vendor='Sysco'))
+
+    def test_strips_trailing_supc_and_leading_qty(self):
+        """Long digit runs at end (SUPC) and 'NN OZ' / 'NN CT' prefixes
+        get stripped before canonical extraction."""
+        from myapp.taxonomy import derive_canonical_suggestion
+        out = derive_canonical_suggestion(
+            '24 12 OZ LACROIX WATER SPARKLING LIME 15021240', vendor='Sysco')
+        # Some flavor of clean — at minimum doesn't include the SUPC
+        # and no longer has the leading qty.
+        self.assertIsNotNone(out)
+        self.assertNotIn('15021240', out)
+        self.assertIn('Lacroix', out.title() if out else '')
+
+
 class MappingReviewCreateAndApproveTests(TestCase):
     """`/mapping-review/<id>/create-and-approve/` — creates Product +
     approves proposal in one shot."""

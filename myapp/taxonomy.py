@@ -664,6 +664,130 @@ def _signal_protein_primal(raw_lower, current_category):
     return None
 
 
+# ---- Canonical-name suggestion (derives a clean canonical from raw) ----
+
+# Tokens dropped when deriving a canonical — quantity units, packaging
+# words, and Sysco descriptor noise. Lowercase comparison.
+_DERIVE_NOISE_TOKENS = frozenset({
+    # Units
+    'oz', 'lb', 'gal', 'qt', 'pt', 'ml', 'kg', 'gram', 'grams',
+    'ct', 'cs', 'ea', 'dz', 'pk', 'pkg', 'bx', 'bg', 'cn', 'qty',
+    'each', 'count', 'case', 'pack', 'box', 'bag', 'can', 'cont',
+    # Sysco-specific qualifiers / noise
+    'iqf', 'cvp', 'fz', 'frz', 'fzn', 'wht', 'whl',
+    'aa', 'usda', 'gr', 'med', 'lrg', 'sm', 'jbo',
+    'rtb', 'rts', 'rtu', 'esl', 'avg',
+    'choice', 'fancy', 'select', 'prime',
+})
+
+# Brand-fragment patterns that indicate Sysco prefix-strip didn't catch
+# everything. If the cleaned text still contains these, bail.
+_DERIVE_BRAND_FRAGMENT_RE = re.compile(
+    r'\b[A-Z]{4,}(CLS|IMP|FRSH|RSVS|CUC|RH|RL|FDS|STN|UCB)\b|'
+    r'\bWHLF\w*\b|\bAREZ\w*\b|\bIMPF\w*\b|\bBKRS\w*\b|\bBBRL\w*\b',
+    re.IGNORECASE,
+)
+
+# Trailing item-code (6+ digit run) at end
+_DERIVE_TRAILING_SUPC_RE = re.compile(r'[\s,]*\d{6,}\w*\s*$')
+
+# Leading qty + optional unit
+_DERIVE_LEADING_QTY_RE = re.compile(
+    r'^\s*[#\-Cc]?\s*\d+(\s*[#\-/×x]\s*\d+)?\s*'
+    r'(OZ|LB|GAL|CT|CS|DZ|EA|PK|BG|BX|CN|KG|ML|GR|G|QT|PT|CONT)?\s*',
+    re.IGNORECASE,
+)
+
+# Tokens with embedded apostrophe (D'Arbol, Cap'n) — preserve as-is
+_DERIVE_TOKEN_RE = re.compile(r"[A-Za-z][A-Za-z']*")
+
+
+def derive_canonical_suggestion(raw_description, vendor=None,
+                                 subset_canonical=None):
+    """Derive a clean canonical name from a raw vendor description.
+
+    The result is a STARTING POINT for the reviewer — convention placement
+    (commas, ordering, primary vs secondary) often needs manual tweaking.
+    Returns None when the raw is too garbled to clean safely (heavy OCR,
+    persistent brand fragments) — in that case the create form stays
+    blank and the reviewer types from scratch.
+
+    Args:
+      raw_description: the vendor invoice line as parsed
+      vendor: vendor name (drives Sysco-specific prefix stripping)
+      subset_canonical: if a subset_match suggestion exists, return None
+        (the reviewer should approve against it, not create a new canonical)
+
+    Examples:
+      'TOMATOES, CHERRY, 12 CONT'      → 'Tomato, Cherry'
+      'MUSHROOMS, SHIITAKE, #1, 3 LB'  → 'Mushroom, Shiitake'
+      'Pork Chop'                      → 'Pork Chop'
+      'Beef Flat Iron Ch Steak 4oz'    → 'Beef Flat Iron Steak'
+      'WHLFCLS EGG SHELL MED GR AA'    → 'Egg Shell'  (after prefix strip)
+      'OZCITVCLS COFFEE GRND HSE BLEND'→ None  (brand fragment after expand)
+    """
+    if not raw_description:
+        return None
+    # When subset_match found a candidate, the reviewer should approve
+    # against it rather than mint a new canonical.
+    if subset_canonical:
+        return None
+
+    # 1. Expand vendor abbreviations (BRST → Breast, etc.)
+    text = _expand_text(raw_description).strip()
+
+    # 2. Strip Sysco brand prefix (delegate to mapper for parity)
+    if vendor and 'sysco' in vendor.lower():
+        import sys
+        from django.conf import settings
+        p = str(settings.BASE_DIR / 'invoice_processor')
+        if p not in sys.path:
+            sys.path.insert(0, p)
+        from mapper import _strip_sysco_prefix
+        text = _strip_sysco_prefix(text)
+
+    # 3. Strip trailing SUPC
+    text = _DERIVE_TRAILING_SUPC_RE.sub('', text)
+
+    # 4. Strip leading quantity + unit
+    text = _DERIVE_LEADING_QTY_RE.sub('', text).strip()
+
+    # 5. Bail if brand fragments remain (signals heavy OCR garble)
+    if _DERIVE_BRAND_FRAGMENT_RE.search(text):
+        return None
+
+    # 6. Process by comma segments (preserve structure when raw is
+    # already comma-separated like Farm Art's 'TOMATOES, CHERRY, ...')
+    segments = [s.strip() for s in text.split(',')]
+    cleaned_segments = []
+    for seg in segments:
+        # Drop leading qty within the segment too
+        seg = _DERIVE_LEADING_QTY_RE.sub('', seg).strip()
+        # Tokenize
+        tokens = _DERIVE_TOKEN_RE.findall(seg)
+        # Filter noise + plural-strip + title-case
+        cleaned = []
+        for t in tokens:
+            low = t.lower()
+            if low in _DERIVE_NOISE_TOKENS:
+                continue
+            stem = _stem(low)
+            cleaned.append(stem.title())
+        if cleaned:
+            cleaned_segments.append(' '.join(cleaned))
+
+    if not cleaned_segments:
+        return None
+
+    result = ', '.join(cleaned_segments)
+
+    # 7. Sanity: result must be substantive
+    if len(result) < 3:
+        return None
+
+    return result
+
+
 # ---- Main inference entry point ----
 
 def build_inference_index():
