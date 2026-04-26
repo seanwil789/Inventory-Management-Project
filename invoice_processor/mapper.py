@@ -52,6 +52,33 @@ def _has_missing_qualifier(raw_stemmed: str, canonical_stemmed: str) -> bool:
     return bool(missing)
 
 
+# Token-overlap gate — applied to fuzzy tiers as a pre-commit sanity check.
+# Fuzzy scoring (token_sort_ratio, token_set_ratio) can produce semantically
+# nonsense matches that pass the threshold (e.g. SPICE GARLIC PWDR →
+# Cinnamon, Ground at score >=90 because of shared structural tokens). This
+# gate enforces: if the matched canonical doesn't share at least one
+# meaningful stemmed 3+letter token with the raw description, reject and
+# try the next tier. Replicates the after-the-fact logic in
+# audit_suspect_mappings as a pre-commit guard so the bad FK never lands
+# in the DB.
+#
+# Uses STEMMED comparison (via _stem_text) so legitimate plural/singular
+# matches (PINEAPPLES → Pineapple) are still allowed. NOT applied to
+# tier 6c (char-level fallback) because that tier exists specifically to
+# catch spelling variants (Canteloupe → Cantaloupe) where stems differ.
+
+
+def _has_token_overlap(raw: str, canonical: str) -> bool:
+    """True if raw_description and canonical share at least one
+    stemmed 3+letter token. Used as a fuzzy-tier pre-commit gate to
+    reject zero-overlap nonsense matches. Stemming via _stem_text
+    means PINEAPPLES → Pineapple still passes (both stem to 'pineapple')
+    while SPICE GARLIC PWDR → Cinnamon, Ground does not."""
+    raw_tokens = set(_stem_text(raw).split())
+    can_tokens = set(_stem_text(canonical).split())
+    return bool(raw_tokens & can_tokens)
+
+
 # Per-vendor threshold overrides for the vendor_fuzzy tier.
 # Exceptional Foods has catch-weight descriptions that lose tokens faster
 # than typical vendors (e.g. "1.00 CS Bacon Applewood Slice Martins 30530"
@@ -412,7 +439,13 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
         return _attach_category({**item, "canonical": vendor_map[normalized],
                                  "confidence": "vendor_exact", "score": 100})
 
-    # 3. Vendor-scoped fuzzy match (with per-vendor threshold)
+    # 3. Vendor-scoped fuzzy match (with per-vendor threshold).
+    # Token-overlap gate is intentionally NOT applied here — vendor_desc_map
+    # entries are Sean's curated sheet mappings. A fuzzy hit means the raw
+    # description is similar to a description Sean explicitly assigned to a
+    # canonical, even when the canonical is an abbreviation (AMER →
+    # American), plural (PEACH → Peaches), or category synonym (BEEF PATTY
+    # → Burgers). Trust the curation at this layer.
     if vendor_map and normalized:
         vendor_threshold = _fuzzy_threshold_for(vendor)
         best_match, score, _ = process.extractOne(
@@ -437,8 +470,11 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
             scorer=fuzz.token_sort_ratio,
         )
         if score >= FUZZY_THRESHOLD:
-            return _attach_category({**item, "canonical": desc_map[best_match],
-                                     "confidence": "fuzzy", "score": score})
+            candidate_canonical = desc_map[best_match]
+            if _has_token_overlap(normalized, candidate_canonical):
+                return _attach_category({**item, "canonical": candidate_canonical,
+                                         "confidence": "fuzzy", "score": score})
+            # else: fall through to stripped-fuzzy tier
 
     # 6. Strip Sysco brand prefix and fuzzy match against canonical names directly.
     #    Sysco descriptions like "WHLFCLS ROMAINE HEARTS 3CT" → "ROMAINE HEARTS 3CT"
@@ -473,7 +509,8 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
                 )
                 if result and result[1] >= STRIPPED_FUZZY_THRESHOLD and \
                         fuzz.token_sort_ratio(stripped, result[0],
-                                             processor=fuzz_utils.default_process) >= 75:
+                                             processor=fuzz_utils.default_process) >= 75 and \
+                        _has_token_overlap(normalized, result[0]):
                     return _attach_category({
                         **item,
                         "canonical":  result[0],
@@ -481,7 +518,12 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
                         "score":      result[1],
                     })
 
-            # 6b. Stemmed fuzzy with qualifier gate
+            # 6b. Stemmed fuzzy with qualifier gate.
+            # Token-overlap gate is intentionally NOT applied here — this
+            # tier's token_set_ratio can catch single-token typos like
+            # 'Canteloupe' → 'Cantaloupe' where stems differ. The
+            # existing safeguards (90 threshold + token_sort_ratio>=75 +
+            # qualifier check) are sufficient at this layer.
             if stemmed_desc:
                 stemmed_canonicals = {_stem_text(c): c for c in canonical_names if c}
                 stem_result = process.extractOne(
@@ -500,7 +542,12 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
                         "score":      stem_result[1],
                     })
 
-            # 6c. Char-level fallback with qualifier gate
+            # 6c. Char-level fallback with qualifier gate.
+            # Token-overlap gate is intentionally NOT applied here — this
+            # tier exists specifically to catch spelling variants
+            # (Canteloupe → Cantaloupe) where stems differ. The high
+            # CHAR_RATIO_THRESHOLD (95) + token_sort_ratio>=60 constraints
+            # are the safeguard against nonsense matches at this layer.
             char_result = process.extractOne(
                 stripped_for_stem,
                 canonical_names,

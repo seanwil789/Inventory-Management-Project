@@ -5376,3 +5376,138 @@ class DBWriteDriftDetectionTests(TestCase):
         self.assertIsNone(ili.product)
         self.assertEqual(ili.match_confidence, 'unmatched',
                          'Genuine unmatched must NOT be re-tagged as drift')
+
+
+class MapperTokenOverlapGateTests(TestCase):
+    """`mapper.resolve_item` — token-overlap gate on fuzzy tiers.
+
+    Fuzzy scoring (token_sort_ratio, token_set_ratio, char ratio) can
+    produce semantically nonsense matches that pass the threshold —
+    e.g. SPICE GARLIC PWDR → Cinnamon, Ground at score >=90 because of
+    shared structural tokens after stemming. The gate enforces: if the
+    matched canonical doesn't share at least one meaningful 3+letter
+    content token with the raw description, reject and try the next
+    tier. Replicates audit_suspect_mappings logic at the pre-commit
+    layer so the bad FK never lands in the DB."""
+
+    def test_has_token_overlap_helper_basic(self):
+        """Helper unit test — case-insensitive 3+letter token overlap."""
+        mapper = _import_mapper()
+        self.assertTrue(mapper._has_token_overlap('SYSCO ROMAINE 3CT', 'Romaine'))
+        self.assertTrue(mapper._has_token_overlap('Tomato Sauce 6/10CAN', 'Sauce, Tomato'))
+        self.assertFalse(mapper._has_token_overlap('SPICE GARLIC PWDR', 'Cinnamon, Ground'))
+        # 1- and 2-letter tokens don't count (filters noise)
+        self.assertFalse(mapper._has_token_overlap('A B C 12', 'X Y Z'))
+        # Empty inputs are false
+        self.assertFalse(mapper._has_token_overlap('', 'Romaine'))
+        self.assertFalse(mapper._has_token_overlap('SYSCO', ''))
+
+    def test_global_fuzzy_gate_blocks_zero_overlap(self):
+        """Tier 5 (global fuzzy) is gated. When no vendor map exists and
+        a global fuzzy match would land on a canonical with zero shared
+        stemmed tokens, the gate rejects it."""
+        mapper = _import_mapper()
+        # No vendor_desc_map for the vendor — forces fall-through to global fuzzy
+        mappings = {
+            "code_map": {},
+            "desc_map": {
+                # Only desc_map entry — fuzzy could match into it from various raws
+                "WHLFCLS PEPPER BLACK GROUND 50LB": "Pepper, Black",
+            },
+            "vendor_desc_map": {},  # empty → tier 3 skipped
+            "category_map": {
+                "Pepper, Black": {"category": "Drystock", "primary_descriptor": "Spices",
+                                  "secondary_descriptor": ""},
+            },
+        }
+        # Raw shares 'GROUND' + 'LB' with the desc but the CANONICAL ('Pepper, Black')
+        # has zero stemmed-token overlap with the raw ('turmeric', 'ground', 'lb').
+        # If score >= 90 the gate must reject; if score < 90 it falls through anyway.
+        # Either path: result MUST NOT be 'Pepper, Black'.
+        item = {'sysco_item_code': '',
+                'raw_description': 'WHLFIMP TURMERIC GROUND 50LB'}
+        r = mapper.resolve_item(item, mappings, vendor='UnknownVendor')
+        self.assertNotEqual(r['canonical'], 'Pepper, Black',
+                            'Global fuzzy gate must reject zero-overlap match')
+
+    def test_vendor_fuzzy_intentionally_ungated(self):
+        """vendor_fuzzy bypasses the gate by design — Sean's curated sheet
+        mappings are trusted even when the canonical is an abbreviation
+        (AMER → American), plural (PEACH → Peaches), or category synonym
+        (BEEF PATTY → Burgers). Documents the intentional design choice."""
+        mapper = _import_mapper()
+        mappings = {
+            "code_map": {},
+            "desc_map": {},
+            "vendor_desc_map": {
+                "SYSCO": {
+                    # Sean curated: this Sysco abbreviation maps to American
+                    "BBRLCLS CHEESE AMER 160 SLI WHT": "American",
+                },
+            },
+            "category_map": {
+                "American": {"category": "Cheese", "primary_descriptor": "Processed",
+                             "secondary_descriptor": "Processed"},
+            },
+        }
+        # Slight typo / variant — fuzzy not exact
+        item = {'sysco_item_code': '',
+                'raw_description': 'BBRLCLS CHEESE AMER 160 SLICE WHITE'}
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        # Despite zero stemmed overlap between 'amer' and 'american',
+        # vendor_fuzzy must still resolve via Sean's curation
+        self.assertEqual(r['canonical'], 'American')
+        self.assertEqual(r['confidence'], 'vendor_fuzzy')
+
+    def test_legitimate_fuzzy_match_still_passes(self):
+        """A fuzzy match with shared tokens (typo in 'ROMAINE') passes —
+        gate never fires when there's content overlap."""
+        mapper = _import_mapper()
+        item = {'sysco_item_code': '', 'raw_description': 'WHLFCLS ROMAINE HEART 3CT'}
+        r = mapper.resolve_item(item, _fixture_mappings(), vendor='Sysco')
+        self.assertEqual(r['canonical'], 'Romaine')
+        self.assertEqual(r['confidence'], 'vendor_fuzzy')
+
+    def test_stripped_fuzzy_6a_gate_blocks_nonsense(self):
+        """Tier 6a (stripped + token_set_ratio) IS gated — matches against
+        canonical names directly with no curation, so the gate applies.
+        After stripping a Sysco brand prefix, the remaining content tokens
+        must overlap (stem-wise) with the proposed canonical."""
+        mapper = _import_mapper()
+        # Engineer a fixture that forces tier 6a path
+        mappings = {
+            "code_map": {},
+            "desc_map": {},
+            "vendor_desc_map": {},
+            "category_map": {
+                # Canonical with no overlap with what the prefix-strip leaves
+                "Olive Oil": {"category": "Drystock", "primary_descriptor": "Oil",
+                              "secondary_descriptor": ""},
+            },
+        }
+        # raw → after _strip_sysco_prefix → "TURMERIC GROUND 5LB"
+        # vs canonical "Olive Oil" → zero stemmed overlap → gate rejects
+        item = {'sysco_item_code': '',
+                'raw_description': 'WHLFIMP TURMERIC GROUND 5LB'}
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        self.assertNotEqual(r['canonical'], 'Olive Oil',
+                            'Stripped-fuzzy 6a gate must reject this')
+
+    def test_typo_recovery_still_works_via_6c(self):
+        """Tier 6c (char-level fallback) is intentionally NOT gated — exists
+        specifically for typo recovery (Canteloupe → Cantaloupe) where the
+        stems differ. Confirms the gate didn't break this path."""
+        mapper = _import_mapper()
+        mappings = {
+            "code_map": {},
+            "desc_map": {},
+            "vendor_desc_map": {},
+            "category_map": {
+                "Cantaloupe": {"category": "Produce", "primary_descriptor": "Stone Fruit",
+                               "secondary_descriptor": ""},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'Canteloupe'}
+        r = mapper.resolve_item(item, mappings, vendor='Farm Art')
+        self.assertEqual(r['canonical'], 'Cantaloupe',
+                         'Typo recovery must still work — gate must skip char tier')
