@@ -38,6 +38,12 @@ The-Book-of-Yields*.pdf
 *-sample.pdf
 *sample*.pdf
 
+# Raw Sysco CSV exports (downloaded from portal, dropped here in transit
+# before processing — should be moved to ~/New Invoices/, not tracked)
+[A-Z][a-z][a-z]\ *.csv
+*\ AM\ */*.csv
+*\ PM\ */*.csv
+
 # Generated historical stats (from import_production_tracker)
 .historical_stats/
 .archive/
