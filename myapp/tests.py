@@ -16,7 +16,8 @@ from django.test import TestCase, Client, override_settings
 from django.urls import reverse
 
 from myapp.models import (
-    Recipe, RecipeIngredient, Menu, Census, Vendor, Product, InvoiceLineItem,
+    Recipe, RecipeIngredient, Menu, Census, Vendor, Product, ProductMapping,
+    InvoiceLineItem,
 )
 
 
@@ -5511,3 +5512,156 @@ class MapperTokenOverlapGateTests(TestCase):
         r = mapper.resolve_item(item, mappings, vendor='Farm Art')
         self.assertEqual(r['canonical'], 'Cantaloupe',
                          'Typo recovery must still work — gate must skip char tier')
+
+
+class SyncItemMappingFromSheetTests(TestCase):
+    """`sync_item_mapping_from_sheet` — Step 1 of the sheet→DB migration.
+
+    Pulls Item Mapping sheet rows into ProductMapping. Conservative on
+    errors: skips rows with unknown vendors or orphan canonicals rather
+    than auto-creating ghosts. Idempotent on (vendor, description)."""
+
+    def _patch_sheet(self, rows):
+        """Patch _import_sheet_helpers in the command module to return
+        a fake get_sheet_values returning the given rows. Avoids any
+        real Sheets API call."""
+        from unittest.mock import patch
+        from myapp.management.commands import sync_item_mapping_from_sheet as cmd
+        return patch.object(cmd, '_import_sheet_helpers',
+                            return_value=(lambda sid, rng: rows, 'fake_sheet', 'Item Mapping'))
+
+    def _setup_basic(self):
+        """Vendor + Product fixtures shared by most tests."""
+        sysco = Vendor.objects.create(name='Sysco')
+        farmart = Vendor.objects.create(name='Farm Art')
+        Product.objects.create(canonical_name='Romaine')
+        Product.objects.create(canonical_name='Carrot')
+        return sysco, farmart
+
+    def test_dry_run_creates_no_rows(self):
+        """Dry-run (default) reports what would happen but writes nothing."""
+        from io import StringIO
+        from django.core.management import call_command
+        self._setup_basic()
+        rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['Sysco', 'WHLFCLS ROMAINE HEARTS 3CT', 'Produce', '', '', 'Romaine', '1234567'],
+            ['Farm Art', 'CARROTS, 48/1 LB CELLO', 'Produce', '', '', 'Carrot', ''],
+        ]
+        out = StringIO()
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', stdout=out)
+        self.assertEqual(ProductMapping.objects.count(), 0,
+                         'Dry-run must NOT write to DB')
+        self.assertIn('DRY-RUN', out.getvalue())
+        self.assertIn('Created:                            2', out.getvalue())
+
+    def test_apply_creates_rows(self):
+        """--apply writes the mapping rows to DB with correct FKs + SUPCs."""
+        from django.core.management import call_command
+        self._setup_basic()
+        rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['Sysco', 'WHLFCLS ROMAINE HEARTS 3CT', 'Produce', '', '', 'Romaine', '1234567'],
+            ['Farm Art', 'CARROTS, 48/1 LB CELLO', 'Produce', '', '', 'Carrot', ''],
+        ]
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', '--apply', verbosity=0)
+        self.assertEqual(ProductMapping.objects.count(), 2)
+        pm = ProductMapping.objects.get(description='WHLFCLS ROMAINE HEARTS 3CT')
+        self.assertEqual(pm.vendor.name, 'Sysco')
+        self.assertEqual(pm.product.canonical_name, 'Romaine')
+        self.assertEqual(pm.supc, '1234567')
+
+    def test_orphan_canonical_skipped_not_created(self):
+        """Sheet references a canonical that doesn't exist in DB →
+        SKIP the row, don't auto-create a ghost Product."""
+        from django.core.management import call_command
+        self._setup_basic()
+        before_products = Product.objects.count()
+        rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['Sysco', 'KETCHUP HEINZ 6/10', 'Drystock', '', '', 'Ketchup', ''],   # Ketchup not in DB
+            ['Sysco', 'WHLFCLS ROMAINE HEARTS 3CT', 'Produce', '', '', 'Romaine', ''],   # OK
+        ]
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', '--apply', verbosity=0)
+        # Only Romaine row created; Ketchup skipped
+        self.assertEqual(ProductMapping.objects.count(), 1)
+        self.assertFalse(Product.objects.filter(canonical_name='Ketchup').exists(),
+                         'Orphan canonical must NOT auto-create a ghost Product')
+        self.assertEqual(Product.objects.count(), before_products,
+                         'No new Products created')
+
+    def test_idempotent_rerun_unchanged(self):
+        """Re-running the command on the same sheet → all rows unchanged
+        (no duplicates, no spurious updates)."""
+        from django.core.management import call_command
+        self._setup_basic()
+        rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['Sysco', 'WHLFCLS ROMAINE HEARTS 3CT', 'Produce', '', '', 'Romaine', '1234567'],
+        ]
+        # First apply
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', '--apply', verbosity=0)
+        self.assertEqual(ProductMapping.objects.count(), 1)
+        # Second apply with same sheet — must not create duplicates or update
+        from io import StringIO
+        out = StringIO()
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', '--apply', stdout=out)
+        self.assertEqual(ProductMapping.objects.count(), 1)
+        self.assertIn('Created:                            0', out.getvalue())
+        self.assertIn('Unchanged (already in sync):        1', out.getvalue())
+
+    def test_existing_pm_with_different_canonical_gets_updated(self):
+        """A PM exists with FK to product A, sheet now says canonical B →
+        --apply repoints the FK to B."""
+        from django.core.management import call_command
+        sysco, _ = self._setup_basic()
+        old_p = Product.objects.create(canonical_name='Pesto')
+        new_p = Product.objects.get(canonical_name='Romaine')
+        # Pre-existing PM with old FK
+        ProductMapping.objects.create(
+            vendor=sysco, description='SOMETHING WEIRD', product=old_p, supc='',
+        )
+        rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['Sysco', 'SOMETHING WEIRD', 'Produce', '', '', 'Romaine', ''],
+        ]
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', '--apply', verbosity=0)
+        pm = ProductMapping.objects.get(description='SOMETHING WEIRD')
+        self.assertEqual(pm.product, new_p,
+                         'PM FK should be updated to match sheet')
+
+    def test_unknown_vendor_skipped_not_created(self):
+        """Sheet references a vendor not in DB Vendor table → skip, don't auto-create."""
+        from django.core.management import call_command
+        self._setup_basic()
+        before_vendors = Vendor.objects.count()
+        rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['BogusVendor', 'SOMETHING', 'Produce', '', '', 'Romaine', ''],
+        ]
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', '--apply', verbosity=0)
+        self.assertEqual(ProductMapping.objects.count(), 0)
+        self.assertEqual(Vendor.objects.count(), before_vendors,
+                         'No new Vendor auto-created')
+
+    def test_empty_canonical_skipped(self):
+        """Rows with empty col F (canonical) are skipped silently —
+        these are the 773 'orphan mapping' bloat rows in the sheet."""
+        from django.core.management import call_command
+        self._setup_basic()
+        rows = [
+            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
+            ['Sysco', 'SOME DESCRIPTION', '', '', '', '', ''],   # empty canonical
+            ['Sysco', 'WHLFCLS ROMAINE HEARTS 3CT', 'Produce', '', '', 'Romaine', ''],
+        ]
+        with self._patch_sheet(rows):
+            call_command('sync_item_mapping_from_sheet', '--apply', verbosity=0)
+        # Only Romaine created; empty-canonical row skipped
+        self.assertEqual(ProductMapping.objects.count(), 1)
