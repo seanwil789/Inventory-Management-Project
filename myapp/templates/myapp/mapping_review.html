@@ -144,11 +144,17 @@
                   + Create new
                 </button>
               {% else %}
-                <span class="text-xs text-slate-500">
+                <div class="text-xs text-slate-500">
                   {{ p.get_status_display }}
                   {% if p.reviewed_by %} by {{ p.reviewed_by.username }}{% endif %}
                   {% if p.reviewed_at %}<br>{{ p.reviewed_at|date:"M j H:i" }}{% endif %}
-                </span>
+                </div>
+                {% if p.status == 'approved' and p.suggested_product %}
+                  <a href="{% url 'product_edit' p.suggested_product.id %}"
+                     class="inline-block mt-1 px-2 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded text-xs">
+                    Edit canonical
+                  </a>
+                {% endif %}
               {% endif %}
             </td>
           </tr>

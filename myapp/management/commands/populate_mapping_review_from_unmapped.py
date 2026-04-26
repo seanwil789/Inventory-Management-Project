@@ -9,6 +9,7 @@ Usage:
     python manage.py populate_mapping_review_from_unmapped              # dry-run
     python manage.py populate_mapping_review_from_unmapped --apply
 """
+import re
 import sys
 from collections import Counter, defaultdict
 
@@ -26,70 +27,45 @@ def _import_mapper():
     return mapper
 
 
-# Skip patterns — rows that shouldn't be queued for normal review.
+# Skip patterns — rows that shouldn't be queued for human review because
+# they're parser/OCR artifacts rather than real product lines.
+# Surfaced from 2026-04-25 mapping-review queue audit; each pattern was
+# evidenced by a concrete proposal that should never have queued.
+_SKIP_PATTERNS = [
+    re.compile(r'^\s*\*{2,}'),                          # ** HAZARD ** lines
+    re.compile(r'^\s*zz\s+', re.IGNORECASE),            # Farm Art zz placeholder ($0 special-order)
+    re.compile(r'^\s*\.?P\.?\s*O\.?\s*Num', re.IGNORECASE),   # P.O. Number header
+    re.compile(r'^\s*Delivery\s+Cha', re.IGNORECASE),   # Delivery Charge truncated
+    re.compile(r'Printed\s*:', re.IGNORECASE),          # 's Printed: 03-18-2026' footer
+    re.compile(r'^\s*\d+\s+QTY\s+PACK\s+SIZE\s*$', re.IGNORECASE),
+    re.compile(r'^\s*[\d.]+\s+EACH\s+\w{1,4}\s*$', re.IGNORECASE),  # 2.00 EACH CL2
+    re.compile(r'^\s*[A-Z]{0,5}\d{1,5}\s*$'),           # KSX04, CL2 — short alphanumeric
+    re.compile(r'^\s*[A-Za-z]{1,3}\s*$'),               # 'T', 'OK' — too short to be product
+]
+
+
 def _is_skippable(raw_desc: str) -> bool:
+    """Return True for rows that are parser/OCR artifacts, not real
+    product lines. Order matters — cheap checks first."""
     raw = (raw_desc or '').strip()
     if not raw:
         return True
     if raw.startswith('[Sysco #'):
         # SUPC placeholder — needs Sysco rep CSV, not human canonical guessing
         return True
+    # Pure non-alpha content (no word ≥3 letters) → junk
+    if not re.search(r'[A-Za-z]{3,}', raw):
+        return True
+    for pat in _SKIP_PATTERNS:
+        if pat.search(raw):
+            return True
     return False
 
 
-def _find_subset_canonical(raw: str, canonicals_with_stems):
-    """Subset-match tier: find a canonical whose ALL stemmed tokens appear
-    in the raw description's stemmed token set. Surfaces matches that
-    fuzzy/token scorers miss because the raw has many extra modifier
-    tokens pulling the ratio down — e.g. 'Apple Danish' → 'Danish' fails
-    token_sort_ratio (score 11) but trivially passes a subset check.
-
-    Prefers the most-specific match (longest canonical by token count).
-    Returns None if no match or if the top tier is ambiguous (multiple
-    canonicals tied for most-specific).
-
-    Args:
-      raw: raw_description string
-      canonicals_with_stems: list of (canonical_name, stemmed_token_set)
-                              precomputed once for speed
-    Returns:
-      best canonical name, or None
-    """
-    import re
-    word_re = re.compile(r'[A-Za-z]{3,}')
-    def stems(s):
-        out = set()
-        for t in word_re.findall(s or ''):
-            low = t.lower()
-            if len(low) >= 4 and low.endswith('s') and not low.endswith('ss'):
-                low = low[:-1]
-            out.add(low)
-        return out
-
-    raw_tokens = stems(raw)
-    if not raw_tokens:
-        return None
-
-    matches = []
-    for canon, ctokens in canonicals_with_stems:
-        if not ctokens:
-            continue
-        if ctokens.issubset(raw_tokens):
-            matches.append((canon, len(ctokens)))
-
-    if not matches:
-        return None
-
-    # Prefer most-specific (most tokens)
-    matches.sort(key=lambda x: -x[1])
-    top_n = matches[0][1]
-    top_tier = [c for c, n in matches if n == top_n]
-
-    if len(top_tier) == 1:
-        return top_tier[0]
-    # Ambiguous — multiple equally-specific matches (e.g. 'Cherry Tomato'
-    # matches both 'Cherry' and 'Tomato' if both exist as 1-token canonicals)
-    return None
+# NOTE: subset-match logic now lives in the production mapper
+# (`invoice_processor/mapper._find_subset_canonical_in_pool`). This command
+# delegates to it so the noise-token + head-noun filters apply uniformly
+# to both proposal-suggestion generation and live mapper resolution.
 
 
 class Command(BaseCommand):
@@ -100,10 +76,29 @@ class Command(BaseCommand):
                             help='Write proposals to DB. Default is dry-run.')
         parser.add_argument('--min-occurrences', type=int, default=1,
                             help='Only queue items seen N+ times (default 1).')
+        parser.add_argument('--prune-junk', action='store_true',
+                            help='Also delete existing pending proposals whose '
+                                 'raw_description now matches a skip pattern '
+                                 '(parser/OCR junk). Requires --apply to fire.')
 
     def handle(self, *args, **opts):
         apply_changes = opts['apply']
         min_occ = opts['min_occurrences']
+        prune_junk = opts['prune_junk']
+
+        # Optional first pass: clean up pending proposals whose raw is now
+        # recognized as junk. Runs in dry-count mode unless --apply is set.
+        if prune_junk:
+            junk_qs = ProductMappingProposal.objects.filter(status='pending')
+            to_delete = [p for p in junk_qs if _is_skippable(p.raw_description)]
+            self.stdout.write(f"Pending proposals matching junk patterns: {len(to_delete)}")
+            if to_delete and apply_changes:
+                ids = [p.id for p in to_delete]
+                ProductMappingProposal.objects.filter(id__in=ids).delete()
+                self.stdout.write(f"  Deleted {len(ids)} junk proposals.")
+            elif to_delete:
+                self.stdout.write(f"  (Dry-run — re-run with --apply to delete.)")
+            self.stdout.write('')
 
         # Aggregate unmapped ILIs by (vendor_id, raw_description)
         # Counts occurrence per pair so we can prioritize / threshold.
@@ -143,19 +138,10 @@ class Command(BaseCommand):
         mapper = _import_mapper()
         mappings = mapper.load_mappings(force_refresh=True)
 
-        # Pre-compute canonical token-sets for the subset-match tier
-        import re as _re
-        word_re = _re.compile(r'[A-Za-z]{3,}')
-        def _stems(s):
-            out = set()
-            for t in word_re.findall(s or ''):
-                low = t.lower()
-                if len(low) >= 4 and low.endswith('s') and not low.endswith('ss'):
-                    low = low[:-1]
-                out.add(low)
-            return out
+        # Pre-compute canonical pool for the subset-match fallback. The
+        # production mapper does its own stemming inside the function, so
+        # we pass canonical names directly.
         all_canonicals = list(Product.objects.values_list('canonical_name', flat=True))
-        canonicals_with_stems = [(c, _stems(c)) for c in all_canonicals]
 
         created = pending_updated = unchanged = 0
         with_mapper_suggestion = 0
@@ -179,9 +165,11 @@ class Command(BaseCommand):
                 with_mapper_suggestion += 1
 
             # 2. Fallback: subset-match tier (catches Apple Danish → Danish
-            # class that token-based scorers miss)
+            # class that token-based scorers miss). Delegates to the
+            # production mapper so noise-token + head-noun filters apply.
             if suggested is None:
-                subset_canon = _find_subset_canonical(raw_desc, canonicals_with_stems)
+                subset_canon = mapper._find_subset_canonical_in_pool(
+                    raw_desc, all_canonicals)
                 if subset_canon:
                     suggested = Product.objects.filter(canonical_name=subset_canon).first()
                     if suggested:
@@ -210,8 +198,13 @@ class Command(BaseCommand):
                     )
                 created += 1
             elif existing.status == 'pending':
-                # Refresh suggestion if we found something better
-                if suggested is not None and existing.suggested_product != suggested:
+                # Refresh suggestion when the new run produces a different
+                # outcome — including clearing a now-rejected stale one.
+                # Three cases: (a) old had nothing, new has match → set it,
+                # (b) old had X, new has Y (different match) → swap,
+                # (c) old had X, new has nothing (mapper rejects via new
+                # filters like noise/head-noun) → clear it.
+                if existing.suggested_product != suggested:
                     if apply_changes:
                         existing.suggested_product = suggested
                         existing.score = int(score) if score else None

@@ -2600,6 +2600,95 @@ def mapping_review_create_and_approve(request, proposal_id: int):
     return redirect('mapping_review')
 
 
+def product_edit(request, product_id: int):
+    """Edit-after-approve flow. Two modes via POST:
+      - rename: update canonical_name + taxonomy fields in place
+      - merge:  repoint all FKs (ILI, ProductMapping, Proposal.suggested) to
+                a target Product, then delete this one
+
+    Surfaces the gap that bad approvals (e.g. OCR-garbled canonicals like
+    'SARALEE SAGEL PLAIN 3 OZ' that should have been 'Bagel') were
+    previously only fixable via Django admin or manual shell.
+    """
+    from .models import ProductMappingProposal, ProductMapping
+    from django.db import transaction
+
+    product = get_object_or_404(Product, id=product_id)
+
+    if request.method == 'POST':
+        action = (request.POST.get('action') or '').strip()
+
+        if action == 'merge':
+            target_id = (request.POST.get('merge_into') or '').strip()
+            if not target_id:
+                messages.error(request, 'No merge target selected.')
+                return redirect('product_edit', product_id=product.id)
+            try:
+                target = Product.objects.get(id=int(target_id))
+            except (Product.DoesNotExist, ValueError):
+                messages.error(request, f'Target product #{target_id} not found.')
+                return redirect('product_edit', product_id=product.id)
+            if target.id == product.id:
+                messages.error(request, 'Cannot merge a product into itself.')
+                return redirect('product_edit', product_id=product.id)
+
+            with transaction.atomic():
+                ili_n  = InvoiceLineItem.objects.filter(product=product).update(product=target)
+                pm_n   = ProductMapping.objects.filter(product=product).update(product=target)
+                prop_n = ProductMappingProposal.objects.filter(suggested_product=product).update(suggested_product=target)
+                source_name = product.canonical_name
+                product.delete()
+
+            messages.success(request,
+                f"Merged {source_name!r} → {target.canonical_name!r}: "
+                f"{ili_n} ILI / {pm_n} mappings / {prop_n} proposals repointed; "
+                f"source product deleted.")
+            return redirect('product_edit', product_id=target.id)
+
+        # Default: rename / re-taxonomize in place
+        new_name = (request.POST.get('canonical_name') or '').strip()
+        new_cat  = (request.POST.get('category') or '').strip()
+        new_pri  = (request.POST.get('primary_descriptor') or '').strip()
+        new_sec  = (request.POST.get('secondary_descriptor') or '').strip()
+
+        if not new_name:
+            messages.error(request, 'canonical_name cannot be empty.')
+            return redirect('product_edit', product_id=product.id)
+
+        # Collision check — if new_name matches a different existing product,
+        # tell the user to use Merge instead. Don't silently overwrite.
+        clash = Product.objects.filter(canonical_name=new_name).exclude(id=product.id).first()
+        if clash:
+            messages.error(request,
+                f"Canonical {new_name!r} already belongs to Product #{clash.id}. "
+                f"Use the Merge action to consolidate.")
+            return redirect('product_edit', product_id=product.id)
+
+        product.canonical_name = new_name
+        product.category = new_cat
+        product.primary_descriptor = new_pri
+        product.secondary_descriptor = new_sec
+        product.save()
+        messages.success(request, f"Saved Product #{product.id} → {new_name!r}.")
+        return redirect('product_edit', product_id=product.id)
+
+    # GET — show edit form
+    ili_count = InvoiceLineItem.objects.filter(product=product).count()
+    mapping_count = ProductMapping.objects.filter(product=product).count()
+    other_products = (Product.objects.exclude(id=product.id)
+                      .order_by('canonical_name')
+                      .values('id', 'canonical_name', 'category'))
+    categories = sorted({c for c in Product.objects.values_list('category', flat=True).distinct() if c})
+
+    return render(request, 'myapp/product_edit.html', {
+        'product': product,
+        'ili_count': ili_count,
+        'mapping_count': mapping_count,
+        'other_products': list(other_products),
+        'categories': categories,
+    })
+
+
 # ---- Mapper health dashboard (Step 2 of sheet→DB migration follow-up) ----
 
 def mapping_health(request):

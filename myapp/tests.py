@@ -6323,10 +6323,34 @@ class TaxonomyInferenceTests(TestCase):
         from myapp.taxonomy import infer_taxonomy
         r = infer_taxonomy('Lemon Danish', vendor='Philadelphia Bakery Merchants')
         self.assertEqual(r['category'][0], 'Bakery')
-        self.assertEqual(r['primary'][0], 'Pastry')
+        self.assertEqual(r['primary'][0], 'Pastries')
 
         r2 = infer_taxonomy('Cheese Danish', vendor='Philadelphia Bakery Merchants')
         self.assertEqual(r2['category'][0], 'Bakery')
+
+    def test_bakery_five_bucket_taxonomy(self):
+        """Bakery items resolve to one of the 5 locked primaries:
+        Bread/Fermented, Cakes & Sponges, Pastries, Quick Breads,
+        Cookies & Bars."""
+        from myapp.taxonomy import infer_taxonomy
+        cases = [
+            ('SOURDOUGH BREAD LOAF',         'Bread/Fermented'),
+            ('HAMBURGER BUN 4IN',            'Bread/Fermented'),
+            ('FLOUR TORTILLA 12IN',          'Bread/Fermented'),
+            ('CHOCOLATE CAKE SHEET',         'Cakes & Sponges'),
+            ('BLUEBERRY CHEESECAKE',         'Cakes & Sponges'),
+            ('BUTTER CROISSANT',             'Pastries'),
+            ('GLAZED DONUT',                 'Pastries'),
+            ('BLUEBERRY MUFFIN',             'Quick Breads'),
+            ('CORNBREAD SQUARE',             'Quick Breads'),
+            ('CHOCOLATE CHIP COOKIE',        'Cookies & Bars'),
+            ('FUDGE BROWNIE',                'Cookies & Bars'),
+        ]
+        for raw, expected_primary in cases:
+            r = infer_taxonomy(raw, vendor='Philadelphia Bakery Merchants')
+            self.assertEqual(r['category'][0], 'Bakery', f'{raw}: category')
+            self.assertEqual(r['primary'][0], expected_primary,
+                             f'{raw}: expected primary={expected_primary} got {r["primary"][0]}')
 
     def test_produce_botanical_primary_assignment(self):
         """Produce category + token 'mango' → primary='Stone Fruit'."""
@@ -6570,6 +6594,86 @@ class MapperSubsetMatchTier6dTests(TestCase):
         self.assertEqual(r['canonical'], 'Pork, Belly')
         self.assertEqual(r['confidence'], 'subset_match')
 
+    def test_modifier_only_match_rejected_when_head_noun_present(self):
+        """'Blueberry Muffins' raw must NOT match canonical 'Blueberries'
+        (the canonical is a modifier — flavor of the muffin, not the
+        product). When raw has a food-form head ('muffin'), the
+        candidate must share that head. Otherwise reject."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Blueberries': {'category': 'Produce', 'primary_descriptor': 'Berry',
+                                'secondary_descriptor': ''},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'Blueberry Muffins'}
+        r = mapper.resolve_item(item, mappings, vendor='Philadelphia Bakery Merchants')
+        # No bakery canonical exists yet → must NOT lock onto the
+        # modifier ('Blueberries'). Should fall through to unmatched.
+        self.assertNotEqual(r['confidence'], 'subset_match')
+
+    def test_modifier_only_match_butter_croissant(self):
+        """'Butter Croissant' must NOT map to 'Butter'."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Butter': {'category': 'Dairy', 'primary_descriptor': '',
+                           'secondary_descriptor': ''},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'Butter Croissant'}
+        r = mapper.resolve_item(item, mappings, vendor='Philadelphia Bakery Merchants')
+        self.assertNotEqual(r['canonical'], 'Butter')
+
+    def test_filling_only_match_bun_hot_dog(self):
+        """'BUN HOT DOG' must NOT map to 'Hot Dogs' — head is bun, the
+        Hot Dog tokens are describing what filling the bun holds."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Hot Dogs': {'category': 'Proteins', 'primary_descriptor': 'Pork',
+                             'secondary_descriptor': ''},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'BKRSCLS BUN HOT DOG WHITE 6 HINGD'}
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        self.assertNotEqual(r['canonical'], 'Hot Dogs')
+
+    def test_head_noun_match_still_works_when_canonical_shares_head(self):
+        """When raw has head 'bun' AND a canonical contains 'bun',
+        the head-noun rule allows the match. 'Hot Dog Bun' canonical
+        for raw 'BUN HOT DOG' should resolve correctly."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Hot Dog Bun': {'category': 'Bakery', 'primary_descriptor': 'Bread/Fermented',
+                                'secondary_descriptor': 'Hot Dog Bun'},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'BKRSCLS BUN HOT DOG WHITE 6 HINGD'}
+        r = mapper.resolve_item(item, mappings, vendor='Sysco')
+        self.assertEqual(r['canonical'], 'Hot Dog Bun')
+        self.assertEqual(r['confidence'], 'subset_match')
+
+    def test_noise_only_canonical_rejected(self):
+        """'DRIED APRICOT 3 LB BAG' must NOT map to canonical 'Bags' —
+        Bag is packaging noise, not a product."""
+        mapper = self._mapper()
+        mappings = {
+            'code_map': {}, 'desc_map': {}, 'vendor_desc_map': {},
+            'category_map': {
+                'Bags': {'category': 'Paper/Disposable', 'primary_descriptor': '',
+                         'secondary_descriptor': ''},
+            },
+        }
+        item = {'sysco_item_code': '', 'raw_description': 'DRIED, APRICOT, 3 LB BAG'}
+        r = mapper.resolve_item(item, mappings, vendor='Farm Art')
+        self.assertNotEqual(r['canonical'], 'Bags')
+
     def test_abbreviation_expansion_enables_subset_match(self):
         """Verify subset-match resolves correctly through the abbreviation
         expansion path. 'BRST CHKN BNLS' → 'Breast Chicken Boneless' may
@@ -6620,3 +6724,102 @@ class MapperSubsetMatchTier6dTests(TestCase):
         self.assertTrue(ProductMappingProposal.objects.filter(
             raw_description='Apple Danish', status='pending'
         ).exists())
+
+
+class ProductEditViewTests(TestCase):
+    """`/products/<id>/edit/` — rename or merge an approved Product.
+    Surfaces the edit-after-approve gap that was forcing manual shell
+    work to fix bad approvals (e.g. OCR-garbled canonicals)."""
+
+    def setUp(self):
+        super().setUp()
+        from django.contrib.auth.models import User
+        self.user = User.objects.create_user(username='reviewer3', password='x')
+        self.client.force_login(self.user)
+        self.sysco = Vendor.objects.create(name='Sysco')
+        self.bagel = Product.objects.create(
+            canonical_name='Bagel', category='Bakery',
+            primary_descriptor='Bread/Fermented', secondary_descriptor='Bagel',
+        )
+        self.bad = Product.objects.create(
+            canonical_name='SARALEE SAGEL PLAIN 3 OZ',
+            category='Bakery', primary_descriptor='Bread/Yeast',
+        )
+
+    def test_get_renders_form(self):
+        r = self.client.get(f'/products/{self.bad.id}/edit/')
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'SARALEE SAGEL')
+        self.assertContains(r, 'Merge into another canonical')
+
+    def test_rename_in_place(self):
+        r = self.client.post(f'/products/{self.bad.id}/edit/', {
+            'action': 'rename',
+            'canonical_name': 'Sara Lee Bagel, Plain',
+            'category': 'Bakery',
+            'primary_descriptor': 'Bread/Fermented',
+            'secondary_descriptor': 'Bagel',
+        })
+        self.assertEqual(r.status_code, 302)
+        self.bad.refresh_from_db()
+        self.assertEqual(self.bad.canonical_name, 'Sara Lee Bagel, Plain')
+        self.assertEqual(self.bad.primary_descriptor, 'Bread/Fermented')
+
+    def test_rename_collision_blocked(self):
+        """Renaming to an existing canonical_name must error, not overwrite."""
+        r = self.client.post(f'/products/{self.bad.id}/edit/', {
+            'action': 'rename',
+            'canonical_name': 'Bagel',  # already exists on a different product
+            'category': 'Bakery', 'primary_descriptor': '', 'secondary_descriptor': '',
+        })
+        self.assertEqual(r.status_code, 302)
+        # Bad product's name unchanged
+        self.bad.refresh_from_db()
+        self.assertEqual(self.bad.canonical_name, 'SARALEE SAGEL PLAIN 3 OZ')
+
+    def test_merge_repoints_fks_and_deletes_source(self):
+        """Merge: ILI + ProductMapping + Proposal.suggested all repoint
+        to target; source Product is deleted."""
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.sysco, raw_description='SARALEE SAGEL PLAIN 3 OZ',
+            product=self.bad, match_confidence='vendor_exact',
+            invoice_date=date(2026, 4, 20),
+        )
+        pm = ProductMapping.objects.create(
+            vendor=self.sysco, description='SARALEE SAGEL PLAIN 3 OZ',
+            product=self.bad,
+        )
+        prop = ProductMappingProposal.objects.create(
+            vendor=self.sysco, raw_description='SARALEE SAGEL PLAIN 3 OZ',
+            suggested_product=self.bad, source='discover_unmapped', status='approved',
+        )
+        bad_id = self.bad.id
+
+        r = self.client.post(f'/products/{bad_id}/edit/', {
+            'action': 'merge',
+            'merge_into': str(self.bagel.id),
+        })
+        self.assertEqual(r.status_code, 302)
+        # Source deleted
+        self.assertFalse(Product.objects.filter(id=bad_id).exists())
+        # FKs all repointed
+        ili.refresh_from_db(); self.assertEqual(ili.product, self.bagel)
+        pm.refresh_from_db(); self.assertEqual(pm.product, self.bagel)
+        prop.refresh_from_db(); self.assertEqual(prop.suggested_product, self.bagel)
+
+    def test_merge_self_blocked(self):
+        """Cannot merge a Product into itself."""
+        r = self.client.post(f'/products/{self.bagel.id}/edit/', {
+            'action': 'merge', 'merge_into': str(self.bagel.id),
+        })
+        self.assertEqual(r.status_code, 302)
+        # Bagel still exists
+        self.assertTrue(Product.objects.filter(id=self.bagel.id).exists())
+
+    def test_merge_missing_target_blocked(self):
+        """Merging requires a target — empty merge_into is rejected."""
+        r = self.client.post(f'/products/{self.bad.id}/edit/', {
+            'action': 'merge', 'merge_into': '',
+        })
+        self.assertEqual(r.status_code, 302)
+        self.assertTrue(Product.objects.filter(id=self.bad.id).exists())

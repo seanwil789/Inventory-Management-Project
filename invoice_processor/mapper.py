@@ -725,20 +725,84 @@ def resolve_item(item: dict, mappings: dict, vendor: str = "") -> dict:
             "category": "", "primary_descriptor": "", "secondary_descriptor": ""}
 
 
+# Packaging / quantity-noise tokens. A canonical that consists *only*
+# of these is rejected as a subset-match candidate — matching "Bags"
+# against "DRIED, APRICOT, 3 LB BAG" is locked onto the package, not
+# the product. Stemmed forms (no trailing 's' since _stem_text strips).
+_SUBSET_NOISE_TOKENS = frozenset({
+    'bag', 'box', 'case', 'carton', 'pack', 'container', 'pouch',
+    'jar', 'bottle', 'can', 'piece', 'each', 'unit', 'crate', 'tray',
+    'lid', 'cup',  # too generic on their own — rely on multi-token canonicals
+})
+
+# Food-form HEAD nouns. When raw description contains one of these,
+# a subset-match candidate must ALSO contain at least one head — else
+# the candidate is matching only modifiers (Blueberry inside "Blueberry
+# Muffin", Butter inside "Butter Croissant"), which is the wrong
+# resolution. Stemmed forms.
+_SUBSET_FOOD_FORM_HEADS = frozenset({
+    # Bakery — locked 5-bucket taxonomy heads
+    'muffin', 'scone', 'biscuit',
+    'cookie', 'brownie', 'blondie',
+    'cake', 'cupcake', 'cheesecake',
+    'pie', 'cobbler', 'tart', 'turnover',
+    'donut', 'doughnut',
+    'croissant', 'danish',
+    'eclair', 'strudel',
+    'bread', 'loaf', 'baguette', 'roll', 'bun',
+    'bagel', 'tortilla', 'wrap',
+    'pita', 'naan', 'focaccia', 'ciabatta',
+    # Dish forms — same head-noun logic applies (the FORM is the product
+    # identity; flavor/filling tokens are modifiers)
+    'soup', 'salad', 'sandwich',
+    'patty', 'burger',
+    'eggroll',  # post-abbreviation expansion this stays one token; also
+    # gets split to 'egg' + 'roll' if expansion adds a space, in which
+    # case 'roll' covers it.
+    'pizza', 'calzone', 'stromboli',
+})
+
+
 def _find_subset_canonical_in_pool(raw: str, canonicals) -> str | None:
     """Return the most-specific canonical whose stemmed tokens are all
     contained in raw's stemmed tokens. None if no match or if multiple
-    equally-specific matches (ambiguous)."""
+    equally-specific matches (ambiguous).
+
+    Rejection rules layered on top of pure subset:
+      1. NOISE-ONLY canonicals — if every canonical token is a packaging
+         noise word (Bag, Box, Cup), reject. The match is locking onto
+         the container, not the product identity.
+      2. HEAD-NOUN MISMATCH — if raw contains a food-form head noun
+         (muffin, croissant, bun, pie, ...), the candidate must also
+         contain at least one of the same heads. Otherwise the candidate
+         is matching only modifier/filling tokens (Blueberry, Butter,
+         Corn) and producing wrong-product suggestions.
+
+    These rules surfaced from 2026-04-25 mapping-review queue audit:
+      - "Blueberry Muffins" → "Blueberries"   (head=muffin, candidate=modifier)
+      - "Butter Croissant"  → "Butter"        (head=croissant, candidate=modifier)
+      - "BUN HOT DOG"       → "Hot Dogs"      (head=bun, candidate=filling)
+      - "DRIED APRICOT 3 LB BAG" → "Bags"     (noise-only candidate)
+    """
     raw_tokens = set(_stem_text(raw).split())
     if not raw_tokens:
         return None
+    raw_heads = raw_tokens & _SUBSET_FOOD_FORM_HEADS
+
     matches = []   # [(canonical, n_tokens)]
     for canon in canonicals:
         ctokens = set(_stem_text(canon).split())
         if not ctokens:
             continue
-        if ctokens.issubset(raw_tokens):
-            matches.append((canon, len(ctokens)))
+        if not ctokens.issubset(raw_tokens):
+            continue
+        # Rule 1: reject candidates made entirely of packaging noise.
+        if ctokens.issubset(_SUBSET_NOISE_TOKENS):
+            continue
+        # Rule 2: when raw has a food-form head, candidate must share one.
+        if raw_heads and not (ctokens & raw_heads):
+            continue
+        matches.append((canon, len(ctokens)))
     if not matches:
         return None
     matches.sort(key=lambda x: -x[1])

@@ -286,36 +286,73 @@ _CHEESE_TYPES = {
 # Bakery item keywords — when these appear in raw, it's almost certainly
 # a bakery product regardless of other ingredient-name tokens.
 # Maps to (primary_descriptor) within Bakery category.
+#
+# Five-bucket bakery-science taxonomy (locked 2026-04-25):
+#   Bread/Fermented   — yeast-leavened structures (incl. flatbreads)
+#   Cakes & Sponges   — foam/chemically-leavened sweet goods
+#   Pastries          — laminated dough, shortcrust, choux
+#   Quick Breads      — chemically-leavened, non-laminated
+#   Cookies & Bars    — cookies, brownies, blondies, bar cookies
+#
+# Edge calls:
+#   - donuts → Pastries (yeast vs cake split exists, but treating as
+#     pastry by default; donut sub-type can split if needed)
+#   - flatbreads (tortilla, pita, wrap) → Bread/Fermented (industry
+#     convention; pita is yeasted, tortilla often baking-powder leavened)
+#   - cheesecake → Cakes & Sponges (structurally a custard, but kitchen
+#     usage groups with cakes)
 _BAKERY_KEYWORDS = {
-    'danish':       'Pastry',
-    'croissant':    'Pastry',
-    'muffin':       'Pastry',
-    'muffins':      'Pastry',
-    'scone':        'Pastry',
-    'scones':       'Pastry',
-    'cookie':       'Pastry',
-    'cookies':      'Pastry',
-    'donut':        'Pastry',
-    'donuts':       'Pastry',
-    'cake':         'Pastry',
-    'cupcake':      'Pastry',
-    'pie':          'Pastry',
-    'cobbler':      'Pastry',
-    'biscuit':      'Pastry',
-    'bagel':        'Roll',
-    'bagels':       'Roll',
-    'roll':         'Roll',
-    'rolls':        'Roll',
-    'bun':          'Roll',
-    'buns':         'Roll',
-    'bread':        'Loaf',
-    'loaf':         'Loaf',
-    'baguette':     'Loaf',
-    'tortilla':     'Tortilla',
-    'tortillas':    'Tortilla',
-    'pita':         'Loaf',
-    'wrap':         'Tortilla',
-    'wraps':        'Tortilla',
+    # Pastries — laminated/shortcrust/choux
+    'danish':       'Pastries',
+    'croissant':    'Pastries',
+    'pie':          'Pastries',
+    'cobbler':      'Pastries',
+    'donut':        'Pastries',
+    'donuts':       'Pastries',
+    'doughnut':     'Pastries',
+    'doughnuts':    'Pastries',
+    'eclair':       'Pastries',
+    'turnover':     'Pastries',
+    'turnovers':    'Pastries',
+    'strudel':      'Pastries',
+    # Cakes & Sponges
+    'cake':         'Cakes & Sponges',
+    'cupcake':      'Cakes & Sponges',
+    'cupcakes':     'Cakes & Sponges',
+    'cheesecake':   'Cakes & Sponges',
+    # Quick Breads
+    'muffin':       'Quick Breads',
+    'muffins':      'Quick Breads',
+    'scone':        'Quick Breads',
+    'scones':       'Quick Breads',
+    'biscuit':      'Quick Breads',
+    'biscuits':     'Quick Breads',
+    'cornbread':    'Quick Breads',
+    # Cookies & Bars
+    'cookie':       'Cookies & Bars',
+    'cookies':      'Cookies & Bars',
+    'brownie':      'Cookies & Bars',
+    'brownies':     'Cookies & Bars',
+    'blondie':      'Cookies & Bars',
+    'blondies':     'Cookies & Bars',
+    # Bread/Fermented (yeasted structures + flatbreads)
+    'bread':        'Bread/Fermented',
+    'loaf':         'Bread/Fermented',
+    'baguette':     'Bread/Fermented',
+    'bagel':        'Bread/Fermented',
+    'bagels':       'Bread/Fermented',
+    'roll':         'Bread/Fermented',
+    'rolls':        'Bread/Fermented',
+    'bun':          'Bread/Fermented',
+    'buns':         'Bread/Fermented',
+    'pita':         'Bread/Fermented',
+    'tortilla':     'Bread/Fermented',
+    'tortillas':    'Bread/Fermented',
+    'wrap':         'Bread/Fermented',
+    'wraps':        'Bread/Fermented',
+    'naan':         'Bread/Fermented',
+    'focaccia':     'Bread/Fermented',
+    'ciabatta':     'Bread/Fermented',
 }
 
 

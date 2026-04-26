@@ -1,0 +1,120 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Edit {{ product.canonical_name }}{% endblock %}
+
+{% block content %}
+<div class="space-y-6 max-w-3xl">
+
+  <div>
+    <a href="{% url 'mapping_review' %}?status=approved"
+       class="text-sm text-slate-500 hover:text-slate-700">← Back to Mapping Review</a>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900 mt-2">Edit canonical</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Rename or re-taxonomize a Product in place, or merge it into another existing canonical
+      (repoints all linked InvoiceLineItems, ProductMappings, and proposal suggestions).
+    </p>
+  </div>
+
+  {% if messages %}
+    <div class="space-y-2">
+      {% for message in messages %}
+        <div class="rounded-lg border p-3 text-sm
+          {% if message.tags == 'success' %}border-emerald-200 bg-emerald-50 text-emerald-900
+          {% elif message.tags == 'warning' %}border-amber-200 bg-amber-50 text-amber-900
+          {% elif message.tags == 'error' %}border-red-200 bg-red-50 text-red-900
+          {% else %}border-slate-200 bg-slate-50 text-slate-900{% endif %}">
+          {{ message }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <!-- Stats card -->
+  <div class="rounded-lg border border-slate-200 bg-white p-4 grid grid-cols-3 gap-3 text-sm">
+    <div>
+      <div class="text-slate-500">Product ID</div>
+      <div class="font-mono text-slate-900">#{{ product.id }}</div>
+    </div>
+    <div>
+      <div class="text-slate-500">InvoiceLineItems linked</div>
+      <div class="font-mono text-slate-900">{{ ili_count }}</div>
+    </div>
+    <div>
+      <div class="text-slate-500">Vendor mappings</div>
+      <div class="font-mono text-slate-900">{{ mapping_count }}</div>
+    </div>
+  </div>
+
+  <!-- Section 1: edit in place -->
+  <form method="post" class="rounded-lg border border-slate-200 bg-white p-4 space-y-3">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="rename">
+    <h2 class="text-lg font-semibold text-slate-900">Rename / re-taxonomize</h2>
+    <p class="text-xs text-slate-500">Updates this Product in place. All FKs preserved.</p>
+
+    <div>
+      <label class="block text-xs font-medium text-slate-600 mb-1">Canonical name</label>
+      <input type="text" name="canonical_name" value="{{ product.canonical_name }}"
+             required class="w-full rounded border border-slate-300 px-3 py-2 text-sm">
+    </div>
+
+    <div class="grid grid-cols-3 gap-3">
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Category</label>
+        <input type="text" name="category" value="{{ product.category }}" list="cat-list"
+               class="w-full rounded border border-slate-300 px-3 py-2 text-sm">
+        <datalist id="cat-list">
+          {% for c in categories %}<option value="{{ c }}">{% endfor %}
+        </datalist>
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Primary descriptor</label>
+        <input type="text" name="primary_descriptor" value="{{ product.primary_descriptor }}"
+               class="w-full rounded border border-slate-300 px-3 py-2 text-sm">
+      </div>
+      <div>
+        <label class="block text-xs font-medium text-slate-600 mb-1">Secondary descriptor</label>
+        <input type="text" name="secondary_descriptor" value="{{ product.secondary_descriptor }}"
+               class="w-full rounded border border-slate-300 px-3 py-2 text-sm">
+      </div>
+    </div>
+
+    <div class="pt-2">
+      <button type="submit"
+              class="px-4 py-2 rounded bg-slate-900 hover:bg-slate-700 text-white text-sm font-medium">
+        Save changes
+      </button>
+    </div>
+  </form>
+
+  <!-- Section 2: merge -->
+  <form method="post" class="rounded-lg border border-amber-200 bg-amber-50 p-4 space-y-3"
+        onsubmit="return confirm('Merge {{ product.canonical_name|escapejs }} into the selected target? This deletes the source Product and cannot be undone.');">
+    {% csrf_token %}
+    <input type="hidden" name="action" value="merge">
+    <h2 class="text-lg font-semibold text-amber-900">Merge into another canonical</h2>
+    <p class="text-xs text-amber-800">
+      Repoints all {{ ili_count }} ILI{{ ili_count|pluralize }} + {{ mapping_count }} vendor
+      mapping{{ mapping_count|pluralize }} to the target, then deletes this Product.
+    </p>
+
+    <div>
+      <label class="block text-xs font-medium text-amber-900 mb-1">Merge target</label>
+      <select name="merge_into" required
+              class="w-full rounded border border-amber-300 px-3 py-2 text-sm bg-white">
+        <option value="">— Select target Product —</option>
+        {% for p in other_products %}
+          <option value="{{ p.id }}">{{ p.canonical_name }}{% if p.category %} ({{ p.category }}){% endif %}</option>
+        {% endfor %}
+      </select>
+    </div>
+
+    <div class="pt-2">
+      <button type="submit"
+              class="px-4 py-2 rounded bg-amber-700 hover:bg-amber-800 text-white text-sm font-medium">
+        Merge and delete this Product
+      </button>
+    </div>
+  </form>
+
+</div>
+{% endblock %}
