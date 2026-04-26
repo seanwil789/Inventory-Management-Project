@@ -16,8 +16,17 @@ if not os.environ.get('DJANGO_SETTINGS_MODULE'):
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
     django.setup()
 
-from myapp.models import Vendor, Product, InvoiceLineItem
+from myapp.models import Vendor, Product, ProductMappingProposal, InvoiceLineItem
 from django.db.models import Avg
+
+
+# Phase 2 of mapper safety: fuzzy tiers don't auto-commit FKs. They land
+# as ILI rows with product=NULL + match_confidence='<tier>_pending' and
+# create a ProductMappingProposal queue entry for human review. The
+# Django /mapping-review/ UI surfaces the queue. On approval, the FK is
+# attached and a ProductMapping row is created so future invoices auto-
+# resolve. Tiers below auto-commit deterministically as before.
+_FUZZY_TIERS = {'vendor_fuzzy', 'fuzzy', 'stripped_fuzzy'}
 
 
 def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:
@@ -104,6 +113,44 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                   f"returned by mapper has no Product in DB — "
                   f"tagging row as 'unmatched_drift'")
             item = {**item, 'confidence': 'unmatched_drift'}
+
+        # Phase 2 — Fuzzy quarantine. Fuzzy tiers don't auto-attach FKs.
+        # The product= we just looked up is "the mapper's suggestion"; we
+        # detach it from the ILI write below and instead create a pending
+        # ProductMappingProposal so a human reviews via /mapping-review/
+        # before the FK is committed.
+        is_fuzzy_quarantine = (
+            product is not None
+            and item.get('confidence', '') in _FUZZY_TIERS
+        )
+        if is_fuzzy_quarantine:
+            suggested_product = product
+            product = None  # detach from this ILI write
+            # Re-tag confidence so the row is distinguishable
+            new_conf = item.get('confidence') + '_pending'
+            score = item.get('score')
+            item = {**item, 'confidence': new_conf}
+            # Queue a proposal for human review. unique_together guarantees
+            # one row per (vendor, raw_description) — respect existing
+            # pending or rejected proposals (don't churn the queue).
+            raw_for_proposal = item.get('raw_description', '')
+            if vendor and raw_for_proposal:
+                existing_proposal = ProductMappingProposal.objects.filter(
+                    vendor=vendor, raw_description=raw_for_proposal,
+                ).first()
+                if existing_proposal is None:
+                    ProductMappingProposal.objects.create(
+                        vendor=vendor,
+                        raw_description=raw_for_proposal,
+                        suggested_product=suggested_product,
+                        score=int(score) if score is not None else None,
+                        confidence_tier=item['confidence'].replace('_pending', ''),
+                        source='mapper_quarantine',
+                        status='pending',
+                    )
+                # If existing is 'pending' or 'rejected', leave it alone.
+                # 'approved' shouldn't happen here (would have hit
+                # vendor_exact via the resulting ProductMapping row).
 
         # Always preserve the raw description — it's the original invoice text
         # and is critical for auditing, even when the item is mapped to a product.

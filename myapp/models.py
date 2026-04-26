@@ -43,6 +43,132 @@ class ProductMapping(models.Model):
         return f"{self.description} → {self.product}"
 
 
+class ProductMappingProposal(models.Model):
+    """
+    Pending mapping suggestion awaiting human review. Replaces the
+    Sheets-based Mapping Review tab workflow with a DB queue that the
+    Django /mapping-review/ UI can render and approve/reject.
+
+    Two surfacing paths feed this queue:
+      1. Mapper quarantine (Phase 2 of mapper safety) — when db_write
+         encounters a fuzzy-tier match (vendor_fuzzy / fuzzy /
+         stripped_fuzzy), it does NOT auto-attach the FK to the ILI.
+         Instead it sets product=NULL + match_confidence='<tier>_pending'
+         and creates a proposal row. The fuzzy match never silently
+         becomes ground truth.
+      2. discover_unmapped scan — periodic batch finds ILI rows still
+         unmapped after N occurrences, fuzzy-matches against existing
+         canonicals, and proposes the best fits for human review.
+
+    On approval: the proposal's suggested_product is committed to
+    ProductMapping (so future invoices map automatically) AND attached
+    as the FK to all matching ILI rows (with match_confidence flipped to
+    'manual_review' for audit trail).
+
+    On rejection: status flips to 'rejected'; no DB writes elsewhere.
+    Re-suggestion of the same (vendor, description) pair is suppressed
+    by the negative_matches.json cache.
+    """
+    STATUS_CHOICES = [
+        ('pending',  'Pending Review'),
+        ('approved', 'Approved'),
+        ('rejected', 'Rejected'),
+    ]
+    SOURCE_CHOICES = [
+        ('mapper_quarantine', 'Mapper Quarantine (fuzzy held at write)'),
+        ('discover_unmapped', 'Discover Unmapped Scan'),
+    ]
+    vendor              = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name='mapping_proposals')
+    raw_description     = models.CharField(max_length=500)
+    suggested_product   = models.ForeignKey(
+        Product, null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='mapping_proposals',
+        help_text="The mapper's best guess. Null when the human is inventing a new canonical.",
+    )
+    score               = models.IntegerField(null=True, blank=True,
+                                               help_text="Fuzzy score 0-100 from the source scorer.")
+    confidence_tier     = models.CharField(max_length=30, blank=True,
+                                            help_text="vendor_fuzzy / fuzzy / stripped_fuzzy / etc.")
+    source              = models.CharField(max_length=30, choices=SOURCE_CHOICES,
+                                            default='mapper_quarantine')
+    status              = models.CharField(max_length=15, choices=STATUS_CHOICES,
+                                            default='pending', db_index=True)
+    notes               = models.TextField(blank=True)
+    created_at          = models.DateTimeField(auto_now_add=True)
+    reviewed_at         = models.DateTimeField(null=True, blank=True)
+    reviewed_by         = models.ForeignKey(
+        'auth.User', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='mapping_proposals_reviewed',
+    )
+
+    class Meta:
+        unique_together = [('vendor', 'raw_description')]
+        indexes = [models.Index(fields=['status', '-created_at'])]
+        ordering = ['-created_at']
+
+    def __str__(self):
+        suggested = self.suggested_product.canonical_name if self.suggested_product else '(none)'
+        return f"[{self.status}] {self.vendor.name if self.vendor else '?'} | {self.raw_description[:40]} → {suggested}"
+
+    def approve(self, *, product=None, reviewer=None, notes: str = ''):
+        """Apply this proposal:
+          1. Update the proposal row (status='approved', suggested_product
+             possibly overridden, reviewed_at set, reviewed_by set).
+          2. Upsert ProductMapping(vendor, description) → product so future
+             invoices auto-resolve at vendor_exact.
+          3. Attach the FK to ALL existing ILI rows with the same
+             (vendor, raw_description) and bump their match_confidence to
+             'manual_review' for audit trail.
+
+        Returns dict: {'ili_updated': int, 'product_mapping': ProductMapping}
+        """
+        from django.utils import timezone
+        # Allow caller to override the suggested_product (Sean disagrees with mapper)
+        final_product = product or self.suggested_product
+        if final_product is None:
+            raise ValueError('Cannot approve a proposal with no product set')
+
+        # 1. Update proposal
+        self.status = 'approved'
+        self.suggested_product = final_product
+        self.reviewed_at = timezone.now()
+        self.reviewed_by = reviewer
+        if notes:
+            self.notes = (self.notes + '\n' if self.notes else '') + notes
+        self.save()
+
+        # 2. Upsert ProductMapping
+        pm, _ = ProductMapping.objects.update_or_create(
+            vendor=self.vendor,
+            description=self.raw_description,
+            defaults={'product': final_product},
+        )
+
+        # 3. Backfill ILI rows (all historical with same vendor + raw_desc)
+        ili_updated = InvoiceLineItem.objects.filter(
+            vendor=self.vendor,
+            raw_description=self.raw_description,
+        ).update(
+            product=final_product,
+            match_confidence='manual_review',
+        )
+
+        return {'ili_updated': ili_updated, 'product_mapping': pm}
+
+    def reject(self, *, reviewer=None, notes: str = ''):
+        """Mark this proposal rejected — no DB writes elsewhere. Future
+        re-suggestion of the same (vendor, raw_description) is suppressed
+        by the unique_together constraint + the negative_matches.json
+        cache the discover_unmapped scan reads."""
+        from django.utils import timezone
+        self.status = 'rejected'
+        self.reviewed_at = timezone.now()
+        self.reviewed_by = reviewer
+        if notes:
+            self.notes = (self.notes + '\n' if self.notes else '') + notes
+        self.save()
+
+
 class InvoiceLineItem(models.Model):
     """
     Single line item from a processed invoice.

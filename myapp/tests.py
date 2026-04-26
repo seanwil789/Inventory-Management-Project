@@ -17,7 +17,7 @@ from django.urls import reverse
 
 from myapp.models import (
     Recipe, RecipeIngredient, Menu, Census, Vendor, Product, ProductMapping,
-    InvoiceLineItem,
+    ProductMappingProposal, InvoiceLineItem,
 )
 
 
@@ -5793,3 +5793,201 @@ class MapperLoadFromDBTests(TestCase):
         # Should have fallen back to sheet
         self.assertEqual(cache['desc_map'].get('TESTROW'), 'TestCanonical')
         self.assertEqual(cache['code_map'].get('999'), 'TestCanonical')
+
+
+class FuzzyQuarantineTests(TestCase):
+    """Phase 2 of mapper safety: fuzzy tiers (vendor_fuzzy / fuzzy /
+    stripped_fuzzy) DO NOT auto-attach FKs. They land as ILI rows with
+    product=NULL + match_confidence='<tier>_pending' AND create a
+    ProductMappingProposal queue entry for human review."""
+
+    def _import_db_write(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import db_write
+        return db_write
+
+    def test_fuzzy_match_does_not_attach_fk(self):
+        """When confidence is fuzzy, ILI lands with product=NULL even
+        though the mapper resolved a canonical."""
+        Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Romaine')
+        items = [{
+            'raw_description': 'WHLFCLS ROMAINE HEART 3CT',
+            'canonical': 'Romaine',
+            'unit_price': 12.50,
+            'case_size_raw': '3/24CT',
+            'confidence': 'vendor_fuzzy',
+            'score': 92,
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='t.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description='WHLFCLS ROMAINE HEART 3CT')
+        self.assertIsNone(ili.product, 'Fuzzy match must not attach FK')
+        self.assertEqual(ili.match_confidence, 'vendor_fuzzy_pending')
+
+    def test_fuzzy_match_creates_proposal(self):
+        """A fuzzy match queues a ProductMappingProposal for review."""
+        v = Vendor.objects.create(name='Sysco')
+        p = Product.objects.create(canonical_name='Romaine')
+        items = [{
+            'raw_description': 'WHLFCLS ROMAINE HEART 3CT',
+            'canonical': 'Romaine',
+            'unit_price': 12.50,
+            'case_size_raw': '3/24CT',
+            'confidence': 'vendor_fuzzy',
+            'score': 92,
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='t.jpg')
+
+        proposal = ProductMappingProposal.objects.get(vendor=v,
+                                                       raw_description='WHLFCLS ROMAINE HEART 3CT')
+        self.assertEqual(proposal.suggested_product, p)
+        self.assertEqual(proposal.score, 92)
+        self.assertEqual(proposal.confidence_tier, 'vendor_fuzzy')
+        self.assertEqual(proposal.source, 'mapper_quarantine')
+        self.assertEqual(proposal.status, 'pending')
+
+    def test_code_match_still_auto_commits(self):
+        """Code/exact tiers (deterministic) bypass quarantine — FK attaches as before."""
+        Vendor.objects.create(name='Sysco')
+        p = Product.objects.create(canonical_name='Romaine')
+        items = [{
+            'raw_description': 'Romaine',
+            'canonical': 'Romaine',
+            'unit_price': 12.50,
+            'case_size_raw': '3/24CT',
+            'confidence': 'code',
+            'score': 100,
+            'sysco_item_code': '1234567',
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='t.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description='Romaine')
+        self.assertEqual(ili.product, p, 'Code-tier match must auto-attach FK')
+        self.assertEqual(ili.match_confidence, 'code')
+        self.assertEqual(ProductMappingProposal.objects.count(), 0,
+                         'Auto-commit tiers must not queue proposals')
+
+    def test_repeated_fuzzy_does_not_duplicate_proposal(self):
+        """Same (vendor, raw_desc) seen twice → only ONE proposal row
+        (unique_together enforces this; existing pending leaves alone)."""
+        Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Romaine')
+        items = [{
+            'raw_description': 'WHLFCLS ROMAINE HEART 3CT',
+            'canonical': 'Romaine',
+            'unit_price': 12.50,
+            'case_size_raw': '3/24CT',
+            'confidence': 'vendor_fuzzy',
+            'score': 92,
+        }]
+        dbw = self._import_db_write()
+        # First invoice
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='a.jpg')
+        # Second invoice on a different date but same item
+        dbw.write_invoice_to_db('Sysco', '2026-04-21', items, source_file='b.jpg')
+        self.assertEqual(ProductMappingProposal.objects.count(), 1)
+        # And both ILIs landed quarantined
+        self.assertEqual(InvoiceLineItem.objects.filter(
+            raw_description='WHLFCLS ROMAINE HEART 3CT',
+            product__isnull=True,
+            match_confidence='vendor_fuzzy_pending',
+        ).count(), 2)
+
+    def test_proposal_approve_backfills_ili_and_creates_mapping(self):
+        """Approving a proposal: (1) writes ProductMapping, (2) attaches
+        FK to all matching ILI, (3) bumps confidence to manual_review."""
+        v = Vendor.objects.create(name='Sysco')
+        p = Product.objects.create(canonical_name='Romaine')
+        # Seed: 2 quarantined ILI rows
+        items = [{
+            'raw_description': 'WHLFCLS ROMAINE HEART 3CT',
+            'canonical': 'Romaine',
+            'unit_price': 12.50,
+            'case_size_raw': '3/24CT',
+            'confidence': 'vendor_fuzzy',
+            'score': 92,
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='a.jpg')
+        dbw.write_invoice_to_db('Sysco', '2026-04-21', items, source_file='b.jpg')
+        proposal = ProductMappingProposal.objects.get(
+            vendor=v, raw_description='WHLFCLS ROMAINE HEART 3CT'
+        )
+
+        # Approve
+        from django.contrib.auth.models import User
+        u = User.objects.create_user(username='reviewer', password='x')
+        result = proposal.approve(reviewer=u, notes='looks right')
+
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.status, 'approved')
+        self.assertEqual(proposal.reviewed_by, u)
+        self.assertIsNotNone(proposal.reviewed_at)
+        self.assertIn('looks right', proposal.notes)
+
+        # ProductMapping was created
+        pm = ProductMapping.objects.get(vendor=v, description='WHLFCLS ROMAINE HEART 3CT')
+        self.assertEqual(pm.product, p)
+        self.assertEqual(result['product_mapping'], pm)
+
+        # All ILI rows now have FK + manual_review confidence
+        self.assertEqual(result['ili_updated'], 2)
+        for ili in InvoiceLineItem.objects.filter(raw_description='WHLFCLS ROMAINE HEART 3CT'):
+            self.assertEqual(ili.product, p)
+            self.assertEqual(ili.match_confidence, 'manual_review')
+
+    def test_proposal_approve_with_override_product(self):
+        """Reviewer can pick a different canonical than the mapper suggested."""
+        v = Vendor.objects.create(name='Sysco')
+        suggested = Product.objects.create(canonical_name='Romaine')
+        actual = Product.objects.create(canonical_name='Iceberg')
+
+        items = [{
+            'raw_description': 'WHLFCLS LETTUCE HEART 3CT',
+            'canonical': 'Romaine',
+            'unit_price': 12.50, 'case_size_raw': '3/24CT',
+            'confidence': 'vendor_fuzzy', 'score': 88,
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='t.jpg')
+        proposal = ProductMappingProposal.objects.get(vendor=v)
+        # Approve with override
+        proposal.approve(product=actual)
+        # ILI now points to overriden product
+        ili = InvoiceLineItem.objects.get(raw_description='WHLFCLS LETTUCE HEART 3CT')
+        self.assertEqual(ili.product, actual)
+        # ProductMapping reflects override
+        pm = ProductMapping.objects.get(vendor=v, description='WHLFCLS LETTUCE HEART 3CT')
+        self.assertEqual(pm.product, actual)
+
+    def test_proposal_reject_creates_no_mapping(self):
+        """Rejecting flips status; no DB writes elsewhere."""
+        v = Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Romaine')
+        items = [{
+            'raw_description': 'BOGUS FUZZY MATCH',
+            'canonical': 'Romaine',
+            'unit_price': 12.50, 'case_size_raw': '3/24CT',
+            'confidence': 'vendor_fuzzy', 'score': 90,
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-20', items, source_file='t.jpg')
+        proposal = ProductMappingProposal.objects.get(vendor=v)
+        proposal.reject(notes='wrong product')
+        proposal.refresh_from_db()
+        self.assertEqual(proposal.status, 'rejected')
+        # No ProductMapping created
+        self.assertEqual(ProductMapping.objects.filter(
+            vendor=v, description='BOGUS FUZZY MATCH'
+        ).count(), 0)
+        # ILI still unmapped
+        ili = InvoiceLineItem.objects.get(raw_description='BOGUS FUZZY MATCH')
+        self.assertIsNone(ili.product)
