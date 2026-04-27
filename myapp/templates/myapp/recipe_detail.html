@@ -52,9 +52,12 @@
         {% endif %}
         {% endwith %}
       </div>
-      <div class="flex gap-2">
+      <div class="flex gap-2 flex-wrap">
         <a href="{% url 'recipe_edit' recipe.id %}"
            class="px-3 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Edit recipe</a>
+        <a href="{% url 'recipe_quick_add' recipe.id %}"
+           class="px-3 py-1.5 bg-emerald-600 text-white text-sm rounded hover:bg-emerald-700"
+           title="Mobile-friendly add ingredients one at a time">Quick add (mobile)</a>
         {% if recipe.is_current %}
         <form method="post" action="{% url 'recipe_new_version' recipe.id %}" class="inline"
               onsubmit="return confirm('Create V{{ recipe.version_number|add:1 }} as a new editable copy? Current version will be preserved in history.');">
