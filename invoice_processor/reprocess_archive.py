@@ -34,7 +34,6 @@ from ocr import extract_text
 from parser import parse_invoice
 from docai import parse_with_docai
 from mapper import load_mappings, map_items
-from sheets import append_to_data_sheet
 from db_write import write_invoice_to_db
 from synergy_sync import sync_prices_from_items
 
@@ -287,10 +286,6 @@ def main():
                         source_file=file_name,
                     )
                     print(f"  [LIVE] {db_rows} rows written to database")
-
-                    print("  [LIVE] Syncing to Data Sheets...")
-                    append_to_data_sheet(parsed["vendor"], parsed["invoice_date"], mapped_items,
-                                        skip_if_exists=True)
 
                     print("  [LIVE] Syncing prices...")
                     price_summary = sync_prices_from_items(

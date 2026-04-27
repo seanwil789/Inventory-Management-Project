@@ -15,7 +15,7 @@ import argparse
 from ocr import extract_text
 from parser import parse_invoice
 from mapper import map_items
-from sheets import update_price, append_to_data_sheet
+from sheets import update_price
 from drive import archive_invoice
 
 
@@ -60,12 +60,8 @@ def main():
         print("\n[DRY RUN] Skipping Sheets update and Drive archiving.")
         return
 
-    # Step 4a: Append all items to the Data Sheets transaction log
-    print("\n4. Writing to Data Sheets log...")
-    append_to_data_sheet(parsed["vendor"], parsed["invoice_date"], mapped_items)
-
-    # Step 4b: Update prices in the monthly inventory tab (matched items only)
-    print("\n5. Updating inventory prices...")
+    # Step 4: Update prices in the monthly inventory tab (matched items only)
+    print("\n4. Updating inventory prices...")
     for item in matched:
         if item.get("needs_review"):
             print(f"  [skip] '{item['raw_description']}' flagged for review")

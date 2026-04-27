@@ -28,7 +28,6 @@ from config import DRIVE_INBOX_FOLDER_ID, DOCAI_PROCESSOR_ID
 from ocr import extract_text
 from parser import parse_invoice
 from mapper import load_mappings, map_items
-from sheets import append_to_data_sheet
 from db_write import write_invoice_to_db
 from drive import archive_invoice, get_drive_client
 from csv_ingest import ingest_csv
@@ -377,7 +376,13 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
         if not parsed["items"]:
             # Non-itemized pages (e.g. Sysco cover/totals pages) — archive and
             # remove from inbox so the inbox stays clean, but don't write to sheets.
-            print("   [!] No line items found — treating as non-itemized page.")
+            # Also catches documents the parser explicitly rejected via the
+            # rejected_reason flag (pick sheets, packing slips).
+            rej = parsed.get("rejected_reason")
+            if rej:
+                print(f"   [!] REJECTED: {rej} — archiving without DB write.")
+            else:
+                print("   [!] No line items found — treating as non-itemized page.")
             if dry_run:
                 print("\n[DRY RUN] Would archive non-itemized page and remove from inbox.")
                 return True
@@ -408,9 +413,6 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
             source_file=file_name,
         )
         print(f"   [✓] {db_rows} rows written to database")
-
-        print("   Syncing to Data Sheets log...")
-        append_to_data_sheet(parsed["vendor"], parsed["invoice_date"], mapped_items)
 
         print("\n   Syncing prices to Synergy sheet...")
         price_summary = sync_prices_from_items(

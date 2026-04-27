@@ -2465,6 +2465,30 @@ def _try_spatial_sysco(pages: list[dict] | None, text: str) -> list[dict] | None
     return _try_spatial("Sysco", pages)
 
 
+def _is_non_invoice_document(text: str) -> str | None:
+    """Detect documents that look like invoices to OCR but aren't priced
+    invoices (pick sheets, packing slips). Returns a short reason string
+    when rejected, None when the document looks like a normal invoice.
+
+    Surfaced 2026-04-26 from an Aramark pick sheet that landed 7 priceless
+    ILI rows. The pattern is documents with "Sales Order Pick Sheet" /
+    "Pick Qty" headers but no price column — DocAI extracts descriptions
+    and quantities just fine, leaving unit_price=NULL across every line.
+    Caller (batch.py) skips db_write when this returns non-None.
+    """
+    upper = (text or '').upper()
+    if 'SALES ORDER PICK SHEET' in upper:
+        return 'pick_sheet'
+    # Belt-and-suspenders: documents with "Pick Qty" AND "Picked" headers
+    # but no $/Price/Total column in the first 1500 chars are pick sheets
+    # even when the title isn't captured (rotated/cropped photo).
+    if 'PICK QTY' in upper and 'PICKED' in upper:
+        head = upper[:1500]
+        if 'PRICE' not in head and 'TOTAL' not in head and 'AMOUNT' not in head:
+            return 'pick_sheet'
+    return None
+
+
 def parse_invoice(text: str, vendor: str = None,
                   pages: list[dict] | None = None) -> dict:
     """Parse invoice OCR. Optional `pages` is DocAI layout data
@@ -2473,6 +2497,18 @@ def parse_invoice(text: str, vendor: str = None,
     Other vendors still use text-based parsing."""
     vendor = vendor or detect_vendor(text)
     date   = extract_date(text)
+
+    # Reject pick sheets / packing slips before parser dispatch — they
+    # OCR like invoices but carry no prices, so per-line ILI writes
+    # produce only NULL-price rows that pollute reporting.
+    rejected = _is_non_invoice_document(text)
+    if rejected:
+        return {
+            'vendor':          vendor or 'Unknown',
+            'invoice_date':    date,
+            'items':           [],
+            'rejected_reason': rejected,
+        }
 
     parsers = {
         "Sysco":                 _parse_sysco,
@@ -2486,32 +2522,33 @@ def parse_invoice(text: str, vendor: str = None,
         "Delaware County Linen": _parse_delaware_linen,
     }
 
-    # Spatial path — try first for vendors with a matcher, fall back to
-    # heuristics on any gap.
+    # Run BOTH spatial and text parsers, pick whichever extracts more
+    # items. Spatial usually wins for clean OCR (Sysco column-dump,
+    # Exceptional, PBM digital), but on layouts where the spatial
+    # row-cluster or x-band detection misses items (Farm Art multi-page
+    # produce invoices have shown 6/16 spatial vs 16/16 text), we fall
+    # back to text. Text parsers are also where invoice_total comes from,
+    # so we always need to run them anyway.
     invoice_total = None
     spatial_items = _try_spatial(vendor, pages)
 
-    if spatial_items is not None:
-        items = spatial_items
-        # Invoice totals live in the footer, which is text-based — run the
-        # vendor's heuristic parser just to harvest invoice_total; discard
-        # its items (spatial already has them). Cheap insurance for the
-        # total-reconciliation step in batch.py / budget_sync.py.
-        parser_fn = parsers.get(vendor)
-        if parser_fn is not None:
-            try:
-                heur_result = parser_fn(text)
-                if isinstance(heur_result, tuple) and len(heur_result) >= 2:
-                    invoice_total = heur_result[1]
-            except Exception:
-                pass
-    else:
-        parser_fn = parsers.get(vendor, _fallback_parse)
+    text_items: list[dict] = []
+    parser_fn = parsers.get(vendor, _fallback_parse)
+    try:
         result = parser_fn(text)
         if isinstance(result, tuple):
-            items, invoice_total = result
+            text_items, invoice_total = result
         else:
-            items = result
+            text_items = result
+    except Exception:
+        text_items = []
+
+    # Pick the source with more items. Tie-breaker: prefer spatial (it's
+    # the path tuned for clean DocAI bounding-box layouts).
+    if spatial_items is not None and len(spatial_items) >= len(text_items):
+        items = spatial_items
+    else:
+        items = text_items
 
     if vendor not in parsers:
         for item in items:

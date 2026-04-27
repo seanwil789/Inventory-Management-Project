@@ -29,7 +29,6 @@ from ocr import extract_text
 from parser import parse_invoice
 from mapper import load_mappings, map_items
 from db_write import write_invoice_to_db
-from sheets import append_to_data_sheet
 from synergy_sync import sync_prices_from_items
 from reprocess_archive import walk_archive, download_file
 
