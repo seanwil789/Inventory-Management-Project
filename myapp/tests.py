@@ -133,6 +133,100 @@ class SmokeTests(AuthedTestCase):
     def test_price_alerts_200(self):
         self.assertEqual(self.client.get(reverse('price_alerts')).status_code, 200)
 
+    def test_item_mapping_list_200(self):
+        self.assertEqual(self.client.get(reverse('item_mapping_list')).status_code, 200)
+
+
+@override_settings(ALLOWED_HOSTS=['testserver'])
+class ItemMappingEditorTests(AuthedTestCase):
+    """Item Mapping editor view (Step 4 of sheet→DB migration)."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.vendor = Vendor.objects.create(name='Test Vendor IM')
+        cls.product = Product.objects.create(
+            canonical_name='IM Test Product',
+            category='Drystock', primary_descriptor='Test',
+        )
+        cls.pm = ProductMapping.objects.create(
+            vendor=cls.vendor,
+            description='RAW TEST DESCRIPTION 12345',
+            supc='1234567',
+            product=cls.product,
+        )
+
+    def test_list_renders(self):
+        r = self.client.get(reverse('item_mapping_list'))
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'RAW TEST DESCRIPTION')
+        self.assertContains(r, 'IM Test Product')
+
+    def test_list_filter_by_vendor(self):
+        r = self.client.get(reverse('item_mapping_list'),
+                            {'vendor': self.vendor.name})
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'RAW TEST DESCRIPTION')
+
+    def test_list_search(self):
+        r = self.client.get(reverse('item_mapping_list'), {'q': '12345'})
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'RAW TEST DESCRIPTION')
+
+    def test_create_new_mapping(self):
+        v2 = Vendor.objects.create(name='Test Vendor IM 2')
+        p2 = Product.objects.create(
+            canonical_name='IM Test Product 2', category='Drystock',
+        )
+        before = ProductMapping.objects.count()
+        resp = self.client.post(reverse('item_mapping_create'), {
+            'vendor':      v2.id,
+            'description': 'NEW MAPPING TEST',
+            'supc':        '7654321',
+            'product':     p2.id,
+        })
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(ProductMapping.objects.count(), before + 1)
+        self.assertTrue(ProductMapping.objects.filter(
+            description='NEW MAPPING TEST', product=p2).exists())
+
+    def test_edit_mapping_get_renders(self):
+        r = self.client.get(reverse('item_mapping_edit', args=[self.pm.id]))
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'RAW TEST DESCRIPTION')
+
+    def test_edit_mapping_post_saves(self):
+        p2 = Product.objects.create(
+            canonical_name='IM Test Product Updated', category='Drystock',
+        )
+        resp = self.client.post(reverse('item_mapping_edit', args=[self.pm.id]), {
+            'vendor':      self.vendor.id,
+            'description': 'UPDATED DESCRIPTION',
+            'supc':        '7777777',
+            'product':     p2.id,
+        })
+        self.assertEqual(resp.status_code, 302)
+        self.pm.refresh_from_db()
+        self.assertEqual(self.pm.description, 'UPDATED DESCRIPTION')
+        self.assertEqual(self.pm.product_id, p2.id)
+
+    def test_delete_mapping(self):
+        v3 = Vendor.objects.create(name='Test Vendor IM 3')
+        p3 = Product.objects.create(canonical_name='IM Delete Me', category='Drystock')
+        pm = ProductMapping.objects.create(
+            vendor=v3, description='DELETE ME', product=p3,
+        )
+        before = ProductMapping.objects.count()
+        resp = self.client.post(reverse('item_mapping_delete', args=[pm.id]))
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(ProductMapping.objects.count(), before - 1)
+        self.assertFalse(ProductMapping.objects.filter(pk=pm.id).exists())
+
+    def test_delete_mapping_get_rejected(self):
+        # GET should be 405 (require_POST decorator)
+        resp = self.client.get(reverse('item_mapping_delete', args=[self.pm.id]))
+        self.assertEqual(resp.status_code, 405)
+        self.assertTrue(ProductMapping.objects.filter(pk=self.pm.id).exists())
+
 
 @override_settings(ALLOWED_HOSTS=['testserver'])
 class RecipeCreationTests(AuthedTestCase):

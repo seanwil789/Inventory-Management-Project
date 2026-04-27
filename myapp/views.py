@@ -14,11 +14,12 @@ from .calendar_utils import (
 )
 from collections import defaultdict
 
-from .forms import MenuForm, RecipeForm, RecipeIngredientFormSet, YieldReferenceForm
+from .forms import (MenuForm, RecipeForm, RecipeIngredientFormSet,
+                    YieldReferenceForm, ProductMappingForm)
 from .models import (
     Census, IngredientSkipNote, InvoiceLineItem, Menu, MenuFreetextComponent,
-    PrepTask, Product, Recipe, RecipeIngredient, Vendor, YieldReference,
-    PROTEIN_CHOICES, CONFLICT_LABELS, CONFLICT_ICONS,
+    PrepTask, Product, ProductMapping, Recipe, RecipeIngredient, Vendor,
+    YieldReference, PROTEIN_CHOICES, CONFLICT_LABELS, CONFLICT_ICONS,
 )
 
 
@@ -1246,10 +1247,17 @@ def recipe_edit(request, recipe_id: int):
     # per-row <select> bloat (was ~500KB page; now ~30KB).
     yield_refs = list(YieldReference.objects.order_by('ingredient', 'prep_state'))
     sub_recipes = list(Recipe.objects.order_by('name').exclude(pk=recipe.pk))
+    # Products list for the name_raw autocomplete: typing a value that
+    # matches a Product canonical_name auto-links the ingredient to the
+    # Product FK (set client-side via the dl-products datalist + hidden
+    # product input on each row).
+    products = list(Product.objects.order_by('canonical_name')
+                    .values('id', 'canonical_name'))
     return render(request, 'myapp/recipe_form.html', {
         'recipe': recipe, 'form': form, 'formset': formset,
         'yield_refs': yield_refs,
         'sub_recipes': sub_recipes,
+        'products': products,
     })
 
 
@@ -2708,6 +2716,143 @@ def product_edit(request, product_id: int):
         'other_products': list(other_products),
         'categories': categories,
     })
+
+
+# ---- Item Mapping editor (Step 4 of sheet→DB migration) ----
+# Direct-edit surface for the ProductMapping table — replaces hand-edits
+# of the Item Mapping sheet col F. Mapper reads from this table (Step 2),
+# so saves here propagate to live invoice mapping after the cache TTL
+# (1hr). Errors land in Django form validation rather than silently
+# dropping into the mapper's "skip orphan canonical" branch.
+
+def item_mapping_list(request):
+    """List + search ProductMapping rows. Each row links to edit/delete.
+    Inline create form at the top.
+
+    Filters:
+      - vendor: dropdown
+      - q: substring match on description, supc, or canonical name
+    """
+    from django.db.models import Q, Count
+
+    vendor_filter = request.GET.get('vendor', '')
+    q = (request.GET.get('q') or '').strip()
+
+    qs = (ProductMapping.objects
+          .select_related('vendor', 'product')
+          .order_by('vendor__name', 'description'))
+
+    if vendor_filter:
+        qs = qs.filter(vendor__name=vendor_filter)
+    if q:
+        qs = qs.filter(
+            Q(description__icontains=q)
+            | Q(supc__icontains=q)
+            | Q(product__canonical_name__icontains=q)
+        )
+
+    # Pre-compute ILI counts in one aggregate so the list doesn't N+1
+    ili_count_qs = (InvoiceLineItem.objects
+                    .filter(vendor__isnull=False, product__isnull=False)
+                    .values('vendor_id', 'raw_description')
+                    .annotate(n=Count('id')))
+    ili_count_map = {(r['vendor_id'], r['raw_description']): r['n']
+                     for r in ili_count_qs}
+
+    rows = list(qs[:300])   # cap at 300; user filters to narrow further
+    total_count = qs.count()
+    rows_data = []
+    for pm in rows:
+        rows_data.append({
+            'pm': pm,
+            'ili_count': ili_count_map.get((pm.vendor_id, pm.description), 0),
+        })
+
+    vendors = list(Vendor.objects.order_by('name').values_list('name', flat=True))
+    has_more = total_count > len(rows)
+
+    return render(request, 'myapp/item_mapping_list.html', {
+        'rows':          rows_data,
+        'total_count':   total_count,
+        'shown_count':   len(rows),
+        'has_more':      has_more,
+        'vendor_filter': vendor_filter,
+        'q':             q,
+        'vendors':       vendors,
+        'create_form':   ProductMappingForm(),
+    })
+
+
+def item_mapping_create(request):
+    """POST-only: create a new ProductMapping row from the inline form
+    on /mappings/. GET redirects back to the list."""
+    if request.method != 'POST':
+        return redirect('item_mapping_list')
+
+    form = ProductMappingForm(request.POST)
+    if form.is_valid():
+        pm = form.save()
+        messages.success(request,
+            f'Created mapping: {pm.vendor.name if pm.vendor else "?"} | '
+            f'"{pm.description[:40]}" → {pm.product.canonical_name if pm.product else "(unmapped)"}')
+        return redirect('item_mapping_list')
+
+    # Form invalid — re-render the list with errors visible inline.
+    # Cheap path: stash errors in a session message and redirect. The
+    # alternative (re-rendering the full list with form bound) would
+    # require duplicating list-view setup; not worth the complexity for
+    # an admin form that rarely fails.
+    err_summary = '; '.join(
+        f'{field}: {", ".join(errors)}' for field, errors in form.errors.items()
+    )
+    messages.error(request, f'Could not create mapping: {err_summary}')
+    return redirect('item_mapping_list')
+
+
+def item_mapping_edit(request, mapping_id: int):
+    """Edit a single ProductMapping row. POST saves; GET shows form."""
+    pm = get_object_or_404(ProductMapping, pk=mapping_id)
+    if request.method == 'POST':
+        form = ProductMappingForm(request.POST, instance=pm)
+        if form.is_valid():
+            form.save()
+            messages.success(request,
+                f'Updated mapping #{pm.id}: '
+                f'"{pm.description[:40]}" → '
+                f'{pm.product.canonical_name if pm.product else "(unmapped)"}')
+            return redirect('item_mapping_list')
+    else:
+        form = ProductMappingForm(instance=pm)
+
+    # ILI rows that share this (vendor, raw_description) — shows the
+    # blast radius of editing this row. After save, the mapper's
+    # 1hr-TTL cache refresh propagates the new canonical to future
+    # invoices; existing ILI rows aren't auto-rewritten (would need a
+    # separate reprocess pass).
+    ili_count = InvoiceLineItem.objects.filter(
+        vendor=pm.vendor, raw_description=pm.description,
+    ).count() if pm.vendor else 0
+    ili_sample = list(InvoiceLineItem.objects.filter(
+        vendor=pm.vendor, raw_description=pm.description,
+    ).order_by('-invoice_date')[:5]) if pm.vendor else []
+
+    return render(request, 'myapp/item_mapping_edit.html', {
+        'form':       form,
+        'pm':         pm,
+        'ili_count':  ili_count,
+        'ili_sample': ili_sample,
+    })
+
+
+@require_POST
+def item_mapping_delete(request, mapping_id: int):
+    """Delete a ProductMapping row. POST-only; confirmation lives in the
+    list-view UI."""
+    pm = get_object_or_404(ProductMapping, pk=mapping_id)
+    label = f'{pm.vendor.name if pm.vendor else "?"} | "{pm.description[:40]}"'
+    pm.delete()
+    messages.success(request, f'Deleted mapping: {label}')
+    return redirect('item_mapping_list')
 
 
 # ---- Mapper health dashboard (Step 2 of sheet→DB migration follow-up) ----

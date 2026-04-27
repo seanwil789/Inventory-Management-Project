@@ -2,7 +2,8 @@ from django import forms
 from django.forms import inlineformset_factory
 from django.utils.safestring import mark_safe
 from django.utils.html import escape
-from .models import Menu, Recipe, RecipeIngredient, YieldReference, CONFLICT_CHOICES
+from .models import (Menu, Recipe, RecipeIngredient, YieldReference,
+                     ProductMapping, CONFLICT_CHOICES)
 
 
 class SharedDatalistWidget(forms.Widget):
@@ -128,18 +129,57 @@ class RecipeForm(forms.ModelForm):
 RecipeIngredientFormSet = inlineformset_factory(
     Recipe, RecipeIngredient,
     fk_name='recipe',
-    fields=['name_raw', 'quantity', 'unit', 'yield_pct', 'yield_ref', 'sub_recipe'],
+    fields=['name_raw', 'quantity', 'unit', 'yield_pct', 'yield_ref',
+            'sub_recipe', 'product'],
     extra=2,
     can_delete=True,
     widgets={
-        'name_raw':   forms.TextInput(attrs={'class': 'border rounded px-2 py-1 w-full text-sm'}),
+        # name_raw doubles as the canonical-product autocomplete trigger:
+        # when the typed value matches a Product canonical_name, JS in
+        # recipe_form.html populates the hidden `product` input below
+        # so the FK gets saved on submit. Typing freetext that doesn't
+        # match a canonical leaves product=NULL — same as before.
+        'name_raw':   forms.TextInput(attrs={
+            'class': 'border rounded px-2 py-1 w-full text-sm',
+            'list':  'dl-products',
+            'autocomplete': 'off',
+        }),
         'quantity':   forms.NumberInput(attrs={'class': 'border rounded px-2 py-1 w-full text-sm', 'step': '0.001'}),
         'unit':       forms.TextInput(attrs={'class': 'border rounded px-2 py-1 w-full text-sm'}),
         'yield_pct':  forms.NumberInput(attrs={'class': 'border rounded px-2 py-1 w-full text-sm', 'step': '0.01', 'placeholder': '%'}),
         'yield_ref':  SharedDatalistWidget(datalist_id='dl-yield-refs'),
         'sub_recipe': SharedDatalistWidget(datalist_id='dl-sub-recipes'),
+        'product':    forms.HiddenInput(),
     },
 )
+
+
+class ProductMappingForm(forms.ModelForm):
+    """Edit / create form for a single ProductMapping row.
+
+    Per the sheet→DB migration roadmap (Step 4): replaces direct edits
+    of the Item Mapping sheet with a Django UI. The DB ProductMapping
+    table is the source of truth (mapper reads it via Step 2 refactor),
+    so saves here propagate to the live mapper on next cache refresh
+    (1hr TTL). Surfacing through this form means errors land in the
+    Django form-validation layer instead of silently dropping into the
+    mapper's "skip orphan canonical" branch.
+    """
+    class Meta:
+        model = ProductMapping
+        fields = ['vendor', 'description', 'supc', 'product']
+        widgets = {
+            'vendor': forms.Select(attrs={'class': 'border rounded px-2 py-1 text-sm w-full'}),
+            'description': forms.TextInput(attrs={
+                'class': 'border rounded px-2 py-1 text-sm w-full font-mono',
+                'placeholder': 'Raw vendor description (matches invoice OCR)',
+            }),
+            'supc': forms.TextInput(attrs={
+                'class': 'border rounded px-2 py-1 text-sm w-full',
+                'placeholder': 'Sysco SUPC (optional)',
+            }),
+            'product': forms.Select(attrs={'class': 'border rounded px-2 py-1 text-sm w-full'}),
+        }
 
 
 class YieldReferenceForm(forms.ModelForm):

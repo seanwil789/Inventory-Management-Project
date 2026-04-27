@@ -29,7 +29,7 @@
           </a>
         </div>
         {{ formset.management_form }}
-        <div class="border rounded divide-y bg-slate-50">
+        <div id="ingredient-rows" class="border rounded divide-y bg-slate-50">
           <div class="grid grid-cols-12 gap-2 px-3 py-2 text-xs font-semibold text-slate-500 uppercase tracking-wide">
             <div class="col-span-3">Name</div>
             <div class="col-span-1">Qty</div>
@@ -40,7 +40,7 @@
             <div class="col-span-1 text-right">Del</div>
           </div>
           {% for f in formset %}
-          <div class="grid grid-cols-12 gap-2 px-3 py-2 items-center {% if f.errors %}bg-red-50{% endif %}">
+          <div class="ingredient-row grid grid-cols-12 gap-2 px-3 py-2 items-center {% if f.errors %}bg-red-50{% endif %}">
             {% for hidden in f.hidden_fields %}{{ hidden }}{% endfor %}
             <div class="col-span-3">{{ f.name_raw }}</div>
             <div class="col-span-1">{{ f.quantity }}</div>
@@ -55,7 +55,17 @@
           </div>
           {% endfor %}
         </div>
-        <p class="text-xs text-slate-500 mt-2">Two blank rows at the bottom are for adding ingredients. Tick "Remove" to delete a row on save.</p>
+
+        <div class="mt-2 flex items-center justify-between">
+          <button type="button" id="add-ingredient"
+                  class="text-xs px-3 py-1 bg-indigo-600 text-white rounded hover:bg-indigo-700 flex items-center gap-1">
+            <span class="text-sm leading-none">+</span> Add ingredient
+          </button>
+          <p class="text-xs text-slate-500">
+            Type in Name to autocomplete an existing product (auto-links the FK).
+            Tick "Remove" to delete on save.
+          </p>
+        </div>
       </div>
 
       {% if form.non_field_errors or formset.non_form_errors %}
@@ -78,9 +88,25 @@
 <datalist id="dl-sub-recipes">
   {% for r in sub_recipes %}<option value="{{ r.id }}">{{ r.name }}</option>{% endfor %}
 </datalist>
+<datalist id="dl-products">
+  {% for p in products %}<option value="{{ p.canonical_name }}" data-pk="{{ p.id }}">{% endfor %}
+</datalist>
+
+<template id="empty-ingredient-row">
+  <div class="ingredient-row grid grid-cols-12 gap-2 px-3 py-2 items-center">
+    {% for hidden in formset.empty_form.hidden_fields %}{{ hidden }}{% endfor %}
+    <div class="col-span-3">{{ formset.empty_form.name_raw }}</div>
+    <div class="col-span-1">{{ formset.empty_form.quantity }}</div>
+    <div class="col-span-1">{{ formset.empty_form.unit }}</div>
+    <div class="col-span-1">{{ formset.empty_form.yield_pct }}</div>
+    <div class="col-span-3">{{ formset.empty_form.yield_ref }}</div>
+    <div class="col-span-2">{{ formset.empty_form.sub_recipe }}</div>
+    <div class="col-span-1 text-right text-xs">{{ formset.empty_form.DELETE }}</div>
+  </div>
+</template>
 
 <script>
-// Shared-datalist bridge for SharedDatalistWidget.
+// Shared-datalist bridge for SharedDatalistWidget (yield_ref, sub_recipe).
 // Each visible <input> has data-dl-pk-target (hidden input's id) and
 // data-dl-list (datalist id). We sync bidirectionally:
 //   - On page load: hidden PK → visible label (from datalist lookup)
@@ -98,21 +124,81 @@
     const opt = Array.from(dl.options).find(o => o.textContent === label);
     return opt ? opt.value : '';
   }
-  document.querySelectorAll('input[data-dl-pk-target]').forEach(function (visible) {
+  function bindDatalist(visible) {
     const hidden = document.getElementById(visible.dataset.dlPkTarget);
     const listId = visible.dataset.dlList;
-    // Initial hydrate: if hidden has a PK, set visible text to the matching label
     if (hidden && hidden.value) {
       visible.value = lookupLabel(listId, hidden.value);
     }
-    // On change/input: resolve visible text → hidden PK
     function sync() {
       if (!visible.value) { hidden.value = ''; return; }
       const pk = lookupPk(listId, visible.value);
-      hidden.value = pk;  // blank if no match — form will re-validate
+      hidden.value = pk;
     }
     visible.addEventListener('change', sync);
     visible.addEventListener('input', sync);
+  }
+  document.querySelectorAll('input[data-dl-pk-target]').forEach(bindDatalist);
+  // Expose for newly-cloned rows below
+  window._bindDatalist = bindDatalist;
+})();
+
+// Product autocomplete: when name_raw matches a Product canonical_name in
+// the dl-products datalist, populate the row's hidden product input with
+// the Product PK. If the typed text doesn't match, leave product blank
+// (stays as freetext name_raw with no FK link).
+(function () {
+  const dl = document.getElementById('dl-products');
+  // Build canonical → pk map once
+  const canonToPk = {};
+  if (dl) {
+    Array.from(dl.options).forEach(o => {
+      canonToPk[o.value] = o.dataset.pk;
+    });
+  }
+  function bindNameRaw(input) {
+    // Find this row's hidden product input. Form name pattern:
+    //   ingredients-N-name_raw  →  ingredients-N-product
+    const productName = input.name.replace(/-name_raw$/, '-product');
+    const productInput = input.form.querySelector(`input[name="${productName}"]`);
+    if (!productInput) return;
+    function sync() {
+      const pk = canonToPk[input.value];
+      productInput.value = pk || '';
+    }
+    input.addEventListener('change', sync);
+    input.addEventListener('input', sync);
+  }
+  document.querySelectorAll('input[list="dl-products"]').forEach(bindNameRaw);
+  window._bindNameRaw = bindNameRaw;
+})();
+
+// "Add ingredient" button: clone the empty-form template, replace the
+// __prefix__ placeholder with the next form index from TOTAL_FORMS,
+// append to the rows container, increment TOTAL_FORMS, and bind the
+// new row's autocomplete handlers.
+(function () {
+  const btn = document.getElementById('add-ingredient');
+  const tpl = document.getElementById('empty-ingredient-row');
+  const rows = document.getElementById('ingredient-rows');
+  const total = document.querySelector('input[name="ingredients-TOTAL_FORMS"]');
+  if (!btn || !tpl || !rows || !total) return;
+
+  btn.addEventListener('click', function () {
+    const idx = parseInt(total.value, 10);
+    // Clone the template's content, swap __prefix__ for the next index
+    const html = tpl.innerHTML.replace(/__prefix__/g, idx);
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = html;
+    const newRow = wrapper.firstElementChild;
+    rows.appendChild(newRow);
+    total.value = idx + 1;
+    // Bind new row's datalist + product-autocomplete handlers
+    newRow.querySelectorAll('input[data-dl-pk-target]').forEach(window._bindDatalist);
+    newRow.querySelectorAll('input[list="dl-products"]').forEach(window._bindNameRaw);
+    // Focus the name field of the new row for fast data entry
+    const nameField = newRow.querySelector('input[list="dl-products"]');
+    if (nameField) nameField.focus();
   });
 })();
 </script>

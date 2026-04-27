@@ -1,0 +1,111 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Edit Mapping #{{ pm.id }}{% endblock %}
+
+{% block content %}
+<div class="space-y-6 max-w-3xl">
+
+  <div>
+    <a href="{% url 'item_mapping_list' %}" class="text-sm text-slate-500 hover:text-indigo-600">
+      ← Item Mapping list
+    </a>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900 mt-1">
+      Edit Mapping #{{ pm.id }}
+    </h1>
+  </div>
+
+  {% if messages %}
+    <div class="space-y-2">
+      {% for message in messages %}
+        <div class="rounded-lg border p-3 text-sm
+          {% if message.tags == 'success' %}border-emerald-200 bg-emerald-50 text-emerald-900
+          {% elif message.tags == 'error' %}border-red-200 bg-red-50 text-red-900
+          {% else %}border-slate-200 bg-slate-50 text-slate-900{% endif %}">
+          {{ message }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <form method="post" class="space-y-4 rounded-lg bg-white border border-slate-200 p-6">
+    {% csrf_token %}
+    <div>
+      <label class="block">
+        <span class="text-xs text-slate-600">Vendor *</span>
+        {{ form.vendor }}
+        {% if form.vendor.errors %}
+          <span class="text-xs text-red-600">{{ form.vendor.errors|join:", " }}</span>
+        {% endif %}
+      </label>
+    </div>
+    <div>
+      <label class="block">
+        <span class="text-xs text-slate-600">Raw description *</span>
+        {{ form.description }}
+        <span class="text-xs text-slate-400 italic">
+          The raw OCR text from invoice line items. Must match exactly (case-insensitive after
+          normalization) for the mapper to hit at the vendor_exact tier.
+        </span>
+        {% if form.description.errors %}
+          <span class="text-xs text-red-600">{{ form.description.errors|join:", " }}</span>
+        {% endif %}
+      </label>
+    </div>
+    <div>
+      <label class="block">
+        <span class="text-xs text-slate-600">SUPC (Sysco only)</span>
+        {{ form.supc }}
+        <span class="text-xs text-slate-400 italic">
+          Sysco's 7-digit product code. Empty for non-Sysco vendors.
+        </span>
+        {% if form.supc.errors %}
+          <span class="text-xs text-red-600">{{ form.supc.errors|join:", " }}</span>
+        {% endif %}
+      </label>
+    </div>
+    <div>
+      <label class="block">
+        <span class="text-xs text-slate-600">Canonical product *</span>
+        {{ form.product }}
+        {% if form.product.errors %}
+          <span class="text-xs text-red-600">{{ form.product.errors|join:", " }}</span>
+        {% endif %}
+      </label>
+    </div>
+
+    <div class="flex gap-2 justify-end pt-2">
+      <a href="{% url 'item_mapping_list' %}"
+         class="px-3 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-sm">
+        Cancel
+      </a>
+      <button type="submit"
+              class="px-3 py-1 bg-emerald-600 hover:bg-emerald-700 text-white rounded text-sm">
+        Save changes
+      </button>
+    </div>
+  </form>
+
+  <div class="rounded-lg bg-slate-50 border border-slate-200 p-4 text-sm">
+    <h2 class="font-semibold text-slate-700 mb-2">Blast radius</h2>
+    <p class="text-slate-600">
+      <strong>{{ ili_count }}</strong> InvoiceLineItem row{{ ili_count|pluralize }} share this
+      (vendor, description) pair.
+    </p>
+    {% if ili_sample %}
+      <p class="text-xs text-slate-500 mt-2">Most recent {{ ili_sample|length }}:</p>
+      <ul class="text-xs text-slate-600 mt-1 space-y-0.5 font-mono">
+        {% for ili in ili_sample %}
+          <li>
+            {{ ili.invoice_date }} · ${{ ili.unit_price|default:"—" }} ·
+            currently linked to: {{ ili.product.canonical_name|default:"(unmapped)" }}
+          </li>
+        {% endfor %}
+      </ul>
+    {% endif %}
+    <p class="text-xs text-slate-500 mt-3">
+      Saving here updates the mapping for <em>future</em> invoice processing. Existing ILI rows
+      keep their current product FK until a reprocess pass runs.
+    </p>
+  </div>
+
+</div>
+{% endblock %}

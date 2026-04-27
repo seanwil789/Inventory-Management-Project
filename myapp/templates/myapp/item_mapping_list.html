@@ -1,0 +1,177 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Item Mapping{% endblock %}
+
+{% block content %}
+<div class="space-y-6">
+
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Item Mapping</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Direct edits to the <code>ProductMapping</code> table. Mapper reads from this
+      table on every cron cycle (1hr cache TTL) — so saves here propagate to live
+      invoice mapping. Use this to fix wrong canonicals surfaced by
+      <a href="{% url 'mapping_health' %}" class="text-indigo-600 hover:underline">/mapping-health/</a>
+      or
+      <code>audit_real_suspects</code>.
+    </p>
+  </div>
+
+  {% if messages %}
+    <div class="space-y-2">
+      {% for message in messages %}
+        <div class="rounded-lg border p-3 text-sm
+          {% if message.tags == 'success' %}border-emerald-200 bg-emerald-50 text-emerald-900
+          {% elif message.tags == 'warning' %}border-amber-200 bg-amber-50 text-amber-900
+          {% elif message.tags == 'error' %}border-red-200 bg-red-50 text-red-900
+          {% else %}border-slate-200 bg-slate-50 text-slate-900{% endif %}">
+          {{ message }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <!-- Filters -->
+  <form method="get" class="flex flex-wrap gap-2 items-center text-sm">
+    <span class="text-slate-500">Vendor:</span>
+    <select name="vendor" class="border rounded px-2 py-1 text-sm">
+      <option value="">All vendors</option>
+      {% for v in vendors %}
+        <option value="{{ v }}" {% if v == vendor_filter %}selected{% endif %}>{{ v }}</option>
+      {% endfor %}
+    </select>
+
+    <input type="text" name="q" value="{{ q }}"
+           placeholder="Search description, SUPC, or canonical"
+           class="border rounded px-2 py-1 text-sm w-72">
+
+    <button type="submit"
+            class="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-sm">
+      Filter
+    </button>
+    {% if vendor_filter or q %}
+      <a href="{% url 'item_mapping_list' %}"
+         class="px-3 py-1 bg-slate-200 hover:bg-slate-300 text-slate-700 rounded text-sm">
+        Clear
+      </a>
+    {% endif %}
+
+    <span class="ml-auto text-xs text-slate-500">
+      Showing {{ shown_count }} of {{ total_count }} mappings
+      {% if has_more %} · narrow filters to see more{% endif %}
+    </span>
+  </form>
+
+  <!-- Inline create form -->
+  <details class="rounded-lg border border-indigo-200 bg-indigo-50/30 p-3">
+    <summary class="cursor-pointer text-sm font-semibold text-indigo-900">
+      + Add new mapping
+    </summary>
+    <form method="post" action="{% url 'item_mapping_create' %}" class="mt-3 grid grid-cols-1 sm:grid-cols-4 gap-2 items-start">
+      {% csrf_token %}
+      <label class="block">
+        <span class="text-xs text-slate-600">Vendor *</span>
+        {{ create_form.vendor }}
+      </label>
+      <label class="block">
+        <span class="text-xs text-slate-600">Raw description *</span>
+        {{ create_form.description }}
+      </label>
+      <label class="block">
+        <span class="text-xs text-slate-600">SUPC (Sysco only)</span>
+        {{ create_form.supc }}
+      </label>
+      <label class="block">
+        <span class="text-xs text-slate-600">Canonical product *</span>
+        {{ create_form.product }}
+      </label>
+      <div class="sm:col-span-4 flex justify-end">
+        <button type="submit"
+                class="px-3 py-1 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-sm">
+          Create mapping
+        </button>
+      </div>
+    </form>
+  </details>
+
+  {% if rows %}
+  <div class="rounded-lg bg-white border border-slate-200 overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide bg-slate-50">
+        <tr>
+          <th class="text-left py-2 px-3">Vendor</th>
+          <th class="text-left py-2 px-3">Raw Description</th>
+          <th class="text-left py-2 px-3">Canonical</th>
+          <th class="text-left py-2 px-3">SUPC</th>
+          <th class="text-right py-2 px-3">ILIs</th>
+          <th class="text-left py-2 px-3 w-32">Actions</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in rows %}
+          {% with pm=row.pm %}
+          <tr class="border-t border-slate-100">
+            <td class="py-2 px-3 text-xs text-slate-600">
+              {{ pm.vendor.name|default:"—" }}
+            </td>
+            <td class="py-2 px-3 font-mono text-xs">
+              {{ pm.description|truncatechars:60 }}
+            </td>
+            <td class="py-2 px-3 text-xs">
+              {% if pm.product %}
+                {{ pm.product.canonical_name }}
+              {% else %}
+                <span class="text-red-600 italic">(unmapped)</span>
+              {% endif %}
+            </td>
+            <td class="py-2 px-3 font-mono text-xs text-slate-500">
+              {{ pm.supc|default:"—" }}
+            </td>
+            <td class="py-2 px-3 text-right tabular-nums text-xs text-slate-600">
+              {{ row.ili_count }}
+            </td>
+            <td class="py-2 px-3">
+              <a href="{% url 'item_mapping_edit' pm.id %}"
+                 class="px-2 py-0.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs">
+                Edit
+              </a>
+              <form method="post" action="{% url 'item_mapping_delete' pm.id %}"
+                    class="inline"
+                    onsubmit="return confirm('Delete mapping for &quot;{{ pm.description|escapejs|truncatechars:30 }}&quot;? Existing ILI rows are not affected; future invoices with this description will fall back to fuzzy matching.');">
+                {% csrf_token %}
+                <button type="submit"
+                        class="px-2 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-xs ml-1">
+                  Delete
+                </button>
+              </form>
+            </td>
+          </tr>
+          {% endwith %}
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% else %}
+    <div class="rounded-lg bg-white border border-slate-200 p-8 text-center">
+      <p class="text-slate-600">
+        {% if vendor_filter or q %}
+          No mappings match this filter.
+        {% else %}
+          No ProductMapping rows in DB. Run
+          <code>manage.py sync_item_mapping_from_sheet --apply</code>
+          to backfill from the legacy sheet, or use the form above to add one.
+        {% endif %}
+      </p>
+    </div>
+  {% endif %}
+
+  <p class="text-xs text-slate-400">
+    Related:
+    <a href="{% url 'mapping_review' %}" class="hover:underline">Mapping Review queue</a>
+    ·
+    <a href="{% url 'mapping_health' %}" class="hover:underline">Mapping Health</a>
+    ·
+    <a href="{% url 'pipeline_health' %}" class="hover:underline">Pipeline Health</a>
+  </p>
+
+</div>
+{% endblock %}
