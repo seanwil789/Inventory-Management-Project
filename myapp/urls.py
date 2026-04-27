@@ -32,6 +32,7 @@ urlpatterns = [
     path('recipe/new/',                     views.recipe_new,          name='recipe_new'),
     path('recipe/<int:recipe_id>/',         views.recipe_detail,       name='recipe_detail'),
     path('recipe/<int:recipe_id>/edit/',    views.recipe_edit,         name='recipe_edit'),
+    path('recipe/<int:recipe_id>/quick-add/', views.recipe_quick_add,  name='recipe_quick_add'),
     path('recipe/<int:recipe_id>/new-version/', views.recipe_new_version, name='recipe_new_version'),
     path('yields/',                         views.yield_list,          name='yield_list'),
     path('yields/new/',                     views.yield_edit,          name='yield_new'),

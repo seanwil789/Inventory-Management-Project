@@ -74,9 +74,14 @@
       </div>
       {% endif %}
 
-      <div class="flex gap-2">
+      <div class="flex flex-wrap gap-2 items-center">
         <button type="submit" class="px-4 py-1.5 bg-indigo-600 text-white text-sm rounded hover:bg-indigo-700">Save</button>
         <a href="{% url 'recipe_detail' recipe.id %}" class="px-4 py-1.5 bg-white border text-sm rounded hover:bg-slate-50">Cancel</a>
+        <a href="{% url 'recipe_quick_add' recipe.id %}"
+           class="ml-auto px-3 py-1.5 bg-emerald-600 text-white text-sm rounded hover:bg-emerald-700"
+           title="Mobile-friendly add-one-at-a-time flow">
+          Quick add (mobile)
+        </a>
       </div>
     </form>
   </div>

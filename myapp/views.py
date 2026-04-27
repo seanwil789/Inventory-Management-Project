@@ -1230,6 +1230,85 @@ def menu_save_prefab(request, menu_id: int):
     return redirect(reverse('recipe_detail', args=[meal.id]))
 
 
+def recipe_quick_add(request, recipe_id: int):
+    """Mobile-first single-ingredient-at-a-time quick-add view.
+
+    Built for the use case Sean described 2026-04-26: standing in the
+    kitchen with a paper recipe, transcribing ingredients on a phone.
+    The standard /recipe/<id>/edit/ form has a 6-column inline formset
+    that's miserable on mobile; this view shows ONE ingredient form per
+    screen, with full-width inputs and big tap targets.
+
+    Flow:
+      GET  → form with name + qty + unit + (collapsed) yield_pct
+      POST 'add_another' → save row, redirect back here for next
+      POST 'done'        → save row, redirect to recipe detail
+
+    Auto-links Product FK when name matches a canonical (same datalist
+    pattern as recipe_form.html). Displays running list of ingredients
+    already added so the operator can see progress without leaving the
+    page.
+    """
+    from decimal import Decimal, InvalidOperation
+    recipe = get_object_or_404(Recipe, pk=recipe_id)
+
+    if request.method == 'POST':
+        name = (request.POST.get('name_raw') or '').strip()
+        if not name:
+            messages.error(request, 'Name is required.')
+            return redirect('recipe_quick_add', recipe_id=recipe.id)
+
+        # Optional fields
+        qty = None
+        qty_raw = (request.POST.get('quantity') or '').strip()
+        if qty_raw:
+            try:
+                qty = Decimal(qty_raw)
+            except InvalidOperation:
+                messages.error(request, f'Invalid quantity: {qty_raw}')
+                return redirect('recipe_quick_add', recipe_id=recipe.id)
+
+        unit = (request.POST.get('unit') or '').strip()[:30]
+
+        yield_pct = None
+        yield_raw = (request.POST.get('yield_pct') or '').strip()
+        if yield_raw:
+            try:
+                yield_pct = Decimal(yield_raw)
+            except InvalidOperation:
+                pass
+
+        # Auto-link product when name matches a canonical
+        product = Product.objects.filter(canonical_name=name).first()
+
+        RecipeIngredient.objects.create(
+            recipe=recipe,
+            name_raw=name[:300],
+            quantity=qty,
+            unit=unit,
+            yield_pct=yield_pct,
+            product=product,
+        )
+        link_note = f' → {product.canonical_name}' if product else ''
+        messages.success(request, f'Added: {name}{link_note}')
+
+        if 'done' in request.POST:
+            return redirect('recipe_detail', recipe_id=recipe.id)
+        # Default: add another
+        return redirect('recipe_quick_add', recipe_id=recipe.id)
+
+    # GET — render form
+    existing = list(recipe.ingredients.select_related('product')
+                    .order_by('id'))
+    products = list(Product.objects.order_by('canonical_name')
+                    .values_list('canonical_name', flat=True))
+    return render(request, 'myapp/recipe_quick_add.html', {
+        'recipe':   recipe,
+        'existing': existing,
+        'products': products,
+    })
+
+
 def recipe_edit(request, recipe_id: int):
     recipe = get_object_or_404(Recipe, pk=recipe_id)
     if request.method == 'POST':

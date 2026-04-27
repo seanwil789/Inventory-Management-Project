@@ -1,0 +1,185 @@
+{% extends "myapp/base.html" %}
+{% load kitchen_filters %}
+{% block title %}Quick add — {{ recipe.name }}{% endblock %}
+
+{% block content %}
+<div class="max-w-md mx-auto px-3 py-4 space-y-4">
+
+  <!-- Header — recipe name + back link -->
+  <div class="flex items-center justify-between">
+    <a href="{% url 'recipe_detail' recipe.id %}" class="text-sm text-indigo-600 hover:underline">&larr; Back</a>
+    <a href="{% url 'recipe_edit' recipe.id %}" class="text-xs text-slate-500 hover:underline">Full edit</a>
+  </div>
+
+  <h1 class="text-xl font-semibold text-slate-900 leading-tight">
+    {{ recipe.name }}
+  </h1>
+  <p class="text-xs text-slate-500 -mt-2">
+    Quick-add — one ingredient per screen. Save & Add Another to keep going.
+  </p>
+
+  <!-- Messages -->
+  {% if messages %}
+    <div class="space-y-2">
+      {% for message in messages %}
+        <div class="rounded-lg p-3 text-sm
+          {% if message.tags == 'success' %}bg-emerald-50 text-emerald-900 border border-emerald-200
+          {% elif message.tags == 'error' %}bg-red-50 text-red-900 border border-red-200
+          {% else %}bg-slate-50 text-slate-900 border border-slate-200{% endif %}">
+          {{ message }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  <!-- Already-added ingredients (collapsed by default) -->
+  <details class="rounded-lg border border-slate-200 bg-slate-50 px-3 py-2">
+    <summary class="text-sm font-medium text-slate-700 cursor-pointer">
+      {{ existing|length }} ingredient{{ existing|length|pluralize }} so far
+    </summary>
+    {% if existing %}
+      <ul class="mt-2 space-y-1 text-sm">
+        {% for ing in existing %}
+          <li class="flex items-baseline gap-2 py-1 border-t border-slate-200 first:border-t-0">
+            <span class="text-slate-400 tabular-nums w-12 text-right">
+              {% if ing.quantity %}{{ ing.quantity|pretty_qty }}{% endif %}
+            </span>
+            <span class="text-slate-500 w-12">{{ ing.unit }}</span>
+            <span class="text-slate-900 flex-1">{{ ing.name_raw }}</span>
+            {% if ing.product %}
+              <span class="text-xs text-emerald-700 shrink-0">✓</span>
+            {% endif %}
+          </li>
+        {% endfor %}
+      </ul>
+    {% else %}
+      <p class="mt-2 text-xs text-slate-500">No ingredients yet — add the first below.</p>
+    {% endif %}
+  </details>
+
+  <!-- The form: ONE ingredient at a time, full-width, big tap targets -->
+  <form method="post" class="space-y-4">
+    {% csrf_token %}
+
+    <div>
+      <label for="name_raw" class="block text-sm font-semibold text-slate-700 mb-1">
+        Ingredient name
+      </label>
+      <input
+        type="text"
+        id="name_raw"
+        name="name_raw"
+        list="dl-products"
+        autocomplete="off"
+        autofocus
+        required
+        inputmode="text"
+        placeholder="e.g. flour, eggs, romaine"
+        class="block w-full text-lg px-4 py-3 border-2 border-slate-300 rounded-lg
+               focus:border-indigo-500 focus:outline-none">
+      <p class="text-xs text-slate-500 mt-1">
+        Type a Product canonical to auto-link, or freetext anything.
+      </p>
+    </div>
+
+    <div class="grid grid-cols-3 gap-3">
+      <div class="col-span-1">
+        <label for="quantity" class="block text-sm font-semibold text-slate-700 mb-1">
+          Quantity
+        </label>
+        <input
+          type="number"
+          id="quantity"
+          name="quantity"
+          step="0.001"
+          inputmode="decimal"
+          placeholder="2"
+          class="block w-full text-lg px-4 py-3 border-2 border-slate-300 rounded-lg
+                 focus:border-indigo-500 focus:outline-none tabular-nums">
+      </div>
+      <div class="col-span-2">
+        <label for="unit" class="block text-sm font-semibold text-slate-700 mb-1">
+          Unit
+        </label>
+        <input
+          type="text"
+          id="unit"
+          name="unit"
+          list="dl-units"
+          autocomplete="off"
+          inputmode="text"
+          placeholder="cup, lb, tsp..."
+          class="block w-full text-lg px-4 py-3 border-2 border-slate-300 rounded-lg
+                 focus:border-indigo-500 focus:outline-none">
+      </div>
+    </div>
+
+    <details class="text-sm">
+      <summary class="text-slate-600 cursor-pointer font-medium">
+        Optional: yield % (edible portion vs as-purchased)
+      </summary>
+      <div class="mt-2">
+        <input
+          type="number"
+          name="yield_pct"
+          step="0.01"
+          inputmode="decimal"
+          placeholder="e.g. 81 for peeled carrots"
+          class="block w-full text-base px-3 py-2 border border-slate-300 rounded-lg
+                 focus:border-indigo-500 focus:outline-none">
+      </div>
+    </details>
+
+    <!-- Action buttons — large tap targets, primary action emphasized -->
+    <div class="space-y-2 pt-2">
+      <button
+        type="submit"
+        name="add_another"
+        value="1"
+        class="w-full text-lg font-semibold py-4 px-4 bg-indigo-600 hover:bg-indigo-700
+               active:bg-indigo-800 text-white rounded-lg shadow-sm">
+        Save & Add Another
+      </button>
+      <button
+        type="submit"
+        name="done"
+        value="1"
+        class="w-full text-base font-medium py-3 px-4 bg-white hover:bg-slate-50
+               active:bg-slate-100 text-slate-900 border border-slate-300 rounded-lg">
+        Save & Done
+      </button>
+      <a href="{% url 'recipe_detail' recipe.id %}"
+         class="block w-full text-center text-sm py-2 text-slate-500 hover:text-slate-700">
+        Cancel
+      </a>
+    </div>
+  </form>
+
+</div>
+
+<datalist id="dl-products">
+  {% for canonical in products %}<option value="{{ canonical }}">{% endfor %}
+</datalist>
+<datalist id="dl-units">
+  <option value="cup">
+  <option value="cups">
+  <option value="tsp">
+  <option value="tbsp">
+  <option value="oz">
+  <option value="lb">
+  <option value="g">
+  <option value="kg">
+  <option value="ml">
+  <option value="liter">
+  <option value="gal">
+  <option value="quart">
+  <option value="pint">
+  <option value="each">
+  <option value="clove">
+  <option value="cloves">
+  <option value="bunch">
+  <option value="head">
+  <option value="pinch">
+  <option value="dash">
+</datalist>
+{% endblock %}

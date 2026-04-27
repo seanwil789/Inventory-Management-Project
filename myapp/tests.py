@@ -138,6 +138,90 @@ class SmokeTests(AuthedTestCase):
 
 
 @override_settings(ALLOWED_HOSTS=['testserver'])
+class RecipeQuickAddTests(AuthedTestCase):
+    """Mobile-friendly /recipe/<id>/quick-add/ flow."""
+
+    @classmethod
+    def setUpTestData(cls):
+        cls.recipe = Recipe.objects.create(
+            name='Quick Add Test Recipe', level='recipe', yield_servings=10,
+        )
+        cls.product = Product.objects.create(
+            canonical_name='Test Quick-Add Flour',
+            category='Drystock', primary_descriptor='Flour',
+        )
+
+    def test_get_renders_form(self):
+        r = self.client.get(reverse('recipe_quick_add', args=[self.recipe.id]))
+        self.assertEqual(r.status_code, 200)
+        self.assertContains(r, 'Quick Add Test Recipe')
+        self.assertContains(r, 'Save & Add Another')
+
+    def test_post_add_another_creates_ingredient_and_redirects_back(self):
+        before = self.recipe.ingredients.count()
+        resp = self.client.post(reverse('recipe_quick_add', args=[self.recipe.id]), {
+            'name_raw': 'butter',
+            'quantity': '0.5',
+            'unit': 'cup',
+            'add_another': '1',
+        })
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self.recipe.ingredients.count(), before + 1)
+        # Redirect targets the same quick-add URL for next ingredient
+        self.assertIn('quick-add', resp.url)
+        ri = self.recipe.ingredients.last()
+        self.assertEqual(ri.name_raw, 'butter')
+        self.assertEqual(ri.unit, 'cup')
+
+    def test_post_done_redirects_to_recipe_detail(self):
+        resp = self.client.post(reverse('recipe_quick_add', args=[self.recipe.id]), {
+            'name_raw': 'salt',
+            'quantity': '1',
+            'unit': 'tsp',
+            'done': '1',
+        })
+        self.assertEqual(resp.status_code, 302)
+        self.assertIn(reverse('recipe_detail', args=[self.recipe.id]), resp.url)
+
+    def test_post_auto_links_product_when_name_matches_canonical(self):
+        resp = self.client.post(reverse('recipe_quick_add', args=[self.recipe.id]), {
+            'name_raw': 'Test Quick-Add Flour',  # matches canonical exactly
+            'quantity': '2',
+            'unit': 'cup',
+            'add_another': '1',
+        })
+        self.assertEqual(resp.status_code, 302)
+        ri = self.recipe.ingredients.filter(name_raw='Test Quick-Add Flour').first()
+        self.assertIsNotNone(ri)
+        self.assertEqual(ri.product_id, self.product.id)
+
+    def test_post_freetext_name_no_canonical_match_leaves_product_null(self):
+        resp = self.client.post(reverse('recipe_quick_add', args=[self.recipe.id]), {
+            'name_raw': 'totally made up ingredient xyz',
+            'quantity': '1',
+            'unit': 'each',
+            'add_another': '1',
+        })
+        self.assertEqual(resp.status_code, 302)
+        ri = self.recipe.ingredients.filter(
+            name_raw='totally made up ingredient xyz').first()
+        self.assertIsNotNone(ri)
+        self.assertIsNone(ri.product_id)
+
+    def test_post_empty_name_rejected(self):
+        before = self.recipe.ingredients.count()
+        resp = self.client.post(reverse('recipe_quick_add', args=[self.recipe.id]), {
+            'name_raw': '',
+            'quantity': '1',
+            'unit': 'cup',
+            'add_another': '1',
+        })
+        # Redirect back to the form with an error message
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(self.recipe.ingredients.count(), before)
+
+
+@override_settings(ALLOWED_HOSTS=['testserver'])
 class ItemMappingEditorTests(AuthedTestCase):
     """Item Mapping editor view (Step 4 of sheet→DB migration)."""
 
