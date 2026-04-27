@@ -53,6 +53,22 @@ class SmokeTests(AuthedTestCase):
     def test_calendar_200(self):
         self.assertEqual(self.client.get(reverse('calendar_current')).status_code, 200)
 
+    def test_calendar_cell_has_quick_add_link_when_menu_has_recipe(self):
+        # Place a menu on a Mon-Fri inside the current biweekly window so the
+        # cell actually renders (the calendar view only emits Mon-Fri cells).
+        from myapp.calendar_utils import biweekly_start_for
+        bw_start = biweekly_start_for(date.today())  # Monday
+        wkday_menu = Menu.objects.create(
+            date=bw_start, meal_slot='dinner', recipe=self.r1,
+            dish_freetext='Test Pancakes Weekday',
+        )
+        try:
+            r = self.client.get(reverse('calendar_current'))
+            self.assertEqual(r.status_code, 200)
+            self.assertContains(r, reverse('recipe_quick_add', args=[self.r1.id]))
+        finally:
+            wkday_menu.delete()
+
     def test_cogs_dashboard_200(self):
         self.assertEqual(self.client.get(reverse('cogs_dashboard')).status_code, 200)
 

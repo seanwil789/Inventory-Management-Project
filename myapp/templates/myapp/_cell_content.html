@@ -33,6 +33,13 @@
       {% endwith %}
     </div>
   </a>
+  {% if cell.menu.recipe %}
+  <a href="{% url 'recipe_quick_add' cell.menu.recipe.id %}"
+     class="md:hidden mt-1 inline-flex items-center gap-1 text-[10px] text-emerald-700 hover:text-emerald-900 hover:underline"
+     title="Quick add ingredients to {{ cell.menu.recipe.name }}">
+    + Quick add ingredients
+  </a>
+  {% endif %}
 {% else %}
   <div class="flex gap-1">
     <a href="{% url 'menu_new' %}?date={{ cell.date|date:'Y-m-d' }}&slot={{ cell.slot }}"
