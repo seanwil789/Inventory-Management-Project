@@ -1576,8 +1576,9 @@ class AuditSemanticMismatchesTests(TestCase):
         self.assertIn('0 unique', out)
 
     def test_dairy_section_accepts_cheese_category(self):
-        """Sysco DAIRY section commonly includes cheese — should NOT flag."""
-        p = Product.objects.create(canonical_name='TestCheese', category='Cheese')
+        """Sysco DAIRY section accepts unified Dairy (cheese collapsed in 0035)."""
+        p = Product.objects.create(canonical_name='TestCheese', category='Dairy',
+                                   primary_descriptor='Cheese, Hard')
         self._ili(p, 'DAIRY')
         out = self._run()
         self.assertNotIn('TestCheese', out)
@@ -4847,11 +4848,11 @@ class MapperNewTiersTests(TestCase):
         useful (else returns empty = 'use full pool')."""
         mapper = self._mapper()
         cat_map = self._category_map({
-            'Milk': 'Dairy', 'Cheese': 'Cheese', 'Yogurt': 'Dairy',
+            'Milk': 'Dairy', 'Cheese': 'Dairy', 'Yogurt': 'Dairy',
             'Butter': 'Dairy',
             'Spaghetti': 'Drystock', 'Rice': 'Drystock',
         })
-        # DAIRY section → Dairy + Cheese canonicals (4 items, >=3 ok)
+        # DAIRY section → unified Dairy canonicals (4 items, >=3 ok)
         dairy = mapper._candidates_for_section('**** DAIRY ****', cat_map)
         self.assertEqual(set(dairy), {'Milk', 'Cheese', 'Yogurt', 'Butter'})
 
@@ -6519,28 +6520,30 @@ class TaxonomyInferenceTests(TestCase):
 
     def test_cheese_signal_handles_pepper_jack(self):
         """The token 'pepper' would normally route to Capsicum/Produce,
-        but 'pepperjack' / 'jack' as cheese types should win."""
+        but 'pepperjack' / 'jack' as cheese types should win.
+        Under unified Dairy: primary = processing tier."""
         from myapp.taxonomy import infer_taxonomy
         r = infer_taxonomy('BBRLIMP CHEESE PEPPER JACK SLI', vendor='Sysco')
-        self.assertEqual(r['category'][0], 'Cheese')
-        self.assertEqual(r['primary'][0], 'Cow')
-        # Either Pepper Jack or Jack matches; both → Semi-Hard or Semi-Soft
-        self.assertIn(r['secondary'][0], ['Semi-Hard', 'Semi-Soft'])
+        self.assertEqual(r['category'][0], 'Dairy')
+        # Pepperjack → Semi-Soft, Jack → Semi-Hard; either matches first
+        self.assertIn(r['primary'][0], ['Cheese, Semi-Soft', 'Cheese, Semi-Hard'])
 
     def test_cheese_signal_correct_milk_source_for_feta(self):
-        """Feta is Sheep traditionally — ensure encoded knowledge fires."""
+        """Feta is Sheep traditionally — ensure encoded knowledge fires.
+        Under unified Dairy: tier in primary, milk source in secondary."""
         from myapp.taxonomy import infer_taxonomy
         r = infer_taxonomy('CHEESE FETA CRUMBLED', vendor='Sysco', section_hint='DAIRY')
-        self.assertEqual(r['category'][0], 'Cheese')
-        self.assertEqual(r['primary'][0], 'Sheep')
-        self.assertEqual(r['secondary'][0], 'Fresh')
+        self.assertEqual(r['category'][0], 'Dairy')
+        self.assertEqual(r['primary'][0], 'Cheese, Fresh')
+        self.assertEqual(r['secondary'][0], 'Sheep')
 
     def test_cheese_signal_correct_for_goat(self):
-        """The word 'GOAT' as a cheese type should drive primary='Goat'."""
+        """The word 'GOAT' as a cheese type should drive secondary='Goat'."""
         from myapp.taxonomy import infer_taxonomy
         r = infer_taxonomy('CHEESE GOAT FRESH 4 OZ', vendor='Farm Art')
-        self.assertEqual(r['category'][0], 'Cheese')
-        self.assertEqual(r['primary'][0], 'Goat')
+        self.assertEqual(r['category'][0], 'Dairy')
+        self.assertEqual(r['primary'][0], 'Cheese, Fresh')
+        self.assertEqual(r['secondary'][0], 'Goat')
 
     def test_bakery_keyword_overrides_ingredient_tokens(self):
         """'Lemon Danish' has Lemon (Citrus token) but Danish (bakery
@@ -6578,11 +6581,12 @@ class TaxonomyInferenceTests(TestCase):
                              f'{raw}: expected primary={expected_primary} got {r["primary"][0]}')
 
     def test_produce_botanical_primary_assignment(self):
-        """Produce category + token 'mango' → primary='Stone Fruit'."""
+        """Produce category + token 'mango' → primary='Drupe' (mango is botanically a drupe).
+        Per Sean 2026-04-30: 'tropical is not a categorization scientifically'."""
         from myapp.taxonomy import infer_taxonomy
         r = infer_taxonomy('MANGO, RED, 9CT', vendor='Farm Art')
         self.assertEqual(r['category'][0], 'Produce')
-        self.assertEqual(r['primary'][0], 'Stone Fruit')
+        self.assertEqual(r['primary'][0], 'Drupe')
 
     def test_section_hint_drives_category(self):
         """Sysco section_hint='SEAFOOD' → category=Proteins."""
