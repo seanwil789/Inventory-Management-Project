@@ -41,8 +41,8 @@ NEW_CANONICALS = [
     ('Corn Muffin',               'Bakery',   'Quick Breads',    'Muffin'),
     ('Potato Hamburger Bun',      'Bakery',   'Bread/Fermented', 'Hamburger Bun'),
 
-    # Cheese — milk source as primary
-    ('American Cheese, Sliced',   'Cheese',   'Cow',             'Processed'),
+    # Cheese under unified Dairy — processing tier as primary, milk source in secondary if non-Cow
+    ('American Cheese, Sliced',   'Dairy',    'Cheese, Processed', ''),
 
     # Produce — botanical groupings
     ('Apples, Fuji',              'Produce',  'Pome',            ''),

@@ -89,14 +89,21 @@ _PRODUCE_TOKEN_TO_PRIMARY = {
     'honeydew': 'Cucurbit', 'cantaloupe': 'Cucurbit',
     'watermelon': 'Cucurbit', 'pumpkin': 'Cucurbit',
     'melon': 'Cucurbit', 'melons': 'Cucurbit',
-    # Stone Fruit
-    'mango': 'Stone Fruit', 'mangoes': 'Stone Fruit',
-    'peach': 'Stone Fruit', 'peaches': 'Stone Fruit',
-    'plum': 'Stone Fruit', 'plums': 'Stone Fruit',
-    'cherry': 'Stone Fruit', 'cherries': 'Stone Fruit',
-    'apricot': 'Stone Fruit', 'apricots': 'Stone Fruit',
-    'olive': 'Stone Fruit', 'olives': 'Stone Fruit',
-    'avocado': 'Stone Fruit', 'avocados': 'Stone Fruit',
+    # Drupe (was "Stone Fruit" — Drupe is the botanical name; per Sean 2026-04-30)
+    'mango': 'Drupe', 'mangoes': 'Drupe',
+    'peach': 'Drupe', 'peaches': 'Drupe',
+    'plum': 'Drupe', 'plums': 'Drupe',
+    'cherry': 'Drupe', 'cherries': 'Drupe',
+    'apricot': 'Drupe', 'apricots': 'Drupe',
+    'olive': 'Drupe', 'olives': 'Drupe',
+    # Avocado is Lauraceae (laurel family), not a drupe — own solo tier
+    'avocado': 'Lauraceae', 'avocados': 'Lauraceae',
+    # Banana is Musa/Musaceae, Pineapple is Bromeliaceae — solo tiers each
+    'banana': 'Musa', 'bananas': 'Musa',
+    'pineapple': 'Bromeliaceae', 'pineapples': 'Bromeliaceae',
+    # Grapes are Vitaceae (grape family)
+    'grape': 'Vitaceae', 'grapes': 'Vitaceae',
+    # Rhubarb stays Polygonaceae solo (already populated in DB)
     # Citrus
     'lemon': 'Citrus', 'lemons': 'Citrus',
     'lime': 'Citrus', 'limes': 'Citrus',
@@ -219,68 +226,66 @@ _PROTEIN_PRIMAL_RULES = [
     ('crab base',   ('Bases', None)),
 ]
 
-# Cheese knowledge per the locked convention (Cheese category requires
-# milk source as primary and texture/age as secondary). The CHEESE_TYPES
-# table encodes industry-standard cheese classifications. When raw
-# contains "cheese" + a recognizable cheese type, this signal fires.
+# Cheese knowledge per the unified Dairy taxonomy (Sean 2026-04-30): cheese
+# is just dairy at processing tiers 5-10 along the continuous milk→cream→
+# cultured→butter→cheese-tiers→processed→frozen chain. Category is "Dairy"
+# (not "Cheese" — collapsed in migration 0035), primary_descriptor is the
+# texture-based processing tier ("Cheese, Fresh" / "Cheese, Hard" etc.),
+# secondary_descriptor holds non-default milk source (Goat / Sheep — Cow is default).
 #
-# Milk source: Cow (default for unspecified blends/most US cheeses),
-# Goat, Sheep, Processed.
-# Texture: Fresh, Soft-Ripened, Semi-Soft, Semi-Hard, Hard, Blue, Processed.
-# Sources: standard dairy/cheese references; updatable as Sean refines.
+# Sub-tiers: Fresh, Soft-Ripened, Semi-Soft (incl. Blue per Sean), Semi-Hard,
+# Hard, Processed. Blue cheese folds into Semi-Soft (mold-ripening produces
+# semi-soft texture; one-product tier didn't justify a separate slot).
 _CHEESE_TYPES = {
-    # token (lower)        : (primary_milk_source, secondary_texture_or_age)
-    # Fresh cow cheeses
-    'mozzarella':  ('Cow',       'Fresh'),
-    'ricotta':     ('Cow',       'Fresh'),
-    'cottage':     ('Cow',       'Fresh'),
-    'burrata':     ('Cow',       'Fresh'),
-    'cream':       ('Cow',       'Fresh'),  # cream cheese
-    'mascarpone':  ('Cow',       'Fresh'),
-    # Soft-ripened cow
-    'brie':        ('Cow',       'Soft-Ripened'),
-    'camembert':   ('Cow',       'Soft-Ripened'),
-    # Semi-soft cow
-    'provolone':   ('Cow',       'Semi-Soft'),
-    'muenster':    ('Cow',       'Semi-Soft'),
-    'monterey':    ('Cow',       'Semi-Soft'),
-    'havarti':     ('Cow',       'Semi-Soft'),
-    'pepperjack':  ('Cow',       'Semi-Soft'),
-    'colby':       ('Cow',       'Semi-Soft'),
-    # Semi-hard cow
-    'cheddar':     ('Cow',       'Semi-Hard'),
-    'swiss':       ('Cow',       'Semi-Hard'),
-    'gouda':       ('Cow',       'Semi-Hard'),
-    'edam':        ('Cow',       'Semi-Hard'),
-    'gruyere':     ('Cow',       'Semi-Hard'),
-    'emmental':    ('Cow',       'Semi-Hard'),
-    'fontina':     ('Cow',       'Semi-Hard'),
-    'taleggio':    ('Cow',       'Semi-Hard'),
-    'jack':        ('Cow',       'Semi-Hard'),  # monterey jack et al
-    # Hard cow
-    'parmesan':    ('Cow',       'Hard'),
-    'parm':        ('Cow',       'Hard'),
-    'asiago':      ('Cow',       'Hard'),
-    # Goat
-    'goat':        ('Goat',      'Fresh'),
-    'chevre':      ('Goat',      'Fresh'),
-    'chèvre':      ('Goat',      'Fresh'),
-    # Sheep
-    'feta':        ('Sheep',     'Fresh'),
-    'manchego':    ('Sheep',     'Hard'),
-    'pecorino':    ('Sheep',     'Hard'),
-    'romano':      ('Sheep',     'Hard'),
-    'roquefort':   ('Sheep',     'Blue'),
-    # Blue (mostly cow)
-    'gorgonzola':  ('Cow',       'Blue'),
-    'stilton':     ('Cow',       'Blue'),
-    'blue':        ('Cow',       'Blue'),  # context-dependent — Sean overrides if Sheep/Goat
+    # token (lower)        : (primary_processing_tier, milk_source_if_non_cow)
+    # Fresh
+    'mozzarella':  ('Cheese, Fresh',         ''),
+    'ricotta':     ('Cheese, Fresh',         ''),
+    'cottage':     ('Cheese, Fresh',         ''),
+    'burrata':     ('Cheese, Fresh',         ''),
+    'cream':       ('Cheese, Fresh',         ''),  # cream cheese
+    'mascarpone':  ('Cheese, Fresh',         ''),
+    'feta':        ('Cheese, Fresh',         'Sheep'),
+    'goat':        ('Cheese, Fresh',         'Goat'),
+    'chevre':      ('Cheese, Fresh',         'Goat'),
+    'chèvre':      ('Cheese, Fresh',         'Goat'),
+    # Soft-Ripened
+    'brie':        ('Cheese, Soft-Ripened',  ''),
+    'camembert':   ('Cheese, Soft-Ripened',  ''),
+    # Semi-Soft (incl. Blue per Sean — mold-ripening = semi-soft texture)
+    'provolone':   ('Cheese, Semi-Soft',     ''),
+    'muenster':    ('Cheese, Semi-Soft',     ''),
+    'monterey':    ('Cheese, Semi-Soft',     ''),
+    'havarti':     ('Cheese, Semi-Soft',     ''),
+    'pepperjack':  ('Cheese, Semi-Soft',     ''),
+    'colby':       ('Cheese, Semi-Soft',     ''),
+    'gorgonzola':  ('Cheese, Semi-Soft',     ''),
+    'stilton':     ('Cheese, Semi-Soft',     ''),
+    'blue':        ('Cheese, Semi-Soft',     ''),
+    'roquefort':   ('Cheese, Semi-Soft',     'Sheep'),
+    # Semi-Hard
+    'cheddar':     ('Cheese, Semi-Hard',     ''),
+    'swiss':       ('Cheese, Semi-Hard',     ''),
+    'gouda':       ('Cheese, Semi-Hard',     ''),
+    'edam':        ('Cheese, Semi-Hard',     ''),
+    'gruyere':     ('Cheese, Semi-Hard',     ''),
+    'emmental':    ('Cheese, Semi-Hard',     ''),
+    'fontina':     ('Cheese, Semi-Hard',     ''),
+    'taleggio':    ('Cheese, Semi-Hard',     ''),
+    'jack':        ('Cheese, Semi-Hard',     ''),
+    # Hard
+    'parmesan':    ('Cheese, Hard',          ''),
+    'parm':        ('Cheese, Hard',          ''),
+    'asiago':      ('Cheese, Hard',          ''),
+    'manchego':    ('Cheese, Hard',          'Sheep'),
+    'pecorino':    ('Cheese, Hard',          'Sheep'),
+    'romano':      ('Cheese, Hard',          'Sheep'),
     # Processed
-    'american':    ('Processed', 'Processed'),
-    'velveeta':    ('Processed', 'Processed'),
-    'singles':     ('Processed', 'Processed'),
-    # Generic fallback patterns
-    'queso':       ('Cow',       None),  # too many sub-types
+    'american':    ('Cheese, Processed',     ''),
+    'velveeta':    ('Cheese, Processed',     ''),
+    'singles':     ('Cheese, Processed',     ''),
+    # Generic fallback
+    'queso':       ('Cheese, Fresh',         ''),  # too many sub-types; default fresh
 }
 
 # Bakery item keywords — when these appear in raw, it's almost certainly
@@ -593,8 +598,9 @@ def _signal_cheese(raw_lower, raw_tokens):
     """Detect cheese products. Matching strategy:
       1. Raw contains the word 'cheese' OR
       2. Raw contains a recognized cheese-type token from _CHEESE_TYPES
-    Returns category=Cheese with the convention's milk-source primary
-    + texture/age secondary derived from the matched type.
+    Returns category=Dairy with the texture-based processing tier
+    (e.g., 'Cheese, Hard') as primary_descriptor, and milk source
+    (Goat / Sheep) in secondary_descriptor when non-default.
 
     High confidence — overrides generic ingredient matches for tokens
     like 'pepper' (Pepper Jack), 'cream' (Cream Cheese), 'goat' (Goat
@@ -606,24 +612,24 @@ def _signal_cheese(raw_lower, raw_tokens):
         return None
 
     out = {
-        'category': ('Cheese', 'high'),
+        'category': ('Dairy', 'high'),
         'reasoning': [],
     }
     if has_cheese_word:
-        out['reasoning'].append("token 'cheese' present → category=Cheese")
+        out['reasoning'].append("token 'cheese' present → category=Dairy")
     if matched_types:
         # Pick the FIRST recognized cheese type (raw token order roughly preserved)
-        chosen_token, (milk, texture) = matched_types[0]
-        out['primary'] = (milk, 'high')
+        chosen_token, (tier, milk_source) = matched_types[0]
+        out['primary'] = (tier, 'high')
         out['reasoning'].append(
-            f"cheese type {chosen_token!r} → milk source {milk!r}"
-            + (f" / texture {texture!r}" if texture else ""))
-        if texture:
-            out['secondary'] = (texture, 'high')
+            f"cheese type {chosen_token!r} → processing tier {tier!r}"
+            + (f" / milk source {milk_source!r}" if milk_source else ""))
+        if milk_source:
+            out['secondary'] = (milk_source, 'high')
     elif has_cheese_word:
-        # Cheese category set but type unrecognized — leave primary as default Cow
-        out['primary'] = ('Cow', 'medium')
-        out['reasoning'].append("cheese type unrecognized → defaulting to Cow")
+        # Cheese word but type unrecognized — default to Semi-Hard (most common)
+        out['primary'] = ('Cheese, Semi-Hard', 'medium')
+        out['reasoning'].append("cheese type unrecognized → defaulting to Cheese, Semi-Hard")
     return out
 
 

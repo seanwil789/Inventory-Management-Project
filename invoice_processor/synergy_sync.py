@@ -256,21 +256,84 @@ CATEGORY_TO_SECTION: dict[tuple[str, str], str] = {
     ("Proteins",  "Poultry"):  "poultry",
     ("Proteins",  "Pork"):     "pork",
     ("Proteins",  "Seafood"):  "seafood",
-    ("Produce",   "Leaf"):     "leaf/greens",
-    ("Produce",   "Vegetable"):"vegetables",
-    ("Produce",   "Fruit"):    "fruit",
-    ("Produce",   "Herb"):     "herbs",
-    ("Dairy",     ""):         "dairy",
-    ("Dairy",     "Cheese"):   "cheese",
-    ("Dairy",     "Egg"):      "eggs",
-    ("Drystock",  ""):         "dry goods",
-    ("Drystock",  "Spice"):    "spices",
-    ("Drystock",  "Oil"):      "oils/vinegars",
-    ("Drystock",  "Sauce"):    "sauces/condiments",
+    # Produce — botanical-family taxonomy (locked 2026-04-30; vegetables-before-fruits)
+    ("Produce",   "Herb"):           "Herb",
+    ("Produce",   "Allium"):         "Allium",
+    ("Produce",   "Capsicum"):       "Capsicum",
+    ("Produce",   "Solanaceae"):     "Solanaceae",
+    ("Produce",   "Cucurbit"):       "Cucurbit",
+    ("Produce",   "Brassica"):       "Brassica",
+    ("Produce",   "Leaf/Greens"):    "Leaf/Greens",
+    ("Produce",   "Legume"):         "Legume",
+    ("Produce",   "Lily"):           "Lily",
+    ("Produce",   "Polygonaceae"):   "Polygonaceae",
+    ("Produce",   "Root"):           "Root",
+    ("Produce",   "Tuber"):          "Tuber",
+    ("Produce",   "Rhizome"):        "Rhizome",
+    ("Produce",   "Corn"):           "Corn",
+    ("Produce",   "Fungus"):         "Fungus",
+    ("Produce",   "Lauraceae"):      "Lauraceae",
+    ("Produce",   "Berry"):          "Berry",
+    ("Produce",   "Citrus"):         "Citrus",
+    ("Produce",   "Drupe"):          "Drupe",
+    ("Produce",   "Melon"):          "Melon",
+    ("Produce",   "Pome"):           "Pome",
+    ("Produce",   "Vitaceae"):       "Vitaceae",
+    ("Produce",   "Musa"):           "Musa",
+    ("Produce",   "Bromeliaceae"):   "Bromeliaceae",
+    # Unified Dairy 12-tier processing chain (locked 2026-04-30)
+    ("Dairy",     ""):                       "dairy",
+    ("Dairy",     "Milk"):                   "Milk",
+    ("Dairy",     "Cream"):                  "Cream",
+    ("Dairy",     "Yogurt"):                 "Yogurt",
+    ("Dairy",     "Butter"):                 "Butter",
+    ("Dairy",     "Cheese, Fresh"):          "Cheese, Fresh",
+    ("Dairy",     "Cheese, Soft-Ripened"):   "Cheese, Soft-Ripened",
+    ("Dairy",     "Cheese, Semi-Soft"):      "Cheese, Semi-Soft",
+    ("Dairy",     "Cheese, Semi-Hard"):      "Cheese, Semi-Hard",
+    ("Dairy",     "Cheese, Hard"):           "Cheese, Hard",
+    ("Dairy",     "Cheese, Processed"):      "Cheese, Processed",
+    ("Dairy",     "Processed"):              "Processed",
+    ("Dairy",     "Frozen"):                 "Frozen",
+    # Eggs moved out of Dairy → Proteins/Poultry/Egg (per protein remap, ships separately)
+    # Drystock cooking-stage flow (locked 2026-05-01)
+    ("Drystock",  ""):                       "dry goods",
+    ("Drystock",  "Grains/Legumes"):         "Grains/Legumes",
+    ("Drystock",  "Pastas"):                 "Pastas",
+    ("Drystock",  "Flours and Starches"):    "Flours and Starches",
+    ("Drystock",  "Oils"):                   "Oils",
+    ("Drystock",  "Vinegars"):               "Vinegars",
+    ("Drystock",  "Condiments"):             "Condiments",
+    ("Drystock",  "Sauces"):                 "Sauces",
+    ("Drystock",  "Canned Vegetables"):      "Canned Vegetables",
+    ("Drystock",  "Sugars/Sweeteners"):      "Sugars/Sweeteners",
+    ("Drystock",  "Baking"):                 "Baking",
+    ("Drystock",  "Leaveners"):              "Leaveners",
+    ("Drystock",  "PreFabs"):                "PreFabs",
+    # Spices (own top-level category, cooking-stage flow)
+    ("Spices",    "Salt"):                   "Salt",
+    ("Spices",    "Pepper"):                 "Pepper",
+    ("Spices",    "Heat"):                   "Heat",
+    ("Spices",    "Aromatic"):               "Aromatic",
+    ("Spices",    "Earthy"):                 "Earthy",
+    ("Spices",    "Allium"):                 "Allium",
+    ("Spices",    "Dried Herbs"):            "Dried Herbs",
+    ("Spices",    "Blends"):                 "Blends",
+    ("Spices",    "Seeds"):                  "Seeds",
     ("Beverage",  ""):         "beverages",
     ("Bakery",    ""):         "bakery",
-    ("Chemicals", ""):         "chemicals",
-    ("Smallwares",""):         "smallwares",
+    # Chemicals task-based tiers (locked 2026-05-01)
+    ("Chemicals", ""):                "chemicals",
+    ("Chemicals", "Dish"):            "Dish",
+    ("Chemicals", "Floor"):           "Floor",
+    ("Chemicals", "Equipment"):       "Equipment",
+    ("Chemicals", "Bathroom"):        "Bathroom",
+    ("Chemicals", "General"):         "General",
+    # Smallwares cost-behavior tiers (locked 2026-05-01)
+    ("Smallwares",""):                       "smallwares",
+    ("Smallwares","Paper Consumables"):      "Paper Consumables",
+    ("Smallwares","Plastic Consumables"):    "Plastic Consumables",
+    ("Smallwares","Durable Smallwares"):     "Durable Smallwares",
 }
 
 
@@ -1419,6 +1482,10 @@ def main():
                              "(e.g. 'Synergy Apr 2026')")
     parser.add_argument("--find-new", action="store_true",
                         help="List canonical names that have no row in the tab")
+    parser.add_argument("--insert-new", action="store_true",
+                        help="Find canonicals with no row in the tab AND insert them "
+                             "at the end of their target section. Routes by "
+                             "(category, primary_descriptor) → section via CATEGORY_TO_SECTION.")
     parser.add_argument("--refresh-carryover", metavar="TAB",
                         help="For products with no current-month invoice on this tab, "
                              "pull the latest historical invoice and refresh E/I/J. "
@@ -1489,6 +1556,22 @@ def main():
                       f"{it.get('primary_descriptor','')}]")
         else:
             print(f"All canonicals already present in '{tab}'.")
+        return
+
+    if args.insert_new:
+        _bootstrap_django()
+        items = load_items_for_month(*parse_tab_month(tab))
+        new = find_new_items(items, sheet_tab=tab)
+        if not new:
+            print(f"All canonicals already present in '{tab}'. Nothing to insert.")
+            return
+        print(f"\n{len(new)} canonical(s) to insert into '{tab}':")
+        for it in new:
+            print(f"  {it['canonical']:<35} → "
+                  f"[{it.get('category','')} / {it.get('primary_descriptor','')}]")
+        summary = insert_new_items(new, sheet_tab=tab, dry_run=args.dry_run)
+        print(f"\nDone — Inserted: {summary['inserted']}  |  "
+              f"Skipped (no section): {summary['skipped_no_section']}")
         return
 
     parser.print_help()

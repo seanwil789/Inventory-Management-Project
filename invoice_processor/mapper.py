@@ -153,27 +153,25 @@ def _stem_text(text: str) -> str:
 # fall back to unrestricted (preserves recall when Product.category is
 # wrong or empty in the DB).
 #
-# Sections map to MULTIPLE categories where ambiguous (DAIRY covers both
-# Dairy and Cheese; BEVERAGES covers Beverages and Coffee/Concessions).
-# Keys are substring-matched against the section header UPPERcased, so
-# "**** CANNED & DRY ****" matches both "CANNED" and "DRY" — union of
-# both target sets is used.
+# Sections map to MULTIPLE categories where ambiguous. Keys are substring-
+# matched against the section header UPPERcased, so "**** CANNED & DRY ****"
+# matches both "CANNED" and "DRY" — union of both target sets is used.
 _SYSCO_SECTION_TO_CATEGORIES = {
-    'DAIRY':      ['Dairy', 'Cheese'],
+    'DAIRY':      ['Dairy'],                  # Cheese collapsed into Dairy in 0035
     'PRODUCE':    ['Produce'],
     'MEATS':      ['Proteins'],
     'MEAT':       ['Proteins'],
     'POULTRY':    ['Proteins'],
     'SEAFOOD':    ['Proteins'],
-    'CANNED':     ['Drystock', 'Condiments/Sauces'],
+    'CANNED':     ['Drystock'],  # Condiments/Sauces unified into Drystock in 0052
     'DRY':        ['Drystock', 'Spices'],
-    'PAPER':      ['Paper/Disposable'],
-    'DISPOSABLE': ['Paper/Disposable'],
+    'PAPER':      ['Smallwares'],   # Paper/Disposable renamed in 0057
+    'DISPOSABLE': ['Smallwares'],
     'JANITORIAL': ['Chemicals'],
     'CHEMICAL':   ['Chemicals'],
-    'BEVERAGE':   ['Beverages', 'Coffee/Concessions'],
+    'BEVERAGE':   ['Coffee/Concessions'],   # Beverages cat doesn't exist in DB
     'BAKERY':     ['Bakery'],
-    'DELI':       ['Proteins', 'Cheese'],
+    'DELI':       ['Proteins', 'Dairy'],      # Deli case carries cured meats + sliced cheese
     'SPICES':     ['Spices'],
     'GROCERY':    ['Drystock'],
     # FROZEN intentionally excluded — too ambiguous (frozen meat / frozen

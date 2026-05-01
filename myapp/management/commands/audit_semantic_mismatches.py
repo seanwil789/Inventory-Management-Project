@@ -32,20 +32,20 @@ from myapp.models import InvoiceLineItem
 # Umbrella sections map to larger sets; hazard/chemical/paper/dairy are strict.
 SECTION_TO_VALID_CATEGORIES = {
     'PRODUCE': {'Produce'},
-    # Sysco DAIRY section commonly includes cheese (dairy case) and eggs.
-    # Keep Cheese in the valid set; flag protein-only items (like striploin)
-    # that only leak here via backfill OCR column noise.
-    'DAIRY': {'Dairy', 'Cheese'},
+    # Sysco DAIRY section maps to unified Dairy (Cheese collapsed in 0035).
+    # Flags protein-only items (like striploin) that only leak here via
+    # backfill OCR column noise.
+    'DAIRY': {'Dairy'},
     'CHEMICAL & JANITORIAL': {'Chemicals'},
     'HAZARD': {'Chemicals'},
-    'PAPER & DISP': {'Paper/Disposable'},
-    'SUPPLY & EQUIPMENT': {'Paper/Disposable'},
+    'PAPER & DISP': {'Smallwares'},      # Paper/Disposable renamed to Smallwares (0057)
+    'SUPPLY & EQUIPMENT': {'Smallwares'},
     'MEATS': {'Proteins'},
     'POULTRY': {'Proteins'},
-    'DISPENSER BEVERAGE': {'Beverages', 'Coffee/Concessions'},
+    'DISPENSER BEVERAGE': {'Coffee/Concessions'},  # Beverages cat doesn't exist
     # Ambiguous umbrellas — many categories legitimate
-    'CANNED & DRY': {'Drystock', 'Condiments/Sauces', 'Spices', 'Bakery',
-                     'Coffee/Concessions', 'Beverages'},
+    # Condiments/Sauces unified into Drystock (0052); Beverages cat doesn't exist
+    'CANNED & DRY': {'Drystock', 'Spices', 'Bakery', 'Coffee/Concessions'},
     'FROZEN': {'Proteins', 'Produce', 'Bakery', 'Drystock'},
 }
 

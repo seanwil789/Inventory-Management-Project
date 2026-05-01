@@ -32,11 +32,12 @@ from synergy_sync import calc_iup, calc_price_per_lb
 SHEET_CATEGORIES = [
     ("Proteins",               ["Proteins"]),
     ("Produce",                ["Produce"]),
-    ("Dairy / Cheese",         ["Dairy", "Cheese"]),
-    ("Drystock",               ["Drystock", "Condiments/Sauces", "Spices"]),
+    ("Dairy / Cheese",         ["Dairy"]),
+    ("Drystock",               ["Drystock"]),  # Condiments/Sauces unified in 0052
+    ("Spices",                 ["Spices"]),    # Extracted as own top-level in 0053
     ("Bakery",                 ["Bakery"]),
     ("Coffee / Concessions",   ["Coffee/Concessions", "Beverages"]),
-    ("Chemicals / Smallwares", ["Chemicals", "Paper/Disposable"]),
+    ("Chemicals / Smallwares", ["Chemicals", "Smallwares"]),
 ]
 
 HEADER_LABELS = [
