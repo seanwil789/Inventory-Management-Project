@@ -31,6 +31,16 @@ echo "=== Invoice Batch Run: $(date) ===" | tee "$LOG_FILE"
 python3 invoice_processor/batch.py 2>&1 | tee -a "$LOG_FILE"
 EXIT_CODE=$?
 
+# After batch completes successfully, auto-insert any newly-approved canonicals
+# into the active Synergy tab at their target section. Failure here is
+# non-fatal — sheet-side is recoverable by manual restructure.
+if [ $EXIT_CODE -eq 0 ]; then
+    echo "" | tee -a "$LOG_FILE"
+    echo "=== Inserting new canonicals into active Synergy tab ===" | tee -a "$LOG_FILE"
+    python3 invoice_processor/synergy_sync.py --insert-new 2>&1 | tee -a "$LOG_FILE" || \
+        echo "[!] insert-new failed (non-fatal)" | tee -a "$LOG_FILE"
+fi
+
 # Keep only the 30 most recent log files
 ls -t "$LOG_DIR"/invoice_batch_*.log 2>/dev/null | tail -n +31 | xargs rm -f
 
