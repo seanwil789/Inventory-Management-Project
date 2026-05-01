@@ -21,6 +21,13 @@ class Product(models.Model):
                   "its raw description. Inferred from mode of historical "
                   "invoices by `infer_product_default_case_sizes`.",
     )
+    prep_state           = models.CharField(
+        max_length=30, blank=True,
+        help_text="Per-category form descriptor. Cheese: Whole/Shredded/"
+                  "Sliced/Loaf/Balls/Wedge/Crumbled. Captures price-differential "
+                  "between bought-prepped and prepped-in-house forms. "
+                  "Will phase out as in-house prep replaces purchased pre-prep.",
+    )
 
     def __str__(self):
         return self.canonical_name
