@@ -100,7 +100,8 @@ class Command(BaseCommand):
             fname = os.path.basename(path)
 
             try:
-                parsed = parse_invoice(raw_text, vendor=vendor)
+                parsed = parse_invoice(raw_text, vendor=vendor,
+                                       pages=cache.get('pages'))
                 items = parsed.get('items', [])
                 if not items:
                     continue
