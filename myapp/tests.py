@@ -2749,12 +2749,14 @@ Total
         codes = sorted(it['sysco_item_code'] for it in result['items'])
         self.assertEqual(codes, ['2222222', '3333333', '4444444'])
 
-    def test_parse_invoice_spatial_falls_back_when_too_few_items(self):
-        """Spatial extraction returning <3 items means layout is
-        degenerate (footer-only page, header, etc.). Fall back to the
-        heuristic parser rather than emit a stub result."""
+    def test_parse_invoice_spatial_used_with_few_items(self):
+        """Spatial path is used whenever it returns ≥1 item. Threshold
+        lowered from ≥3 to ≥1 on 2026-05-01 — Sysco's multi-photo
+        workflow (one JPG per invoice page) loses pages whose spatial
+        result has <3 items. Empty/header-only pages produce 0 anchors
+        → 0 spatial items, so the 0-item fallback to text still fires."""
         _, p = self._import()
-        # Only 2 items in spatial layout; below the min-3 threshold
+        # 2 items in spatial layout — accepted under min_items=1
         tokens = []
         for i, code in enumerate(["5555555", "6666666"]):
             tokens += self._build_row(0.10 + i*0.03, [
@@ -2775,10 +2777,10 @@ Total
             'vendor_desc_map': {}, 'category_map': {},
         }):
             result = p.parse_invoice(raw, vendor='Sysco', pages=pages)
-        # Heuristic extracted 1111111 from raw, NOT 5555555/6666666 from pages
+        # Spatial result wins (2 items ≥ 1 from text) — both codes captured.
         codes = [it['sysco_item_code'] for it in result['items']]
-        self.assertIn('1111111', codes)
-        self.assertNotIn('5555555', codes)
+        self.assertIn('5555555', codes)
+        self.assertIn('6666666', codes)
 
 
 class SpatialMatcherOtherVendorsTests(TestCase):

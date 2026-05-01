@@ -2425,9 +2425,11 @@ def _try_spatial(vendor: str, pages: list[dict] | None,
     is plausible, else None so callers fall back to the 1D heuristic
     parser.
 
-    Per-vendor `min_items` defaults: Sysco/Exceptional/Farm Art/PBM use 3
-    (filters page-1-only partial dumps and header-only layouts); Delaware
-    Linen uses 1 (small-volume vendor, 2-5 items per invoice)."""
+    `min_items` default = 1 for all vendors. Originally 3 for non-Delaware
+    vendors to filter page-1-only partial dumps; lowered 2026-05-01 because
+    Sysco's multi-photo workflow (one JPG per invoice page) loses pages
+    whose spatial result has <3 items. Empty/header-only pages produce
+    zero anchors → zero spatial items, so no noise is admitted at 1."""
     if not pages:
         return None
     try:
@@ -2452,8 +2454,7 @@ def _try_spatial(vendor: str, pages: list[dict] | None,
     if not fn:
         return None
     if min_items is None:
-        # Delaware Linen invoices are 2-5 items each; other vendors 3+.
-        min_items = 1 if vendor == "Delaware County Linen" else 3
+        min_items = 1
     items = fn(pages)
     if len(items) < min_items:
         return None
