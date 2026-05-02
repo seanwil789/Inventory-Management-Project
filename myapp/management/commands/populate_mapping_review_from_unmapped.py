@@ -180,9 +180,15 @@ class Command(BaseCommand):
             if suggested is None:
                 without_suggestion += 1
 
-            # 3. Upsert into proposal queue
+            # 3. Upsert into proposal queue. Sean unification (2026-05-02):
+            # if raw still has no canonical AND existing proposal was
+            # rejected, AND the new mapper suggestion differs from the
+            # rejected target, CREATE a new proposal (fresh review chance).
+            # Same target as previously rejected → no new proposal (don't
+            # spam Sean with the suggestion he already declined).
             existing = ProductMappingProposal.objects.filter(
                 vendor=vendor, raw_description=raw_desc,
+                source='discover_unmapped',
             ).first()
 
             if existing is None:
@@ -213,7 +219,24 @@ class Command(BaseCommand):
                     pending_updated += 1
                 else:
                     unchanged += 1
-            # else: approved/rejected — don't touch
+            elif existing.status == 'rejected' and suggested is not None:
+                # Sean's rule: items without canonicals resurface until one
+                # is given. If the previously-rejected suggestion has been
+                # replaced by a new mapper output, give Sean a fresh review.
+                # Skip if same target (avoid re-suggesting what was declined).
+                if existing.suggested_product != suggested:
+                    if apply_changes:
+                        ProductMappingProposal.objects.create(
+                            vendor=vendor,
+                            raw_description=raw_desc,
+                            suggested_product=suggested,
+                            score=int(score) if score else None,
+                            confidence_tier=tier,
+                            source='discover_unmapped',
+                            status='pending',
+                        )
+                    created += 1
+            # else: approved → leave alone (raw is canonicalized)
 
         # Report
         mode = 'APPLY' if apply_changes else 'DRY-RUN'

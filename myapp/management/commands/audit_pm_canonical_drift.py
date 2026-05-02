@@ -45,7 +45,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from myapp.models import Product, ProductMapping, CanonicalDriftRejection
+from myapp.models import Product, ProductMapping, ProductMappingProposal, CanonicalDriftRejection
 
 
 def _import_mapper():
@@ -131,14 +131,22 @@ class Command(BaseCommand):
         def _tokens(s):
             return set(_re.findall(r'[a-z0-9]+', (s or '').lower()))
 
-        # Load previously-rejected (pm_id, rejected_canonical) pairs.
-        # First-pass-rejects-teach-the-system: never re-propose what Sean
-        # already said no to. Convert to set for O(1) lookup.
-        rejected_pairs: set[tuple[int, str]] = set(
+        # Load previously-rejected pairs from BOTH sources during the
+        # transition: legacy CanonicalDriftRejection (keyed on pm_id +
+        # canonical name) AND the unified ProductMappingProposal
+        # rejected-rows (keyed on vendor + raw_description + suggested
+        # product). Both are checked so we never re-propose what Sean
+        # already said no to.
+        rejected_pairs_pm: set[tuple[int, str]] = set(
             CanonicalDriftRejection.objects.values_list(
                 'product_mapping_id', 'rejected_canonical'
             )
         )
+        rejected_pmps = (ProductMappingProposal.objects
+                         .filter(status='rejected', source='drift_audit')
+                         .values_list('vendor_id', 'raw_description',
+                                      'suggested_product__canonical_name'))
+        rejected_pairs_pmp: set[tuple[int, str, str]] = set(rejected_pmps)
 
         proposals = []
         scanned = 0
@@ -163,8 +171,12 @@ class Command(BaseCommand):
             if proposed == current:
                 continue
             # Skip pairs Sean has previously rejected. Permanent learning
-            # signal — first pass rejects teach the system.
-            if (pm.id, proposed) in rejected_pairs:
+            # signal — first pass rejects teach the system. Check both
+            # legacy CanonicalDriftRejection table and the unified
+            # ProductMappingProposal rejected-rows.
+            if (pm.id, proposed) in rejected_pairs_pm:
+                continue
+            if (pm.vendor_id, pm.description, proposed) in rejected_pairs_pmp:
                 continue
             # Tier 6 returned a DIFFERENT canonical → potential drift
             if tier_filter and confidence != tier_filter:
@@ -241,6 +253,41 @@ class Command(BaseCommand):
                 f'\nRe-pointed {len(proposals)} ProductMapping rows.'
             ))
         elif proposals:
+            # Sean unification (2026-05-02): enqueue proposals into the
+            # /mapping-review/ Django queue so they live alongside fuzzy
+            # quarantine items. One review surface, one rejection mechanism,
+            # one teaching signal.
+            enqueued = 0
+            with transaction.atomic():
+                for p in proposals:
+                    target = Product.objects.filter(
+                        canonical_name=p['proposed']
+                    ).first()
+                    if target is None:
+                        continue
+                    pm = ProductMapping.objects.filter(id=p['pm_id']).select_related('vendor').first()
+                    if pm is None or pm.vendor is None:
+                        continue
+                    _, created = ProductMappingProposal.objects.get_or_create(
+                        vendor=pm.vendor,
+                        raw_description=pm.description,
+                        source='drift_audit',
+                        suggested_product=target,
+                        defaults={
+                            'score': p.get('score'),
+                            'confidence_tier': f'drift_{p.get("confidence", "")}',
+                            'status': 'pending',
+                            'notes': (f'Audit proposed re-point of pm_id={p["pm_id"]} '
+                                      f'from {p["current"]!r} to {p["proposed"]!r}.'),
+                        },
+                    )
+                    if created:
+                        enqueued += 1
             self.stdout.write(self.style.WARNING(
                 f'\nDry-run — re-run with --apply to commit {len(proposals)} re-points.'
             ))
+            if enqueued:
+                self.stdout.write(self.style.SUCCESS(
+                    f'Enqueued {enqueued} new proposal(s) in /mapping-review/ '
+                    f'for human review.'
+                ))

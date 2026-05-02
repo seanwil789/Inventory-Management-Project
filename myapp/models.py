@@ -109,6 +109,7 @@ class ProductMappingProposal(models.Model):
     SOURCE_CHOICES = [
         ('mapper_quarantine', 'Mapper Quarantine (fuzzy held at write)'),
         ('discover_unmapped', 'Discover Unmapped Scan'),
+        ('drift_audit', 'Canonical Drift Audit (PM re-evaluation)'),
     ]
     vendor              = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name='mapping_proposals')
     raw_description     = models.CharField(max_length=500)
@@ -146,8 +147,17 @@ class ProductMappingProposal(models.Model):
     )
 
     class Meta:
-        unique_together = [('vendor', 'raw_description')]
-        indexes = [models.Index(fields=['status', '-created_at'])]
+        # Sean 2026-05-02: previously `unique_together(vendor, raw_description)`
+        # which conflated "this raw has been seen" with "this proposal has been
+        # decided." Sean's unification rule: items with no canonical should
+        # resurface; items with canonical only re-review on drift_audit
+        # trigger. Different sources can coexist for the same raw — fuzzy
+        # quarantine + drift audit can both propose without colliding.
+        unique_together = [('vendor', 'raw_description', 'source', 'suggested_product')]
+        indexes = [
+            models.Index(fields=['status', '-created_at']),
+            models.Index(fields=['vendor', 'raw_description']),
+        ]
         ordering = ['-created_at']
 
     def __str__(self):

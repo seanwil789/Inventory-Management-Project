@@ -9935,3 +9935,132 @@ class RejectCanonicalDriftTests(TestCase):
     def test_no_pairs_errors(self):
         _, err = self._run()
         self.assertIn('No pairs', err)
+
+
+class DriftAuditUnifiedQueueTests(TestCase):
+    """Phase 1 unification — drift audit enqueues proposals into PMP queue
+    so /mapping-review/ sees them; reject filter reads PMP rejected rows."""
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, ProductMapping
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.corn = Product.objects.create(canonical_name='Corn', category='Produce')
+        self.corn_frozen = Product.objects.create(
+            canonical_name='Corn, Frozen', category='Produce')
+        self.wrong_pm = ProductMapping.objects.create(
+            vendor=self.v, product=self.corn,
+            description='FROZEN CORN, 12/2.5-LB',
+        )
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('audit_pm_canonical_drift', *args, stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_enqueues_pmp_proposal(self):
+        from myapp.models import ProductMappingProposal
+        self.assertEqual(ProductMappingProposal.objects.count(), 0)
+        out = self._run()
+        self.assertIn('Enqueued', out)
+        pmp = ProductMappingProposal.objects.filter(source='drift_audit').first()
+        self.assertIsNotNone(pmp)
+        self.assertEqual(pmp.vendor, self.v)
+        self.assertEqual(pmp.raw_description, 'FROZEN CORN, 12/2.5-LB')
+        self.assertEqual(pmp.suggested_product, self.corn_frozen)
+        self.assertEqual(pmp.status, 'pending')
+
+    def test_pmp_rejected_blocks_re_proposal(self):
+        from myapp.models import ProductMappingProposal
+        ProductMappingProposal.objects.create(
+            vendor=self.v,
+            raw_description='FROZEN CORN, 12/2.5-LB',
+            source='drift_audit',
+            suggested_product=self.corn_frozen,
+            status='rejected',
+        )
+        out = self._run()
+        # Only the pre-existing rejected exists
+        self.assertEqual(ProductMappingProposal.objects.count(), 1)
+        self.assertEqual(ProductMappingProposal.objects.first().status, 'rejected')
+
+    def test_existing_pmp_reused_not_duplicated(self):
+        from myapp.models import ProductMappingProposal
+        self._run()
+        first_count = ProductMappingProposal.objects.count()
+        self._run()
+        second_count = ProductMappingProposal.objects.count()
+        self.assertEqual(first_count, second_count)
+
+
+class PopulateMappingReviewResurfaceTests(TestCase):
+    """Sean's rule: items without canonicals resurface until one is given."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('populate_mapping_review_from_unmapped', *args, stdout=out)
+        return out.getvalue()
+
+    def test_rejected_with_new_target_reopens(self):
+        from myapp.models import (Vendor, Product, ProductMapping,
+                                   InvoiceLineItem, ProductMappingProposal)
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        wrong = Product.objects.create(canonical_name='Wrong Test', category='Produce')
+        right = Product.objects.create(canonical_name='Right Canonical Test', category='Produce')
+        ProductMapping.objects.create(
+            vendor=v, product=right,
+            description='RIGHT CANONICAL TEST PRODUCT',
+        )
+        InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='RIGHT CANONICAL TEST PRODUCT BLAH',
+            unit_price='10', extended_amount='10', product=None,
+            match_confidence='unmatched',
+        )
+        ProductMappingProposal.objects.create(
+            vendor=v,
+            raw_description='RIGHT CANONICAL TEST PRODUCT BLAH',
+            source='discover_unmapped',
+            suggested_product=wrong,
+            status='rejected',
+        )
+        self._run('--apply')
+        new_pending = ProductMappingProposal.objects.filter(
+            raw_description='RIGHT CANONICAL TEST PRODUCT BLAH',
+            status='pending',
+        ).first()
+        self.assertIsNotNone(new_pending,
+                             'expected re-opened proposal with new target')
+        self.assertNotEqual(new_pending.suggested_product, wrong)
+
+    def test_rejected_with_same_target_does_not_reopen(self):
+        from myapp.models import (Vendor, Product, ProductMapping,
+                                   InvoiceLineItem, ProductMappingProposal)
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        same = Product.objects.create(canonical_name='Same Test Product', category='Produce')
+        ProductMapping.objects.create(
+            vendor=v, product=same,
+            description='SAME TEST PRODUCT',
+        )
+        InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='SAME TEST PRODUCT VARIANT',
+            unit_price='10', extended_amount='10', product=None,
+            match_confidence='unmatched',
+        )
+        ProductMappingProposal.objects.create(
+            vendor=v,
+            raw_description='SAME TEST PRODUCT VARIANT',
+            source='discover_unmapped',
+            suggested_product=same,
+            status='rejected',
+        )
+        self._run('--apply')
+        all_props = ProductMappingProposal.objects.filter(
+            raw_description='SAME TEST PRODUCT VARIANT',
+        )
+        self.assertEqual(all_props.count(), 1,
+                         'should not duplicate rejected target')
