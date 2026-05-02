@@ -50,6 +50,15 @@ def _cache_invoice_total(vendor, invoice_date, total, source_file):
     """
     Cache an invoice total for later budget sync pickup.
     Stored as JSON files in .invoice_totals/ keyed by year-month.
+
+    Dedup rules (per #1 March-cache-double-count fix, 2026-05-02):
+      1. Same (vendor, date, source_file) → already cached, skip
+      2. Same (vendor, date, round(total, 2)) AND existing has source='budget_csv'
+         → REPLACE the budget_csv entry with this pipeline write (better
+         provenance — the CSV fallback was a placeholder).
+      3. Same (vendor, date, round(total, 2)) AND existing has the same
+         filename source → skip (already cached, source_file may differ
+         in case from earlier runs).
     """
     os.makedirs(_INVOICE_TOTALS_DIR, exist_ok=True)
     month_key = str(invoice_date)[:7]  # "2026-04"
@@ -61,22 +70,54 @@ def _cache_invoice_total(vendor, invoice_date, total, source_file):
         with open(cache_file, "r") as f:
             entries = json.load(f)
 
-    # Check for duplicate
-    for e in entries:
-        if e["vendor"] == vendor and e["date"] == str(invoice_date) and e["source_file"] == source_file:
-            return  # already cached
-
-    entries.append({
+    rounded_total = round(total, 2)
+    new_entry = {
         "vendor": vendor,
         "date": str(invoice_date),
-        "total": round(total, 2),
+        "total": rounded_total,
         "source_file": source_file,
-    })
+    }
+
+    # Rule 1: Same source_file → already cached
+    for e in entries:
+        if (e["vendor"] == vendor
+                and e["date"] == str(invoice_date)
+                and e["source_file"] == source_file):
+            return
+
+    # Rule 2: Same (vendor, date, total) AND existing is budget_csv → replace it
+    replaced = False
+    for i, e in enumerate(entries):
+        if (e["vendor"] == vendor
+                and e["date"] == str(invoice_date)
+                and round(float(e.get("total", 0)), 2) == rounded_total
+                and e.get("source") == "budget_csv"):
+            entries[i] = new_entry
+            replaced = True
+            print(f"   [budget] Replaced budget_csv entry with pipeline write: "
+                  f"${total:.2f} {vendor} {invoice_date}")
+            break
+
+    # Rule 3: Same (vendor, date, total) AND existing has filename → skip
+    # (covers the case where reprocess re-emits the same OCR cache with a
+    # different source_file due to upsert key drift)
+    if not replaced:
+        for e in entries:
+            if (e["vendor"] == vendor
+                    and e["date"] == str(invoice_date)
+                    and round(float(e.get("total", 0)), 2) == rounded_total):
+                # Already have an amount-matching entry for this vendor+date.
+                # Skip this write to prevent double-counting.
+                return
+
+    if not replaced:
+        entries.append(new_entry)
 
     with open(cache_file, "w") as f:
         json.dump(entries, f, indent=2)
 
-    print(f"   [budget] Cached invoice total: ${total:.2f} for {vendor} {invoice_date}")
+    if not replaced:
+        print(f"   [budget] Cached invoice total: ${total:.2f} for {vendor} {invoice_date}")
 
 
 def _ensure_monthly_tab():

@@ -8767,3 +8767,97 @@ class ParserCountPerLbExtractionTests(TestCase):
         self.assertTrue(shrimp, 'Sysco parser should emit shrimp item')
         self.assertEqual(shrimp[0].get('count_per_lb_low'), 21)
         self.assertEqual(shrimp[0].get('count_per_lb_high'), 25)
+
+
+class CacheInvoiceTotalDedupTests(TestCase):
+    """#1 March cache double-count fix — _cache_invoice_total dedup rules.
+
+    The bug: pipeline writes EnterpriseInvoice-NNN.pdf as source_file;
+    budget CSV writes "Men's Wentworth Food Budget.csv" as source_file.
+    Same (vendor, date, total) but different source_file → both kept,
+    inflating monthly totals.
+
+    Fix: dedup by (vendor, date, total). Pipeline write replaces
+    budget_csv placeholder; subsequent same-amount writes are skipped.
+    """
+
+    def setUp(self):
+        import tempfile, os
+        self.tmpdir = tempfile.mkdtemp()
+        # Patch _INVOICE_TOTALS_DIR to point at temp.
+        from invoice_processor import batch
+        self._original_dir = batch._INVOICE_TOTALS_DIR
+        batch._INVOICE_TOTALS_DIR = self.tmpdir
+
+    def tearDown(self):
+        import shutil
+        from invoice_processor import batch
+        batch._INVOICE_TOTALS_DIR = self._original_dir
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _read_cache(self, year_month):
+        import json, os
+        path = os.path.join(self.tmpdir, f'{year_month}.json')
+        if not os.path.exists(path):
+            return []
+        with open(path) as f:
+            return json.load(f)
+
+    def _seed(self, year_month, entries):
+        import json, os
+        path = os.path.join(self.tmpdir, f'{year_month}.json')
+        with open(path, 'w') as f:
+            json.dump(entries, f)
+
+    def test_pipeline_write_replaces_budget_csv(self):
+        """Budget CSV entry exists; pipeline writes same (vendor, date,
+        total) — replaces the CSV entry with the more-authoritative one."""
+        from invoice_processor.batch import _cache_invoice_total
+        self._seed('2026-03', [{
+            'vendor': 'Sysco', 'date': '2026-03-03',
+            'total': 958.75, 'source': 'budget_csv',
+            'source_file': "Men's Wentworth Food Budget 2026(Mar).csv",
+        }])
+        _cache_invoice_total('Sysco', '2026-03-03', 958.75,
+                             'EnterpriseInvoice-775719979.pdf')
+        entries = self._read_cache('2026-03')
+        self.assertEqual(len(entries), 1, 'should not duplicate')
+        self.assertEqual(entries[0]['source_file'],
+                         'EnterpriseInvoice-775719979.pdf')
+        self.assertEqual(entries[0]['total'], 958.75)
+
+    def test_same_source_file_idempotent(self):
+        """Re-writing same (vendor, date, source_file) is a no-op."""
+        from invoice_processor.batch import _cache_invoice_total
+        _cache_invoice_total('Sysco', '2026-03-03', 958.75,
+                             'EnterpriseInvoice-775719979.pdf')
+        _cache_invoice_total('Sysco', '2026-03-03', 958.75,
+                             'EnterpriseInvoice-775719979.pdf')
+        entries = self._read_cache('2026-03')
+        self.assertEqual(len(entries), 1)
+
+    def test_same_total_different_filename_still_dedups(self):
+        """Multi-photo case: same invoice, two different OCR-cache hashes
+        both reach _cache_invoice_total with same total → skip second."""
+        from invoice_processor.batch import _cache_invoice_total
+        _cache_invoice_total('Sysco', '2026-03-03', 958.75,
+                             'EnterpriseInvoice-775719979.pdf')
+        _cache_invoice_total('Sysco', '2026-03-03', 958.75,
+                             'photo2_hash_abc123.json')
+        entries = self._read_cache('2026-03')
+        self.assertEqual(len(entries), 1, 'should dedup by amount')
+
+    def test_different_amounts_kept_separate(self):
+        """Two genuinely different invoices same vendor+date stay separate."""
+        from invoice_processor.batch import _cache_invoice_total
+        _cache_invoice_total('Sysco', '2026-03-03', 958.75, 'inv1.pdf')
+        _cache_invoice_total('Sysco', '2026-03-03', 1290.50, 'inv2.pdf')
+        entries = self._read_cache('2026-03')
+        self.assertEqual(len(entries), 2)
+
+    def test_different_vendors_kept_separate(self):
+        from invoice_processor.batch import _cache_invoice_total
+        _cache_invoice_total('Sysco', '2026-03-03', 100.00, 'a.pdf')
+        _cache_invoice_total('Farm Art', '2026-03-03', 100.00, 'b.pdf')
+        entries = self._read_cache('2026-03')
+        self.assertEqual(len(entries), 2)
