@@ -102,6 +102,72 @@ _CASE_SIZE_RE = re.compile(
 )
 
 
+# Phase 3 #6 (Sean 2026-05-02): count-per-lb extraction from raw_description.
+#
+# Industry "count per lb" tokens like SHRIMP 21/25, BACON 18/22, SCALLOPS
+# U/15 are embedded in raw_descriptions. They tell you "21-25 shrimp per
+# pound" / "18-22 bacon strips per pound", and recipe cost math needs
+# them ("2 strips bacon" → 2 / avg_count_per_lb × $/lb).
+#
+# Phase 3b shipped the consumer side (cost_utils dispatch). This is the
+# parser side: extract N/M tokens in protein context and populate
+# count_per_lb_low / count_per_lb_high on the item dict so db_write
+# threads them through to ILI columns.
+#
+# Conservative pattern:
+#   - Protein keyword present in raw (SHRIMP/BACON/SCALLOP/etc.)
+#   - N/M token where 1 ≤ low < high ≤ 100
+#   - NOT followed by unit suffix (LB/OZ/GAL/CT/PT) — those are pack sizes
+#   - First match wins
+_COUNT_PER_LB_PROTEIN_KEYWORDS_RE = re.compile(
+    r'\b('
+    r'SHRIMP|PRAWN|SCALLOP|LOBSTER|CRAB|'
+    r'BACON|'
+    r'SALMON|TUNA|TILAPIA|HALIBUT|TROUT'
+    r')\b',
+    re.IGNORECASE,
+)
+_COUNT_PER_LB_TOKEN_RE = re.compile(
+    # N/M not adjacent to letters or digits (so won't match dates 10/14/25
+    # or pack formats 12/4OZ followed by letters), and the / itself isn't
+    # part of a multi-slash group (L/O 10/14 still matches the 10/14 part).
+    r'(?:^|[^/A-Za-z\d])'
+    r'(\d{1,3})/(\d{1,3})'
+    r'(?![/A-Za-z\d])',
+)
+# Pack-format units that disqualify an N/M from being count-per-lb (it's
+# a pack size like 12/4OZ instead of a count range like 21/25).
+_PACK_UOM_AFTER_NM_RE = re.compile(
+    r'^(LB|LBS|OZ|GAL|GALLON|QT|PT|CT|KG|LTR|FL\s*OZ|FLOZ|CS|EA|PK|BG)\b',
+    re.IGNORECASE,
+)
+
+
+def _extract_count_per_lb(raw_desc: str) -> tuple[int, int] | None:
+    """Extract count-per-lb tokens (SHRIMP 21/25, BACON 18/22).
+
+    Returns (low, high) when raw_description contains BOTH a protein
+    keyword AND an N/M token with no immediately-following unit. Returns
+    None otherwise — callers should leave count_per_lb_low/high unset.
+    """
+    if not raw_desc:
+        return None
+    if not _COUNT_PER_LB_PROTEIN_KEYWORDS_RE.search(raw_desc):
+        return None
+    for m in _COUNT_PER_LB_TOKEN_RE.finditer(raw_desc):
+        low, high = int(m.group(1)), int(m.group(2))
+        # Tail check: is this N/M actually a pack size (12/4OZ)? Look at
+        # what follows the M digits.
+        tail = raw_desc[m.end():]
+        if _PACK_UOM_AFTER_NM_RE.match(tail):
+            continue
+        # Range sanity: low must be strictly less than high, both positive,
+        # high not absurd. Excludes 21/2 (low > high typo) and 100+.
+        if 0 < low < high <= 100:
+            return (low, high)
+    return None
+
+
 def _extract_case_size(text: str) -> str:
     """
     Pull the first case-size token from a raw Sysco description line.
@@ -1262,6 +1328,13 @@ def _parse_sysco(text: str) -> list[dict]:
         # Empty dict when not decomposable; db_write coerces missing keys to NULL.
         item.update(_structured_pack_from_case_size(effective_case_size))
 
+        # Phase 3 #6: count-per-lb extraction for protein items.
+        # SHRIMP 21/25 → (21, 25); BACON 18/22 → (18, 22).
+        cpl = _extract_count_per_lb(description)
+        if cpl is not None:
+            item['count_per_lb_low'] = cpl[0]
+            item['count_per_lb_high'] = cpl[1]
+
         # For catch-weight items, the price on the invoice is the TOTAL
         # (weight × price_per_lb). Override quantity + UoM to the per-lb
         # convention so calc_price_per_lb sees the right shape.
@@ -1718,6 +1791,12 @@ def _parse_exceptional(text: str) -> list[dict]:
             # "quantity" — what the invoice ordered. UoM = the order-level unit.
             item["quantity"] = desc["qty_ordered"]
             item["purchase_uom"] = per
+
+        # Phase 3 #6: count-per-lb extraction (BACON 18/22, SHRIMP 21/25)
+        cpl = _extract_count_per_lb(desc["description"])
+        if cpl is not None:
+            item["count_per_lb_low"] = cpl[0]
+            item["count_per_lb_high"] = cpl[1]
         items.append(item)
 
     # ── Extract and validate invoice total ────────────────────────────

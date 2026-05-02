@@ -8700,3 +8700,70 @@ class Phase3fProteinKeywordClassGuardTests(TestCase):
         self.assertIsNotNone(ili)
         self.assertIsNone(ili.product, 'SHRIMP→non-weighed should be rejected')
         self.assertEqual(ili.match_confidence, 'unmatched_class_mismatch')
+
+
+class ParserCountPerLbExtractionTests(TestCase):
+    """Phase 3 #6 — extract count-per-lb tokens (SHRIMP 21/25, BACON 18/22)
+    from raw_description into ILI.count_per_lb_low/high during parsing.
+    """
+
+    def test_extract_shrimp_count(self):
+        from invoice_processor.parser import _extract_count_per_lb
+        cases = [
+            ('SHRIMP P&D 21/25', (21, 25)),
+            ('LEPORTSIM SHRIMP WHT P&D TLON 21/25', (21, 25)),
+            ('SCALLOP U/15', None),  # single-side U/15, not N/M
+            ('SCALLOP 10/20 BAY', (10, 20)),
+            ('SHRIMP 16/20 RAW EZ PEEL', (16, 20)),
+        ]
+        for raw, expected in cases:
+            self.assertEqual(_extract_count_per_lb(raw), expected,
+                             msg=f'{raw!r} count extraction')
+
+    def test_extract_bacon_count(self):
+        from invoice_processor.parser import _extract_count_per_lb
+        # BACON LAYFLAT 18/22, BACON L/O 10/14
+        self.assertEqual(_extract_count_per_lb('BACON LAYFLAT 18/22'), (18, 22))
+        self.assertEqual(_extract_count_per_lb('BACON L/O 10/14'), (10, 14))
+
+    def test_pack_format_NOT_extracted_as_count(self):
+        """N/M followed by unit (12/4OZ, 4/1GAL) is pack format not count."""
+        from invoice_processor.parser import _extract_count_per_lb
+        self.assertIsNone(_extract_count_per_lb('SHRIMP 12/4OZ FROZEN'))
+        self.assertIsNone(_extract_count_per_lb('TUNA 6/3LB CASE'))
+
+    def test_no_protein_keyword_returns_none(self):
+        """Without protein keyword, N/M is ambiguous (could be date)."""
+        from invoice_processor.parser import _extract_count_per_lb
+        self.assertIsNone(_extract_count_per_lb('SOMETHING 21/25 OTHER'))
+        self.assertIsNone(_extract_count_per_lb('CHICKEN BREAST 8/4LB'))
+
+    def test_low_lt_high_validation(self):
+        """N/M with low >= high is rejected (typos like 21/2)."""
+        from invoice_processor.parser import _extract_count_per_lb
+        # 21/2 is broken — second OCR-truncated. Should not be returned;
+        # the regex should also try later N/M pairs in the same string.
+        self.assertIsNone(_extract_count_per_lb('SHRIMP 21/2'))
+        # But if a valid N/M follows, take that one
+        self.assertEqual(_extract_count_per_lb('SHRIMP 21/2 COOK 16/20 RAW'),
+                         (16, 20))
+
+    def test_word_boundary_chopsticks_not_chop(self):
+        from invoice_processor.parser import _extract_count_per_lb
+        self.assertIsNone(_extract_count_per_lb('CHOPSTICKS 21/25 BAMBOO'))
+
+    def test_parse_sysco_emits_count_per_lb(self):
+        """End-to-end: Sysco text-path parser threads count_per_lb_low/high
+        into the item dict for db_write to persist."""
+        from invoice_processor.parser import _parse_sysco
+        text = """
+2 CS  10 LB  SYSPAD SHRIMP WHT P&D 21/25 RAW   1234567   60.00   60.00
+"""
+        result = _parse_sysco(text)
+        # _parse_sysco returns (items_list, other_meta) — unpack
+        items_list = result[0] if isinstance(result, tuple) else result
+        shrimp = [i for i in items_list
+                  if 'SHRIMP' in i.get('raw_description', '').upper()]
+        self.assertTrue(shrimp, 'Sysco parser should emit shrimp item')
+        self.assertEqual(shrimp[0].get('count_per_lb_low'), 21)
+        self.assertEqual(shrimp[0].get('count_per_lb_high'), 25)

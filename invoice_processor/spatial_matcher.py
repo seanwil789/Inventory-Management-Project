@@ -287,8 +287,13 @@ def _extract_row_item(row: list[dict], anchor: dict,
     # Phase 2a (2026-05-02): structured pack-size fields. Reuse the parser
     # helper so spatial + text paths produce identical structured output.
     try:
-        from parser import _structured_pack_from_case_size
+        from parser import _structured_pack_from_case_size, _extract_count_per_lb
         item.update(_structured_pack_from_case_size(case_size))
+        # Phase 3 #6: count-per-lb extraction for protein items
+        cpl = _extract_count_per_lb(description)
+        if cpl is not None:
+            item['count_per_lb_low'] = cpl[0]
+            item['count_per_lb_high'] = cpl[1]
     except Exception:
         pass
     return item
@@ -541,6 +546,16 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
                     item["quantity"] = qty_shipped
                 if um:
                     item["purchase_uom"] = um
+
+            # Phase 3 #6: count-per-lb (BACON L/O 10/14, SHRIMP 21/25)
+            try:
+                from parser import _extract_count_per_lb
+                cpl = _extract_count_per_lb(description)
+                if cpl is not None:
+                    item["count_per_lb_low"] = cpl[0]
+                    item["count_per_lb_high"] = cpl[1]
+            except Exception:
+                pass
             items.append(item)
     return items
 
