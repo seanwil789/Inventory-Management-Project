@@ -6051,6 +6051,80 @@ INVOICE TOTAL
                 f"Sysco item should default UoM=CASE: {item}")
 
 
+class ParserExceptionalCatchWeightTests(TestCase):
+    """`_parse_exceptional` Phase 2b — catch-weight rows emit structured
+    quantity = shipped lbs + purchase_uom='LB' + case_total_weight_lb.
+
+    The Beef Chuck Flap row 9 cascade in project_bug_register.md is the
+    canonical failure: parser stored price_per_pound = $197.53 (case total)
+    instead of the actual $/lb. Phase 2b's structured fields give consumers
+    a way out: synergy_sync.calc_price_per_lb (Phase 3a) reads
+    case_total_weight_lb directly instead of re-parsing case_size string."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'parser' in sys.modules:
+            del sys.modules['parser']
+        import parser as p
+        return p
+
+    def test_catch_weight_emits_quantity_as_shipped_lb(self):
+        """Catch-weight Exceptional row: quantity = shipped lb (the cross-
+        multiplied weight from the bare-decimal pool), NOT qty_ordered.
+        Matches Sysco catch-weight convention from Phase 2a."""
+        p = self._import()
+        # Synthetic Exceptional invoice — Beef Chuck Flap shape
+        raw = """EXCEPTIONAL FOODS, INC.
+Item ID
+1.00 CS Beef Chuck Flap CVP IBP
+42.7
+10.99 LB
+469.31
+Balance Due
+469.31
+"""
+        result = p.parse_invoice(raw, vendor='Exceptional Foods')
+        items = result['items']
+        beef = next((i for i in items if 'Chuck' in i.get('raw_description', '')), None)
+        self.assertIsNotNone(beef, f'expected Beef item, got {[i.get("raw_description") for i in items]}')
+        # Phase 2b acceptance: shipped weight is the quantity for catch-weight
+        self.assertAlmostEqual(float(beef['quantity']), 42.7, places=1)
+        self.assertEqual(beef['purchase_uom'], 'LB')
+        self.assertAlmostEqual(beef['case_total_weight_lb'], 42.7, places=2)
+        self.assertEqual(beef['case_pack_count'], 1)
+        self.assertEqual(beef['case_pack_unit_uom'], 'LB')
+        # price_per_pound (parser's stored $/lb) preserved
+        self.assertAlmostEqual(beef['price_per_unit'], 10.99, places=2)
+        # extended_amount = case total
+        self.assertAlmostEqual(beef['unit_price'], 469.31, places=2)
+
+    def test_non_catch_weight_uses_qty_ordered(self):
+        """Non-catch-weight rows (per != 'LB'): keep qty_ordered semantics.
+        Cheese byblock or whatever — the order unit is the right quantity."""
+        p = self._import()
+        raw = """EXCEPTIONAL FOODS, INC.
+Item ID
+2.00 CS Cheese Provolone Sliced 5LB
+2.00
+12.50 CS
+25.00
+Balance Due
+25.00
+"""
+        result = p.parse_invoice(raw, vendor='Exceptional Foods')
+        items = result['items']
+        cheese = next((i for i in items if 'Cheese' in i.get('raw_description', '')), None)
+        self.assertIsNotNone(cheese)
+        # qty_ordered semantics for non-catch-weight
+        self.assertEqual(cheese['unit_of_measure'], 'CS')
+        # purchase_uom matches per (the price-per unit, which IS 'CS' here)
+        self.assertEqual(cheese.get('purchase_uom'), 'CS')
+
+
 class ProductInventoryClassFieldTests(TestCase):
     """`Product.inventory_class` + `inventory_unit_descriptor` schema fields.
     Phase 1 of structured schema migration. Pure additive — existing

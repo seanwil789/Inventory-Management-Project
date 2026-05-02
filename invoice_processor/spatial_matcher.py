@@ -514,10 +514,29 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
             # Catch-weight: per-unit U/M is "LB" and unit_price is $/lb.
             # Promote it to price_per_unit; the line total stays as
             # unit_price/extended_amount so DB dollar totals balance.
+            #
+            # Phase 2b: emit structured fields. quantity = shipped lbs (matches
+            # Sysco catch-weight convention). purchase_uom = "LB". Also write
+            # case_total_weight_lb + the case_pack_* triple (count=1 for
+            # single-shipment catch-weight).
             if per_um == "LB" and qty_shipped is not None:
                 item["unit_of_measure"] = "LB"
+                item["purchase_uom"] = "LB"
                 item["price_per_unit"] = unit_price
                 item["case_size_raw"] = f"{qty_shipped}LB"
+                item["quantity"] = qty_shipped
+                item["case_total_weight_lb"] = round(qty_shipped, 3)
+                item["case_pack_count"] = 1
+                item["case_pack_unit_size"] = str(round(qty_shipped, 3))
+                item["case_pack_unit_uom"] = "LB"
+            else:
+                # Non-catch-weight: order-unit qty (1.00 EA / 1.00 CS).
+                # qty_shipped column may carry the case count for non-LB rows;
+                # fall back to qty_shipped→qty when present, else leave NULL.
+                if qty_shipped is not None:
+                    item["quantity"] = qty_shipped
+                if um:
+                    item["purchase_uom"] = um
             items.append(item)
     return items
 

@@ -1687,15 +1687,38 @@ def _parse_exceptional(text: str) -> list[dict]:
             total = best_pp.get("total")
             weight = round(total / price_per_unit, 2) if total and price_per_unit > 0 else None
 
-        items.append({
+        # Phase 2b (2026-05-02): structured fields for Exceptional.
+        # Catch-weight rows (per == "LB"): the actual SHIPPED weight is in
+        # `weight` (cross-multiplied from the invoice's bare-decimal pool).
+        # That's the load-bearing quantity for $/lb math — matches Sysco
+        # catch-weight convention from Phase 2a. Beef Chuck Flap fix:
+        # quantity=42.7 (shipped lb) + purchase_uom='LB' + total_weight_lb=42.7
+        # + price_per_pound=10.99 → consumers compute $/lb directly without
+        # re-parsing case_size string.
+        item = {
             "raw_description": desc["description"],
             "unit_price": total,           # case total (weight × $/lb) — for DB + sheet
             "extended_amount": total,      # same as unit_price for Exceptional (qty already in weight)
             "case_size_raw": f"{weight}LB" if weight and per == "LB" else "",
-            "quantity": desc["qty_ordered"],
             "unit_of_measure": per,
             "price_per_unit": price_per_unit,  # $/lb — for P/# column
-        })
+        }
+        if per == "LB" and weight is not None:
+            # Catch-weight: quantity = shipped lbs (Sysco convention)
+            item["quantity"] = weight
+            item["purchase_uom"] = "LB"
+            item["case_total_weight_lb"] = round(weight, 3)
+            # Also emit case_pack_count=1 to mark it as a single-unit shipment
+            # rather than a packed case. case_pack_unit_size = weight, uom = LB.
+            item["case_pack_count"] = 1
+            item["case_pack_unit_size"] = str(round(weight, 3))
+            item["case_pack_unit_uom"] = "LB"
+        else:
+            # Non-catch-weight (per == "CS" / "EA"): qty_ordered is the right
+            # "quantity" — what the invoice ordered. UoM = the order-level unit.
+            item["quantity"] = desc["qty_ordered"]
+            item["purchase_uom"] = per
+        items.append(item)
 
     # ── Extract and validate invoice total ────────────────────────────
     all_lines = [l.strip() for l in text.splitlines()]
