@@ -9559,3 +9559,93 @@ class CleanupUndeliveredItemsTests(TestCase):
         self._run('--apply')
         # Sysco row preserved (only Farm Art touched by default)
         self.assertTrue(InvoiceLineItem.objects.filter(id=ili.id).exists())
+
+
+class CleanupCanonicalConflationTests(TestCase):
+    """Token-based detach for canonical-conflation bugs (Liner Trash with
+    towels/cups/avocados/etc. mismapped in)."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('cleanup_canonical_conflation', *args, stdout=out)
+        return out.getvalue()
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.liner = Product.objects.create(
+            canonical_name='Liner, Trash Test', category='Smallwares')
+        # Real liner row
+        self.liner_ok = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-20',
+            raw_description='SYS CLS LINER TRASH 38X58 1.6M BLK',
+            unit_price=30, extended_amount=30, product=self.liner)
+        # Wrong: towel mapped to Liner Trash
+        self.towel_wrong = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-20',
+            raw_description='TORKUNV TOWEL ROLL KTCHN 9X11',
+            unit_price=27, extended_amount=27, product=self.liner)
+        # Wrong: avocado mapped to Liner Trash
+        self.avo_wrong = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-20',
+            raw_description='CASAIMP AVOCADO HASS FRSH HLV',
+            unit_price=41, extended_amount=41, product=self.liner)
+
+    def test_repoints_rows_lacking_keep_tokens(self):
+        self._run('--canonical', 'Liner, Trash Test',
+                  '--keep-tokens', 'LINER,TRASH', '--apply')
+        self.liner_ok.refresh_from_db()
+        self.towel_wrong.refresh_from_db()
+        self.avo_wrong.refresh_from_db()
+        # Real liner kept
+        self.assertEqual(self.liner_ok.product, self.liner)
+        # Towel + avocado detached + tagged
+        self.assertIsNone(self.towel_wrong.product)
+        self.assertEqual(self.towel_wrong.match_confidence, 'unmatched_repointed')
+        self.assertIsNone(self.avo_wrong.product)
+        self.assertEqual(self.avo_wrong.match_confidence, 'unmatched_repointed')
+
+    def test_dry_run_does_not_detach(self):
+        out = self._run('--canonical', 'Liner, Trash Test',
+                        '--keep-tokens', 'LINER,TRASH')
+        self.assertIn('Dry-run', out)
+        self.towel_wrong.refresh_from_db()
+        self.assertEqual(self.towel_wrong.product, self.liner)
+
+    def test_also_delete_ids_drops_rows(self):
+        from myapp.models import InvoiceLineItem
+        garble = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-27',
+            raw_description='Trash Liner',
+            unit_price=200.23, extended_amount=200.23, product=self.liner)
+        self._run('--canonical', 'Liner, Trash Test',
+                  '--keep-tokens', 'LINER,TRASH',
+                  '--also-delete-ids', str(garble.id), '--apply')
+        self.assertFalse(InvoiceLineItem.objects.filter(id=garble.id).exists())
+        # The legit liner is preserved
+        self.assertTrue(InvoiceLineItem.objects.filter(id=self.liner_ok.id).exists())
+
+    def test_keep_tokens_match_either_word(self):
+        """raw with just 'TRASH' (no LINER) still matches keep tokens."""
+        from myapp.models import InvoiceLineItem
+        weird = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-20',
+            raw_description='SOME TRASH BAG WHATEVER',
+            unit_price=30, extended_amount=30, product=self.liner)
+        self._run('--canonical', 'Liner, Trash Test',
+                  '--keep-tokens', 'LINER,TRASH', '--apply')
+        weird.refresh_from_db()
+        # Has TRASH token → kept
+        self.assertEqual(weird.product, self.liner)
+
+    def test_canonical_not_found_errors(self):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO(); err = StringIO()
+        call_command('cleanup_canonical_conflation',
+                     '--canonical', 'Nonexistent',
+                     '--keep-tokens', 'X',
+                     stdout=out, stderr=err)
+        self.assertIn('not found', err.getvalue())
