@@ -257,6 +257,15 @@
                            value="{% if row.inferred.secondary.0 %}{{ row.inferred.secondary.0 }}{% endif %}"
                            class="border rounded px-2 py-1 text-sm w-full">
                   </label>
+                  <label class="block">
+                    <span class="text-xs text-slate-600">
+                      Prep state
+                      <span class="text-slate-400">(optional)</span>
+                    </span>
+                    <input type="text" name="prep_state"
+                           placeholder="e.g. Cured, Smoked, Shredded, Whole"
+                           class="border rounded px-2 py-1 text-sm w-full">
+                  </label>
                 </div>
                 <div class="text-xs text-slate-500">
                   <span class="font-semibold">Inference reasoning:</span>

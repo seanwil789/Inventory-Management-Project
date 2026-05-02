@@ -2668,6 +2668,7 @@ def mapping_review_create_and_approve(request, proposal_id: int):
     category = (request.POST.get('category') or '').strip()
     primary = (request.POST.get('primary_descriptor') or '').strip()
     secondary = (request.POST.get('secondary_descriptor') or '').strip()
+    prep_state = (request.POST.get('prep_state') or '').strip()
     # Auto-derived suggestion the reviewer was offered (may be empty when
     # derivation bailed). Captured for suggestion-vs-final analysis.
     suggested_text = (request.POST.get('suggested_canonical_text') or '').strip()
@@ -2687,21 +2688,28 @@ def mapping_review_create_and_approve(request, proposal_id: int):
         messages.warning(request,
             f"Canonical {canonical!r} already exists — using existing Product.")
         product = existing
+        # If reviewer supplied a prep_state and existing Product has none,
+        # backfill it. Don't overwrite an existing prep_state value.
+        if prep_state and not product.prep_state:
+            product.prep_state = prep_state[:30]
+            product.save(update_fields=['prep_state'])
     else:
         product = Product.objects.create(
             canonical_name=canonical,
             category=category,
             primary_descriptor=primary,
             secondary_descriptor=secondary,
+            prep_state=prep_state[:30],
         )
+        prep_label = f'/{prep_state}' if prep_state else ''
         messages.success(request,
-            f"Created Product {canonical!r} ({category}/{primary}/{secondary}).")
+            f"Created Product {canonical!r} ({category}/{primary}/{secondary}{prep_label}).")
 
     # Now approve the proposal pointing at the new (or existing) Product
     result = proposal.approve(
         product=product,
         reviewer=request.user if request.user.is_authenticated else None,
-        notes=f'Created via inline form. Inferred fields: {category}/{primary}/{secondary}',
+        notes=f'Created via inline form. Inferred fields: {category}/{primary}/{secondary}/{prep_state}',
     )
     messages.success(request,
         f"Approved → {canonical!r} | backfilled {result['ili_updated']} ILI rows.")
