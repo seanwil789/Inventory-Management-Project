@@ -168,12 +168,25 @@ def parse_total_weight_lbs(case_size: str) -> float | None:
     return None
 
 
-def calc_iup(unit_price: float, case_size: str) -> float | None:
+def calc_iup(unit_price: float, case_size: str,
+             case_pack_count: int | None = None) -> float | None:
     """
     Compute Individual Unit Price = unit_price / units_per_case.
     Returns None if the case size cannot be parsed or unit count is 1
     (no subdivision meaningful).
+
+    Phase 3a (2026-05-02): when `case_pack_count` is provided (from
+    InvoiceLineItem.case_pack_count after structured-schema migration),
+    use it directly — bypasses the case_size string parsing entirely.
+    Falls back to legacy parse_unit_count(case_size) when the structured
+    field is null (rows pre-backfill, or vendors whose parser doesn't
+    yet emit case_pack_*).
     """
+    # Structured path — load-bearing for fixing the Beef Chuck Flap
+    # cascade + similar string-parse failures.
+    if case_pack_count is not None and case_pack_count > 1:
+        return round(unit_price / case_pack_count, 4)
+    # Legacy string path
     count = parse_unit_count(case_size)
     if count is None or count <= 1:
         return None
@@ -182,23 +195,24 @@ def calc_iup(unit_price: float, case_size: str) -> float | None:
 
 def calc_price_per_lb(unit_price: float, case_size: str,
                       unit_col: str = "",
-                      stored_price_per_lb=None) -> float | None:
+                      stored_price_per_lb=None,
+                      case_total_weight_lb=None) -> float | None:
     """
     Compute Price per Pound = unit_price / total_weight_in_lbs.
 
-    When `stored_price_per_lb` is provided (from the parser's direct
-    computation on Sysco catch-weight / Exceptional rows, persisted as
-    InvoiceLineItem.price_per_pound), it takes priority over any
-    reverse-engineering from unit_price + case_size. The stored value is
-    immune to case_size OCR drift — if the parser already knew $/lb at
-    write time, that's the authoritative answer.
-
-    Falls back to unit_price / total_weight when the stored field is null
-    (the 4 of 6 vendors whose parsers don't emit it, plus pre-Track-B
-    rows that haven't been backfilled).
-
-    Uses case size to derive total weight. If case size is a bare number
-    and the unit column is "#" (pounds), treats the number as total pounds.
+    Priority order (Phase 3a, 2026-05-02):
+      1. `stored_price_per_lb` — parser's direct $/lb computation on
+         Sysco catch-weight / Exceptional rows. Most authoritative.
+      2. `case_total_weight_lb` — structured field set by parser/spatial
+         + persisted on ILI. unit_price / case_total_weight_lb gives
+         the canonical $/lb for any weighed product without re-parsing
+         strings. Closes the Beef Chuck Flap cascade — when parser
+         emits case_total_weight_lb=42.7, calc_price_per_lb returns
+         469.31 / 42.7 = $10.99/lb (correct), NOT 469.31 / 17.99
+         (Product.default_case_size, the wrong fallback).
+      3. Legacy `parse_total_weight_lbs(case_size)` string parsing.
+      4. Bare-number `unit_col='#'` fallback (per-Sean inventory
+         convention for weighed items in the Synergy sheet).
 
     Returns None if weight cannot be determined or item isn't sold by weight.
     """
@@ -211,7 +225,16 @@ def calc_price_per_lb(unit_price: float, case_size: str,
         except (TypeError, ValueError):
             pass
 
-    # First try extracting weight from case size string with unit suffix
+    # Structured weight path — Phase 3a unlock.
+    if case_total_weight_lb is not None:
+        try:
+            tw = float(case_total_weight_lb)
+            if tw > 0:
+                return round(unit_price / tw, 4)
+        except (TypeError, ValueError):
+            pass
+
+    # Legacy string path
     weight = parse_total_weight_lbs(case_size)
     if weight and weight > 0:
         return round(unit_price / weight, 4)
@@ -484,6 +507,12 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
                 "price_per_pound":       (float(ili.price_per_pound)
                                           if ili.price_per_pound is not None
                                           else None),
+                # Phase 3a structured fields — calc_iup_v2 + calc_price_per_lb_v2
+                # read these directly when populated, bypassing case_size string parse.
+                "case_pack_count":       ili.case_pack_count,
+                "case_total_weight_lb":  (float(ili.case_total_weight_lb)
+                                          if ili.case_total_weight_lb is not None
+                                          else None),
             }
 
     return list(seen.values())
@@ -615,6 +644,9 @@ def _sync_prices_core(
         unit_price  = item.get("unit_price")
         case_size   = item.get("case_size_raw", "")
         stored_ppp  = item.get("price_per_pound")
+        # Phase 3a structured-field path
+        case_pack_count = item.get("case_pack_count")
+        case_total_weight_lb = item.get("case_total_weight_lb")
 
         # Step 1: find all sheet rows whose product name fuzzy-matches
         all_matches = process.extract(
@@ -712,9 +744,11 @@ def _sync_prices_core(
                 summary["updated"] += 1
                 continue
 
-            iup = calc_iup(unit_price, effective_case_size)
+            iup = calc_iup(unit_price, effective_case_size,
+                           case_pack_count=case_pack_count)
             pplb = calc_price_per_lb(unit_price, effective_case_size, sheet_unit,
-                                     stored_price_per_lb=stored_ppp)
+                                     stored_price_per_lb=stored_ppp,
+                                     case_total_weight_lb=case_total_weight_lb)
 
             batch_data.append({
                 "range": f"'{tab}'!E{row_num}",
@@ -1280,9 +1314,13 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
             "values": [[unit_price]],
         })
 
-        iup = calc_iup(unit_price, case_size)
+        # Phase 3a structured fields from latest ILI — bypass case_size string
+        # parse when populated.
+        iup = calc_iup(unit_price, case_size,
+                       case_pack_count=latest.case_pack_count)
         pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
-                                 stored_price_per_lb=latest.price_per_pound)
+                                 stored_price_per_lb=latest.price_per_pound,
+                                 case_total_weight_lb=latest.case_total_weight_lb)
 
         if iup is not None:
             batch_data.append({
@@ -1420,9 +1458,12 @@ def refresh_stale_carryover(sheet_tab: str = None, dry_run: bool = False) -> dic
 
         case_size = latest.case_size or entry.get("case_size", "")
         latest_vendor = latest.vendor.name if latest.vendor else "?"
-        iup = calc_iup(unit_price, case_size)
+        # Phase 3a structured-field path
+        iup = calc_iup(unit_price, case_size,
+                       case_pack_count=latest.case_pack_count)
         pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
-                                 stored_price_per_lb=latest.price_per_pound)
+                                 stored_price_per_lb=latest.price_per_pound,
+                                 case_total_weight_lb=latest.case_total_weight_lb)
 
         if dry_run:
             print(f"   [DRY RUN] row {row_num}: '{product_name}' → ${unit_price:.2f} "

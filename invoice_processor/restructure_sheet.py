@@ -116,13 +116,22 @@ def _load_products_from_db():
         case_size = latest.case_size if latest else ""
         vendor = top_vendor['vendor__name'] if top_vendor else ""
 
-        # Calculate IUP and P/#. Parser's stored price_per_pound wins over
-        # reverse-engineering whenever the ILI carries it.
+        # Calculate IUP and P/#. Phase 3a: structured fields from latest ILI
+        # (case_pack_count, case_total_weight_lb) bypass case_size string parse
+        # when populated. Parser's stored_price_per_lb still wins over derived
+        # weight math.
         stored_ppp = latest.price_per_pound if latest else None
-        iup = calc_iup(unit_price, case_size) if unit_price and case_size else None
+        case_pack_count = latest.case_pack_count if latest else None
+        case_total_weight_lb = (float(latest.case_total_weight_lb)
+                                if latest and latest.case_total_weight_lb is not None
+                                else None)
+        iup = (calc_iup(unit_price, case_size, case_pack_count=case_pack_count)
+               if unit_price and (case_size or case_pack_count) else None)
         pplb = (calc_price_per_lb(unit_price, case_size,
-                                  stored_price_per_lb=stored_ppp)
-                if unit_price and (case_size or stored_ppp) else None)
+                                  stored_price_per_lb=stored_ppp,
+                                  case_total_weight_lb=case_total_weight_lb)
+                if unit_price and (case_size or stored_ppp or case_total_weight_lb)
+                else None)
 
         result.append({
             "canonical_name": p.canonical_name,

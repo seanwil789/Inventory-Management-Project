@@ -6197,6 +6197,131 @@ class SpatialFarmArtPurchaseUOMTests(TestCase):
         self.assertEqual(items[0]["case_size_raw"], "")
 
 
+class SynergySyncStructuredFieldTests(TestCase):
+    """`synergy_sync.calc_iup` + `calc_price_per_lb` Phase 3a — accept
+    structured kwargs (case_pack_count, case_total_weight_lb) from ILI
+    rows, bypass case_size string parse when present.
+
+    The Beef Chuck Flap cascade end-to-end fix: parser stores
+    case_total_weight_lb=42.7 (Phase 2b), calc_price_per_lb_v2 reads
+    it directly → 469.31 / 42.7 = $10.99/lb (correct), NOT the
+    Product.default_case_size fallback that produced the $197.53 cascade.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'synergy_sync' in sys.modules:
+            del sys.modules['synergy_sync']
+        import synergy_sync
+        return synergy_sync
+
+    def test_calc_iup_structured_path(self):
+        """case_pack_count provided → use it directly. $24.50 / 6 = $4.083."""
+        ss = self._import()
+        # 6 individual cans of Heinz @ $24.50 case price → IUP $4.0833
+        self.assertEqual(ss.calc_iup(24.50, '', case_pack_count=6), 4.0833)
+        # Bigger pack — Burgers 60×5.3OZ — $82.85 / 60 patties = $1.3808/patty
+        self.assertEqual(ss.calc_iup(82.85, '', case_pack_count=60), 1.3808)
+
+    def test_calc_iup_structured_takes_priority_over_case_size_string(self):
+        """When BOTH case_pack_count AND case_size are provided, the
+        structured field wins. Closes the case_size-string-parse-error
+        attack surface."""
+        ss = self._import()
+        # case_size='garbage' would fail parse_unit_count → None
+        # case_pack_count=12 should still drive the IUP correctly
+        self.assertEqual(ss.calc_iup(24.00, 'garbage_string',
+                                      case_pack_count=12), 2.00)
+
+    def test_calc_iup_falls_back_to_string_when_structured_null(self):
+        """When case_pack_count is None, legacy parse_unit_count(case_size)
+        path runs — backward-compat for ILI rows pre-backfill."""
+        ss = self._import()
+        # No case_pack_count → must parse '12/1GAL' as count=12
+        self.assertEqual(ss.calc_iup(24.00, '12/1GAL', case_pack_count=None),
+                          2.0)
+
+    def test_calc_iup_pack_count_one_returns_none(self):
+        """case_pack_count=1 means single-unit case — IUP is meaningless
+        (would equal unit_price). Returns None to signal 'no subdivision'."""
+        ss = self._import()
+        self.assertIsNone(ss.calc_iup(50.00, '', case_pack_count=1))
+
+    def test_calc_price_per_lb_structured_path(self):
+        """case_total_weight_lb provided → bypass case_size parsing.
+        THE Beef Chuck Flap cascade fix: $469.31 / 42.7 lb = $10.99/lb
+        (correct), not $197.53 (which was the case-total leak from
+        parser's price_per_pound storage error)."""
+        ss = self._import()
+        self.assertEqual(ss.calc_price_per_lb(469.31, '', '',
+                                               case_total_weight_lb=42.7),
+                          10.9909)
+
+    def test_calc_price_per_lb_priority_order(self):
+        """Priority: stored > structured > case_size string > unit_col fallback."""
+        ss = self._import()
+        # 1. Stored ppp wins over everything
+        self.assertEqual(ss.calc_price_per_lb(
+            469.31, '17.99LB', '',
+            stored_price_per_lb=10.99,
+            case_total_weight_lb=42.7,
+        ), 10.99)
+        # 2. Structured wins over case_size string when stored is null
+        self.assertEqual(ss.calc_price_per_lb(
+            469.31, '17.99LB', '',
+            stored_price_per_lb=None,
+            case_total_weight_lb=42.7,
+        ), 10.9909)
+        # 3. case_size string used when both stored + structured null
+        self.assertEqual(ss.calc_price_per_lb(
+            469.31, '42.7LB', '',
+            stored_price_per_lb=None,
+            case_total_weight_lb=None,
+        ), 10.9909)
+        # All three null + no unit_col fallback → None
+        self.assertIsNone(ss.calc_price_per_lb(
+            469.31, '', '',
+            stored_price_per_lb=None,
+            case_total_weight_lb=None,
+        ))
+
+    def test_calc_price_per_lb_zero_total_weight_skipped(self):
+        """case_total_weight_lb=0 (or negative) shouldn't divide-by-zero —
+        treat as null and fall through."""
+        ss = self._import()
+        # Falls through to case_size parse
+        self.assertEqual(ss.calc_price_per_lb(50.0, '10LB', '',
+                                               case_total_weight_lb=0), 5.0)
+
+    def test_calc_price_per_lb_invalid_total_weight_skipped(self):
+        """Non-numeric case_total_weight_lb → fall through to legacy."""
+        ss = self._import()
+        self.assertEqual(ss.calc_price_per_lb(50.0, '10LB', '',
+                                               case_total_weight_lb='bad'),
+                          5.0)
+
+
+class SnapshotSynergySheetCommandTests(TestCase):
+    """`snapshot_synergy_sheet` mgmt cmd — smoke + error-path tests.
+    Full snapshot/restore exercises the live Sheets API, which test
+    fixtures don't drive. Tests here cover argument validation +
+    file-not-found error path."""
+
+    def test_restore_file_not_found_raises(self):
+        """Restore mode with a missing path → clear CommandError."""
+        from django.core.management import call_command
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError) as ctx:
+            call_command('snapshot_synergy_sheet',
+                         '--restore', '/tmp/nonexistent_snapshot.json',
+                         verbosity=0)
+        self.assertIn('not found', str(ctx.exception).lower())
+
+
 class ProductInventoryClassFieldTests(TestCase):
     """`Product.inventory_class` + `inventory_unit_descriptor` schema fields.
     Phase 1 of structured schema migration. Pure additive — existing
