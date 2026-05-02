@@ -476,7 +476,17 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
             unit_price__isnull=False,
         )
         .select_related("product", "vendor")
-        .order_by("-invoice_date", "-imported_at")   # latest first
+        # Phase 3c (2026-05-02): -extended_amount tiebreaker per the bug
+        # register umbrella entry's "Three new variants" #3. Butter row 182
+        # had two same-date ILIs ($1.40 fragment vs $97.39 case total); the
+        # default -invoice_date / -imported_at order picked the fragment
+        # (whichever was inserted last). Sorting by -extended_amount within
+        # date pushes the real case-price row to the top, so first-wins
+        # dedup picks the right one. Backward compat for non-conflict cases:
+        # only tiebreaks when multiple rows share (canonical, vendor, date),
+        # which is uncommon outside the path-divergence dup case.
+        .order_by("-invoice_date", "-extended_amount", "-unit_price",
+                   "-imported_at")
     )
 
     # Deduplicate: keep the latest price per (canonical, vendor)

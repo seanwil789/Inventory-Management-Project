@@ -6424,6 +6424,104 @@ class IngredientCostCountPerLbTests(TestCase):
         self.assertEqual(cost, Decimal('0.39'))
 
 
+class SynergySyncWrongDupPickFixTests(TestCase):
+    """`load_items_for_month` Phase 3c — when same-date ILI duplicates exist
+    with conflicting unit_prices, prefer the row with the higher
+    extended_amount. The Butter row 182 case from the umbrella entry's
+    "Three new variants" #3: \$1.40 fragment + \$97.39 case total on the
+    same date — sheet was getting the fragment. New: case total wins."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'synergy_sync' in sys.modules:
+            del sys.modules['synergy_sync']
+        import synergy_sync
+        return synergy_sync
+
+    def test_picks_higher_extended_amount_among_same_date_dups(self):
+        """Two ILIs same (canonical, vendor, invoice_date) with $1.40 vs
+        $97.39 → load_items_for_month returns the $97.39 one."""
+        ss = self._import()
+        sysco = Vendor.objects.create(name='Sysco')
+        butter = Product.objects.create(
+            canonical_name='Butter, Salted',
+            category='Dairy',
+            primary_descriptor='Butter',
+        )
+        # Fragment row (the wrong one — synergy_sync was picking this)
+        InvoiceLineItem.objects.create(
+            vendor=sysco, product=butter,
+            raw_description='BUTTER FRAGMENT',
+            unit_price=Decimal('1.40'),
+            extended_amount=Decimal('1.40'),
+            case_size='1', invoice_date=date(2026, 4, 20),
+            match_confidence='vendor_exact',
+        )
+        # Real case row (the correct one)
+        InvoiceLineItem.objects.create(
+            vendor=sysco, product=butter,
+            raw_description='SYS CLS BUTTER PRINTS 36/1#',
+            unit_price=Decimal('97.39'),
+            extended_amount=Decimal('97.39'),
+            case_size='36/1LB', invoice_date=date(2026, 4, 20),
+            match_confidence='vendor_exact',
+        )
+        items = ss.load_items_for_month(2026, 4)
+        butter_items = [i for i in items if i['canonical'] == 'Butter, Salted']
+        self.assertEqual(len(butter_items), 1)
+        # The real case price wins, not the $1.40 fragment
+        self.assertEqual(butter_items[0]['unit_price'], 97.39)
+
+    def test_normal_single_row_unaffected(self):
+        """Non-conflict case: one ILI per (canonical, vendor, date). Phase 3c
+        change must not alter the answer."""
+        ss = self._import()
+        sysco = Vendor.objects.create(name='Sysco')
+        flour = Product.objects.create(canonical_name='AP Flour', category='Drystock')
+        InvoiceLineItem.objects.create(
+            vendor=sysco, product=flour,
+            raw_description='FLOUR ALL PURP',
+            unit_price=Decimal('19.95'),
+            extended_amount=Decimal('19.95'),
+            case_size='50LB', invoice_date=date(2026, 4, 15),
+            match_confidence='vendor_exact',
+        )
+        items = ss.load_items_for_month(2026, 4)
+        flour_items = [i for i in items if i['canonical'] == 'AP Flour']
+        self.assertEqual(len(flour_items), 1)
+        self.assertEqual(flour_items[0]['unit_price'], 19.95)
+
+    def test_latest_date_still_wins_across_dates(self):
+        """Two ILIs different dates: latest still wins (existing behavior).
+        Phase 3c only tiebreaks WITHIN a date, not across."""
+        ss = self._import()
+        sysco = Vendor.objects.create(name='Sysco')
+        flour = Product.objects.create(canonical_name='AP Flour', category='Drystock')
+        # Earlier date, higher price
+        InvoiceLineItem.objects.create(
+            vendor=sysco, product=flour, raw_description='FLOUR',
+            unit_price=Decimal('25.00'), extended_amount=Decimal('25.00'),
+            case_size='50LB', invoice_date=date(2026, 4, 1),
+            match_confidence='vendor_exact',
+        )
+        # Later date, lower price (sale week)
+        InvoiceLineItem.objects.create(
+            vendor=sysco, product=flour, raw_description='FLOUR',
+            unit_price=Decimal('19.95'), extended_amount=Decimal('19.95'),
+            case_size='50LB', invoice_date=date(2026, 4, 20),
+            match_confidence='vendor_exact',
+        )
+        items = ss.load_items_for_month(2026, 4)
+        flour_items = [i for i in items if i['canonical'] == 'AP Flour']
+        self.assertEqual(len(flour_items), 1)
+        # Latest date wins, not highest price across dates
+        self.assertEqual(flour_items[0]['unit_price'], 19.95)
+
+
 class ProductInventoryClassFieldTests(TestCase):
     """`Product.inventory_class` + `inventory_unit_descriptor` schema fields.
     Phase 1 of structured schema migration. Pure additive — existing
