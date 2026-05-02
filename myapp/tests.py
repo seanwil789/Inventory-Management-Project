@@ -8261,3 +8261,143 @@ class ProductEditViewTests(TestCase):
         })
         self.assertEqual(r.status_code, 302)
         self.assertTrue(Product.objects.filter(id=self.bad.id).exists())
+
+
+class BackfillInventoryClassTests(TestCase):
+    """Phase 3e prerequisite — Product.inventory_class auto-backfill heuristics.
+
+    The mapper inventory_class type-check needs the field populated. These
+    tests pin the conservative heuristic so future drift is caught.
+    """
+
+    def _run(self, apply_writes=False):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        args = ['backfill_inventory_class']
+        if apply_writes:
+            args.append('--apply')
+        call_command(*args, stdout=out)
+        return out.getvalue()
+
+    def test_proteins_default_to_weighed(self):
+        from myapp.models import Product
+        p = Product.objects.create(canonical_name='Sirloin', category='Proteins',
+                                   default_case_size='10LB')
+        self._run(apply_writes=True)
+        p.refresh_from_db()
+        self.assertEqual(p.inventory_class, 'weighed')
+
+    def test_eggs_carve_out(self):
+        from myapp.models import Product
+        eggs = Product.objects.create(canonical_name='Eggs', category='Proteins',
+                                      default_case_size='15DOZ')
+        self._run(apply_writes=True)
+        eggs.refresh_from_db()
+        self.assertEqual(eggs.inventory_class, 'counted_with_weight')
+
+    def test_volume_regex_overrides_category(self):
+        from myapp.models import Product
+        # Mayo lives in Drystock but ships in gallons → volume not weight.
+        mayo = Product.objects.create(canonical_name='Mayo', category='Drystock',
+                                      default_case_size='1 GAL')
+        self._run(apply_writes=True)
+        mayo.refresh_from_db()
+        self.assertEqual(mayo.inventory_class, 'counted_with_volume')
+
+    def test_cheese_skipped_subjective(self):
+        from myapp.models import Product
+        # Block cheese vs shredded cheese is subjective — leave blank.
+        cheddar = Product.objects.create(canonical_name='Cheddar Block',
+                                         category='Dairy',
+                                         primary_descriptor='Cheese, Semi-Hard',
+                                         default_case_size='5LB')
+        self._run(apply_writes=True)
+        cheddar.refresh_from_db()
+        self.assertEqual(cheddar.inventory_class, '')
+
+    def test_spices_skipped_mixed(self):
+        from myapp.models import Product
+        salt = Product.objects.create(canonical_name='Salt', category='Spices',
+                                      default_case_size='1/23LB')
+        self._run(apply_writes=True)
+        salt.refresh_from_db()
+        self.assertEqual(salt.inventory_class, '')
+
+    def test_pseudo_skipped(self):
+        from myapp.models import Product
+        meatball = Product.objects.create(canonical_name='Meatball-Synth',
+                                          category='Pseudo')
+        self._run(apply_writes=True)
+        meatball.refresh_from_db()
+        self.assertEqual(meatball.inventory_class, '')
+
+    def test_clear_packaged_categories(self):
+        from myapp.models import Product
+        bagel = Product.objects.create(canonical_name='Bagel', category='Bakery',
+                                       default_case_size='15/6CT')
+        gloves = Product.objects.create(canonical_name='Gloves Test',
+                                        category='Smallwares',
+                                        default_case_size='10/100CT')
+        cereal = Product.objects.create(canonical_name='Cinnamon Toast',
+                                        category='Coffee/Concessions',
+                                        default_case_size='4/34OZ')
+        self._run(apply_writes=True)
+        for p in (bagel, gloves, cereal):
+            p.refresh_from_db()
+            self.assertEqual(p.inventory_class, 'counted_with_weight',
+                             msg=f'{p.canonical_name} mis-classified')
+
+    def test_produce_split_by_case_size(self):
+        from myapp.models import Product
+        # CT case size → counted_with_weight
+        apple = Product.objects.create(canonical_name='Apple, Test',
+                                       category='Produce',
+                                       default_case_size='88CT')
+        # LB case size → weighed
+        carrot = Product.objects.create(canonical_name='Carrot, Test',
+                                        category='Produce',
+                                        default_case_size='1/50LB')
+        # No signal → blank
+        eggplant = Product.objects.create(canonical_name='Eggplant, Test',
+                                          category='Produce',
+                                          default_case_size='1/9')
+        self._run(apply_writes=True)
+        apple.refresh_from_db(); carrot.refresh_from_db(); eggplant.refresh_from_db()
+        self.assertEqual(apple.inventory_class, 'counted_with_weight')
+        self.assertEqual(carrot.inventory_class, 'weighed')
+        self.assertEqual(eggplant.inventory_class, '')
+
+    def test_dry_run_does_not_write(self):
+        from myapp.models import Product
+        p = Product.objects.create(canonical_name='Pork Loin Test',
+                                   category='Proteins', default_case_size='10LB')
+        out = self._run(apply_writes=False)
+        self.assertIn('DRY-RUN', out)
+        p.refresh_from_db()
+        self.assertEqual(p.inventory_class, '')  # untouched
+
+    def test_idempotent_already_set(self):
+        """Re-running on a product whose class is already set is a no-op."""
+        from myapp.models import Product
+        p = Product.objects.create(canonical_name='Pork Loin Idem',
+                                   category='Proteins',
+                                   default_case_size='10LB',
+                                   inventory_class='counted_with_volume')  # wrong-but-set
+        self._run(apply_writes=True)
+        p.refresh_from_db()
+        # Heuristic should NOT overwrite an existing value.
+        self.assertEqual(p.inventory_class, 'counted_with_volume')
+
+    def test_volume_regex_does_not_match_pt_in_other_words(self):
+        """`Apple, Gala` (no 'GAL' substring vs whole word) — verify the
+        regex only fires on standalone unit tokens, not embedded letters."""
+        from myapp.models import Product
+        # 'GALA' should NOT match 'GAL' volume token
+        apple = Product.objects.create(canonical_name='Apple, Gala Test',
+                                       category='Produce',
+                                       default_case_size='88GALA')  # contrived
+        self._run(apply_writes=True)
+        apple.refresh_from_db()
+        self.assertNotEqual(apple.inventory_class, 'counted_with_volume',
+                            msg='GALA in case_size should not trigger volume regex')
