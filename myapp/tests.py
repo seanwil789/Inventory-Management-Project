@@ -8443,11 +8443,15 @@ class DBWriteClassMismatchGuardTests(TestCase):
         self.assertFalse(_is_class_mismatch(self.mayo, 'MAYONNAISE 1 GAL', '1 GAL'))
 
     def test_no_class_signal_bypasses_check(self):
-        """Plain weight-pack raw with no volume signal → no rejection."""
+        """Plain weight-pack raw with no volume + no protein signal → no rejection."""
         from invoice_processor.db_write import _is_class_mismatch
-        # Counted-with-weight raw with no volume tokens passes any product.
+        # No volume tokens AND no protein keyword → bypass.
+        # NOTE: 'YOGURT GREEK 12/4OZ' against weighed-shrimp doesn't trigger
+        # protein keyword (YOGURT not in seafood list); doesn't trigger
+        # volume (12/4OZ is a pack format, not GAL/QT/PT).
         self.assertFalse(_is_class_mismatch(self.shrimp, 'YOGURT GREEK 12/4OZ', '12/4OZ'))
-        self.assertFalse(_is_class_mismatch(self.yogurt, 'SHRIMP 16/20', '2/5LB'))
+        # Plain produce with no signals
+        self.assertFalse(_is_class_mismatch(self.yogurt, 'CARROT FRESH 50LB', '50LB'))
 
     def test_unset_product_class_bypasses_check(self):
         """Product.inventory_class='' (122 unset products) → no rejection."""
@@ -8595,3 +8599,86 @@ class CleanupExistingMismapsTests(TestCase):
         sysco_ili.refresh_from_db(); farmart_ili.refresh_from_db()
         self.assertIsNone(sysco_ili.product)         # detached
         self.assertEqual(farmart_ili.product, prod)  # untouched (other vendor)
+
+
+class Phase3fProteinKeywordClassGuardTests(TestCase):
+    """Phase 3f — extend class guard to detect seafood/cured-cut keywords
+    as 'weighed' signal. Catches SHRIMP → Uncrustables PBJ class of mismaps.
+    """
+
+    def test_shrimp_keyword_infers_weighed(self):
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        cases = [
+            'LEPORTSIM SHRIMP WHT P&D TLON 21/2 CF2125PDTON',
+            'SHRIMP P&D 21/25',
+            'shrimp cocktail premium',
+        ]
+        for raw in cases:
+            self.assertEqual(_infer_raw_inventory_class(raw, ''), 'weighed',
+                             msg=f'{raw!r} should infer weighed')
+
+    def test_seafood_keywords(self):
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        for kw in ['SCALLOP', 'PRAWN', 'LOBSTER', 'CRAB', 'OYSTER',
+                   'SALMON', 'TUNA', 'TILAPIA', 'HALIBUT', 'TROUT']:
+            raw = f'IMP CLS {kw} FRESH PREM'
+            self.assertEqual(_infer_raw_inventory_class(raw, ''), 'weighed',
+                             msg=f'{kw!r} should infer weighed')
+
+    def test_cured_cut_keywords(self):
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        for kw in ['BACON', 'PROSCIUTTO', 'PEPPERONI', 'SALAMI', 'CAPOCOLLA',
+                   'BRISKET', 'RIBEYE', 'TENDERLOIN', 'SIRLOIN']:
+            raw = f'BBR IMP {kw} 16/20 CASE'
+            self.assertEqual(_infer_raw_inventory_class(raw, ''), 'weighed',
+                             msg=f'{kw!r} should infer weighed')
+
+    def test_volume_wins_over_protein_keyword(self):
+        """A '1 GAL salmon stock' is a volume product despite SALMON keyword.
+        Volume signal must win to avoid false-rejecting volume products with
+        seafood-named raw_descriptions."""
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        raw = 'SALMON STOCK 1 GAL'
+        self.assertEqual(_infer_raw_inventory_class(raw, '1 GAL'),
+                         'counted_with_volume')
+
+    def test_chopsticks_does_not_match_chop(self):
+        """Word-boundary regex must NOT match CHOP inside CHOPSTICKS."""
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        self.assertIsNone(_infer_raw_inventory_class('CHOPSTICKS BAMBOO', ''))
+        self.assertIsNone(_infer_raw_inventory_class('CHOPPED ONIONS', ''))
+
+    def test_no_protein_keyword_returns_none(self):
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        self.assertIsNone(_infer_raw_inventory_class('FLOUR AP 50LB', '50LB'))
+        self.assertIsNone(_infer_raw_inventory_class('CHEESE BLOCK 5LB', '5LB'))
+
+    def test_db_write_rejects_shrimp_to_non_weighed(self):
+        """Real-world Pi case: SHRIMP raw → Uncrustables PBJ canonical."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        Vendor.objects.get_or_create(name='Sysco')
+        # Pretend Uncrustables is in Coffee/Concessions = counted_with_weight
+        uncrust = Product.objects.create(
+            canonical_name='Uncrustables Test',
+            category='Coffee/Concessions',
+            inventory_class='counted_with_weight',
+            default_case_size='72CT')
+        items = [{
+            'canonical': 'Uncrustables Test',
+            'raw_description': 'LEPORTCLS SHRIMP WHT P&D TLOF 21/25',
+            'case_size_raw': '2/5LB',  # plausible shrimp pack
+            'unit_price': '5.50',
+            'extended_amount': '11.00',
+            'sysco_item_code': '',
+            'confidence': 'code',
+            'score': 100,
+            'quantity_ordered': '2',
+            'quantity_shipped': '2',
+        }]
+        write_invoice_to_db('Sysco', '2026-04-15', items, source_file='test.pdf')
+        ili = InvoiceLineItem.objects.filter(
+            raw_description__icontains='SHRIMP').first()
+        self.assertIsNotNone(ili)
+        self.assertIsNone(ili.product, 'SHRIMP→non-weighed should be rejected')
+        self.assertEqual(ili.match_confidence, 'unmatched_class_mismatch')

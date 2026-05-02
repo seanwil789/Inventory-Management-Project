@@ -98,14 +98,47 @@ _VOLUME_UNIT_RE = re.compile(
     re.IGNORECASE,
 )
 
+# Phase 3f (Sean 2026-05-02): protein keyword inference for class guard.
+#
+# Seafood + cured/butchered cuts are unambiguously WEIGHED in this domain
+# (industry $/lb pricing, scale at receiving). When a raw_description
+# mentions one of these and the candidate Product is NOT weighed, the
+# class guard rejects the FK attach. Catches the SHRIMP → Uncrustables
+# PBJ class of mismaps that the volume-only Phase 3e helper missed.
+#
+# Keywords are tight + explicit. Word boundaries prevent CHOP* false
+# positives (CHOPSTICKS, CHOPPED ONIONS). Beef/Pork/Chicken/Turkey are
+# excluded because they appear in many counted formats (sandwiches,
+# nuggets, frozen patties); use specific cut names instead.
+_PROTEIN_WEIGHED_KEYWORDS_RE = re.compile(
+    r'\b('
+    r'SHRIMP|PRAWN|LOBSTER|SCALLOP|CRAB|OYSTER|CLAM|MUSSEL|'
+    r'SALMON|TUNA|TILAPIA|HALIBUT|SARDINE|ANCHOVY|TROUT|'
+    r'BACON|PROSCIUTTO|PEPPERONI|SALAMI|CAPOCOLLA|CAPICOLA|'
+    r'BRISKET|RIBEYE|TENDERLOIN|SIRLOIN|FILET\s+MIGNON|'
+    r'PORK\s+BELLY|PORK\s+SHOULDER|PORK\s+LOIN|'
+    r'LAMB\s+SHOULDER|LAMB\s+CHOP|VEAL\s+CHOP'
+    r')\b',
+    re.IGNORECASE,
+)
+
+
 def _infer_raw_inventory_class(raw_desc: str, case_size: str) -> str | None:
-    """Best-effort class inference from raw line-item signals. Currently
-    only volume signal — high-confidence anchor. Returns None when no
-    strong signal exists (don't enforce → bypass)."""
+    """Best-effort class inference from raw line-item signals.
+
+    Volume signal (GAL/QT/PT/FL OZ) → counted_with_volume.
+    Protein keyword (SHRIMP/SCALLOP/BACON/etc.) → weighed.
+    Volume wins when both fire (a 1 GAL salmon-flavored stock is volume).
+
+    Returns None when no strong signal exists (don't enforce → bypass)."""
     candidates = (case_size or '', raw_desc or '')
     for text in candidates:
         if text and _VOLUME_UNIT_RE.search(text):
             return 'counted_with_volume'
+    # Protein keyword check on raw_description only — case_size never
+    # contains protein words.
+    if raw_desc and _PROTEIN_WEIGHED_KEYWORDS_RE.search(raw_desc):
+        return 'weighed'
     return None
 
 
