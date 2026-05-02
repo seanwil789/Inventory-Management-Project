@@ -79,6 +79,48 @@ def _is_boilerplate_raw_description(raw_desc: str) -> bool:
     return bool(_BOILERPLATE_RE.match(raw_desc.strip()))
 
 
+# Phase 3e (Sean 2026-05-02): inventory_class type-check guard.
+#
+# Catches catastrophic class-mismatch mismaps the boilerplate guard misses.
+# The umbrella bug class:
+#   "DAIRY YOGURT GREEK" (case_size 12/4OZ) → mapped to Shrimp (Proteins)
+#   "MAYONNAISE 1 GAL"   (case_size 1 GAL)  → mapped to Mayo (counted_with_weight)
+# When the raw line item has clear inventory-class signal (volume regex on
+# case_size or raw_description) AND the candidate Product has a populated
+# inventory_class that disagrees, we refuse the FK attach. Tags as
+# 'unmatched_class_mismatch' so the row surfaces in unmapped queue +
+# audits without polluting downstream cost/spend/sheet sync.
+#
+# Conservative — fires only when BOTH sides have determined class. Empty
+# Product.inventory_class (122 unset products as of backfill) → bypass.
+_VOLUME_UNIT_RE = re.compile(
+    r'(?:^|[^A-Za-z])(GAL|GALLON|QT|QUART|PT|PINT|FL\s*OZ|FLOZ)(?=$|[^A-Za-z])',
+    re.IGNORECASE,
+)
+
+def _infer_raw_inventory_class(raw_desc: str, case_size: str) -> str | None:
+    """Best-effort class inference from raw line-item signals. Currently
+    only volume signal — high-confidence anchor. Returns None when no
+    strong signal exists (don't enforce → bypass)."""
+    candidates = (case_size or '', raw_desc or '')
+    for text in candidates:
+        if text and _VOLUME_UNIT_RE.search(text):
+            return 'counted_with_volume'
+    return None
+
+
+def _is_class_mismatch(product, raw_desc: str, case_size: str) -> bool:
+    """True when raw line item's inferred class disagrees with the
+    product's inventory_class. Conservative: only fires on confident
+    signals on both sides."""
+    if product is None or not product.inventory_class:
+        return False
+    raw_class = _infer_raw_inventory_class(raw_desc, case_size)
+    if raw_class is None:
+        return False
+    return raw_class != product.inventory_class
+
+
 def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:
     """
     Check if a price is anomalous compared to the 90-day historical average
@@ -160,6 +202,21 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             product = None
             item = {**item, 'confidence': 'unmatched'}
             canonical = None  # also clear so drift-detection below doesn't fire
+
+        # Phase 3e (Sean 2026-05-02): inventory_class type-check guard.
+        # Reject FK attach when raw line item's volume/weight signal
+        # disagrees with the candidate Product's inventory_class. Catches
+        # CHOBANI YOGURT → Shrimp class jumps + GAL/QT-packed liquids
+        # mismapped to weighed proteins. Bypass when either side lacks
+        # determined class (122 of 549 Products are still 'review/blank').
+        if product is not None and _is_class_mismatch(
+                product, raw_desc_for_check, item.get('case_size_raw', '')):
+            print(f"  [!] Class mismatch: raw {raw_desc_for_check!r} "
+                  f"(cs={item.get('case_size_raw', '')!r}) → {canonical!r} "
+                  f"[{product.inventory_class}] — refusing FK attach.")
+            product = None
+            item = {**item, 'confidence': 'unmatched_class_mismatch'}
+            canonical = None
 
         # Sheet/DB drift detection: the mapper returned a canonical string
         # but no Product with that canonical_name exists in the DB. This

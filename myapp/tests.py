@@ -8401,3 +8401,108 @@ class BackfillInventoryClassTests(TestCase):
         apple.refresh_from_db()
         self.assertNotEqual(apple.inventory_class, 'counted_with_volume',
                             msg='GALA in case_size should not trigger volume regex')
+
+
+class DBWriteClassMismatchGuardTests(TestCase):
+    """Phase 3e — inventory_class type-check at db_write boundary.
+
+    Rejects FK attach when raw line item's class signal disagrees with
+    candidate Product.inventory_class. Catches CHOBANI YOGURT → Shrimp
+    class jumps that boilerplate guard misses.
+    """
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, ProductMapping
+        self.vendor, _ = Vendor.objects.get_or_create(name='Sysco')
+        # Weighed protein candidate (Shrimp).
+        self.shrimp = Product.objects.create(
+            canonical_name='Shrimp', category='Proteins',
+            inventory_class='weighed', default_case_size='2/5LB')
+        # Counted-with-weight dairy candidate (Yogurt single-serve).
+        self.yogurt = Product.objects.create(
+            canonical_name='Yogurt, Test', category='Dairy',
+            inventory_class='counted_with_weight', default_case_size='12/4OZ')
+        # Counted-with-volume candidate (Mayo gallon).
+        self.mayo = Product.objects.create(
+            canonical_name='Mayo, Test', category='Drystock',
+            inventory_class='counted_with_volume', default_case_size='1 GAL')
+
+    def test_volume_raw_blocked_from_weighed_canonical(self):
+        """raw with GAL in case_size → rejects weighed Product candidate."""
+        from invoice_processor.db_write import _is_class_mismatch
+        self.assertTrue(_is_class_mismatch(self.shrimp, 'OIL OLIVE BLEND', '6/1GAL'))
+
+    def test_volume_raw_blocked_from_counted_with_weight_canonical(self):
+        """raw with GAL in raw_description → rejects counted_w_w Product."""
+        from invoice_processor.db_write import _is_class_mismatch
+        self.assertTrue(_is_class_mismatch(self.yogurt, 'MAYONNAISE 1 GAL', ''))
+
+    def test_volume_raw_passes_volume_canonical(self):
+        """raw with GAL → passes counted_with_volume Product (matching)."""
+        from invoice_processor.db_write import _is_class_mismatch
+        self.assertFalse(_is_class_mismatch(self.mayo, 'MAYONNAISE 1 GAL', '1 GAL'))
+
+    def test_no_class_signal_bypasses_check(self):
+        """Plain weight-pack raw with no volume signal → no rejection."""
+        from invoice_processor.db_write import _is_class_mismatch
+        # Counted-with-weight raw with no volume tokens passes any product.
+        self.assertFalse(_is_class_mismatch(self.shrimp, 'YOGURT GREEK 12/4OZ', '12/4OZ'))
+        self.assertFalse(_is_class_mismatch(self.yogurt, 'SHRIMP 16/20', '2/5LB'))
+
+    def test_unset_product_class_bypasses_check(self):
+        """Product.inventory_class='' (122 unset products) → no rejection."""
+        from invoice_processor.db_write import _is_class_mismatch
+        from myapp.models import Product
+        unset = Product.objects.create(canonical_name='Cheddar Block Test',
+                                       category='Dairy', primary_descriptor='Cheese, Semi-Hard',
+                                       inventory_class='')
+        # Even with strong volume signal, blank class → bypass.
+        self.assertFalse(_is_class_mismatch(unset, 'CREAM 4/1GAL', '4/1GAL'))
+
+    def test_db_write_rejects_class_mismatch_end_to_end(self):
+        """db_write integration — class mismatch results in product=None
+        and confidence='unmatched_class_mismatch'."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import InvoiceLineItem, ProductMapping
+        # Pre-seed mapping so mapper produces 'code'-tier match.
+        items = [{
+            'canonical': 'Shrimp',  # mapper said Shrimp (Proteins, weighed)
+            'raw_description': 'MAYONNAISE 1 GAL CULINARY',
+            'case_size_raw': '1 GAL',
+            'unit_price': '5.50',
+            'extended_amount': '5.50',
+            'sysco_item_code': '',
+            'confidence': 'code',  # would normally bypass, but class-check still applies
+            'score': 100,
+            'quantity_ordered': '1',
+            'quantity_shipped': '1',
+        }]
+        write_invoice_to_db('Sysco', '2026-04-15', items, source_file='test.pdf')
+        ili = InvoiceLineItem.objects.filter(
+            raw_description='MAYONNAISE 1 GAL CULINARY').first()
+        self.assertIsNotNone(ili, 'ILI should be written')
+        self.assertIsNone(ili.product, 'Product FK should be detached')
+        self.assertEqual(ili.match_confidence, 'unmatched_class_mismatch')
+
+    def test_db_write_lets_through_class_match(self):
+        """Class match → FK attaches normally (no false positives)."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import InvoiceLineItem
+        items = [{
+            'canonical': 'Mayo, Test',
+            'raw_description': 'MAYONNAISE 1 GAL CULINARY',
+            'case_size_raw': '1 GAL',
+            'unit_price': '5.50',
+            'extended_amount': '5.50',
+            'sysco_item_code': '',
+            'confidence': 'code',
+            'score': 100,
+            'quantity_ordered': '1',
+            'quantity_shipped': '1',
+        }]
+        write_invoice_to_db('Sysco', '2026-04-15', items, source_file='test.pdf')
+        ili = InvoiceLineItem.objects.filter(
+            raw_description='MAYONNAISE 1 GAL CULINARY').first()
+        self.assertIsNotNone(ili)
+        self.assertEqual(ili.product, self.mayo,
+                         'Class match should preserve FK attach')
