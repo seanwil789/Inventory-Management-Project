@@ -6525,6 +6525,122 @@ class SynergySyncWrongDupPickFixTests(TestCase):
         self.assertEqual(flour_items[0]['unit_price'], 19.95)
 
 
+class DBWriteBoilerplateRejectionTests(TestCase):
+    """`db_write` Phase 3d — refuse to auto-attach FK when raw_description
+    matches known invoice boilerplate (SYNERGY HOUSES, addresses, phones,
+    headers). Per project_bug_register.md "Three new variants" #1: SUPC
+    code-tier matches were silently producing 'SYNERGY HOUSES' → Fries
+    Frozen mismaps because the mapper hit a legitimate code tier on an
+    adjacent column.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'db_write' in sys.modules:
+            del sys.modules['db_write']
+        import db_write
+        return db_write
+
+    def test_rejects_synergy_houses_boilerplate(self):
+        """The umbrella entry's canonical example: 'SYNERGY HOUSES' raw
+        with a SUPC code-tier match → reject FK, tag as unmatched."""
+        Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Fries Frozen',
+                                category='Drystock')
+        items = [{
+            'raw_description': 'SYNERGY HOUSES',
+            'canonical': 'Fries Frozen',
+            'sysco_item_code': '1234567',
+            'unit_price': 25.00, 'extended_amount': 25.00,
+            'case_size_raw': '', 'confidence': 'code',
+        }]
+        dbw = self._import()
+        dbw.write_invoice_to_db('Sysco', '2026-04-15', items, source_file='boil.jpg')
+
+        ili = InvoiceLineItem.objects.get(raw_description='SYNERGY HOUSES')
+        self.assertIsNone(ili.product, 'Boilerplate must NOT auto-attach FK')
+        self.assertEqual(ili.match_confidence, 'unmatched')
+
+    def test_rejects_address_boilerplate(self):
+        """City + state + ZIP pattern → reject."""
+        Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Lays', category='Coffee/Concessions')
+        items = [{
+            'raw_description': 'WEST CHESTER PA 19382-3223',
+            'canonical': 'Lays',
+            'sysco_item_code': '7654321',
+            'unit_price': 18.50, 'confidence': 'code',
+        }]
+        dbw = self._import()
+        dbw.write_invoice_to_db('Sysco', '2026-04-15', items, source_file='addr.jpg')
+        ili = InvoiceLineItem.objects.get(raw_description='WEST CHESTER PA 19382-3223')
+        self.assertIsNone(ili.product)
+
+    def test_rejects_phone_number(self):
+        """Phone number pattern → reject."""
+        Vendor.objects.create(name='Sysco')
+        Product.objects.create(canonical_name='Coffee', category='Coffee/Concessions')
+        items = [{
+            'raw_description': '610-888-1864',
+            'canonical': 'Coffee',
+            'sysco_item_code': '5555555',
+            'unit_price': 30.00, 'confidence': 'code',
+        }]
+        dbw = self._import()
+        dbw.write_invoice_to_db('Sysco', '2026-04-15', items, source_file='phone.jpg')
+        ili = InvoiceLineItem.objects.get(raw_description='610-888-1864')
+        self.assertIsNone(ili.product)
+
+    def test_legitimate_product_unaffected(self):
+        """Real product description must still attach FK normally."""
+        Vendor.objects.create(name='Sysco')
+        flour = Product.objects.create(canonical_name='AP Flour', category='Drystock')
+        items = [{
+            'raw_description': 'SYS CLS FLOUR ALL PURP H&R BL E',
+            'canonical': 'AP Flour',
+            'sysco_item_code': '5239389',
+            'unit_price': 12.49, 'extended_amount': 12.49,
+            'case_size_raw': '50LB', 'confidence': 'code',
+        }]
+        dbw = self._import()
+        dbw.write_invoice_to_db('Sysco', '2026-04-15', items, source_file='real.jpg')
+        ili = InvoiceLineItem.objects.get(
+            raw_description='SYS CLS FLOUR ALL PURP H&R BL E')
+        self.assertEqual(ili.product, flour, 'Real product must attach FK')
+        self.assertEqual(ili.match_confidence, 'code')
+
+    def test_helper_pattern_coverage(self):
+        """Direct test of _is_boilerplate_raw_description for each
+        documented boilerplate pattern."""
+        dbw = self._import()
+        # Positives — should reject
+        for raw in [
+            'SYNERGY HOUSES', "CUSTOMER'S ORIGINAL", 'TRUCK STOP',
+            'WEST CHESTER PA 19382-3223', 'PHILADELPHIA, PA',
+            '610-888-1864', '(610) 888-1864',
+            'PA 19013', 'CONFIDENTIAL PROPERTY OF SYSCO',
+            'P.O. BOX 723', "DRIVER'S SIGNATURE",
+        ]:
+            self.assertTrue(dbw._is_boilerplate_raw_description(raw),
+                f"Should reject: {raw!r}")
+
+        # Negatives — must pass through
+        for raw in [
+            'SYS CLS FLOUR ALL PURP H&R BL E',
+            'PINEAPPLES, "GOLDEN RIPE" 6CT',
+            'BACON LAYFLAT 10/14',
+            'JTM BURGER BEEF SBSDR ANGUS 5.3 OZ PATTY',
+            '',  # empty is not boilerplate; just no-data
+            None,
+        ]:
+            self.assertFalse(dbw._is_boilerplate_raw_description(raw),
+                f"Should NOT reject: {raw!r}")
+
+
 class ProductInventoryClassFieldTests(TestCase):
     """`Product.inventory_class` + `inventory_unit_descriptor` schema fields.
     Phase 1 of structured schema migration. Pure additive — existing

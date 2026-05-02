@@ -5,6 +5,7 @@ Writes processed invoice line items to the Django database.
 Must be called from within a Django context (settings configured).
 """
 import os
+import re
 import sys
 import django
 from decimal import Decimal, InvalidOperation
@@ -32,6 +33,50 @@ from django.db.models import Avg
 # subset-match 'Apple' canonical when there's no Apple Cider canonical
 # yet. Quarantine surfaces the suggestion for Sean to confirm/override.
 _FUZZY_TIERS = {'vendor_fuzzy', 'fuzzy', 'stripped_fuzzy', 'subset_match'}
+
+
+# Phase 3d (Sean 2026-05-02): boilerplate-rejection guard.
+#
+# OCR captures invoice headers/addresses/customer-names as text that
+# accidentally pairs with adjacent SUPC codes during column-dump parsing.
+# The mapper hits a SUPC code-tier match (legitimate Product), but the
+# raw_description is "SYNERGY HOUSES" or "TRUCK STOP" — not a real
+# product line. Today's db_write attaches the FK regardless, producing
+# silent mismaps:
+#   "SYNERGY HOUSES"           → Fries Frozen
+#   "WEST CHESTER PA 19382"    → Lays
+#   "CUSTOMER'S ORIGINAL"      → Bread, White
+#   "TRUCK STOP"               → Wrap, White
+# audit_real_suspects surfaces these AFTER the fact; the guard prevents
+# them at write time. Tags rows as 'unmatched' (no FK) so they show up
+# in the unmapped queue + don't pollute spend/cost/sheet sync.
+_BOILERPLATE_RE = re.compile(
+    r"^CUSTOMER'?S\s+ORIGINAL$"
+    r"|^TRUCK\s+STOP$"
+    r"|^SYNERGY\s+HOUSE[S]?$"
+    r"|^THE\s+WENTWORTH\s+SYNERGY"
+    r"|^JFT\s+COMMUNIT(?:Y|IES)$"
+    r"|^WEST\s+CHESTER\s+PA"
+    r"|^PHILADELPHIA,?\s+PA"
+    r"|^CHESTER,?\s+PA"
+    r"|^P\.?O\.?\s*BOX"
+    r"|^\d{2,5}\s+[A-Z]\s+(?:CHURCH|BROAD|MAIN|MARKET|HIGH|HEMLOCK)"  # street addr
+    r"|^\d{3}[-.]\d{3}[-.]\d{4}$"   # phone number
+    r"|^\([0-9]{3}\)\s*\d{3}[-.]\d{4}$"
+    r"|^[A-Z]{2}\s+\d{5}(?:-\d{4})?$"  # state ZIP
+    r"|^DRIVER'?S\s+SIGN"
+    r"|^CONFIDENTIAL\s+PROPERTY",
+    re.IGNORECASE,
+)
+
+def _is_boilerplate_raw_description(raw_desc: str) -> bool:
+    """True when raw_description matches known invoice boilerplate
+    (header/address/customer-name/phone). At db_write time, refuse to
+    auto-attach a Product FK to these rows even if a code tier hit —
+    they aren't real products."""
+    if not raw_desc:
+        return False
+    return bool(_BOILERPLATE_RE.match(raw_desc.strip()))
 
 
 def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:
@@ -101,6 +146,20 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
     for item in items:
         canonical = item.get('canonical')
         product   = Product.objects.filter(canonical_name=canonical).first() if canonical else None
+        raw_desc_for_check = item.get('raw_description', '')
+
+        # Phase 3d (Sean 2026-05-02): boilerplate-rejection guard.
+        # If the raw_description matches known invoice header/address/
+        # customer-name boilerplate, refuse to auto-attach the FK even
+        # if mapper produced a canonical (typically via SUPC code tier
+        # on an adjacent column). Tag as 'unmatched' so the row surfaces
+        # in the unmapped queue + doesn't pollute spend/cost/sheet sync.
+        if product is not None and _is_boilerplate_raw_description(raw_desc_for_check):
+            print(f"  [!] Boilerplate rejection: raw {raw_desc_for_check!r} "
+                  f"would have mapped to {canonical!r} — refusing FK attach.")
+            product = None
+            item = {**item, 'confidence': 'unmatched'}
+            canonical = None  # also clear so drift-detection below doesn't fire
 
         # Sheet/DB drift detection: the mapper returned a canonical string
         # but no Product with that canonical_name exists in the DB. This
