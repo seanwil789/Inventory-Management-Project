@@ -75,6 +75,16 @@ class Command(BaseCommand):
                                  'current canonical PLUS extra tokens. Proven '
                                  '100% accurate empirically; suitable for '
                                  'bulk --apply without per-row review.')
+                            # Mutually exclusive with --safe-only is fine —
+                            # --safe-only is stricter so it implicitly excludes
+                            # bad proposals.
+        parser.add_argument('--exclude-bad', action='store_true',
+                            help='Filter OUT proposals where proposed has '
+                                 'fewer tokens than current (specificity-loss '
+                                 'class — Sausage,Italian → Sausage; Trail '
+                                 'Mix → Almonds). Keeps SAFE + AMBIGUOUS '
+                                 'buckets, drops the BAD bucket. Use as the '
+                                 'default review surface.')
 
     def handle(self, *args, **opts):
         apply_writes = opts['apply']
@@ -152,10 +162,14 @@ class Command(BaseCommand):
             # → Almonds) that subset_match's most-specific tiebreaker
             # mistakenly proposes when the current canonical is also a
             # subset of raw tokens but coarser.
+            cur_t = _tokens(current)
+            pro_t = _tokens(proposed)
             if safe_only:
-                cur_t = _tokens(current)
-                pro_t = _tokens(proposed)
                 if not (pro_t > cur_t and cur_t.issubset(pro_t)):
+                    continue
+            elif opts['exclude_bad']:
+                # Drop only the "less-specific" class — keeps SAFE + AMBIGUOUS.
+                if len(pro_t) < len(cur_t):
                     continue
             proposals.append({
                 'pm_id': pm.id,

@@ -9853,3 +9853,23 @@ class AuditPMCanonicalDriftTests(TestCase):
         # Original drift case (FROZEN CORN → Corn, Frozen) is gain-specificity
         self.assertIn("'Corn'", out)
         self.assertIn("'Corn, Frozen'", out)
+
+    def test_exclude_bad_drops_specificity_loss(self):
+        """--exclude-bad drops proposals where proposed has fewer tokens
+        than current. Keeps gain-specificity AND ambiguous proposals."""
+        from myapp.models import Product, ProductMapping
+        # Set up specificity-loss case: 'Sausage Italian Test' currently mapped
+        # via PM with raw lacking 'Italian' — subset_match would propose 'Sausage Test'
+        sausage = Product.objects.create(canonical_name='Sausage Test', category='Proteins')
+        sausage_italian = Product.objects.create(
+            canonical_name='Sausage, Italian Test', category='Proteins')
+        bad_pm = ProductMapping.objects.create(
+            vendor=self.v, product=sausage_italian,
+            description='SAUSAGE PORK CKD',  # only 'Sausage' token, no 'Italian'
+        )
+        out = self._run('--exclude-bad')
+        # Bad proposal (Sausage, Italian → Sausage) filtered out
+        self.assertNotIn("'Sausage Test'", out)
+        # Gain-specificity proposal still surfaces
+        self.assertIn("'Corn'", out)
+        self.assertIn("'Corn, Frozen'", out)
