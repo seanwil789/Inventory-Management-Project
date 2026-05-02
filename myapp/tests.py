@@ -2889,7 +2889,13 @@ class SpatialMatcherOtherVendorsTests(TestCase):
         self.assertIn("CREAM", desc.upper())
         self.assertNotIn("United", desc)  # COOL filtered out
         self.assertEqual(items[0]["extended_amount"], 9.80)
-        self.assertEqual(items[0]["case_size_raw"], "EACH")
+        # Phase 2c (2026-05-02): U/M (EACH) lands in purchase_uom, NOT
+        # case_size_raw. case_size_raw is now blank for Farm Art (the U/M
+        # column was being mis-stuffed there before, polluting downstream
+        # calc_iup / calc_price_per_lb).
+        self.assertEqual(items[0]["case_size_raw"], "")
+        self.assertEqual(items[0]["purchase_uom"], "EACH")
+        self.assertEqual(items[0]["unit_of_measure"], "EACH")
 
     # ── Delaware ───────────────────────────────────────────────────────
     def test_delaware_small_volume_extraction(self):
@@ -6123,6 +6129,72 @@ Balance Due
         self.assertEqual(cheese['unit_of_measure'], 'CS')
         # purchase_uom matches per (the price-per unit, which IS 'CS' here)
         self.assertEqual(cheese.get('purchase_uom'), 'CS')
+
+
+class SpatialFarmArtPurchaseUOMTests(TestCase):
+    """`match_farmart_spatial` Phase 2c — U/M column (EACH/CASE/LB) lands
+    in purchase_uom, NOT case_size_raw. The umbrella entry's Celery row 163
+    is the failing case: '3 stalks @ $2.60/EACH = $7.72' couldn't be
+    distinguished from '$7.72/case' downstream because U/M was dropped
+    (or worse, mis-stuffed into case_size_raw)."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'spatial_matcher' in sys.modules:
+            del sys.modules['spatial_matcher']
+        import spatial_matcher
+        return spatial_matcher
+
+    def _row(self, y, tokens):
+        out = []
+        for text, x in tokens:
+            out.append({"text": text, "x_min": x, "x_max": x + 0.05,
+                        "y_min": y, "y_max": y + 0.01,
+                        "char_start": 0, "char_end": 0})
+        return out
+
+    def test_celery_each_distinguished_from_case(self):
+        """Celery '3 stalks @ EACH pricing' — purchase_uom='EACH' lets
+        downstream consumers treat unit_price as per-stalk, not per-case."""
+        sm = self._import()
+        # Synthetic Farm Art row: 3 EACH celery stalks @ $2.60 each = $7.72
+        tokens = self._row(0.40, [
+            ("3.000", 0.07), ("3.000", 0.12),  # qty ord/ship
+            ("EACH", 0.16),                      # U/M
+            ("CRESC", 0.20),                     # item code
+            ("CELERY", 0.30), ("STALK", 0.36),
+            ("United", 0.70), ("States", 0.74),
+            ("2.60", 0.83), ("7.80", 0.90),
+        ])
+        items = sm.match_farmart_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 1)
+        # Phase 2c acceptance: per-piece distinguishable from per-case
+        self.assertEqual(items[0]["purchase_uom"], "EACH")
+        self.assertEqual(items[0]["case_size_raw"], "")
+        self.assertEqual(items[0]["quantity"], 3.0)
+        self.assertEqual(items[0]["extended_amount"], 7.80)
+
+    def test_case_unit_distinct_from_each(self):
+        """1 CASE Milk @ $24.50 — purchase_uom='CASE' tags as case-priced."""
+        sm = self._import()
+        tokens = self._row(0.40, [
+            ("1.000", 0.07), ("1.000", 0.12),
+            ("CASE", 0.16),
+            ("MIL2", 0.20),
+            ("DAIRY", 0.30), ("MILK", 0.36),
+            ("United", 0.70), ("States", 0.74),
+            ("24.50", 0.83), ("24.50", 0.90),
+        ])
+        items = sm.match_farmart_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 1)
+        self.assertEqual(items[0]["purchase_uom"], "CASE")
+        # Same purchase_uom for both CASE and EACH paths — downstream
+        # consumers branch on the value, not on field presence
+        self.assertEqual(items[0]["case_size_raw"], "")
 
 
 class ProductInventoryClassFieldTests(TestCase):

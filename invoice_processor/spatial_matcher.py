@@ -708,13 +708,22 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
             if not description:
                 continue
 
+            # Phase 2c (2026-05-02): structured Farm Art emit.
+            # U/M (EACH/CASE/LB) lands in purchase_uom — it's the order unit,
+            # NOT the case size. Today's case_size_raw was being stuffed with
+            # U/M which polluted downstream calc_iup / calc_price_per_lb.
+            # case_size_raw left blank from spatial; description-extracted
+            # weight (e.g. "1-1/9 BUSHEL" / "10 LB") is a Phase 3 cost_utils
+            # concern via case_size_candidates_for_cost.
             items.append({
                 "raw_description": description,
                 "sysco_item_code": "",
                 "unit_price": extended,
                 "extended_amount": extended,
-                "case_size_raw": um or "",
+                "case_size_raw": "",
                 "section": "",
                 "quantity": qty_shipped,
+                "purchase_uom": um,
+                "unit_of_measure": um,
             })
     return items
