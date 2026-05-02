@@ -9018,3 +9018,82 @@ class DedupInvoiceLineItemsCommandTests(TestCase):
         self._run(apply_writes=True)
         # Both rows survive
         self.assertEqual(InvoiceLineItem.objects.filter(raw_description='RAW').count(), 2)
+
+
+class CleanupOrphanProductsTests(TestCase):
+    """Pure-orphan listing + targeted-delete safety."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('cleanup_orphan_products', *args, stdout=out)
+        return out.getvalue()
+
+    def test_lists_pure_orphans(self):
+        from myapp.models import Product
+        Product.objects.create(canonical_name='Lone Orphan', category='Drystock')
+        out = self._run()
+        self.assertIn('Lone Orphan', out)
+        self.assertIn('Pure orphans:', out)
+
+    def test_skips_products_with_ili(self):
+        from myapp.models import Product, Vendor, InvoiceLineItem
+        attached = Product.objects.create(canonical_name='Has ILI', category='Drystock')
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-06', raw_description='RAW',
+            unit_price='1', extended_amount='1', product=attached)
+        out = self._run()
+        self.assertNotIn('Has ILI', out)
+
+    def test_skips_products_with_recipe_ingredient(self):
+        from myapp.models import Product, Recipe, RecipeIngredient
+        prod = Product.objects.create(canonical_name='Has RI', category='Drystock')
+        r = Recipe.objects.create(name='Test Recipe')
+        RecipeIngredient.objects.create(recipe=r, product=prod, name_raw='X')
+        out = self._run()
+        self.assertNotIn('Has RI', out)
+
+    def test_skips_products_with_product_mapping(self):
+        from myapp.models import Product, Vendor, ProductMapping
+        prod = Product.objects.create(canonical_name='Has PM', category='Drystock')
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        ProductMapping.objects.create(vendor=v, description='SOME DESC', product=prod)
+        out = self._run()
+        self.assertNotIn('Has PM', out)
+
+    def test_apply_without_ids_errors(self):
+        from io import StringIO
+        from django.core.management import call_command
+        err = StringIO()
+        out = StringIO()
+        call_command('cleanup_orphan_products', '--apply', stdout=out, stderr=err)
+        self.assertIn('--apply requires --delete-ids', err.getvalue())
+
+    def test_apply_deletes_specified_orphans(self):
+        from myapp.models import Product
+        a = Product.objects.create(canonical_name='Orphan A', category='Drystock')
+        b = Product.objects.create(canonical_name='Orphan B', category='Drystock')
+        c = Product.objects.create(canonical_name='Orphan C', category='Drystock')
+        self._run('--delete-ids', f'{a.id},{b.id}', '--apply')
+        # A and B deleted, C kept
+        self.assertFalse(Product.objects.filter(id=a.id).exists())
+        self.assertFalse(Product.objects.filter(id=b.id).exists())
+        self.assertTrue(Product.objects.filter(id=c.id).exists())
+
+    def test_apply_skips_product_that_lost_orphan_status(self):
+        """If a Product gained an FK reference between list-time and
+        apply-time, the apply phase skips it (race-safety)."""
+        from myapp.models import Product, Vendor, InvoiceLineItem
+        prod = Product.objects.create(canonical_name='Race Risk', category='Drystock')
+        # Simulate concurrent write attaching an ILI between when caller
+        # decided to delete and when apply ran
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-06', raw_description='X',
+            unit_price='1', extended_amount='1', product=prod)
+        out = self._run('--delete-ids', str(prod.id), '--apply')
+        self.assertIn('NO LONGER ORPHAN', out)
+        # Prod still exists
+        self.assertTrue(Product.objects.filter(id=prod.id).exists())
