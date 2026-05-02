@@ -9873,3 +9873,65 @@ class AuditPMCanonicalDriftTests(TestCase):
         # Gain-specificity proposal still surfaces
         self.assertIn("'Corn'", out)
         self.assertIn("'Corn, Frozen'", out)
+
+    def test_rejected_pair_excluded_from_proposals(self):
+        """A previously-rejected (pm_id, proposed_canonical) pair must
+        NOT surface as a proposal on subsequent runs. First-pass-rejects-
+        teach-the-system."""
+        from myapp.models import CanonicalDriftRejection
+        # Without rejection: drift surfaces
+        out_before = self._run()
+        self.assertIn("'Corn, Frozen'", out_before)
+        # Record rejection
+        CanonicalDriftRejection.objects.create(
+            product_mapping=self.wrong_pm,
+            rejected_canonical='Corn, Frozen',
+            note='test rejection',
+        )
+        # Re-run audit: drift no longer surfaces
+        out_after = self._run()
+        self.assertNotIn("'Corn, Frozen'", out_after)
+
+
+class RejectCanonicalDriftTests(TestCase):
+    """Cmd that records audit-proposal rejections."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO(); err = StringIO()
+        call_command('reject_canonical_drift', *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, ProductMapping
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.corn = Product.objects.create(canonical_name='Corn Test', category='Produce')
+        self.pm = ProductMapping.objects.create(
+            vendor=self.v, product=self.corn, description='CORN, YELLOW')
+
+    def test_records_rejection(self):
+        from myapp.models import CanonicalDriftRejection
+        self._run('--pairs', f'{self.pm.id}:Almonds Test', '--note', 'wrong product')
+        # Doesn't matter the canonical exists — we store by string
+        rej = CanonicalDriftRejection.objects.first()
+        self.assertEqual(rej.product_mapping, self.pm)
+        self.assertEqual(rej.rejected_canonical, 'Almonds Test')
+        self.assertEqual(rej.note, 'wrong product')
+
+    def test_idempotent_duplicate_rejection_skipped(self):
+        from myapp.models import CanonicalDriftRejection
+        self._run('--pairs', f'{self.pm.id}:Almonds Test')
+        out, _ = self._run('--pairs', f'{self.pm.id}:Almonds Test')
+        self.assertEqual(CanonicalDriftRejection.objects.count(), 1)
+        self.assertIn('already rejected', out)
+
+    def test_missing_pm_id_aborts(self):
+        from myapp.models import CanonicalDriftRejection
+        _, err = self._run('--pairs', '99999:NoSuchProduct')
+        self.assertIn('Missing ProductMapping', err)
+        self.assertEqual(CanonicalDriftRejection.objects.count(), 0)
+
+    def test_no_pairs_errors(self):
+        _, err = self._run()
+        self.assertIn('No pairs', err)

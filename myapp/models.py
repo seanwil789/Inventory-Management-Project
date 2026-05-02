@@ -909,3 +909,44 @@ class StandardPortionReference(models.Model):
 
     def __str__(self):
         return f"{self.menu_item} ({self.average_measure})"
+
+
+# ─────────────────────────────────────────────────────────────────────
+# Canonical drift audit feedback (Sean 2026-05-02)
+# ─────────────────────────────────────────────────────────────────────
+class CanonicalDriftRejection(models.Model):
+    """A `(ProductMapping, proposed_canonical)` pair that Sean has
+    rejected during canonical-drift audit review. The audit reads this
+    table on every run and excludes the pair from future proposals.
+
+    First pass = reject = teaches the system. Each rejection prunes one
+    branch of the proposal tree permanently. Over time the AMBIGUOUS
+    bucket converges to empty.
+
+    Decoupled from Product FK by canonical_name string so a Product
+    rename or merge doesn't lose the rejection signal.
+    """
+    product_mapping = models.ForeignKey(
+        'ProductMapping',
+        on_delete=models.CASCADE,
+        related_name='drift_rejections',
+    )
+    rejected_canonical = models.CharField(
+        max_length=200,
+        help_text="canonical_name string of the rejected proposal target.",
+    )
+    rejected_at = models.DateTimeField(auto_now_add=True)
+    note = models.TextField(blank=True,
+                            help_text="Optional reason for the rejection.")
+
+    class Meta:
+        ordering = ['-rejected_at']
+        constraints = [
+            models.UniqueConstraint(
+                fields=['product_mapping', 'rejected_canonical'],
+                name='uniq_drift_rejection_per_pair',
+            ),
+        ]
+
+    def __str__(self):
+        return f"reject pm={self.product_mapping_id} → {self.rejected_canonical!r}"

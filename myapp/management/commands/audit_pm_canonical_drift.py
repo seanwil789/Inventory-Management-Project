@@ -45,7 +45,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from myapp.models import Product, ProductMapping
+from myapp.models import Product, ProductMapping, CanonicalDriftRejection
 
 
 def _import_mapper():
@@ -131,6 +131,15 @@ class Command(BaseCommand):
         def _tokens(s):
             return set(_re.findall(r'[a-z0-9]+', (s or '').lower()))
 
+        # Load previously-rejected (pm_id, rejected_canonical) pairs.
+        # First-pass-rejects-teach-the-system: never re-propose what Sean
+        # already said no to. Convert to set for O(1) lookup.
+        rejected_pairs: set[tuple[int, str]] = set(
+            CanonicalDriftRejection.objects.values_list(
+                'product_mapping_id', 'rejected_canonical'
+            )
+        )
+
         proposals = []
         scanned = 0
         for pm in qs.iterator():
@@ -152,6 +161,10 @@ class Command(BaseCommand):
             if not proposed:
                 continue
             if proposed == current:
+                continue
+            # Skip pairs Sean has previously rejected. Permanent learning
+            # signal — first pass rejects teach the system.
+            if (pm.id, proposed) in rejected_pairs:
                 continue
             # Tier 6 returned a DIFFERENT canonical → potential drift
             if tier_filter and confidence != tier_filter:
