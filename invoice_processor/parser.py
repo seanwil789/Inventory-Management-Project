@@ -168,6 +168,115 @@ def _extract_count_per_lb(raw_desc: str) -> tuple[int, int] | None:
     return None
 
 
+# Farm Art raw_description pack extractor (Sean 2026-05-02).
+#
+# Farm Art's _parse_farmart and match_farmart_spatial both emit empty
+# case_size_raw — pack info is buried in raw_description as natural-
+# language tokens. This extractor pulls those tokens into the same
+# canonical case_size string + structured fields the Sysco path produces,
+# so synergy_sync / cost_utils / class_guard treat Farm Art rows
+# identically to Sysco rows.
+#
+# Three patterns supported (most-specific first; first match wins):
+#   1. N/M-UNIT  e.g. "4 / 1 - GAL", "12/1 QUART", "12 / 3LB", "6/1QT"
+#   2. N-UNIT    e.g. "9CT", "15 - DOZ", "60 BU", "1/40LB" (degenerate N=1)
+#   3. N#        pound symbol e.g. "5 # BAG", "11 # X FANCY"
+#
+# Skipped (too ambiguous):
+#   * Bare numbers without unit ("XL FANCY 18", "POTATOES 50") — could be
+#     LB, count, or vendor code; conservative don't-guess.
+#   * BAG / HEAD / CASE alone ("3 BAG") — those are containers, not
+#     measurements; Farm Art "3 BAG" might mean 3 paper bags or 3×5lb bags.
+_FARMART_PACK_NM_RE = re.compile(
+    r'\b(\d+)\s*/\s*(\d+(?:\.\d+)?)\s*-?\s*'
+    r'(GAL|GALLON|QT|QUART|PT|PINT|LB|LBS|OZ|CT|DOZ|EA|FL\s*OZ|DZ)\b',
+    re.IGNORECASE,
+)
+_FARMART_PACK_BARE_RE = re.compile(
+    r'\b(\d+(?:\.\d+)?)\s*-?\s*'
+    r'(CT|DOZ|BU|GAL|GALLON|QT|QUART|PT|PINT|LB|LBS|OZ|FL\s*OZ|DZ)\b',
+    re.IGNORECASE,
+)
+_FARMART_PACK_HASH_RE = re.compile(
+    r'\b(\d+(?:\.\d+)?)\s*#'
+)
+# Map plain-English unit to canonical uom + LB factor. Includes BU
+# (bushel) which has no LB conversion (~weight varies by produce) — we
+# keep BU as a recognized uom but don't compute case_total_weight_lb.
+_FARMART_UOM_NORMALIZE: dict[str, str] = {
+    'GAL': 'GAL', 'GALLON': 'GAL',
+    'QT':  'QT',  'QUART':  'QT',
+    'PT':  'PT',  'PINT':   'PT',
+    'LB':  'LB',  'LBS':    'LB',
+    'OZ':  'OZ',
+    'CT':  'CT',
+    'DOZ': 'DOZ', 'DZ': 'DOZ',
+    'EA':  'EA',
+    'BU':  'BU',
+    'FL OZ': 'FL_OZ', 'FLOZ': 'FL_OZ',
+}
+
+
+def _build_pack_dict(count: int, size_str: str, uom_raw: str) -> dict:
+    """Assemble the structured fields + canonical case_size_raw."""
+    uom_key = uom_raw.upper().replace('  ', ' ').strip()
+    uom = _FARMART_UOM_NORMALIZE.get(uom_key, uom_key)
+    out = {
+        'case_size_raw': f'{count}/{size_str}{uom}' if count > 1 else f'{size_str}{uom}',
+        'case_pack_count': count,
+        'case_pack_unit_size': size_str,
+        'case_pack_unit_uom': uom,
+    }
+    factor = _PACK_UOM_TO_LB.get(uom)
+    if factor is not None:
+        try:
+            total_lb = float(size_str) * count * factor
+            out['case_total_weight_lb'] = round(total_lb, 3)
+        except ValueError:
+            pass
+    return out
+
+
+def _extract_farmart_pack(raw_desc: str) -> dict:
+    """Parse Farm Art raw_description for embedded pack tokens.
+
+    Returns dict with case_size_raw + structured fields, or {} when no
+    confident pack token found. Most-specific N/M pattern checked first.
+
+    Examples:
+      "JUICE ORANGE 4 / 1 - GAL"       → 4/1GAL, count=4, size=1, uom=GAL
+      "DAIRY HEAVY CREAM 40% 12/1 QT"  → 12/1QT, count=12, size=1, uom=QT
+      "MELONS, CANTALOUPES, 9CT"       → 9CT, count=1, size=9, uom=CT
+      "EGGS XL LOOSE 15 - DOZ"         → 15DOZ, count=1, size=15, uom=DOZ
+      "HERB CILANTRO 60 BU"            → 60BU, count=1, size=60, uom=BU
+      "CARROT, 5 # BAG"                → 5LB, count=1, size=5, uom=LB
+      "POTATOES 50"                    → {} (no unit, ambiguous)
+    """
+    if not raw_desc:
+        return {}
+    # Pattern 1: N/M-UNIT (most specific — count + size + uom)
+    m = _FARMART_PACK_NM_RE.search(raw_desc)
+    if m:
+        count = int(m.group(1))
+        size = m.group(2)
+        uom = m.group(3)
+        return _build_pack_dict(count, size, uom)
+    # Pattern 2: bare N-UNIT (count=1, size in N)
+    m = _FARMART_PACK_BARE_RE.search(raw_desc)
+    if m:
+        size = m.group(1)
+        uom = m.group(2)
+        # Skip if size has a leading zero of a fraction (e.g. 0.5) — those
+        # are typically bagged subdivisions, not pack counts.
+        return _build_pack_dict(1, size, uom)
+    # Pattern 3: N# (pound symbol)
+    m = _FARMART_PACK_HASH_RE.search(raw_desc)
+    if m:
+        size = m.group(1)
+        return _build_pack_dict(1, size, 'LB')
+    return {}
+
+
 def _extract_case_size(text: str) -> str:
     """
     Pull the first case-size token from a raw Sysco description line.
@@ -1954,12 +2063,17 @@ def _parse_farmart(text: str) -> list[dict]:
 
         if best_pp and best_pp["amount"] > 0:
             used_prices.add(best_idx)
-            items.append({
+            item = {
                 "raw_description": desc["description"],
                 "unit_price": best_pp["unit_price"],
                 "extended_amount": best_pp["amount"],
                 "case_size_raw": "",
-            })
+            }
+            # Extract embedded pack tokens (4/1GAL, 9CT, 15DOZ, 5#) into
+            # structured fields. Falls back to {} on ambiguous, leaving
+            # case_size_raw empty for db_write's default_case_size fallback.
+            item.update(_extract_farmart_pack(desc["description"]))
+            items.append(item)
 
     # ── Pass 4: Extract and validate invoice total ────────────────────────
     invoice_total = _extract_farmart_invoice_total(lines)

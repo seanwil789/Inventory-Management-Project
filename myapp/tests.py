@@ -9097,3 +9097,109 @@ class CleanupOrphanProductsTests(TestCase):
         self.assertIn('NO LONGER ORPHAN', out)
         # Prod still exists
         self.assertTrue(Product.objects.filter(id=prod.id).exists())
+
+
+class FarmArtPackExtractorTests(TestCase):
+    """Pull pack-size tokens from Farm Art raw_description into structured
+    fields. Closes the 0% case_pack_count coverage gap for Farm Art's
+    556 ILI rows.
+    """
+
+    def test_nm_with_dash_and_spaces(self):
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('JUICE , ORANGE , FRESH SQUEEZED , NATALIES 4 / 1 - GAL')
+        self.assertEqual(out['case_size_raw'], '4/1GAL')
+        self.assertEqual(out['case_pack_count'], 4)
+        self.assertEqual(out['case_pack_unit_size'], '1')
+        self.assertEqual(out['case_pack_unit_uom'], 'GAL')
+        self.assertEqual(out['case_total_weight_lb'], 33.38)
+
+    def test_nm_compact(self):
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('LETTUCE , ROMAINE HEARTS 12 / 3LB')
+        self.assertEqual(out['case_pack_count'], 12)
+        self.assertEqual(out['case_pack_unit_size'], '3')
+        self.assertEqual(out['case_pack_unit_uom'], 'LB')
+        self.assertEqual(out['case_total_weight_lb'], 36.0)
+
+    def test_quart_word_form(self):
+        """Some Farm Art rows use 'QUART' spelled out."""
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('DAIRY HEAVY CREAM , 40 % , 12/1 QUART * LOCAL')
+        self.assertEqual(out['case_pack_count'], 12)
+        self.assertEqual(out['case_pack_unit_uom'], 'QT')
+
+    def test_bare_count_unit(self):
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('MELONS , CANTALOUPES , 9CT . NO HALF')
+        self.assertEqual(out['case_pack_count'], 1)
+        self.assertEqual(out['case_pack_unit_size'], '9')
+        self.assertEqual(out['case_pack_unit_uom'], 'CT')
+
+    def test_bare_with_dash_separator(self):
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('EGGS XL LOOSE , WHITE , 15 - DOZ * LOCAL * NO SPLITS')
+        self.assertEqual(out['case_pack_unit_size'], '15')
+        self.assertEqual(out['case_pack_unit_uom'], 'DOZ')
+
+    def test_bushel(self):
+        """Bushel — recognized uom, no LB conversion."""
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('HERB , CILANTRO , 60 BU')
+        self.assertEqual(out['case_pack_unit_uom'], 'BU')
+        self.assertNotIn('case_total_weight_lb', out)
+
+    def test_pound_symbol(self):
+        """5 # BAG → 5 LB."""
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('CARROT , 5 # BAG ** NO SPLIT')
+        self.assertEqual(out['case_pack_count'], 1)
+        self.assertEqual(out['case_pack_unit_size'], '5')
+        self.assertEqual(out['case_pack_unit_uom'], 'LB')
+        self.assertEqual(out['case_total_weight_lb'], 5.0)
+
+    def test_bare_number_no_unit_returns_empty(self):
+        """Conservative: bare numbers without units are NOT extracted."""
+        from invoice_processor.parser import _extract_farmart_pack
+        # No unit anywhere
+        self.assertEqual(_extract_farmart_pack('GRAPES , RED SEEDLESS , XL FANCY 18'), {})
+        # 50 with no unit
+        self.assertEqual(_extract_farmart_pack('POTATOES , RED BLISS , " A " 50'), {})
+        # Just MUSHROOMS and 5
+        self.assertEqual(_extract_farmart_pack('MUSHROOMS , OYSTER , 5 * NO SPLITS *'), {})
+
+    def test_empty_input(self):
+        from invoice_processor.parser import _extract_farmart_pack
+        self.assertEqual(_extract_farmart_pack(''), {})
+        self.assertEqual(_extract_farmart_pack(None), {})
+
+    def test_nm_takes_priority_over_bare(self):
+        """If both N/M-UNIT and bare-N-UNIT match, N/M wins (most specific)."""
+        from invoice_processor.parser import _extract_farmart_pack
+        # "12/1 QT" and also "1 QT" inside it
+        out = _extract_farmart_pack('YOGURT 6 / 1 - QT VANILLA')
+        self.assertEqual(out['case_pack_count'], 6)
+        self.assertEqual(out['case_pack_unit_size'], '1')
+        self.assertEqual(out['case_pack_unit_uom'], 'QT')
+
+    def test_dz_alias_normalizes_to_doz(self):
+        from invoice_processor.parser import _extract_farmart_pack
+        out = _extract_farmart_pack('EGGS 15 DZ')
+        self.assertEqual(out['case_pack_unit_uom'], 'DOZ')
+
+    def test_parse_farmart_threads_pack_into_item_dict(self):
+        """End-to-end: _parse_farmart attaches structured fields to the
+        item dict so db_write can persist them."""
+        from invoice_processor.parser import _parse_farmart
+        text = """
+1.000 EACH
+JUICE , ORANGE , FRESH SQUEEZED 4 / 1 - GAL
+United States
+24.50
+24.50
+"""
+        items, _ = _parse_farmart(text)
+        juice = [i for i in items if 'ORANGE' in i.get('raw_description', '').upper()]
+        self.assertTrue(juice, 'parser should extract juice item')
+        self.assertEqual(juice[0].get('case_pack_count'), 4)
+        self.assertEqual(juice[0].get('case_pack_unit_uom'), 'GAL')
