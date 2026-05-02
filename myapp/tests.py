@@ -8861,3 +8861,160 @@ class CacheInvoiceTotalDedupTests(TestCase):
         _cache_invoice_total('Farm Art', '2026-03-03', 100.00, 'b.pdf')
         entries = self._read_cache('2026-03')
         self.assertEqual(len(entries), 2)
+
+
+class DBWriteUpsertKeyTighteningTests(TestCase):
+    """#2 — db_write upsert finds existing rows by raw_description even
+    when product was NULL at original write (fuzzy quarantine path) and
+    attached later via /mapping-review/."""
+
+    def test_quarantine_then_approve_cycle_dedups(self):
+        """Reproduces the GLOVE NITRILE cnt=4 case:
+        1. First write: fuzzy tier → product=None (quarantine)
+        2. /mapping-review/ approves → product attached to existing row
+        3. Reprocess: code tier produces same raw + same product →
+           must find existing row by raw, not create new."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        Vendor.objects.get_or_create(name='Sysco')
+        gloves = Product.objects.create(
+            canonical_name='Gloves Test', category='Smallwares',
+            inventory_class='counted_with_weight')
+
+        # Step 1 — fuzzy quarantine write (product=None on row)
+        items_quarantine = [{
+            'canonical': 'Gloves Test',
+            'raw_description': 'SYS CLS GLOVE NITRILE FDSRV PF BLK 304363444',
+            'case_size_raw': '10/100CT',
+            'unit_price': '155.91',
+            'extended_amount': '155.91',
+            'sysco_item_code': '304363444',
+            'confidence': 'fuzzy',  # routes through quarantine — product detached
+            'score': 80,
+            'quantity_ordered': '1',
+            'quantity_shipped': '1',
+        }]
+        write_invoice_to_db('Sysco', '2026-04-06', items_quarantine,
+                            source_file='hash1')
+        rows = InvoiceLineItem.objects.filter(
+            raw_description='SYS CLS GLOVE NITRILE FDSRV PF BLK 304363444')
+        self.assertEqual(rows.count(), 1)
+        first_id = rows.first().id
+
+        # Step 2 — simulate /mapping-review/ approval attaching the FK
+        rows.update(product=gloves, match_confidence='manual_review')
+
+        # Step 3 — reprocess: same raw at code tier
+        items_reprocess = [{
+            'canonical': 'Gloves Test',
+            'raw_description': 'SYS CLS GLOVE NITRILE FDSRV PF BLK 304363444',
+            'case_size_raw': '10/100CT',
+            'unit_price': '155.91',
+            'extended_amount': '155.91',
+            'sysco_item_code': '304363444',
+            'confidence': 'code',
+            'score': 100,
+            'quantity_ordered': '1',
+            'quantity_shipped': '1',
+        }]
+        write_invoice_to_db('Sysco', '2026-04-06', items_reprocess,
+                            source_file='hash1+1')
+
+        # Should still be ONE row, not two — the upsert key found the
+        # existing row by raw_description.
+        rows_after = InvoiceLineItem.objects.filter(
+            raw_description='SYS CLS GLOVE NITRILE FDSRV PF BLK 304363444')
+        self.assertEqual(rows_after.count(), 1,
+                         'Expected ONE row after reprocess; got duplicate.')
+        self.assertEqual(rows_after.first().id, first_id,
+                         'Original row should survive (UPDATE not CREATE)')
+
+    def test_genuine_separate_invoices_kept_apart(self):
+        """Two real invoices on same date for same product (different
+        unit_price) must NOT be folded — they're legitimately distinct."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(
+            canonical_name='Generic Item', category='Drystock',
+            inventory_class='counted_with_weight')
+        # Different raw_descriptions → must stay separate
+        for i, raw in enumerate(['ITEM A 12CT', 'ITEM B 24CT']):
+            write_invoice_to_db('Sysco', '2026-04-06', [{
+                'canonical': 'Generic Item',
+                'raw_description': raw,
+                'case_size_raw': '12CT',
+                'unit_price': str(10.0 + i),
+                'extended_amount': str(10.0 + i),
+                'sysco_item_code': f'A{i}',
+                'confidence': 'code',
+                'score': 100,
+                'quantity_ordered': '1',
+                'quantity_shipped': '1',
+            }], source_file=f'inv{i}')
+        rows = InvoiceLineItem.objects.filter(invoice_date='2026-04-06')
+        self.assertEqual(rows.count(), 2,
+                         'Different raws should be kept separate')
+
+
+class DedupInvoiceLineItemsCommandTests(TestCase):
+    """#2 — sweep existing duplicates via mgmt cmd."""
+
+    def _run(self, apply_writes=False):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        args = ['dedup_invoice_line_items']
+        if apply_writes:
+            args.append('--apply')
+        call_command(*args, stdout=out)
+        return out.getvalue()
+
+    def test_deletes_true_dups_keeps_survivor(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(canonical_name='X', category='Drystock')
+        common = dict(vendor=v, invoice_date='2026-04-06', raw_description='RAW',
+                      unit_price='10.00', extended_amount='10.00', product=prod)
+        # Three identical rows
+        InvoiceLineItem.objects.create(**common, match_confidence='vendor_exact')
+        InvoiceLineItem.objects.create(**common, match_confidence='code',
+                                       case_pack_count=10)  # most structured
+        InvoiceLineItem.objects.create(**common, match_confidence='vendor_exact')
+
+        self._run(apply_writes=True)
+
+        rows = InvoiceLineItem.objects.filter(raw_description='RAW')
+        self.assertEqual(rows.count(), 1, 'should keep only one row')
+        # Should be the structured one (case_pack_count=10)
+        self.assertEqual(rows.first().case_pack_count, 10)
+
+    def test_dry_run_does_not_delete(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(canonical_name='X', category='Drystock')
+        common = dict(vendor=v, invoice_date='2026-04-06', raw_description='RAW',
+                      unit_price='10.00', extended_amount='10.00', product=prod)
+        InvoiceLineItem.objects.create(**common)
+        InvoiceLineItem.objects.create(**common)
+
+        out = self._run(apply_writes=False)
+        self.assertIn('Dry-run', out)
+        self.assertEqual(InvoiceLineItem.objects.count(), 2)
+
+    def test_mixed_price_groups_NOT_deleted(self):
+        """Same (vendor, date, raw) but different prices → review-only,
+        no auto-delete."""
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(canonical_name='X', category='Drystock')
+        InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-06', raw_description='RAW',
+            unit_price='10.00', extended_amount='10.00', product=prod)
+        InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-06', raw_description='RAW',
+            unit_price='15.00', extended_amount='15.00', product=prod)
+
+        self._run(apply_writes=True)
+        # Both rows survive
+        self.assertEqual(InvoiceLineItem.objects.filter(raw_description='RAW').count(), 2)

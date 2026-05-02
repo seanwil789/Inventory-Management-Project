@@ -431,15 +431,28 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             count_per_lb_high=count_per_lb_high_val,
         )
 
-        if product and parsed_date:
-            lookup = dict(vendor=vendor, product=product, invoice_date=parsed_date)
-        elif parsed_date:
-            lookup = dict(vendor=vendor, raw_description=raw_desc, invoice_date=parsed_date)
-        else:
-            lookup = None  # no reliable key — fall back to plain create
-
-        if lookup:
-            existing = InvoiceLineItem.objects.filter(**lookup).first()
+        # Phase 2 #2 (Sean 2026-05-02): tighten upsert key to also match by
+        # (vendor, raw_description, invoice_date). The previous (vendor,
+        # product, date) lookup missed when product=NULL at original write
+        # (fuzzy quarantine path) and was attached later via /mapping-review/
+        # — the next reprocess wrote a duplicate. Walking BOTH keys here
+        # finds the existing row regardless of which path it came from.
+        existing = None
+        if parsed_date:
+            # Primary key: raw_description match (stable across mapping changes)
+            existing = InvoiceLineItem.objects.filter(
+                vendor=vendor, raw_description=raw_desc, invoice_date=parsed_date
+            ).first()
+            # Secondary key: product match (when raw differs slightly between
+            # parses but the same canonical resolved). Only if first didn't hit.
+            if existing is None and product:
+                existing = InvoiceLineItem.objects.filter(
+                    vendor=vendor, product=product, invoice_date=parsed_date,
+                    # Same dollar amount → same line item, not a separate
+                    # invoice for the same product on the same day.
+                    unit_price=common_fields.get('unit_price'),
+                ).first()
+        if parsed_date:
             if existing:
                 # Fields where a non-None historical value beats a None incoming
                 # value — backfill or prior write may have populated these from
