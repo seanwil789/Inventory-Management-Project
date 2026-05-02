@@ -2001,27 +2001,35 @@ def _parse_farmart(text: str) -> list[dict]:
     )
 
     # ── Pass 1: Extract all descriptions with line positions ──────────────
-    # zz-prefixed items are ORDERED but NOT DELIVERED (Sean 2026-05-02).
-    # Farm Art uses "zz " to flag out-of-stock items on the order — they
-    # appear on the invoice paperwork but with qty=0 / unit_price=0. We
-    # must NOT generate ILI rows for these (history-level damage class:
-    # zero-priced ILIs distort cost coverage + sheet IUP averaging).
+    # zz-prefixed items are FLAGGED non-stock on Farm Art's order tracking.
+    # Sean (2026-05-02): zz signals "ordered but possibly not delivered" —
+    # but the prefix alone doesn't determine delivery. Some zz items DO
+    # ship (the prefix is set when the item was non-stock at order-take
+    # time; substitution can still occur). The reliable signal is whether
+    # the row has non-zero price + qty. We KEEP zz lines as descriptions
+    # here so they participate in price-pair matching; db_write filters
+    # the genuinely-zero rows downstream via _is_undelivered_farmart().
     descriptions = []
     for i, line in enumerate(lines):
         is_zz = line.upper().startswith("ZZ ")
-        if is_zz:
-            continue  # out-of-stock — never landed in inventory
         is_desc = (
-            len(line) > 12
+            not is_zz
+            and len(line) > 12
             and re.search(r'[A-Z]{3,}', line)
             and (re.search(r',', line) or re.search(r'[A-Z]{4,}\s+[A-Z]{2,}', line))
             and not skip_patterns.match(line)
             and not re.match(r'^[\d\s.,]+$', line)
         )
-        if is_desc:
-            desc = re.sub(r'\s*\*+.*$', '', line).strip()
+        if is_zz or is_desc:
+            desc = line[3:].strip() if is_zz else line
+            desc = re.sub(r'\s*\*+.*$', '', desc).strip()
             if desc:
-                descriptions.append({"description": desc, "line_idx": i})
+                # Mark zz items so downstream can apply the zero-data filter
+                # Farm-Art-specifically without scanning raw_description.
+                entry = {"description": desc, "line_idx": i}
+                if is_zz:
+                    entry["nonstock_flag"] = True
+                descriptions.append(entry)
 
     # ── Pass 2: Extract all price pairs (unit_price, amount) with positions ──
     price_pairs = []

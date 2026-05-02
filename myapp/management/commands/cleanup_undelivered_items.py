@@ -37,9 +37,14 @@ class Command(BaseCommand):
         apply_writes = opts['apply']
         vendor_filter = opts['vendor']
 
+        # Sean 2026-05-02 correction: zz prefix alone is NOT sufficient
+        # signal for "didn't ship" — some zz items get fulfilled (Anchovies
+        # $22.37, Crab Base $28.22). Require BOTH a non-stock signal
+        # AND zero delivered amount.
         criteria = (
-            Q(raw_description__istartswith='zz ')
-            | (Q(unit_price=0) & Q(extended_amount=0))
+            Q(unit_price=0, extended_amount=0)
+            | Q(unit_price__isnull=True, extended_amount__isnull=True,
+                raw_description__istartswith='zz ')
         )
         qs = InvoiceLineItem.objects.filter(criteria)
         if vendor_filter:

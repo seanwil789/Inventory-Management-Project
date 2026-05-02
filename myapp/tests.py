@@ -1997,10 +1997,10 @@ Nontaxable
         result = parser_mod.parse_invoice(raw, vendor='Farm Art')
         self.assertEqual(result.get('invoice_total'), 25.00)
 
-    def test_zz_prefix_nonstock_items_skipped(self):
-        """Lines starting 'zz ' are out-of-stock orders that didn't ship.
-        Updated 2026-05-02 (Sean): parser must NOT generate ILI rows
-        for zz items — they distort cost coverage + sheet IUP averaging."""
+    def test_zz_prefix_with_real_price_kept(self):
+        """zz-prefixed items that DO ship (have real prices on the invoice)
+        must generate ILI rows. zz prefix is a non-stock FLAG, not a
+        delivery signal — substitution + late fulfillment are common."""
         parser_mod = self._import_parser()
         raw = """Farm Art
 4/15/2026
@@ -2014,9 +2014,10 @@ Invoice Total
 """
         result = parser_mod.parse_invoice(raw, vendor='Farm Art')
         items = result['items']
-        # zz item must be filtered — no items generated from this invoice
-        self.assertEqual(len(items), 0,
-                         f'zz-prefix items should be skipped; got {items}')
+        # The zz item has a real $30.00 amount → should be kept
+        self.assertEqual(len(items), 1)
+        self.assertIn('LENTIL', items[0]['raw_description'])
+        self.assertEqual(items[0].get('extended_amount'), 30.00)
 
 
 class ParserExceptionalIntegrationTests(TestCase):
@@ -9416,8 +9417,9 @@ class FarmArtZzFilteringTests(TestCase):
     + sheet IUP averaging.
     """
 
-    def test_text_path_skips_zz_prefix(self):
-        """zz-prefixed lines don't generate items."""
+    def test_text_path_zz_with_zero_amount_filtered(self):
+        """zz-prefixed items with $0.00 actual amount → no ILI row generated.
+        Tests the implicit filter via best_pp.amount > 0 (long-standing)."""
         from invoice_processor.parser import _parse_farmart
         text = """
 1.000 EACH
@@ -9432,15 +9434,16 @@ United States
 24.50
 """
         items, _ = _parse_farmart(text)
-        # Only orange juice should be extracted; yeast (zz) skipped
         for it in items:
             raw = it.get('raw_description', '')
             self.assertNotIn('YEAST', raw,
-                             msg=f'zz-prefixed yeast leaked: {it}')
+                             msg=f'$0 yeast leaked: {it}')
 
-    def test_spatial_skips_zero_qty_shipped(self):
-        """Spatial path filters rows with qty_shipped=0 (zz items show up
-        as qty_ordered=N qty_shipped=0)."""
+    def test_spatial_skips_zero_qty_AND_zero_extended(self):
+        """Spatial path filters rows where BOTH qty_shipped=0 AND
+        extended=0 (zz items appear as qty_ordered=N qty_shipped=0
+        ext=0). Doesn't drop substituted-fulfilled zz items where
+        extended is non-zero."""
         from invoice_processor.spatial_matcher import match_farmart_spatial
         # Construct synthetic page with zz-pattern row
         # qty_ord=1.000 qty_shp=0.000 ext=0.00 → must be filtered
@@ -9480,7 +9483,8 @@ class CleanupUndeliveredItemsTests(TestCase):
         call_command('cleanup_undelivered_items', *args, stdout=out)
         return out.getvalue()
 
-    def test_deletes_zz_prefix_rows(self):
+    def test_deletes_zz_prefix_zero_amount_rows(self):
+        """zz prefix + zero amount → undelivered, delete."""
         from myapp.models import Vendor, InvoiceLineItem, Product
         v, _ = Vendor.objects.get_or_create(name='Farm Art')
         prod = Product.objects.create(canonical_name='Yeast Test', category='Drystock')
@@ -9499,6 +9503,22 @@ class CleanupUndeliveredItemsTests(TestCase):
         self._run('--apply')
         self.assertFalse(InvoiceLineItem.objects.filter(id=zz.id).exists())
         self.assertTrue(InvoiceLineItem.objects.filter(id=normal.id).exists())
+
+    def test_keeps_zz_prefix_rows_with_real_delivery(self):
+        """zz prefix BUT non-zero amount → fulfilled, KEEP. Sean 2026-05-02:
+        Anchovies $22.37 / Crab Base $28.22 with zz prefix actually shipped."""
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        v, _ = Vendor.objects.get_or_create(name='Farm Art')
+        prod = Product.objects.create(canonical_name='Anchovies Test', category='Proteins')
+        zz_real = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='zz MISC , ANCHOVY , IN OIL , 28',
+            unit_price=22.37, extended_amount=22.37,
+            quantity=1, product=prod,
+        )
+        self._run('--apply')
+        # Real delivery preserved
+        self.assertTrue(InvoiceLineItem.objects.filter(id=zz_real.id).exists())
 
     def test_deletes_zero_priced_zero_qty(self):
         from myapp.models import Vendor, InvoiceLineItem, Product
