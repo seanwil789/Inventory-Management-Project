@@ -9664,3 +9664,163 @@ class CleanupCanonicalConflationTests(TestCase):
                         '--keep-tokens', 'LINER,TRASH')
         self.assertIn('ProductMapping rows would re-cause', out)
         self.assertIn('TOWEL KITCHEN ROLL', out)
+
+
+class RepointProductMappingsTests(TestCase):
+    """Repoint ProductMapping rows from one canonical to another."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        err = StringIO()
+        call_command('repoint_product_mappings', *args, stdout=out, stderr=err)
+        return out.getvalue(), err.getvalue()
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, ProductMapping
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.corn = Product.objects.create(
+            canonical_name='Corn Test', category='Produce')
+        self.corn_frozen = Product.objects.create(
+            canonical_name='Corn, Frozen Test', category='Produce')
+        self.cornstarch = Product.objects.create(
+            canonical_name='Cornstarch Test', category='Drystock')
+        self.pm_frozen = ProductMapping.objects.create(
+            vendor=self.v, product=self.corn,
+            description='FROZEN CORN, 12/2.5-LB',
+        )
+        self.pm_starch = ProductMapping.objects.create(
+            vendor=self.v, product=self.corn,
+            description='SYS CLS CORN STARCH',
+        )
+
+    def test_repoint_two_pms_in_one_run(self):
+        out, _ = self._run(
+            '--pairs',
+            f'{self.pm_frozen.id}:Corn, Frozen Test,{self.pm_starch.id}:Cornstarch Test',
+            '--apply',
+        )
+        self.pm_frozen.refresh_from_db()
+        self.pm_starch.refresh_from_db()
+        self.assertEqual(self.pm_frozen.product, self.corn_frozen)
+        self.assertEqual(self.pm_starch.product, self.cornstarch)
+
+    def test_dry_run_does_not_change(self):
+        out, _ = self._run(
+            '--pairs', f'{self.pm_frozen.id}:Corn, Frozen Test',
+        )
+        self.assertIn('Dry-run', out)
+        self.pm_frozen.refresh_from_db()
+        self.assertEqual(self.pm_frozen.product, self.corn)  # unchanged
+
+    def test_unknown_canonical_aborts_all(self):
+        """Atomicity: if ANY canonical doesn't exist, NO writes happen."""
+        out, err = self._run(
+            '--pairs',
+            f'{self.pm_frozen.id}:Corn, Frozen Test,{self.pm_starch.id}:Nonexistent',
+            '--apply',
+        )
+        self.assertIn('Unknown canonical', err)
+        # Both unchanged
+        self.pm_frozen.refresh_from_db()
+        self.pm_starch.refresh_from_db()
+        self.assertEqual(self.pm_frozen.product, self.corn)
+        self.assertEqual(self.pm_starch.product, self.corn)
+
+    def test_missing_pm_id_aborts_all(self):
+        out, err = self._run(
+            '--pairs',
+            f'{self.pm_frozen.id}:Corn, Frozen Test,99999:Cornstarch Test',
+            '--apply',
+        )
+        self.assertIn('Missing ProductMapping', err)
+        self.pm_frozen.refresh_from_db()
+        self.assertEqual(self.pm_frozen.product, self.corn)
+
+    def test_pairs_parser_handles_commas_in_canonical_name(self):
+        """Canonical names like 'Corn, Frozen' contain commas — splitter
+        must handle that correctly."""
+        from myapp.management.commands.repoint_product_mappings import _parse_pairs
+        result = _parse_pairs('185:Corn, Frozen,297:Corn, Frozen,343:Masa Harina')
+        self.assertEqual(result, [
+            (185, 'Corn, Frozen'),
+            (297, 'Corn, Frozen'),
+            (343, 'Masa Harina'),
+        ])
+
+    def test_no_pairs_errors(self):
+        _, err = self._run('--apply')
+        self.assertIn('No pairs', err)
+
+
+class AuditPMCanonicalDriftTests(TestCase):
+    """Walk all PMs, propose re-points when more-specific canonical exists."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('audit_pm_canonical_drift', *args, stdout=out)
+        return out.getvalue()
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, ProductMapping
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        # Coarse + fine canonicals exist
+        self.corn = Product.objects.create(
+            canonical_name='Corn', category='Produce')
+        self.corn_frozen = Product.objects.create(
+            canonical_name='Corn, Frozen', category='Produce')
+        # Wrong PM: 'FROZEN CORN ...' → Corn (should be → Corn, Frozen)
+        self.wrong_pm = ProductMapping.objects.create(
+            vendor=self.v, product=self.corn,
+            description='FROZEN CORN, 12/2.5-LB',
+        )
+        # Right PM: 'CORN, YELLOW' → Corn (no drift)
+        self.right_pm = ProductMapping.objects.create(
+            vendor=self.v, product=self.corn,
+            description='CORN, YELLOW, 40-48CT',
+        )
+
+    def test_proposes_more_specific_canonical(self):
+        """Sees 'FROZEN CORN ...' → currently Corn → proposes Corn, Frozen."""
+        out = self._run()
+        self.assertIn('Drift proposals:', out)
+        self.assertIn(str(self.wrong_pm.id), out)
+        self.assertIn('FROZEN CORN', out)
+        self.assertIn("'Corn'", out)
+        self.assertIn("'Corn, Frozen'", out)
+
+    def test_does_not_propose_for_correct_pm(self):
+        """'CORN, YELLOW' → Corn is the most-specific match (no Yellow Corn
+        canonical) — no proposal."""
+        out = self._run()
+        self.assertNotIn(f'CORN, YELLOW', out)
+
+    def test_apply_repoints_pm(self):
+        self._run('--apply')
+        self.wrong_pm.refresh_from_db()
+        self.right_pm.refresh_from_db()
+        self.assertEqual(self.wrong_pm.product, self.corn_frozen)
+        self.assertEqual(self.right_pm.product, self.corn)  # unchanged
+
+    def test_dry_run_does_not_change(self):
+        out = self._run()
+        self.assertIn('Dry-run', out)
+        self.wrong_pm.refresh_from_db()
+        self.assertEqual(self.wrong_pm.product, self.corn)
+
+    def test_vendor_filter_scopes(self):
+        from myapp.models import Vendor, ProductMapping
+        farmart, _ = Vendor.objects.get_or_create(name='Farm Art')
+        # Add a Farm Art PM with same drift pattern
+        fa_pm = ProductMapping.objects.create(
+            vendor=farmart, product=self.corn,
+            description='FROZEN CORN BAG',
+        )
+        out = self._run('--vendor', 'Sysco')
+        # Sysco PM in proposals (drift detected)
+        self.assertIn('FROZEN CORN, 12/2.5-LB', out)
+        # Farm Art PM NOT in proposals — its description differs slightly
+        self.assertNotIn('FROZEN CORN BAG', out)
