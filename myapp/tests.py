@@ -2822,7 +2822,10 @@ class SpatialMatcherOtherVendorsTests(TestCase):
         self.assertIn("Wheat Pita", by_desc)
         self.assertEqual(by_desc["Wheat Pita"]["unit_price"], 5.25)
         self.assertEqual(by_desc["Wheat Pita"]["extended_amount"], 10.50)
-        self.assertEqual(by_desc["Wheat Pita"]["case_size_raw"], "DZ")
+        # Phase 2 polish: UM (DZ/EA) lands in purchase_uom, not case_size_raw
+        self.assertEqual(by_desc["Wheat Pita"]["case_size_raw"], "")
+        self.assertEqual(by_desc["Wheat Pita"]["purchase_uom"], "DZ")
+        self.assertEqual(by_desc["Wheat Pita"]["unit_of_measure"], "DZ")
 
     def test_pbm_rejects_rows_without_code_or_price(self):
         """Header rows, address rows, footer total rows should not

@@ -409,13 +409,17 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
             if not description:
                 description = f"[PBM #{code}]"
 
+            # Phase 2 polish (2026-05-02): UM (DZ/EA) is the purchase unit,
+            # not case-size info. Same fix as Farm Art Phase 2c.
             item = {
                 "raw_description": description,
                 "sysco_item_code": "",   # PBM doesn't use SUPC
                 "unit_price": unit_price,
                 "extended_amount": extended,
-                "case_size_raw": um or "",  # pack info for PBM is the UM (DZ, EA)
+                "case_size_raw": "",
                 "section": "",
+                "purchase_uom": um,
+                "unit_of_measure": um,
             }
             if qty is not None:
                 item["quantity"] = qty
@@ -609,6 +613,8 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
             if not description:
                 continue  # Row with no desc and no code — probably fee row
 
+            # Phase 2 polish: Delaware items are sold per-piece (towels,
+            # mops, aprons billed by count). Default purchase_uom='EA'.
             items.append({
                 "raw_description": description,
                 "sysco_item_code": "",
@@ -617,6 +623,8 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
                 "case_size_raw": "",
                 "section": "",
                 "quantity": qty,
+                "purchase_uom": "EA",
+                "unit_of_measure": "EA",
             })
     return items
 
