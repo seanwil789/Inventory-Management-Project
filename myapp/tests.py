@@ -9318,3 +9318,93 @@ class DBWriteStructuredFallbackTests(TestCase):
         ili = InvoiceLineItem.objects.filter(raw_description='Assorted Donuts').first()
         self.assertEqual(ili.case_size, '2')
         self.assertIsNone(ili.case_pack_count)  # undecomposable
+
+
+class BackfillStructuredFromCaseSizeTests(TestCase):
+    """Retroactive backfill — decompose ILI.case_size strings on rows that
+    were written before the db_write fallback landed.
+    """
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('backfill_structured_from_case_size', *args, stdout=out)
+        return out.getvalue()
+
+    def test_decomposes_colonial_bare_lb(self):
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        from decimal import Decimal
+        v, _ = Vendor.objects.get_or_create(name='Colonial Village Meat Markets')
+        prod = Product.objects.create(canonical_name='Wings TestC', category='Proteins')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='Wings', case_size='40LB',
+            unit_price='74', extended_amount='74', product=prod,
+        )
+        # Before: case_pack_count is None
+        self.assertIsNone(ili.case_pack_count)
+        self._run('--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.case_pack_count, 1)
+        self.assertEqual(ili.case_pack_unit_size, Decimal('40'))
+        self.assertEqual(ili.case_pack_unit_uom, 'LB')
+        self.assertEqual(ili.case_total_weight_lb, Decimal('40'))
+
+    def test_decomposes_pbm_normalized_pack(self):
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        from decimal import Decimal
+        v, _ = Vendor.objects.get_or_create(name='Philadelphia Bakery Merchants')
+        prod = Product.objects.create(canonical_name='Bun TestC', category='Bakery')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='Hamburger Rolls', case_size='10/12CT',
+            unit_price='20', extended_amount='20', product=prod,
+        )
+        self._run('--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.case_pack_count, 10)
+        self.assertEqual(ili.case_pack_unit_size, Decimal('12'))
+        self.assertEqual(ili.case_pack_unit_uom, 'CT')
+
+    def test_skips_undecomposable(self):
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(canonical_name='Donut TestC', category='Bakery')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='Donuts', case_size='2',  # bare number
+            unit_price='8', extended_amount='8', product=prod,
+        )
+        self._run('--apply')
+        ili.refresh_from_db()
+        self.assertIsNone(ili.case_pack_count)
+
+    def test_dry_run_does_not_write(self):
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        v, _ = Vendor.objects.get_or_create(name='Colonial Village Meat Markets')
+        prod = Product.objects.create(canonical_name='Pork TestC', category='Proteins')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='Pork', case_size='25LB',
+            unit_price='100', extended_amount='100', product=prod,
+        )
+        out = self._run()
+        self.assertIn('DRY-RUN', out)
+        ili.refresh_from_db()
+        self.assertIsNone(ili.case_pack_count)
+
+    def test_already_populated_unchanged(self):
+        """Idempotent — case_pack_count already populated → row excluded."""
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(canonical_name='Item TestC', category='Drystock')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='Item', case_size='10LB',
+            case_pack_count=999,  # already set (deliberately wrong to verify no-overwrite)
+            unit_price='100', extended_amount='100', product=prod,
+        )
+        self._run('--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.case_pack_count, 999, 'should not overwrite existing')
