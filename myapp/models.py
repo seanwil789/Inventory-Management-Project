@@ -127,6 +127,26 @@ class ProductMappingProposal(models.Model):
     status              = models.CharField(max_length=15, choices=STATUS_CHOICES,
                                             default='pending', db_index=True)
     notes               = models.TextField(blank=True)
+    # Sean 2026-05-02: structured rejection reason. Free-text `notes` are
+    # for context; `reject_reason` is the categorical signal so audit +
+    # populate cmds can filter by reason class. Empty string when not
+    # yet rejected OR rejected without a reason given.
+    REJECT_REASON_CHOICES = [
+        ('', '— none —'),
+        ('wrong_canonical', 'Wrong canonical (suggestion is the wrong product)'),
+        ('not_a_product', 'Not a product (boilerplate / fee / line noise)'),
+        ('typo_or_garble', 'Typo or OCR garble in raw description'),
+        ('different_class', 'Different inventory class (weighed vs counted)'),
+        ('belongs_elsewhere', 'Belongs in a different canonical that exists'),
+        ('needs_new_canonical', 'Needs a new canonical (none exists yet)'),
+        ('other', 'Other (see notes)'),
+    ]
+    reject_reason       = models.CharField(
+        max_length=30, blank=True, choices=REJECT_REASON_CHOICES,
+        db_index=True,
+        help_text="Categorical reason for the rejection — drives audit "
+                  "filtering + future quality metrics.",
+    )
     created_at          = models.DateTimeField(auto_now_add=True)
     reviewed_at         = models.DateTimeField(null=True, blank=True)
     reviewed_by         = models.ForeignKey(
@@ -209,15 +229,21 @@ class ProductMappingProposal(models.Model):
 
         return {'ili_updated': ili_updated, 'product_mapping': pm}
 
-    def reject(self, *, reviewer=None, notes: str = ''):
-        """Mark this proposal rejected — no DB writes elsewhere. Future
-        re-suggestion of the same (vendor, raw_description) is suppressed
-        by the unique_together constraint + the negative_matches.json
-        cache the discover_unmapped scan reads."""
+    def reject(self, *, reviewer=None, notes: str = '', reason: str = ''):
+        """Mark this proposal rejected. `reason` is a categorical key
+        from REJECT_REASON_CHOICES; `notes` is free-text supplementary
+        context. The audit + populate cmds filter rejected proposals
+        by reason — e.g. 'not_a_product' rejections feed the boilerplate
+        guard regex; 'wrong_canonical' rejections inform the drift
+        audit's negative-pair set."""
         from django.utils import timezone
         self.status = 'rejected'
         self.reviewed_at = timezone.now()
         self.reviewed_by = reviewer
+        if reason:
+            valid = {k for k, _ in self.REJECT_REASON_CHOICES}
+            if reason in valid:
+                self.reject_reason = reason
         if notes:
             self.notes = (self.notes + '\n' if self.notes else '') + notes
         self.save()

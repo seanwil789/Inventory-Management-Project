@@ -2659,18 +2659,27 @@ def mapping_review_approve(request, proposal_id: int):
 
 @require_POST
 def mapping_review_reject(request, proposal_id: int):
-    """POST endpoint: reject a proposal. Optional 'notes' POST param."""
+    """POST endpoint: reject a proposal. Optional 'notes' POST param.
+    Optional 'reason' POST param — categorical key from
+    REJECT_REASON_CHOICES (Sean 2026-05-02 — structured teaching signal)."""
     from .models import ProductMappingProposal
     proposal = get_object_or_404(ProductMappingProposal, id=proposal_id)
     if proposal.status != 'pending':
         messages.warning(request, f"Proposal #{proposal.id} already {proposal.status}.")
         return redirect('mapping_review')
     notes = (request.POST.get('notes') or '').strip()
+    reason = (request.POST.get('reason') or '').strip()
     proposal.reject(
         reviewer=request.user if request.user.is_authenticated else None,
         notes=notes,
+        reason=reason,
     )
-    messages.info(request, f"Rejected proposal #{proposal.id}.")
+    label = ''
+    if reason:
+        label = dict(ProductMappingProposal.REJECT_REASON_CHOICES).get(reason, '')
+        if label:
+            label = f' ({label})'
+    messages.info(request, f"Rejected proposal #{proposal.id}{label}.")
     return redirect('mapping_review')
 
 

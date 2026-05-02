@@ -133,6 +133,18 @@
                 </form>
                 <form method="post" action="{% url 'mapping_review_reject' p.id %}" class="inline">
                   {% csrf_token %}
+                  <select name="reason"
+                          class="border rounded px-1 py-0.5 text-xs ml-1"
+                          title="Categorical reject reason — feeds the teaching signal">
+                    <option value="">— reason —</option>
+                    <option value="wrong_canonical">Wrong canonical</option>
+                    <option value="not_a_product">Not a product</option>
+                    <option value="typo_or_garble">Typo / OCR garble</option>
+                    <option value="different_class">Different class</option>
+                    <option value="belongs_elsewhere">Belongs elsewhere</option>
+                    <option value="needs_new_canonical">Needs new canonical</option>
+                    <option value="other">Other</option>
+                  </select>
                   <button type="submit"
                           class="px-2 py-0.5 bg-red-600 hover:bg-red-700 text-white rounded text-xs ml-1">
                     ✗ Reject

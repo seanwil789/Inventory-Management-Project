@@ -10144,3 +10144,74 @@ class MappingReviewUnresolvedFilterTests(TestCase):
         self.assertIn('RAW PENDING', body)
         self.assertNotIn('RAW REJECTED UNMAPPED', body,
                          'explicit pending filter should not include rejected')
+
+
+class RejectReasonTests(TestCase):
+    """Sean unification phase 2: structured rejection reason."""
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, ProductMappingProposal
+        from django.contrib.auth.models import User
+        self.user = User.objects.create_user(username='r', password='x')
+        self.client.force_login(self.user)
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.prod = Product.objects.create(canonical_name='Test Item', category='Drystock')
+        self.pmp = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='RAW DESC',
+            source='discover_unmapped', suggested_product=self.prod,
+            status='pending',
+        )
+
+    def test_reject_with_reason_records_categorical(self):
+        from myapp.models import ProductMappingProposal
+        resp = self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'wrong_canonical', 'notes': 'wrong product'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.pmp.refresh_from_db()
+        self.assertEqual(self.pmp.status, 'rejected')
+        self.assertEqual(self.pmp.reject_reason, 'wrong_canonical')
+        self.assertIn('wrong product', self.pmp.notes)
+
+    def test_reject_without_reason_still_works(self):
+        """Reason is optional — empty string is valid (legacy behavior)."""
+        from myapp.models import ProductMappingProposal
+        resp = self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'notes': 'just because'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.pmp.refresh_from_db()
+        self.assertEqual(self.pmp.status, 'rejected')
+        self.assertEqual(self.pmp.reject_reason, '')
+
+    def test_invalid_reason_silently_skipped(self):
+        """Defensive: garbage reason value doesn't break rejection."""
+        from myapp.models import ProductMappingProposal
+        self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'GARBAGE-NOT-IN-CHOICES'},
+        )
+        self.pmp.refresh_from_db()
+        self.assertEqual(self.pmp.status, 'rejected')
+        self.assertEqual(self.pmp.reject_reason, '')  # invalid reason ignored
+
+    def test_proposal_reject_method_signature(self):
+        """proposal.reject(reason=X) — direct call from CLI/code paths."""
+        self.pmp.reject(reason='not_a_product', notes='boilerplate')
+        self.assertEqual(self.pmp.reject_reason, 'not_a_product')
+        self.assertEqual(self.pmp.status, 'rejected')
+
+    def test_reject_already_rejected_no_op(self):
+        """Already-rejected proposal shouldn't get re-rejected with new reason."""
+        self.pmp.reject(reason='wrong_canonical')
+        first_reason = self.pmp.reject_reason
+        # Second attempt via view
+        resp = self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'not_a_product'},
+        )
+        self.pmp.refresh_from_db()
+        # View redirect with warning; reason unchanged
+        self.assertEqual(self.pmp.reject_reason, first_reason)
