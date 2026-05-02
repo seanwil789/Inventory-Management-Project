@@ -28,6 +28,31 @@ class Product(models.Model):
                   "between bought-prepped and prepped-in-house forms. "
                   "Will phase out as in-house prep replaces purchased pre-prep.",
     )
+    # ── Structured inventory schema (Phase 1, 2026-05-02) ─────────────────
+    # Per Sean's `feedback_inventory_count_classes.md` 2-class methodology
+    # (Weighed vs Counted-with-Fraction) extended to 3 classes for the
+    # cost-calc / sheet F+G logic.
+    inventory_class = models.CharField(
+        max_length=30, blank=True,
+        choices=[
+            ('', '— unset —'),
+            ('weighed', 'Weighed (proteins, cheese — $/lb pricing, scale required)'),
+            ('counted_with_weight', 'Counted-with-weight (uniform packs — count blocks/tubs/bottles)'),
+            ('counted_with_volume', 'Counted-with-volume (gallons/quarts/pints — count containers)'),
+        ],
+        help_text="Inventory class — drives sheet F+G column logic + recipe "
+                  "cost dispatch. Weighed: F=total lb, G='#'. "
+                  "Counted-with-weight: F=count, G='1# Print' / '5# Tub' / etc. "
+                  "Counted-with-volume: F=count, G='Gal' / 'Qt' / 'Pt'. "
+                  "Future: type-check fuzzy mapper (reject yogurt→shrimp class mismatch).",
+    )
+    inventory_unit_descriptor = models.CharField(
+        max_length=60, blank=True,
+        help_text="Human-readable unit descriptor that lands in sheet col G. "
+                  "Examples: '1# Print' / '5# Tub' / '5.3 oz Patty' / "
+                  "'Half-pint Clamshell' / 'Gal' / 'Btl' / 'Ea'. "
+                  "Replaces sheet col G's ad-hoc strings with controlled values.",
+    )
 
     def __str__(self):
         return self.canonical_name
@@ -226,7 +251,71 @@ class InvoiceLineItem(models.Model):
                   "elsewhere (Farm Art, PBM, Delaware Linen, Colonial). "
                   "Consumers should prefer this field over reverse-engineering "
                   "$/lb from unit_price + case_size.")
-    case_size       = models.CharField(max_length=100, blank=True)
+    case_size       = models.CharField(
+        max_length=100, blank=True,
+        help_text="LEGACY string field — preserved for backward compat + audit. "
+                  "Holds 6+ semantic shapes (vendor weight, pack format, "
+                  "merged count×size, volume container count, catch-weight, "
+                  "U/M token, range). Consumers should prefer the structured "
+                  "fields below (quantity, purchase_uom, case_pack_*) when "
+                  "populated. Deprecation target: post-Phase-3 of structured "
+                  "schema migration.",
+    )
+    # ── Structured invoice-line schema (Phase 1, 2026-05-02) ──────────────
+    # Replaces overloaded `case_size` string with typed fields. Sources from
+    # spatial_matcher (already extracts qty for PBM/Exc/FA/Del) + parser
+    # (catches case-pack tokens). Threaded through db_write.
+    quantity = models.DecimalField(
+        max_digits=10, decimal_places=3, null=True, blank=True,
+        help_text="Quantity ordered/shipped from the invoice line. "
+                  "Exceptional catch-weight = actual shipped lbs (e.g. 8.56). "
+                  "Farm Art / PBM / Delaware = qty in vendor's U/M (often 1.0 CASE). "
+                  "Sysco = always 1 (one case per line). NULL when parser couldn't extract.",
+    )
+    purchase_uom = models.CharField(
+        max_length=10, blank=True,
+        help_text="Vendor's U/M column verbatim. EACH / CASE / LB / DZ / etc. "
+                  "Free varchar — controlled vocabulary will emerge from audit "
+                  "after backfill. Distinguishes per-piece vs per-case pricing "
+                  "for Farm Art (Celery 3 stalks @ $2.60/EACH = $7.72 vs $7.72/case).",
+    )
+    case_pack_count = models.IntegerField(
+        null=True, blank=True,
+        help_text="Units per case (e.g. 60 patties/case for Burgers 60/5.3OZ). "
+                  "First half of vendor's pack-size column. NULL when not applicable "
+                  "(catch-weight rows, single-unit bulk, etc.).",
+    )
+    case_pack_unit_size = models.DecimalField(
+        max_digits=10, decimal_places=3, null=True, blank=True,
+        help_text="Size of each unit (e.g. 5.3 oz for 60/5.3OZ Burgers). "
+                  "Decimal-tolerant (parser caps at 48 missed 5.3oz patties; "
+                  "case_size_decoder handles up to 2000+ with decimals).",
+    )
+    case_pack_unit_uom = models.CharField(
+        max_length=10, blank=True,
+        help_text="Unit-of-size for each pack member: OZ / LB / CT / PT / DZ / GAL.",
+    )
+    case_total_weight_lb = models.DecimalField(
+        max_digits=10, decimal_places=3, null=True, blank=True,
+        help_text="Total case weight in lb — derived canonical for $/lb math. "
+                  "= case_pack_count × case_pack_unit_size (with unit conversion). "
+                  "Replaces the parse-string-and-pray flow in synergy_sync.calc_price_per_lb.",
+    )
+    # Per-piece count grade for weighed products (bacon, shrimp, scallops).
+    # Sean 2026-05-02: bacon is weighed for COUNT purposes — recipe says
+    # "2 strips bacon", we need (10+14)/2 = 12 strips/lb to compute cost.
+    # Range comes from raw_description tokens like "10/14", "21/25", "26/30".
+    count_per_lb_low = models.IntegerField(
+        null=True, blank=True,
+        help_text="Low end of per-lb count grade (e.g. 10 for bacon '10/14'). "
+                  "Used by recipe cost calc for per-piece pricing. "
+                  "Extracted from raw_description by per-vendor parsers.",
+    )
+    count_per_lb_high = models.IntegerField(
+        null=True, blank=True,
+        help_text="High end of per-lb count grade (e.g. 14 for bacon '10/14'). "
+                  "Recipe cost = ($/lb / avg(low,high)) × strips_called_for.",
+    )
     invoice_date    = models.DateField(null=True, blank=True)
     source_file     = models.CharField(max_length=255, blank=True)  # original filename
     match_confidence = models.CharField(max_length=20, blank=True, choices=CONFIDENCE_CHOICES)
