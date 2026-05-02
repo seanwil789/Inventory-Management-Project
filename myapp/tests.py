@@ -8506,3 +8506,92 @@ class DBWriteClassMismatchGuardTests(TestCase):
         self.assertIsNotNone(ili)
         self.assertEqual(ili.product, self.mayo,
                          'Class match should preserve FK attach')
+
+
+class CleanupExistingMismapsTests(TestCase):
+    """#3 — sweep existing class-mismatched rows + detach FKs."""
+
+    def _run(self, apply_writes=False):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        args = ['cleanup_existing_mismaps']
+        if apply_writes:
+            args.append('--apply')
+        call_command(*args, stdout=out)
+        return out.getvalue()
+
+    def test_detaches_class_mismatch_row(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        # weighed protein product
+        shrimp = Product.objects.create(
+            canonical_name='Shrimp Test', category='Proteins',
+            inventory_class='weighed', default_case_size='2/5LB')
+        # ILI mapped wrong: yogurt-volume raw → shrimp
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='DAIRY YOGURT 12/4OZ',
+            case_size='4/1GAL', unit_price='5.00',
+            product=shrimp, match_confidence='code')
+        self._run(apply_writes=True)
+        ili.refresh_from_db()
+        self.assertIsNone(ili.product)
+        self.assertEqual(ili.match_confidence, 'unmatched_class_mismatch')
+
+    def test_dry_run_does_not_detach(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        shrimp = Product.objects.create(
+            canonical_name='Shrimp DryRun', category='Proteins',
+            inventory_class='weighed', default_case_size='2/5LB')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='OIL 4/1GAL',
+            case_size='4/1GAL', unit_price='5.00',
+            product=shrimp, match_confidence='code')
+        out = self._run(apply_writes=False)
+        self.assertIn('DRY-RUN', out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.product, shrimp)  # untouched
+
+    def test_leaves_class_match_alone(self):
+        """Class-matching rows are not detached (no false positives)."""
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        v, _ = Vendor.objects.get_or_create(name='Sysco')
+        mayo = Product.objects.create(
+            canonical_name='Mayo Match Test', category='Drystock',
+            inventory_class='counted_with_volume', default_case_size='1 GAL')
+        ili = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='MAYO 1 GAL',
+            case_size='1 GAL', unit_price='5.00',
+            product=mayo, match_confidence='code')
+        self._run(apply_writes=True)
+        ili.refresh_from_db()
+        self.assertEqual(ili.product, mayo)
+        self.assertEqual(ili.match_confidence, 'code')
+
+    def test_vendor_filter(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        sysco, _ = Vendor.objects.get_or_create(name='Sysco')
+        farmart, _ = Vendor.objects.get_or_create(name='Farm Art')
+        prod = Product.objects.create(
+            canonical_name='Vfilt Test', category='Proteins',
+            inventory_class='weighed', default_case_size='5LB')
+        sysco_ili = InvoiceLineItem.objects.create(
+            vendor=sysco, invoice_date='2026-04-15',
+            raw_description='OIL 4/1GAL', case_size='4/1GAL',
+            unit_price='5.00', product=prod, match_confidence='code')
+        farmart_ili = InvoiceLineItem.objects.create(
+            vendor=farmart, invoice_date='2026-04-15',
+            raw_description='OIL 4/1GAL', case_size='4/1GAL',
+            unit_price='5.00', product=prod, match_confidence='code')
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('cleanup_existing_mismaps', '--apply',
+                     '--vendor', 'Sysco', stdout=out)
+        sysco_ili.refresh_from_db(); farmart_ili.refresh_from_db()
+        self.assertIsNone(sysco_ili.product)         # detached
+        self.assertEqual(farmart_ili.product, prod)  # untouched (other vendor)
