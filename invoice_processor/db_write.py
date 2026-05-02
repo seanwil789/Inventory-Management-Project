@@ -408,6 +408,37 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         # Upsert: if a record for the same (vendor, date, product/description)
         # already exists, update it rather than creating a duplicate.
         # This makes re-processing invoices safe — prices get refreshed in place.
+        # Structured pack-fields fallback for vendors whose parser doesn't
+        # extract them upstream (PBM, Colonial). When incoming_cs has a
+        # decomposable shape ('10/12CT', '21.5LB', '8/38OZ') and the parser
+        # didn't already populate the structured fields, decompose now.
+        # Skipped when parser already supplied values (Sysco/Exceptional/
+        # FarmArt) so authoritative line-item data isn't overwritten by a
+        # default_case_size fallback inference.
+        if (case_pack_count_val is None and incoming_cs):
+            try:
+                _here = os.path.dirname(os.path.abspath(__file__))
+                if _here not in sys.path:
+                    sys.path.insert(0, _here)
+                from parser import _structured_pack_from_case_size
+                fallback = _structured_pack_from_case_size(incoming_cs)
+                if fallback:
+                    case_pack_count_val = fallback.get('case_pack_count')
+                    case_pack_unit_size_val = (
+                        fallback.get('case_pack_unit_size')
+                        if case_pack_unit_size_val is None
+                        else case_pack_unit_size_val
+                    )
+                    case_pack_unit_uom_val = (
+                        fallback.get('case_pack_unit_uom') or ''
+                        if not case_pack_unit_uom_val
+                        else case_pack_unit_uom_val
+                    )
+                    if case_total_weight_lb_val is None:
+                        case_total_weight_lb_val = fallback.get('case_total_weight_lb')
+            except Exception:
+                pass
+
         common_fields = dict(
             unit_price=unit_price,
             extended_amount=extended,

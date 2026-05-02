@@ -5753,14 +5753,17 @@ class DBWriteStructuredFieldsTests(TestCase):
 
     def test_structured_fields_stay_null_when_absent(self):
         """Existing parser output that doesn't include structured fields
-        produces ILI rows with NULL for the new columns. Backward-compat
-        guarantee — the migration is pure-add."""
+        AND has an undecomposable case_size produces ILI rows with NULL
+        for the new columns. Backward-compat guarantee — the migration
+        is pure-add. (Note: post 2026-05-02, db_write decomposes the
+        case_size when shape is recognized — this test uses a bare-int
+        case_size that doesn't match _NORMALIZED_PACK_RE / _BARE_PACK_RE.)"""
         product = self._setup('Farm Art')
         items = [{
-            'raw_description': 'TOMATOES, CHERRY, 12 CONT',
+            'raw_description': 'TOMATOES, CHERRY, BARE NUMBER',
             'canonical': 'Test Product',
             'unit_price': 24.50,
-            'case_size_raw': '12CT',
+            'case_size_raw': '12',  # bare number — not decomposable
             'confidence': 'vendor_exact',
             # No quantity, no unit_of_measure, no case_pack_*, no count_per_lb_*
         }]
@@ -5777,7 +5780,7 @@ class DBWriteStructuredFieldsTests(TestCase):
         self.assertIsNone(ili.count_per_lb_low)
         self.assertIsNone(ili.count_per_lb_high)
         # Legacy field still populated
-        self.assertEqual(ili.case_size, '12CT')
+        self.assertEqual(ili.case_size, '12')
 
     def test_purchase_uom_falls_back_when_absent(self):
         """`unit_of_measure` from parser → ILI.purchase_uom. Either key works
@@ -9203,3 +9206,115 @@ United States
         self.assertTrue(juice, 'parser should extract juice item')
         self.assertEqual(juice[0].get('case_pack_count'), 4)
         self.assertEqual(juice[0].get('case_pack_unit_uom'), 'GAL')
+
+
+class DBWriteStructuredFallbackTests(TestCase):
+    """db_write fallback: when parser didn't populate structured fields but
+    incoming_cs (parser-extracted OR default_case_size inheritance) is
+    decomposable, run _structured_pack_from_case_size and populate.
+    Closes the PBM / Colonial structured-field gap.
+    """
+
+    def test_pbm_inherits_decomposable_pack(self):
+        """PBM parser emits empty case_size_raw + no structured fields;
+        Product.default_case_size inherits to ILI; db_write decomposes."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        Vendor.objects.get_or_create(name='Philadelphia Bakery Merchants')
+        prod = Product.objects.create(
+            canonical_name='Burger Bun PBM', category='Bakery',
+            default_case_size='10/12CT')
+        write_invoice_to_db(
+            'Philadelphia Bakery Merchants', '2026-04-15',
+            [{
+                'canonical': 'Burger Bun PBM',
+                'raw_description': 'Hamburger Rolls',
+                'case_size_raw': '',  # PBM doesn't extract
+                'unit_price': '20.00', 'extended_amount': '20.00',
+                'sysco_item_code': '', 'confidence': 'manual_review',
+                'score': 100,
+            }],
+            source_file='pbm_test')
+        from decimal import Decimal
+        ili = InvoiceLineItem.objects.filter(raw_description='Hamburger Rolls').first()
+        self.assertIsNotNone(ili)
+        self.assertEqual(ili.case_size, '10/12CT')   # inherited
+        self.assertEqual(ili.case_pack_count, 10)    # decomposed by fallback
+        self.assertEqual(ili.case_pack_unit_size, Decimal('12'))
+        self.assertEqual(ili.case_pack_unit_uom, 'CT')
+
+    def test_colonial_catch_weight_LB_decomposes(self):
+        """Colonial uses bare LB weights ('40LB', '21.5LB', '60.1LB')."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        Vendor.objects.get_or_create(name='Colonial Village Meat Markets')
+        prod = Product.objects.create(
+            canonical_name='Wings Colonial', category='Proteins',
+            default_case_size='40LB')
+        write_invoice_to_db(
+            'Colonial Village Meat Markets', '2026-04-15',
+            [{
+                'canonical': 'Wings Colonial',
+                'raw_description': 'Wings',
+                'case_size_raw': '',
+                'unit_price': '74.00', 'extended_amount': '74.00',
+                'sysco_item_code': '', 'confidence': 'manual_review',
+                'score': 100,
+            }],
+            source_file='col_test')
+        from decimal import Decimal
+        ili = InvoiceLineItem.objects.filter(raw_description='Wings').first()
+        self.assertEqual(ili.case_pack_count, 1)
+        self.assertEqual(ili.case_pack_unit_size, Decimal('40'))
+        self.assertEqual(ili.case_pack_unit_uom, 'LB')
+        self.assertEqual(ili.case_total_weight_lb, Decimal('40'))
+
+    def test_parser_supplied_values_NOT_overwritten(self):
+        """When parser already populated case_pack_count, fallback skips."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(
+            canonical_name='Test Sysco Item', category='Drystock',
+            default_case_size='10/12CT')  # would decompose to (10, 12, CT)
+        write_invoice_to_db(
+            'Sysco', '2026-04-15',
+            [{
+                'canonical': 'Test Sysco Item',
+                'raw_description': 'TEST ITEM',
+                'case_size_raw': '24/8OZ',
+                'case_pack_count': 24,           # parser supplied
+                'case_pack_unit_size': '8',      # parser supplied
+                'case_pack_unit_uom': 'OZ',      # parser supplied
+                'unit_price': '50', 'extended_amount': '50',
+                'sysco_item_code': '999', 'confidence': 'code', 'score': 100,
+            }],
+            source_file='sysco_test')
+        from decimal import Decimal
+        ili = InvoiceLineItem.objects.filter(raw_description='TEST ITEM').first()
+        # Parser values preserved
+        self.assertEqual(ili.case_pack_count, 24)
+        self.assertEqual(ili.case_pack_unit_size, Decimal('8'))
+        self.assertEqual(ili.case_pack_unit_uom, 'OZ')
+
+    def test_undecomposable_cs_leaves_fields_null(self):
+        """When case_size is bare/ambiguous, structured fields stay NULL."""
+        from invoice_processor.db_write import write_invoice_to_db
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        Vendor.objects.get_or_create(name='Philadelphia Bakery Merchants')
+        prod = Product.objects.create(
+            canonical_name='Donut PBM', category='Bakery',
+            default_case_size='2')  # bare quantity, no unit
+        write_invoice_to_db(
+            'Philadelphia Bakery Merchants', '2026-04-15',
+            [{
+                'canonical': 'Donut PBM',
+                'raw_description': 'Assorted Donuts',
+                'case_size_raw': '',
+                'unit_price': '20', 'extended_amount': '20',
+                'sysco_item_code': '', 'confidence': 'manual_review', 'score': 100,
+            }],
+            source_file='donut_test')
+        ili = InvoiceLineItem.objects.filter(raw_description='Assorted Donuts').first()
+        self.assertEqual(ili.case_size, '2')
+        self.assertIsNone(ili.case_pack_count)  # undecomposable
