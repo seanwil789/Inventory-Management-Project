@@ -663,6 +663,13 @@ class RecipeIngredient(models.Model):
         # Ensure at least one attempt even when no candidate parses
         attempt_cases = candidates or [latest.case_size or '']
 
+        # Phase 3b: structured fields from latest ILI feed ingredient_cost.
+        # count_per_lb_low/high enable per-piece cost for "2 strips bacon"
+        # (Sean 2026-05-02). NULLs propagate cleanly — ingredient_cost
+        # falls back to the existing dispatch when these are absent.
+        latest_count_low = latest.count_per_lb_low
+        latest_count_high = latest.count_per_lb_high
+
         def _try(qty, unit, yield_pct):
             last = (None, '')
             for cs in attempt_cases:
@@ -672,6 +679,8 @@ class RecipeIngredient(models.Model):
                     yield_pct=yield_pct,
                     ounce_weight_per_cup=density,
                     price_per_pound=latest.price_per_pound,
+                    count_per_lb_low=latest_count_low,
+                    count_per_lb_high=latest_count_high,
                 )
                 if cost is not None:
                     return cost, note

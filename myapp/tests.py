@@ -6322,6 +6322,108 @@ class SnapshotSynergySheetCommandTests(TestCase):
         self.assertIn('not found', str(ctx.exception).lower())
 
 
+class IngredientCostCountPerLbTests(TestCase):
+    """`cost_utils.ingredient_cost` Phase 3b — count_per_lb dynamic
+    per-piece pricing. Sean 2026-05-02 use case: bacon is weighed for
+    count purposes; recipe "2 strips bacon" + ILI count_per_lb=10/14
+    + $/lb known → cost per strip computed dynamically.
+
+    Same pattern works for shrimp (21/25, 26/30 grades), scallops,
+    sliced cheese, etc."""
+
+    def _import(self):
+        from myapp.cost_utils import ingredient_cost
+        return ingredient_cost
+
+    def test_bacon_2_strips_with_count_grade(self):
+        """Bacon 10/14 grade @ $4.69/lb → 2 strips = 2 × (16/12) oz =
+        2.67 oz → $4.69 × 2.67/16 = $0.78."""
+        f = self._import()
+        cost, note = f(
+            recipe_qty=Decimal('2'), recipe_unit='strips',
+            ingredient_name='Bacon', case_price=Decimal('70.35'),
+            case_size_str='15LB', count_per_lb_low=10, count_per_lb_high=14,
+            price_per_pound=Decimal('4.69'),
+        )
+        self.assertIsNotNone(cost, f'expected cost, got note={note!r}')
+        # avg_count = 12, piece_oz = 16/12 = 1.333..., qty_oz = 2 × 1.333 = 2.667
+        # direct $/lb path: 2.667/16 lb × $4.69 = $0.78
+        self.assertEqual(cost, Decimal('0.78'))
+        self.assertEqual(note, 'direct $/lb')
+
+    def test_shrimp_8_pieces_21_25_grade(self):
+        """Shrimp 21/25 grade @ $14.99/lb → 8 pieces. avg=23, piece_oz=0.696,
+        qty_oz = 8 × 0.696 = 5.565 → $14.99 × 5.565/16 = $5.21."""
+        f = self._import()
+        cost, note = f(
+            recipe_qty=Decimal('8'), recipe_unit='pieces',
+            ingredient_name='Shrimp', case_price=Decimal('299.80'),
+            case_size_str='20LB', count_per_lb_low=21, count_per_lb_high=25,
+            price_per_pound=Decimal('14.99'),
+        )
+        self.assertIsNotNone(cost)
+        # avg=23, piece_oz=16/23 = 0.6957, qty=8×0.6957=5.5652
+        # $14.99 × 5.5652/16 = $5.21
+        self.assertEqual(cost, Decimal('5.21'))
+
+    def test_count_grade_falls_through_when_unit_not_piece_word(self):
+        """Recipe asks "1 lb bacon" — count_per_lb is irrelevant. Direct
+        $/lb path runs as before."""
+        f = self._import()
+        cost, note = f(
+            recipe_qty=Decimal('1'), recipe_unit='lb',
+            ingredient_name='Bacon', case_price=Decimal('70.35'),
+            case_size_str='15LB', count_per_lb_low=10, count_per_lb_high=14,
+            price_per_pound=Decimal('4.69'),
+        )
+        self.assertEqual(cost, Decimal('4.69'))
+        self.assertEqual(note, 'direct $/lb')
+
+    def test_count_grade_skipped_when_no_count_data(self):
+        """Bacon recipe "2 strips" but no count grade on ILI — falls
+        through to existing dispatch. Without count_per_lb info, "strips"
+        has no recipe-side cost path → ingredient_cost returns None."""
+        f = self._import()
+        cost, note = f(
+            recipe_qty=Decimal('2'), recipe_unit='strips',
+            ingredient_name='Bacon', case_price=Decimal('70.35'),
+            case_size_str='15LB',
+            count_per_lb_low=None, count_per_lb_high=None,
+            price_per_pound=Decimal('4.69'),
+        )
+        # No count grade + no piece-weight table entry for ('bacon', 'strips')
+        # → falls through; weight↔weight requires recipe_unit weight, which
+        # 'strips' isn't → returns None with incompatible-units note
+        self.assertIsNone(cost)
+
+    def test_count_grade_with_only_low_or_high_falls_through(self):
+        """count_per_lb_low alone (high null) — ambiguous, skip the path.
+        Both required."""
+        f = self._import()
+        cost, note = f(
+            recipe_qty=Decimal('2'), recipe_unit='strips',
+            ingredient_name='Bacon', case_price=Decimal('70.35'),
+            case_size_str='15LB',
+            count_per_lb_low=10, count_per_lb_high=None,
+            price_per_pound=Decimal('4.69'),
+        )
+        self.assertIsNone(cost)
+
+    def test_count_grade_uses_avg_when_low_eq_high(self):
+        """count_per_lb_low == count_per_lb_high (single grade, not range)
+        → avg = that value, piece_oz computed cleanly."""
+        f = self._import()
+        cost, _ = f(
+            recipe_qty=Decimal('1'), recipe_unit='strip',
+            ingredient_name='Bacon', case_price=Decimal('70.35'),
+            case_size_str='15LB',
+            count_per_lb_low=12, count_per_lb_high=12,
+            price_per_pound=Decimal('4.69'),
+        )
+        # piece_oz = 16/12 = 1.333, qty=1×1.333, cost = $4.69 × 1.333/16 = $0.39
+        self.assertEqual(cost, Decimal('0.39'))
+
+
 class ProductInventoryClassFieldTests(TestCase):
     """`Product.inventory_class` + `inventory_unit_descriptor` schema fields.
     Phase 1 of structured schema migration. Pure additive — existing

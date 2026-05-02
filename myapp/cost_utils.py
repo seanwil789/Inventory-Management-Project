@@ -671,6 +671,20 @@ def cup_weight_oz_for(ingredient_name: str) -> Optional[Decimal]:
 
 # ---- Main cost function ----
 
+# Recipe units that signal per-piece pricing for weighed products.
+# Used with InvoiceLineItem.count_per_lb_low/high to compute cost per piece
+# dynamically (Phase 3b). Bacon "2 strips", shrimp "8 each", scallop "3 pieces" etc.
+# Does NOT include "each" / "ea" — those are too generic and already
+# handled by the existing _piece_weight_oz_for lookup table for specific
+# (ingredient, unit) pairs.
+_COUNT_PER_LB_PIECE_UNITS = frozenset({
+    'strip', 'strips',
+    'slice', 'slices',
+    'piece', 'pieces',
+    'shrimp', 'scallop', 'scallops',
+})
+
+
 def ingredient_cost(
     recipe_qty: Decimal | None,
     recipe_unit: str,
@@ -680,6 +694,8 @@ def ingredient_cost(
     yield_pct: Decimal | None = None,
     ounce_weight_per_cup: Decimal | None = None,
     price_per_pound: Decimal | None = None,
+    count_per_lb_low: int | None = None,
+    count_per_lb_high: int | None = None,
 ) -> tuple[Optional[Decimal], str]:
     """
     Compute the estimated dollar cost of an ingredient line.
@@ -693,6 +709,17 @@ def ingredient_cost(
     parsing case_size. This is the accuracy-load-bearing path for protein
     ingredients — avoids the entire case_size → pack_count × pack_size
     chain and produces a cost from a single multiplication.
+
+    Phase 3b (Sean 2026-05-02): when `count_per_lb_low` and
+    `count_per_lb_high` are provided AND `recipe_unit` is a per-piece
+    word (strip/strips/slice/slices/piece/pieces/shrimp/scallop[s]),
+    rewrite (qty, unit) to the equivalent oz-weight using the average
+    count grade. Per Sean: "bacon is weighed for count purposes — being
+    able to count individual slices of bacon is for recipe and meal
+    costing, same with shrimp." Recipe says "2 strips bacon" with
+    count_per_lb_low=10, count_per_lb_high=14 → 16 oz / 12 = 1.333 oz
+    per strip → 2 × 1.333 = 2.67 oz → existing weight↔weight dispatch
+    multiplies by case $/oz.
     """
     if recipe_qty is None:
         return None, 'no quantity'
@@ -709,6 +736,18 @@ def ingredient_cost(
     if piece_oz is not None:
         qty = qty * piece_oz
         recipe_unit = 'oz'
+
+    # Phase 3b: dynamic per-piece weight from ILI count grade.
+    # Recipe asks "2 strips bacon" + ILI carries count_per_lb_low=10 high=14
+    # → avg 12 strips/lb → 16 oz / 12 = 1.333 oz/strip. Rewrite qty + unit
+    # to oz-weight, fall through to weight↔weight dispatch.
+    elif (count_per_lb_low is not None and count_per_lb_high is not None
+            and normalize_unit(recipe_unit) in _COUNT_PER_LB_PIECE_UNITS):
+        avg_count = (Decimal(count_per_lb_low) + Decimal(count_per_lb_high)) / Decimal(2)
+        if avg_count > 0:
+            piece_oz_dynamic = Decimal('16') / avg_count
+            qty = qty * piece_oz_dynamic
+            recipe_unit = 'oz'
 
     # Direct $/lb path. Parser emits price_per_pound for Sysco catch-weight
     # and Exceptional — both are per-lb billed. When the recipe asks in a
