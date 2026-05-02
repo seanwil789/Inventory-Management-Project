@@ -9824,3 +9824,32 @@ class AuditPMCanonicalDriftTests(TestCase):
         self.assertIn('FROZEN CORN, 12/2.5-LB', out)
         # Farm Art PM NOT in proposals — its description differs slightly
         self.assertNotIn('FROZEN CORN BAG', out)
+
+    def test_safe_only_filters_loses_specificity(self):
+        """--safe-only excludes proposals where current has MORE tokens
+        than proposed. Catches the Sausage,Italian→Sausage class."""
+        from myapp.models import Product, ProductMapping
+        # Create coarse "Sausage" canonical (current PMs point at this — wrong direction)
+        # And the more-specific "Sausage, Italian"
+        sausage = Product.objects.create(canonical_name='Sausage Test', category='Proteins')
+        sausage_italian = Product.objects.create(
+            canonical_name='Sausage, Italian Test', category='Proteins')
+        # PM with raw containing only "SAUSAGE" → currently mapped to Italian
+        # subset_match would propose 'Sausage Test' (coarser) — bad direction
+        bad_pm = ProductMapping.objects.create(
+            vendor=self.v, product=sausage_italian,
+            description='SAUSAGE PORK CKD',  # no Italian token
+        )
+        # Without --safe-only, this proposal might surface
+        out_unfiltered = self._run()
+        # With --safe-only, the bad proposal is filtered out
+        out_safe = self._run('--safe-only')
+        self.assertNotIn('Sausage Test', out_safe.split('--- ')[-1] if '---' in out_safe else out_safe,
+                         msg='Safe filter should drop loses-specificity proposals')
+
+    def test_safe_only_keeps_gain_specificity(self):
+        """--safe-only KEEPS proposals where proposed adds tokens (Corn → Corn, Frozen)."""
+        out = self._run('--safe-only')
+        # Original drift case (FROZEN CORN → Corn, Frozen) is gain-specificity
+        self.assertIn("'Corn'", out)
+        self.assertIn("'Corn, Frozen'", out)

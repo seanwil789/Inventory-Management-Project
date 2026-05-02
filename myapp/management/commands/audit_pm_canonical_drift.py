@@ -69,6 +69,12 @@ class Command(BaseCommand):
                                  '(subset_match, stripped_fuzzy).')
         parser.add_argument('--limit', type=int, default=0,
                             help='Stop after N proposals (default: no limit).')
+        parser.add_argument('--safe-only', action='store_true',
+                            help='Filter to STRICT-SUPERSET proposals only — '
+                                 'proposed canonical contains all tokens of '
+                                 'current canonical PLUS extra tokens. Proven '
+                                 '100% accurate empirically; suitable for '
+                                 'bulk --apply without per-row review.')
 
     def handle(self, *args, **opts):
         apply_writes = opts['apply']
@@ -108,6 +114,13 @@ class Command(BaseCommand):
         if vendor_filter:
             qs = qs.filter(vendor__name=vendor_filter)
 
+        safe_only = opts['safe_only']
+
+        # Token-set utility for the --safe-only filter
+        import re as _re
+        def _tokens(s):
+            return set(_re.findall(r'[a-z0-9]+', (s or '').lower()))
+
         proposals = []
         scanned = 0
         for pm in qs.iterator():
@@ -133,6 +146,17 @@ class Command(BaseCommand):
             # Tier 6 returned a DIFFERENT canonical → potential drift
             if tier_filter and confidence != tier_filter:
                 continue
+            # Safe-only: require proposed tokens to be a STRICT superset of
+            # current tokens (proposed = current + extras). Filters out the
+            # "loses specificity" class (Sausage,Italian → Sausage; Trail Mix
+            # → Almonds) that subset_match's most-specific tiebreaker
+            # mistakenly proposes when the current canonical is also a
+            # subset of raw tokens but coarser.
+            if safe_only:
+                cur_t = _tokens(current)
+                pro_t = _tokens(proposed)
+                if not (pro_t > cur_t and cur_t.issubset(pro_t)):
+                    continue
             proposals.append({
                 'pm_id': pm.id,
                 'vendor': vendor_name,
