@@ -2001,21 +2001,25 @@ def _parse_farmart(text: str) -> list[dict]:
     )
 
     # ── Pass 1: Extract all descriptions with line positions ──────────────
+    # zz-prefixed items are ORDERED but NOT DELIVERED (Sean 2026-05-02).
+    # Farm Art uses "zz " to flag out-of-stock items on the order — they
+    # appear on the invoice paperwork but with qty=0 / unit_price=0. We
+    # must NOT generate ILI rows for these (history-level damage class:
+    # zero-priced ILIs distort cost coverage + sheet IUP averaging).
     descriptions = []
     for i, line in enumerate(lines):
         is_zz = line.upper().startswith("ZZ ")
+        if is_zz:
+            continue  # out-of-stock — never landed in inventory
         is_desc = (
-            not is_zz
-            and len(line) > 12
+            len(line) > 12
             and re.search(r'[A-Z]{3,}', line)
             and (re.search(r',', line) or re.search(r'[A-Z]{4,}\s+[A-Z]{2,}', line))
             and not skip_patterns.match(line)
             and not re.match(r'^[\d\s.,]+$', line)
         )
-
-        if is_zz or is_desc:
-            desc = line[3:].strip() if is_zz else line
-            desc = re.sub(r'\s*\*+.*$', '', desc).strip()
+        if is_desc:
+            desc = re.sub(r'\s*\*+.*$', '', line).strip()
             if desc:
                 descriptions.append({"description": desc, "line_idx": i})
 

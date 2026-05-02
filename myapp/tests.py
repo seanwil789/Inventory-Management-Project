@@ -1997,9 +1997,10 @@ Nontaxable
         result = parser_mod.parse_invoice(raw, vendor='Farm Art')
         self.assertEqual(result.get('invoice_total'), 25.00)
 
-    def test_zz_prefix_nonstock_items(self):
-        """Lines starting 'zz ' are non-stock delivery items. Parser
-        treats them as descriptions too (prefix stripped)."""
+    def test_zz_prefix_nonstock_items_skipped(self):
+        """Lines starting 'zz ' are out-of-stock orders that didn't ship.
+        Updated 2026-05-02 (Sean): parser must NOT generate ILI rows
+        for zz items — they distort cost coverage + sheet IUP averaging."""
         parser_mod = self._import_parser()
         raw = """Farm Art
 4/15/2026
@@ -2013,10 +2014,9 @@ Invoice Total
 """
         result = parser_mod.parse_invoice(raw, vendor='Farm Art')
         items = result['items']
-        self.assertEqual(len(items), 1)
-        # 'zz ' prefix stripped in stored raw_description
-        self.assertNotIn('zz ', items[0]['raw_description'])
-        self.assertIn('LENTIL', items[0]['raw_description'])
+        # zz item must be filtered — no items generated from this invoice
+        self.assertEqual(len(items), 0,
+                         f'zz-prefix items should be skipped; got {items}')
 
 
 class ParserExceptionalIntegrationTests(TestCase):
@@ -9408,3 +9408,134 @@ class BackfillStructuredFromCaseSizeTests(TestCase):
         self._run('--apply')
         ili.refresh_from_db()
         self.assertEqual(ili.case_pack_count, 999, 'should not overwrite existing')
+
+
+class FarmArtZzFilteringTests(TestCase):
+    """Sean 2026-05-02: zz-prefix on Farm Art = ordered but not delivered.
+    Parser must NOT create ILI rows for these — they distort cost coverage
+    + sheet IUP averaging.
+    """
+
+    def test_text_path_skips_zz_prefix(self):
+        """zz-prefixed lines don't generate items."""
+        from invoice_processor.parser import _parse_farmart
+        text = """
+1.000 EACH
+zz BAKING YEAST , DRY INSTANT 1
+United States
+0.00
+0.00
+1.000 EACH
+JUICE , ORANGE , 4 / 1 - GAL
+United States
+24.50
+24.50
+"""
+        items, _ = _parse_farmart(text)
+        # Only orange juice should be extracted; yeast (zz) skipped
+        for it in items:
+            raw = it.get('raw_description', '')
+            self.assertNotIn('YEAST', raw,
+                             msg=f'zz-prefixed yeast leaked: {it}')
+
+    def test_spatial_skips_zero_qty_shipped(self):
+        """Spatial path filters rows with qty_shipped=0 (zz items show up
+        as qty_ordered=N qty_shipped=0)."""
+        from invoice_processor.spatial_matcher import match_farmart_spatial
+        # Construct synthetic page with zz-pattern row
+        # qty_ord=1.000 qty_shp=0.000 ext=0.00 → must be filtered
+        # qty_ord=2.000 qty_shp=2.000 ext=20.00 → must be kept
+        pages = [{
+            'tokens': [
+                # row 1 — out-of-stock yeast
+                {'text': '1.000', 'x_min': 0.07, 'y_min': 0.30, 'x_max': 0.10, 'y_max': 0.31},
+                {'text': '0.000', 'x_min': 0.12, 'y_min': 0.30, 'x_max': 0.15, 'y_max': 0.31},
+                {'text': 'EACH', 'x_min': 0.18, 'y_min': 0.30, 'x_max': 0.21, 'y_max': 0.31},
+                {'text': 'YEAST DRY', 'x_min': 0.32, 'y_min': 0.30, 'x_max': 0.50, 'y_max': 0.31},
+                {'text': '0.00', 'x_min': 0.78, 'y_min': 0.30, 'x_max': 0.82, 'y_max': 0.31},
+                {'text': '0.00', 'x_min': 0.90, 'y_min': 0.30, 'x_max': 0.94, 'y_max': 0.31},
+                # row 2 — delivered carrots
+                {'text': '2.000', 'x_min': 0.07, 'y_min': 0.40, 'x_max': 0.10, 'y_max': 0.41},
+                {'text': '2.000', 'x_min': 0.12, 'y_min': 0.40, 'x_max': 0.15, 'y_max': 0.41},
+                {'text': 'EACH', 'x_min': 0.18, 'y_min': 0.40, 'x_max': 0.21, 'y_max': 0.41},
+                {'text': 'CARROT', 'x_min': 0.32, 'y_min': 0.40, 'x_max': 0.45, 'y_max': 0.41},
+                {'text': '10.00', 'x_min': 0.78, 'y_min': 0.40, 'x_max': 0.82, 'y_max': 0.41},
+                {'text': '20.00', 'x_min': 0.90, 'y_min': 0.40, 'x_max': 0.94, 'y_max': 0.41},
+            ],
+        }]
+        items = match_farmart_spatial(pages)
+        # Only carrots should survive
+        descs = [i.get('raw_description', '') for i in items]
+        self.assertEqual(len(items), 1, f'expected 1 item, got {len(items)}: {descs}')
+        self.assertIn('CARROT', items[0]['raw_description'])
+
+
+class CleanupUndeliveredItemsTests(TestCase):
+    """Sweep ILI rows that represent out-of-stock orders."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('cleanup_undelivered_items', *args, stdout=out)
+        return out.getvalue()
+
+    def test_deletes_zz_prefix_rows(self):
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        v, _ = Vendor.objects.get_or_create(name='Farm Art')
+        prod = Product.objects.create(canonical_name='Yeast Test', category='Drystock')
+        zz = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='zz BAKING YEAST , DRY INSTANT 1',
+            unit_price=0, extended_amount=0,
+            product=prod,
+        )
+        normal = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='YEAST DELIVERED',
+            unit_price=15, extended_amount=15,
+            product=prod,
+        )
+        self._run('--apply')
+        self.assertFalse(InvoiceLineItem.objects.filter(id=zz.id).exists())
+        self.assertTrue(InvoiceLineItem.objects.filter(id=normal.id).exists())
+
+    def test_deletes_zero_priced_zero_qty(self):
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        v, _ = Vendor.objects.get_or_create(name='Farm Art')
+        prod = Product.objects.create(canonical_name='Eggplant Test', category='Produce')
+        ghost = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='EGGPLANT SICILIAN 22',
+            unit_price=0, extended_amount=0,
+            product=prod,
+        )
+        self._run('--apply')
+        self.assertFalse(InvoiceLineItem.objects.filter(id=ghost.id).exists())
+
+    def test_dry_run_does_not_delete(self):
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        v, _ = Vendor.objects.get_or_create(name='Farm Art')
+        prod = Product.objects.create(canonical_name='Drytest', category='Produce')
+        zz = InvoiceLineItem.objects.create(
+            vendor=v, invoice_date='2026-04-15',
+            raw_description='zz X',
+            unit_price=0, extended_amount=0, product=prod,
+        )
+        out = self._run()
+        self.assertIn('Dry-run', out)
+        self.assertTrue(InvoiceLineItem.objects.filter(id=zz.id).exists())
+
+    def test_other_vendors_not_affected_by_default(self):
+        """Sysco freight credits with $0 should NOT be touched (default vendor=Farm Art)."""
+        from myapp.models import Vendor, InvoiceLineItem, Product
+        sysco, _ = Vendor.objects.get_or_create(name='Sysco')
+        prod = Product.objects.create(canonical_name='Sysco Item', category='Drystock')
+        ili = InvoiceLineItem.objects.create(
+            vendor=sysco, invoice_date='2026-04-15',
+            raw_description='FREIGHT CREDIT',
+            unit_price=0, extended_amount=0, product=prod,
+        )
+        self._run('--apply')
+        # Sysco row preserved (only Farm Art touched by default)
+        self.assertTrue(InvoiceLineItem.objects.filter(id=ili.id).exists())
