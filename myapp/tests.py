@@ -5833,6 +5833,224 @@ class DBWriteStructuredFieldsTests(TestCase):
         self.assertEqual(ili.purchase_uom, 'CASE')
 
 
+class ParserPackSizeDecompositionTests(TestCase):
+    """`parser._normalize_pack_size` + `_structured_pack_from_case_size` —
+    Phase 2a of structured invoice-line schema migration. Burgers `605.3OZ`
+    is the canonical failure case the schema-gap entry calls out: parser's
+    _COMMON_PACKS capped at 48 + integer-only regex meant 60×5.3 OZ patties
+    were stored as a single 605.3 oz blob.
+    """
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'parser' in sys.modules:
+            del sys.modules['parser']
+        import parser as p
+        return p
+
+    def test_normalize_burgers_decimal_split(self):
+        """Burgers '605.3OZ' → '60/5.3OZ'. THE failure case.
+        Pre-Phase-2a: stored unchanged (regex required integer).
+        Post-Phase-2a: split correctly (60 patties × 5.3 oz)."""
+        p = self._import_parser()
+        self.assertEqual(p._normalize_pack_size('605.3OZ'), '60/5.3OZ')
+        self.assertEqual(p._normalize_pack_size('605.3 OZ'), '60/5.3OZ')
+
+    def test_normalize_pringles_decimal_split(self):
+        """Pringles '122.38OZ' → '12/2.38OZ' (12 cans × 2.38 oz).
+        Two-decimal-place size — schema-gap memo cited this as evidence of
+        OCR ambiguity that requires decimal tolerance."""
+        p = self._import_parser()
+        self.assertEqual(p._normalize_pack_size('122.38OZ'), '12/2.38OZ')
+
+    def test_normalize_pretzels_120_5oz(self):
+        """Pretzels '120.5OZ' → '12/0.5OZ' (12 mini packs × 0.5 oz)."""
+        p = self._import_parser()
+        self.assertEqual(p._normalize_pack_size('120.5OZ'), '12/0.5OZ')
+
+    def test_normalize_integer_unchanged(self):
+        """Existing integer behavior preserved — '124OZ' → '12/4OZ' etc."""
+        p = self._import_parser()
+        self.assertEqual(p._normalize_pack_size('124OZ'), '12/4OZ')
+        self.assertEqual(p._normalize_pack_size('2416 OZ'), '24/16OZ')
+        self.assertEqual(p._normalize_pack_size('123LB'), '1/23LB')
+
+    def test_normalize_expanded_pack_list_60(self):
+        """_COMMON_PACKS expanded to include 60. '605.3OZ' must split
+        on the 60 prefix, not fall back to 6 × 05.3OZ which would be
+        non-physical."""
+        p = self._import_parser()
+        out = p._normalize_pack_size('605.3OZ')
+        self.assertEqual(out, '60/5.3OZ')
+        # Negative case: ensure the expansion doesn't break smaller cases
+        self.assertEqual(p._normalize_pack_size('124OZ'), '12/4OZ')
+
+    def test_normalize_decimal_no_split_when_no_pack_match(self):
+        """'5.3OZ' alone — no pack count splits it (5 isn't pack of 0.3 OZ
+        in any realistic Sysco SKU). Returns unchanged. The structured
+        helper picks count=1 size=5.3 from the bare-pack regex instead."""
+        p = self._import_parser()
+        self.assertEqual(p._normalize_pack_size('5.3OZ'), '5.3OZ')
+
+
+class ParserStructuredPackHelperTests(TestCase):
+    """`parser._structured_pack_from_case_size` — converts the normalized
+    "N/MUNIT" (or bare "NUNIT") string into the dict that db_write reads
+    to populate ILI.case_pack_count / case_pack_unit_size /
+    case_pack_unit_uom / case_total_weight_lb."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'parser' in sys.modules:
+            del sys.modules['parser']
+        import parser as p
+        return p._structured_pack_from_case_size
+
+    def test_n_over_m_oz_with_total_weight(self):
+        f = self._import()
+        out = f('60/5.3OZ')
+        self.assertEqual(out['case_pack_count'], 60)
+        self.assertEqual(out['case_pack_unit_size'], '5.3')
+        self.assertEqual(out['case_pack_unit_uom'], 'OZ')
+        # 60 × 5.3 / 16 = 19.875
+        self.assertAlmostEqual(out['case_total_weight_lb'], 19.875, places=3)
+
+    def test_n_over_m_lb(self):
+        f = self._import()
+        out = f('36/1LB')
+        self.assertEqual(out['case_pack_count'], 36)
+        self.assertEqual(out['case_pack_unit_size'], '1')
+        self.assertEqual(out['case_pack_unit_uom'], 'LB')
+        self.assertAlmostEqual(out['case_total_weight_lb'], 36.0, places=3)
+
+    def test_n_over_m_gal(self):
+        """4/1GAL — converts to total_weight_lb via gallon density approx."""
+        f = self._import()
+        out = f('4/1GAL')
+        self.assertEqual(out['case_pack_count'], 4)
+        self.assertEqual(out['case_pack_unit_size'], '1')
+        self.assertEqual(out['case_pack_unit_uom'], 'GAL')
+        # 4 gal × 8.345 lb/gal = 33.38 lb
+        self.assertAlmostEqual(out['case_total_weight_lb'], 33.38, places=2)
+
+    def test_count_unit_no_total_weight(self):
+        """CT/EA/DZ are count units — total_weight_lb unset (would
+        require per-unit weight from canonical product side)."""
+        f = self._import()
+        out = f('12/24CT')
+        self.assertEqual(out['case_pack_count'], 12)
+        self.assertEqual(out['case_pack_unit_size'], '24')
+        self.assertEqual(out['case_pack_unit_uom'], 'CT')
+        self.assertNotIn('case_total_weight_lb', out)
+
+    def test_bare_pack_decomposes_with_count_one(self):
+        """50LB / 12CT / 1GAL — bare formats decompose as count=1."""
+        f = self._import()
+        out = f('50LB')
+        self.assertEqual(out['case_pack_count'], 1)
+        self.assertEqual(out['case_pack_unit_size'], '50')
+        self.assertEqual(out['case_pack_unit_uom'], 'LB')
+        self.assertAlmostEqual(out['case_total_weight_lb'], 50.0, places=2)
+
+        out = f('12CT')
+        self.assertEqual(out['case_pack_count'], 1)
+        self.assertEqual(out['case_pack_unit_uom'], 'CT')
+        self.assertNotIn('case_total_weight_lb', out)
+
+    def test_undecomposable_returns_empty(self):
+        """Bare numbers / dates / OCR garbage → empty dict (db_write
+        coerces missing keys to NULL)."""
+        f = self._import()
+        self.assertEqual(f(''), {})
+        self.assertEqual(f(None), {})
+        self.assertEqual(f('1'), {})
+        self.assertEqual(f('CASE'), {})
+        self.assertEqual(f('4/11/2026'), {})
+
+    def test_floz_normalizes_to_fl_oz(self):
+        """FLOZ and FL_OZ both land as FL_OZ (canonical form)."""
+        f = self._import()
+        out = f('12/8FLOZ')
+        self.assertEqual(out['case_pack_unit_uom'], 'FL_OZ')
+
+
+class ParserSyscoEmitsStructuredFieldsTests(TestCase):
+    """End-to-end Phase 2a — _parse_sysco emits structured pack fields
+    in each item dict so db_write populates ILI columns."""
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'parser' in sys.modules:
+            del sys.modules['parser']
+        import parser as p
+        return p
+
+    def test_sysco_items_carry_structured_pack_when_decomposable(self):
+        """Synthetic Sysco invoice — items with decomposable pack sizes
+        carry case_pack_count + case_pack_unit_size + case_pack_unit_uom."""
+        p = self._import()
+        # Synthetic minimal Sysco-shape invoice — use the regex-anchored 7-digit code
+        raw = """**** DAIRY ****
+QTY  PACK SIZE   ITEM DESCRIPTION
+1 CS 4/1GAL      DAIRY MILK 2%
+1234567 24.50
+
+1 CS 605.3OZ     JTM BURGER BEEF SBSDR ANGUS 5.3 OZ PATTY
+2345678 82.85
+
+INVOICE TOTAL
+107.35
+"""
+        result = p.parse_invoice(raw, vendor='Sysco')
+        items = result['items']
+        # Find Burgers + Milk by description tokens
+        burgers = next((i for i in items if 'BURGER' in i.get('raw_description', '').upper()), None)
+        milk = next((i for i in items if 'MILK' in i.get('raw_description', '').upper()), None)
+
+        self.assertIsNotNone(burgers, f'expected Burgers item, got {[i.get("raw_description") for i in items]}')
+        # Phase 2a acceptance: Burgers 605.3OZ → 60/5.3OZ → structured fields
+        self.assertEqual(burgers.get('case_pack_count'), 60)
+        self.assertEqual(burgers.get('case_pack_unit_size'), '5.3')
+        self.assertEqual(burgers.get('case_pack_unit_uom'), 'OZ')
+        self.assertAlmostEqual(burgers.get('case_total_weight_lb'), 19.875, places=2)
+
+        self.assertIsNotNone(milk)
+        self.assertEqual(milk.get('case_pack_count'), 4)
+        self.assertEqual(milk.get('case_pack_unit_size'), '1')
+        self.assertEqual(milk.get('case_pack_unit_uom'), 'GAL')
+
+    def test_sysco_items_default_quantity_one_case(self):
+        """Sysco lines = 1 case by convention. quantity=1 + unit_of_measure='CASE'
+        emitted on every item (overridden to weight on catch-weight rows)."""
+        p = self._import()
+        raw = """**** DAIRY ****
+QTY  PACK SIZE   ITEM DESCRIPTION
+1 CS 4/1GAL      DAIRY MILK 2%
+1234567 24.50
+
+INVOICE TOTAL
+24.50
+"""
+        result = p.parse_invoice(raw, vendor='Sysco')
+        for item in result['items']:
+            self.assertEqual(item.get('quantity'), 1,
+                f"Sysco item should default quantity=1: {item}")
+            self.assertEqual(item.get('unit_of_measure'), 'CASE',
+                f"Sysco item should default UoM=CASE: {item}")
+
+
 class ProductInventoryClassFieldTests(TestCase):
     """`Product.inventory_class` + `inventory_unit_descriptor` schema fields.
     Phase 1 of structured schema migration. Pure additive — existing

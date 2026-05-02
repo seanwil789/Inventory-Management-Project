@@ -240,19 +240,28 @@ def _normalize_pack_size(pack: str) -> str:
     """
     Normalize a raw pack size string. Handles Sysco's merged qty+size format
     where the OCR runs count and size together:
-      "120 LB"  → "1/20LB"   (1 case × 20 lbs — e.g. black beans)
-      "210 LB"  → "2/10LB"   (2 cases × 10 lbs)
-      "123LB"   → "1/23LB"   (1 case × 23 lbs)
-      "124 OZ"  → "12/4OZ"   (12 cups × 4 oz — e.g. yogurt)
-      "434 OZ"  → "4/34OZ"   (4 bags × 34 oz — e.g. cereal)
-      "2416 OZ" → "24/16OZ"  (24 cans × 16 oz — e.g. Arizona tea)
-      "230 CT"  → "2/30CT"   ... or leave as "230 CT"?
+      "120 LB"   → "1/20LB"    (1 case × 20 lbs — e.g. black beans)
+      "210 LB"   → "2/10LB"    (2 cases × 10 lbs)
+      "123LB"    → "1/23LB"    (1 case × 23 lbs)
+      "124 OZ"   → "12/4OZ"    (12 cups × 4 oz — e.g. yogurt)
+      "434 OZ"   → "4/34OZ"    (4 bags × 34 oz — e.g. cereal)
+      "2416 OZ"  → "24/16OZ"   (24 cans × 16 oz — e.g. Arizona tea)
+      "605.3OZ"  → "60/5.3OZ"  (60 patties × 5.3 oz — Burgers, Phase 2a fix)
+      "122.38OZ" → "12/2.38OZ" (12 × 2.38 oz — Pringles)
+      "120.5OZ"  → "12/0.5OZ"  (12 × 0.5 oz mini packs — Pretzels)
+      "230 CT"   → "2/30CT"    ... or leave as "230 CT"?
     """
     if not pack:
         return pack
 
-    # Common Sysco pack counts (units per case) — used to split merged PACK+SIZE
-    _COMMON_PACKS = [48, 36, 30, 24, 20, 16, 15, 12, 10, 8, 6, 4, 3, 2, 1]
+    # Common Sysco pack counts (units per case) — used to split merged PACK+SIZE.
+    # Phase 2a (2026-05-02): expanded to match case_size_decoder.COMMON_PACK_COUNTS
+    # so Burgers 60/5.3OZ + similar large-pack items decompose correctly. Order
+    # matters — longer prefixes first (120 before 12 etc.) so the right pack
+    # count wins for ambiguous strings like "120.5".
+    _COMMON_PACKS = [288, 240, 200, 192, 180, 160, 150, 144, 120, 100, 96, 80,
+                     72, 60, 50, 48, 40, 36, 32, 30, 24, 20, 18, 16, 15, 12, 10,
+                     8, 6, 5, 4, 3, 2, 1]
 
     # Check for LB packs that need splitting (> 50 lbs unlikely as single unit)
     m = re.match(r'^(\d+)\s*LB$', pack, re.IGNORECASE)
@@ -268,12 +277,29 @@ def _normalize_pack_size(pack: str) -> str:
     # Normalize 0Z → OZ (OCR misreads letter O as zero)
     pack = re.sub(r'(\d)0Z$', r'\1OZ', pack)
 
-    # Check for OZ packs that need splitting (merged PACK+SIZE across column line)
-    # "124 OZ" = PACK(12) + SIZE(4 OZ), "2416 OZ" = PACK(24) + SIZE(16 OZ)
-    m = re.match(r'^(\d+)\s*OZ$', pack, re.IGNORECASE)
+    # Check for OZ packs that need splitting (merged PACK+SIZE across column line).
+    # Phase 2a: regex tolerates decimal sizes ("605.3OZ", "122.38OZ").
+    # Integer cases keep existing behavior; decimal cases use a separate
+    # int-part split so the decimal lands with the size.
+    m = re.match(r'^(\d+(?:\.\d+)?)\s*OZ$', pack, re.IGNORECASE)
     if m:
         val_str = m.group(1)
-        if len(val_str) >= 3:
+        if '.' in val_str:
+            # Decimal — split integer part as count, attach decimal to size.
+            int_part, _, dec_part = val_str.partition('.')
+            for pack_count in _COMMON_PACKS:
+                pc_str = str(pack_count)
+                if int_part.startswith(pc_str) and len(int_part) > len(pc_str):
+                    size_str = f"{int_part[len(pc_str):]}.{dec_part}"
+                    try:
+                        size = float(size_str)
+                    except ValueError:
+                        continue
+                    if 0.5 <= size <= 64:
+                        return f"{pack_count}/{size_str}OZ"
+            # No split worked — return unchanged (single-unit decimal case)
+            return pack
+        elif len(val_str) >= 3:
             for pack_count in _COMMON_PACKS:
                 pc_str = str(pack_count)
                 if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
@@ -332,6 +358,119 @@ def _normalize_pack_size(pack: str) -> str:
                         return f"{pack_count}/{size}DZ"
 
     return pack
+
+
+# ── Structured pack-size decomposition (Phase 2a, 2026-05-02) ──────────────
+#
+# After _normalize_pack_size produces "60/5.3OZ" or "12/4OZ", we want to
+# emit the structured tuple (case_pack_count, case_pack_unit_size,
+# case_pack_unit_uom) into each item dict so db_write can populate the
+# new ILI columns. case_total_weight_lb is derived where the unit
+# converts cleanly to lb.
+#
+# Bare "NUNIT" forms (e.g. "50LB" = 1 case × 50 lb, "12CT" = 1 case
+# of 12 ct) are also decomposable as count=1.
+
+_NORMALIZED_PACK_RE = re.compile(
+    r'^(\d+)\s*/\s*(\d+(?:\.\d+)?)\s*'
+    r'(LB|OZ|GAL|CT|LTR|L|PT|DZ|QT|EA|CAN|FL_OZ|FLOZ|KG|G|ML)\s*$',
+    re.IGNORECASE,
+)
+
+# Bare "NUNIT" — "50LB" / "12CT" / "1GAL"
+_BARE_PACK_RE = re.compile(
+    r'^(\d+(?:\.\d+)?)\s*'
+    r'(LB|OZ|GAL|CT|LTR|L|PT|DZ|QT|EA|KG|G|ML)\s*$',
+    re.IGNORECASE,
+)
+
+# Conversion factors to LB for case_total_weight_lb derivation. Count
+# units (CT, EA, DZ) intentionally excluded — total weight isn't
+# meaningful without per-unit weight from the canonical product side.
+_PACK_UOM_TO_LB: dict[str, float] = {
+    'LB':  1.0,
+    'OZ':  1.0 / 16,
+    'KG':  2.20462,
+    'G':   0.00220462,
+    'GAL': 8.345,
+    'QT':  2.086,
+    'PT':  1.043,
+    'L':   2.205,
+    'LTR': 2.205,
+    'ML':  0.002205,
+    'FL_OZ': 0.0651,
+    'FLOZ':  0.0651,
+}
+
+
+def _structured_pack_from_case_size(case_size_str: str | None) -> dict:
+    """Decompose a normalized case_size string into structured fields.
+
+    Returns {} when not decomposable. Otherwise returns a dict with:
+      case_pack_count     int
+      case_pack_unit_size str (kept as string to preserve decimal precision)
+      case_pack_unit_uom  str (uppercased, normalized)
+      case_total_weight_lb float (only when unit converts to lb)
+
+    Examples:
+      "60/5.3OZ"  → {count: 60, size: "5.3", uom: "OZ", total_lb: 19.875}
+      "12/4OZ"    → {count: 12, size: "4",   uom: "OZ", total_lb: 3.0}
+      "4/1GAL"    → {count: 4,  size: "1",   uom: "GAL", total_lb: 33.38}
+      "50LB"      → {count: 1,  size: "50",  uom: "LB", total_lb: 50.0}
+      "12CT"      → {count: 1,  size: "12",  uom: "CT"}    (no total_lb)
+      "1"         → {}                                      (bare qty, ambiguous)
+      "10.0LB"    → {count: 1,  size: "10.0", uom: "LB", total_lb: 10.0}
+
+    Threaded into _parse_sysco + match_sysco_spatial item dicts so db_write
+    populates ILI.case_pack_count / case_pack_unit_size / case_pack_unit_uom
+    / case_total_weight_lb columns.
+    """
+    if not case_size_str:
+        return {}
+    s = case_size_str.strip()
+    if not s:
+        return {}
+
+    # First try N/M format (Burgers 60/5.3OZ, butter 36/1LB, etc.)
+    m = _NORMALIZED_PACK_RE.match(s)
+    if m:
+        count = int(m.group(1))
+        size_str = m.group(2)
+        uom = m.group(3).upper().replace('FLOZ', 'FL_OZ')
+        out = {
+            'case_pack_count': count,
+            'case_pack_unit_size': size_str,
+            'case_pack_unit_uom': uom,
+        }
+        factor = _PACK_UOM_TO_LB.get(uom)
+        if factor is not None:
+            try:
+                total_lb = float(size_str) * count * factor
+                out['case_total_weight_lb'] = round(total_lb, 3)
+            except ValueError:
+                pass
+        return out
+
+    # Fall back to bare "NUNIT" form ("50LB", "12CT") — count = 1
+    m = _BARE_PACK_RE.match(s)
+    if m:
+        size_str = m.group(1)
+        uom = m.group(2).upper()
+        out = {
+            'case_pack_count': 1,
+            'case_pack_unit_size': size_str,
+            'case_pack_unit_uom': uom,
+        }
+        factor = _PACK_UOM_TO_LB.get(uom)
+        if factor is not None:
+            try:
+                total_lb = float(size_str) * factor
+                out['case_total_weight_lb'] = round(total_lb, 3)
+            except ValueError:
+                pass
+        return out
+
+    return {}
 
 
 def _clean_description(text: str) -> str:
@@ -1113,16 +1252,27 @@ def _parse_sysco(text: str) -> list[dict]:
             "extended_amount": price,  # Sysco prices are per-line totals (qty usually 1)
             "case_size_raw":   effective_case_size,
             "section":         re.sub(r'[*\s]+', ' ', section_name).strip(),
+            # Sysco lines are always 1 case per anchor; quantity = 1 by convention.
+            "quantity":        1,
+            "unit_of_measure": "CASE",
         }
 
+        # Phase 2a: structured pack-size decomposition into ILI columns.
+        # Decomposes "60/5.3OZ" → (60, "5.3", "OZ") + total_weight_lb.
+        # Empty dict when not decomposable; db_write coerces missing keys to NULL.
+        item.update(_structured_pack_from_case_size(effective_case_size))
+
         # For catch-weight items, the price on the invoice is the TOTAL
-        # (weight × price_per_lb). Calculate the per-lb price.
+        # (weight × price_per_lb). Override quantity + UoM to the per-lb
+        # convention so calc_price_per_lb sees the right shape.
         if cw_info:
             item["unit_of_measure"] = "LB"
             item["price_per_unit"] = cw_info["per_lb"]
+            item["quantity"] = cw_info["weight_lbs"]
         elif catch_wt and catch_wt.get("weight_lbs") and catch_wt["weight_lbs"] > 0:
             item["unit_of_measure"] = "LB"
             item["price_per_unit"] = round(price / catch_wt["weight_lbs"], 4)
+            item["quantity"] = catch_wt["weight_lbs"]
 
         items.append(item)
 

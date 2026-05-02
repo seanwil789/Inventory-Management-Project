@@ -277,10 +277,20 @@ def _extract_row_item(row: list[dict], anchor: dict,
         "extended_amount":  unit_price,
         "case_size_raw":    case_size,
         "section":          section_name,
+        # Sysco lines are always 1 case per anchor — same convention as _parse_sysco
+        "quantity":         1,
+        "unit_of_measure":  "CASE",
     }
     if price_per_unit is not None:
         item["unit_of_measure"] = "LB"
         item["price_per_unit"] = price_per_unit
+    # Phase 2a (2026-05-02): structured pack-size fields. Reuse the parser
+    # helper so spatial + text paths produce identical structured output.
+    try:
+        from parser import _structured_pack_from_case_size
+        item.update(_structured_pack_from_case_size(case_size))
+    except Exception:
+        pass
     return item
 
 
