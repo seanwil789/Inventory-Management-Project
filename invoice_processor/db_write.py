@@ -100,25 +100,36 @@ _VOLUME_UNIT_RE = re.compile(
 
 # Phase 3f (Sean 2026-05-02): protein keyword inference for class guard.
 #
-# Seafood + cured/butchered cuts are unambiguously WEIGHED in this domain
-# (industry $/lb pricing, scale at receiving). When a raw_description
-# mentions one of these and the candidate Product is NOT weighed, the
-# class guard rejects the FK attach. Catches the SHRIMP → Uncrustables
-# PBJ class of mismaps that the volume-only Phase 3e helper missed.
+# Seafood + butchered cuts shipped by-the-pound are unambiguously WEIGHED
+# in this domain (industry $/lb pricing, scale at receiving). When a
+# raw_description mentions one of these AND the case_size carries an LB
+# signal, infer weighed. Catches the SHRIMP → Uncrustables PBJ class of
+# mismaps the volume-only Phase 3e helper missed.
 #
-# Keywords are tight + explicit. Word boundaries prevent CHOP* false
-# positives (CHOPSTICKS, CHOPPED ONIONS). Beef/Pork/Chicken/Turkey are
-# excluded because they appear in many counted formats (sandwiches,
-# nuggets, frozen patties); use specific cut names instead.
+# **Two signals required** — keyword alone isn't enough. ANCHOVIES (in
+# 28 OZ jars) is correctly counted_with_weight even though ANCHOVY is
+# a seafood word; same for canned tuna, jarred herring, sliced deli
+# meats. The LB signal in case_size separates the bulk-weighed format
+# from the canned/jarred/sliced counted formats.
+#
+# Excluded from list: BEEF/PORK/CHICKEN/TURKEY (appear in many counted
+# formats — sandwiches, nuggets, frozen patties); ANCHOVY/SARDINE/HERRING
+# (canned/jarred); PROSCIUTTO/PEPPERONI/SALAMI/CAPOCOLLA (deli-sliced
+# default). Word-boundary regex prevents CHOPSTICKS / CHOPPED false
+# positives.
 _PROTEIN_WEIGHED_KEYWORDS_RE = re.compile(
     r'\b('
-    r'SHRIMP|PRAWN|LOBSTER|SCALLOP|CRAB|OYSTER|CLAM|MUSSEL|'
-    r'SALMON|TUNA|TILAPIA|HALIBUT|SARDINE|ANCHOVY|TROUT|'
-    r'BACON|PROSCIUTTO|PEPPERONI|SALAMI|CAPOCOLLA|CAPICOLA|'
+    r'SHRIMP|PRAWN|LOBSTER|SCALLOP|CRAB|'
+    r'SALMON|TUNA|TILAPIA|HALIBUT|TROUT|'
+    r'BACON|'
     r'BRISKET|RIBEYE|TENDERLOIN|SIRLOIN|FILET\s+MIGNON|'
     r'PORK\s+BELLY|PORK\s+SHOULDER|PORK\s+LOIN|'
     r'LAMB\s+SHOULDER|LAMB\s+CHOP|VEAL\s+CHOP'
     r')\b',
+    re.IGNORECASE,
+)
+_LB_SIGNAL_RE = re.compile(
+    r'(?:^|[^A-Za-z])(\d+(?:\.\d+)?)\s*(LB|LBS|POUND)\b',
     re.IGNORECASE,
 )
 
@@ -127,7 +138,7 @@ def _infer_raw_inventory_class(raw_desc: str, case_size: str) -> str | None:
     """Best-effort class inference from raw line-item signals.
 
     Volume signal (GAL/QT/PT/FL OZ) → counted_with_volume.
-    Protein keyword (SHRIMP/SCALLOP/BACON/etc.) → weighed.
+    Protein keyword + LB signal (SHRIMP+10LB, BACON+15LB) → weighed.
     Volume wins when both fire (a 1 GAL salmon-flavored stock is volume).
 
     Returns None when no strong signal exists (don't enforce → bypass)."""
@@ -135,10 +146,13 @@ def _infer_raw_inventory_class(raw_desc: str, case_size: str) -> str | None:
     for text in candidates:
         if text and _VOLUME_UNIT_RE.search(text):
             return 'counted_with_volume'
-    # Protein keyword check on raw_description only — case_size never
-    # contains protein words.
+    # Protein keyword (raw_description only — case_size never contains
+    # protein words) + LB signal (either side) → weighed. Both gates
+    # required so canned/jarred/sliced seafood formats stay untagged.
     if raw_desc and _PROTEIN_WEIGHED_KEYWORDS_RE.search(raw_desc):
-        return 'weighed'
+        for text in candidates:
+            if text and _LB_SIGNAL_RE.search(text):
+                return 'weighed'
     return None
 
 

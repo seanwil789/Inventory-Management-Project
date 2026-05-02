@@ -8606,32 +8606,50 @@ class Phase3fProteinKeywordClassGuardTests(TestCase):
     as 'weighed' signal. Catches SHRIMP → Uncrustables PBJ class of mismaps.
     """
 
-    def test_shrimp_keyword_infers_weighed(self):
+    def test_shrimp_keyword_with_lb_infers_weighed(self):
+        """Protein keyword + LB signal → weighed."""
         from invoice_processor.db_write import _infer_raw_inventory_class
-        cases = [
-            'LEPORTSIM SHRIMP WHT P&D TLON 21/2 CF2125PDTON',
-            'SHRIMP P&D 21/25',
-            'shrimp cocktail premium',
-        ]
-        for raw in cases:
-            self.assertEqual(_infer_raw_inventory_class(raw, ''), 'weighed',
-                             msg=f'{raw!r} should infer weighed')
+        # LB in case_size
+        self.assertEqual(_infer_raw_inventory_class(
+            'LEPORTSIM SHRIMP WHT P&D TLON 21/25', '42.5LB'), 'weighed')
+        # LB in raw_description
+        self.assertEqual(_infer_raw_inventory_class(
+            'SHRIMP P&D 5 LB FROZEN', ''), 'weighed')
 
-    def test_seafood_keywords(self):
+    def test_seafood_keywords_with_lb(self):
         from invoice_processor.db_write import _infer_raw_inventory_class
-        for kw in ['SCALLOP', 'PRAWN', 'LOBSTER', 'CRAB', 'OYSTER',
+        for kw in ['SCALLOP', 'PRAWN', 'LOBSTER', 'CRAB',
                    'SALMON', 'TUNA', 'TILAPIA', 'HALIBUT', 'TROUT']:
             raw = f'IMP CLS {kw} FRESH PREM'
-            self.assertEqual(_infer_raw_inventory_class(raw, ''), 'weighed',
-                             msg=f'{kw!r} should infer weighed')
+            self.assertEqual(_infer_raw_inventory_class(raw, '10LB'),
+                             'weighed', msg=f'{kw!r} + LB should infer weighed')
 
-    def test_cured_cut_keywords(self):
+    def test_butcher_cut_keywords_with_lb(self):
         from invoice_processor.db_write import _infer_raw_inventory_class
-        for kw in ['BACON', 'PROSCIUTTO', 'PEPPERONI', 'SALAMI', 'CAPOCOLLA',
-                   'BRISKET', 'RIBEYE', 'TENDERLOIN', 'SIRLOIN']:
-            raw = f'BBR IMP {kw} 16/20 CASE'
-            self.assertEqual(_infer_raw_inventory_class(raw, ''), 'weighed',
-                             msg=f'{kw!r} should infer weighed')
+        for kw in ['BACON', 'BRISKET', 'RIBEYE', 'TENDERLOIN', 'SIRLOIN']:
+            self.assertEqual(_infer_raw_inventory_class(
+                f'BBR IMP {kw} CASE', '15LB'), 'weighed',
+                msg=f'{kw!r} + LB should infer weighed')
+
+    def test_anchovy_jarred_NOT_weighed(self):
+        """Canned/jarred seafood (no LB signal) → no inference; class
+        guard does not over-reject jarred anchovies / canned tuna."""
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        # Anchovies in 28 OZ jar — counted_with_weight is correct
+        self.assertIsNone(_infer_raw_inventory_class(
+            'MISC, ANCHOVY, IN OIL, 28 OZ', ''))
+        self.assertIsNone(_infer_raw_inventory_class(
+            'TUNA CANNED 6 OZ CHUNK LIGHT', '24/6OZ'))
+
+    def test_excluded_keywords_do_not_trigger(self):
+        """Removed-from-list keywords don't fire even with LB."""
+        from invoice_processor.db_write import _infer_raw_inventory_class
+        # ANCHOVY, SARDINE, OYSTER, CLAM, MUSSEL, PROSCIUTTO, PEPPERONI,
+        # SALAMI, CAPOCOLLA — context-dependent, kept out of list.
+        for kw in ['ANCHOVY', 'PEPPERONI', 'SALAMI', 'PROSCIUTTO']:
+            self.assertIsNone(_infer_raw_inventory_class(
+                f'IMP {kw} SLICED 5LB', '5LB'),
+                msg=f'{kw!r} should not trigger even with LB')
 
     def test_volume_wins_over_protein_keyword(self):
         """A '1 GAL salmon stock' is a volume product despite SALMON keyword.
