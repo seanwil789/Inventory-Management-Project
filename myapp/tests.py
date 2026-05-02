@@ -10215,3 +10215,95 @@ class RejectReasonTests(TestCase):
         self.pmp.refresh_from_db()
         # View redirect with warning; reason unchanged
         self.assertEqual(self.pmp.reject_reason, first_reason)
+
+
+class ParserGarbleTrackingTests(TestCase):
+    """Sean unification phase 2: rejections with reason='typo_or_garble'
+    tag underlying ILIs as 'unmatched_garbled' AND drop out of the
+    /mapping-review/ unresolved filter."""
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem, ProductMappingProposal
+        from django.contrib.auth.models import User
+        self.user = User.objects.create_user(username='r', password='x')
+        self.client.force_login(self.user)
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.prod = Product.objects.create(canonical_name='Test Item', category='Drystock')
+        # Garbled raw with 2 ILI rows + 1 PMP
+        self.ili1 = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-15',
+            raw_description='SYS GLUED ROW MULTI PRODUCT BLEED',
+            unit_price=10, extended_amount=10,
+            product=None, match_confidence='unmatched',
+        )
+        self.ili2 = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-22',
+            raw_description='SYS GLUED ROW MULTI PRODUCT BLEED',
+            unit_price=11, extended_amount=11,
+            product=None, match_confidence='unmatched',
+        )
+        self.pmp = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='SYS GLUED ROW MULTI PRODUCT BLEED',
+            source='discover_unmapped', suggested_product=self.prod,
+            status='pending',
+        )
+
+    def test_garble_rejection_tags_underlying_ilis(self):
+        """When reject reason=typo_or_garble, all matching ILIs get
+        match_confidence='unmatched_garbled'."""
+        resp = self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'typo_or_garble'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.ili1.refresh_from_db(); self.ili2.refresh_from_db()
+        self.assertEqual(self.ili1.match_confidence, 'unmatched_garbled')
+        self.assertEqual(self.ili2.match_confidence, 'unmatched_garbled')
+
+    def test_other_reasons_do_not_tag_ilis(self):
+        """Wrong-canonical or not-a-product rejections leave ILI tags alone."""
+        self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'wrong_canonical'},
+        )
+        self.ili1.refresh_from_db()
+        self.assertEqual(self.ili1.match_confidence, 'unmatched',
+                         'non-garble rejections should not tag ILIs as garbled')
+
+    def test_garbled_ilis_excluded_from_unresolved_view(self):
+        """After garble-tagging, the /mapping-review/?status=unresolved
+        view should NOT show this raw anymore."""
+        # First — verify it shows up in unresolved BEFORE the garble tag
+        resp = self.client.get('/mapping-review/?status=unresolved')
+        self.assertIn('GLUED ROW MULTI', resp.content.decode())
+        # Reject with garble reason — ILIs get tagged, raw should drop out
+        self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'typo_or_garble'},
+        )
+        # Re-fetch unresolved view
+        resp = self.client.get('/mapping-review/?status=unresolved')
+        body = resp.content.decode()
+        self.assertNotIn('GLUED ROW MULTI', body,
+                         'garbled raw should drop out of unresolved bucket')
+
+    def test_audit_parser_garbles_lists_tagged_rows(self):
+        """audit_parser_garbles cmd surfaces tagged ILIs grouped by
+        (vendor, raw) with frequency."""
+        from io import StringIO
+        from django.core.management import call_command
+        # Tag the rows directly
+        from myapp.models import InvoiceLineItem
+        InvoiceLineItem.objects.filter(id__in=[self.ili1.id, self.ili2.id]).update(
+            match_confidence='unmatched_garbled')
+        out = StringIO()
+        call_command('audit_parser_garbles', stdout=out)
+        self.assertIn('GLUED ROW MULTI', out.getvalue())
+        self.assertIn('×  2', out.getvalue())  # frequency of the (vendor, raw) pair
+
+    def test_audit_empty_when_no_garbles(self):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('audit_parser_garbles', stdout=out)
+        self.assertIn('No garbled rows', out.getvalue())

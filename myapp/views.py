@@ -2512,7 +2512,7 @@ def mapping_review(request):
             InvoiceLineItem.objects
             .filter(product__isnull=True)
             .exclude(match_confidence__in=['non_product', 'unmatched_class_mismatch',
-                                            'unmatched_drift'])
+                                            'unmatched_drift', 'unmatched_garbled'])
             .values_list('vendor_id', 'raw_description')
         )
         pending_qs = qs.filter(status='pending')
@@ -2661,8 +2661,13 @@ def mapping_review_approve(request, proposal_id: int):
 def mapping_review_reject(request, proposal_id: int):
     """POST endpoint: reject a proposal. Optional 'notes' POST param.
     Optional 'reason' POST param — categorical key from
-    REJECT_REASON_CHOICES (Sean 2026-05-02 — structured teaching signal)."""
-    from .models import ProductMappingProposal
+    REJECT_REASON_CHOICES (Sean 2026-05-02 — structured teaching signal).
+
+    Side-effect on reason='typo_or_garble': bulk-update underlying ILIs
+    with same (vendor, raw_description) to match_confidence='unmatched_garbled'.
+    Drops them from the /mapping-review/ unresolved filter AND surfaces
+    them in audit_parser_garbles for parser-bug diagnosis."""
+    from .models import ProductMappingProposal, InvoiceLineItem
     proposal = get_object_or_404(ProductMappingProposal, id=proposal_id)
     if proposal.status != 'pending':
         messages.warning(request, f"Proposal #{proposal.id} already {proposal.status}.")
@@ -2674,12 +2679,21 @@ def mapping_review_reject(request, proposal_id: int):
         notes=notes,
         reason=reason,
     )
+    extra = ''
+    if reason == 'typo_or_garble':
+        n = (InvoiceLineItem.objects
+             .filter(vendor=proposal.vendor,
+                     raw_description=proposal.raw_description,
+                     product__isnull=True)
+             .update(match_confidence='unmatched_garbled'))
+        if n:
+            extra = f' — tagged {n} garbled ILI row(s) for parser audit'
     label = ''
     if reason:
         label = dict(ProductMappingProposal.REJECT_REASON_CHOICES).get(reason, '')
         if label:
             label = f' ({label})'
-    messages.info(request, f"Rejected proposal #{proposal.id}{label}.")
+    messages.info(request, f"Rejected proposal #{proposal.id}{label}{extra}.")
     return redirect('mapping_review')
 
 

@@ -268,6 +268,12 @@ class InvoiceLineItem(models.Model):
         ('non_product', 'Non-Product (surcharge/fee/credit)'),
         ('unmatched', 'Unmatched'),
         ('unmatched_drift', 'Unmatched (Sheet/DB Drift)'),
+        # Sean 2026-05-02: parser-garble tag set when Sean rejects a
+        # PMP with reason='typo_or_garble'. Drops the ILI out of
+        # /mapping-review/ unresolved filter (no point re-surfacing
+        # garbled raws) AND into the audit_parser_garbles queue
+        # which surfaces parser bugs for diagnosis.
+        ('unmatched_garbled', 'Unmatched (Parser Garble)'),
     ]
 
     vendor          = models.ForeignKey(Vendor, null=True, blank=True, on_delete=models.SET_NULL)
