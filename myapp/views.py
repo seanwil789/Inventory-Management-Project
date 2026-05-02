@@ -2491,14 +2491,42 @@ def mapping_review(request):
     from .taxonomy import infer_taxonomy, build_inference_index, derive_canonical_suggestion
     from django.db.models import Count
 
-    status_filter = request.GET.get('status', 'pending')
+    # Sean unification (2026-05-02): default filter is 'unresolved' —
+    # items without canonicals resurface until one is given. Specifically:
+    #   pending: needs review
+    #   rejected + raw still unmapped: Sean said no to the suggestion,
+    #     but the underlying raw still has no canonical → keep visible
+    #   approved: hidden (raw is canonicalized)
+    status_filter = request.GET.get('status', 'unresolved')
     vendor_filter = request.GET.get('vendor', '')
     sort_by = request.GET.get('sort', 'frequency')   # 'frequency' | 'recent'
 
     qs = (ProductMappingProposal.objects
           .select_related('vendor', 'suggested_product', 'reviewed_by'))
 
-    if status_filter and status_filter != 'all':
+    if status_filter == 'unresolved':
+        # Pending OR rejected-with-unmapped-raw — built in Python from two
+        # queries to avoid an N-deep OR chain. Total cost: 2 indexed
+        # queries + a set membership check per row.
+        unmapped_pairs = set(
+            InvoiceLineItem.objects
+            .filter(product__isnull=True)
+            .exclude(match_confidence__in=['non_product', 'unmatched_class_mismatch',
+                                            'unmatched_drift'])
+            .values_list('vendor_id', 'raw_description')
+        )
+        pending_qs = qs.filter(status='pending')
+        rejected_qs = qs.filter(status='rejected')
+        # Materialize once; filter rejected by membership
+        rejected_unmapped = [r for r in rejected_qs
+                             if (r.vendor_id, r.raw_description) in unmapped_pairs]
+        # Combine — preserve PK identity for downstream code
+        pending_list = list(pending_qs)
+        proposal_pool = pending_list + rejected_unmapped
+        # Wrap as a list-not-queryset for downstream; sort + slice happens in
+        # the existing flow on the proposal_rows array.
+        qs = proposal_pool
+    elif status_filter and status_filter != 'all':
         qs = qs.filter(status=status_filter)
     if vendor_filter:
         qs = qs.filter(vendor__name=vendor_filter)

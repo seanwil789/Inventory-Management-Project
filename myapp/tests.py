@@ -9875,26 +9875,25 @@ class AuditPMCanonicalDriftTests(TestCase):
         self.assertIn("'Corn, Frozen'", out)
 
     def test_rejected_pair_excluded_from_proposals(self):
-        """A previously-rejected (pm_id, proposed_canonical) pair must
-        NOT surface as a proposal on subsequent runs. First-pass-rejects-
-        teach-the-system."""
-        from myapp.models import CanonicalDriftRejection
-        # Without rejection: drift surfaces
-        out_before = self._run()
-        self.assertIn("'Corn, Frozen'", out_before)
-        # Record rejection
-        CanonicalDriftRejection.objects.create(
-            product_mapping=self.wrong_pm,
-            rejected_canonical='Corn, Frozen',
-            note='test rejection',
+        """A previously-rejected (vendor, raw_desc, suggested) tuple in
+        ProductMappingProposal must NOT surface as a proposal on
+        subsequent runs. First-pass-rejects-teach-the-system."""
+        from myapp.models import ProductMappingProposal
+        # Pre-create rejected PMP BEFORE running audit
+        ProductMappingProposal.objects.create(
+            vendor=self.v,
+            raw_description=self.wrong_pm.description,
+            source='drift_audit',
+            suggested_product=self.corn_frozen,
+            status='rejected',
         )
-        # Re-run audit: drift no longer surfaces
-        out_after = self._run()
-        self.assertNotIn("'Corn, Frozen'", out_after)
+        # Run audit: drift should NOT surface (filter respects rejection)
+        out = self._run()
+        self.assertNotIn("'Corn, Frozen'", out)
 
 
 class RejectCanonicalDriftTests(TestCase):
-    """Cmd that records audit-proposal rejections."""
+    """Bulk-reject CLI: finds existing drift_audit PMPs and rejects them."""
 
     def _run(self, *args):
         from io import StringIO
@@ -9904,33 +9903,39 @@ class RejectCanonicalDriftTests(TestCase):
         return out.getvalue(), err.getvalue()
 
     def setUp(self):
-        from myapp.models import Vendor, Product, ProductMapping
+        from myapp.models import Vendor, Product, ProductMapping, ProductMappingProposal
         self.v, _ = Vendor.objects.get_or_create(name='Sysco')
         self.corn = Product.objects.create(canonical_name='Corn Test', category='Produce')
+        self.almonds = Product.objects.create(canonical_name='Almonds Test', category='Drystock')
         self.pm = ProductMapping.objects.create(
             vendor=self.v, product=self.corn, description='CORN, YELLOW')
+        # Pre-create a drift_audit pending PMP so the cmd has something to reject
+        self.pmp = ProductMappingProposal.objects.create(
+            vendor=self.v,
+            raw_description='CORN, YELLOW',
+            source='drift_audit',
+            suggested_product=self.almonds,
+            status='pending',
+        )
 
-    def test_records_rejection(self):
-        from myapp.models import CanonicalDriftRejection
-        self._run('--pairs', f'{self.pm.id}:Almonds Test', '--note', 'wrong product')
-        # Doesn't matter the canonical exists — we store by string
-        rej = CanonicalDriftRejection.objects.first()
-        self.assertEqual(rej.product_mapping, self.pm)
-        self.assertEqual(rej.rejected_canonical, 'Almonds Test')
-        self.assertEqual(rej.note, 'wrong product')
+    def test_rejects_existing_pmp(self):
+        self._run('--pairs', f'{self.pm.id}:Almonds Test', '--note', 'wrong')
+        self.pmp.refresh_from_db()
+        self.assertEqual(self.pmp.status, 'rejected')
+        self.assertIn('wrong', self.pmp.notes)
 
-    def test_idempotent_duplicate_rejection_skipped(self):
-        from myapp.models import CanonicalDriftRejection
+    def test_no_proposal_to_reject_reported(self):
+        out, _ = self._run('--pairs', f'{self.pm.id}:Nonexistent Canonical')
+        self.assertIn('no drift_audit proposal exists', out)
+
+    def test_already_rejected_skipped(self):
         self._run('--pairs', f'{self.pm.id}:Almonds Test')
         out, _ = self._run('--pairs', f'{self.pm.id}:Almonds Test')
-        self.assertEqual(CanonicalDriftRejection.objects.count(), 1)
         self.assertIn('already rejected', out)
 
     def test_missing_pm_id_aborts(self):
-        from myapp.models import CanonicalDriftRejection
         _, err = self._run('--pairs', '99999:NoSuchProduct')
         self.assertIn('Missing ProductMapping', err)
-        self.assertEqual(CanonicalDriftRejection.objects.count(), 0)
 
     def test_no_pairs_errors(self):
         _, err = self._run()
@@ -10064,3 +10069,78 @@ class PopulateMappingReviewResurfaceTests(TestCase):
         )
         self.assertEqual(all_props.count(), 1,
                          'should not duplicate rejected target')
+
+
+class MappingReviewUnresolvedFilterTests(TestCase):
+    """Sean unification phase 2 — default filter shows pending PMPs PLUS
+    rejected PMPs whose underlying ILI is still unmapped (so raws
+    Sean said no to but hasn't canonicalized yet stay visible)."""
+
+    def setUp(self):
+        from myapp.models import Vendor, Product, InvoiceLineItem, ProductMappingProposal
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.corn = Product.objects.create(canonical_name='Corn Filter Test', category='Produce')
+        # Three scenarios across 3 raw_descriptions:
+        # A. pending PMP → should show
+        # B. rejected PMP + ILI still unmapped → should show (resurfaces)
+        # C. rejected PMP + ILI canonicalized → should NOT show
+
+        # A: pending
+        self.pending = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='RAW PENDING',
+            source='discover_unmapped', suggested_product=None,
+            status='pending',
+        )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-15',
+            raw_description='RAW PENDING', unit_price=1, extended_amount=1,
+            product=None, match_confidence='unmatched',
+        )
+
+        # B: rejected + ILI unmapped
+        self.rejected_unmapped = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='RAW REJECTED UNMAPPED',
+            source='discover_unmapped', suggested_product=None,
+            status='rejected',
+        )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-15',
+            raw_description='RAW REJECTED UNMAPPED', unit_price=1, extended_amount=1,
+            product=None, match_confidence='unmatched',
+        )
+
+        # C: rejected + ILI mapped (no longer unresolved)
+        self.rejected_mapped = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='RAW REJECTED MAPPED',
+            source='discover_unmapped', suggested_product=None,
+            status='rejected',
+        )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-15',
+            raw_description='RAW REJECTED MAPPED', unit_price=1, extended_amount=1,
+            product=self.corn, match_confidence='manual_review',
+        )
+
+    def _login(self):
+        from django.contrib.auth.models import User
+        u = User.objects.create_user(username='reviewer', password='x')
+        self.client.force_login(u)
+
+    def test_default_unresolved_shows_pending_and_rejected_unmapped(self):
+        self._login()
+        resp = self.client.get('/mapping-review/')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn('RAW PENDING', body)
+        self.assertIn('RAW REJECTED UNMAPPED', body)
+        self.assertNotIn('RAW REJECTED MAPPED', body,
+                         'rejected with mapped underlying ILI should not surface')
+
+    def test_explicit_status_pending_excludes_rejected(self):
+        self._login()
+        resp = self.client.get('/mapping-review/?status=pending')
+        self.assertEqual(resp.status_code, 200)
+        body = resp.content.decode()
+        self.assertIn('RAW PENDING', body)
+        self.assertNotIn('RAW REJECTED UNMAPPED', body,
+                         'explicit pending filter should not include rejected')

@@ -45,7 +45,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
-from myapp.models import Product, ProductMapping, ProductMappingProposal, CanonicalDriftRejection
+from myapp.models import Product, ProductMapping, ProductMappingProposal
 
 
 def _import_mapper():
@@ -131,17 +131,10 @@ class Command(BaseCommand):
         def _tokens(s):
             return set(_re.findall(r'[a-z0-9]+', (s or '').lower()))
 
-        # Load previously-rejected pairs from BOTH sources during the
-        # transition: legacy CanonicalDriftRejection (keyed on pm_id +
-        # canonical name) AND the unified ProductMappingProposal
-        # rejected-rows (keyed on vendor + raw_description + suggested
-        # product). Both are checked so we never re-propose what Sean
-        # already said no to.
-        rejected_pairs_pm: set[tuple[int, str]] = set(
-            CanonicalDriftRejection.objects.values_list(
-                'product_mapping_id', 'rejected_canonical'
-            )
-        )
+        # Load rejected (vendor, raw_description, suggested_canonical)
+        # tuples from ProductMappingProposal. Single source of truth post-
+        # unification. Sean's reject in /mapping-review/ writes to this
+        # table; audit reads here. First pass = teach the system.
         rejected_pmps = (ProductMappingProposal.objects
                          .filter(status='rejected', source='drift_audit')
                          .values_list('vendor_id', 'raw_description',
@@ -171,11 +164,7 @@ class Command(BaseCommand):
             if proposed == current:
                 continue
             # Skip pairs Sean has previously rejected. Permanent learning
-            # signal — first pass rejects teach the system. Check both
-            # legacy CanonicalDriftRejection table and the unified
-            # ProductMappingProposal rejected-rows.
-            if (pm.id, proposed) in rejected_pairs_pm:
-                continue
+            # signal — first pass rejects teach the system.
             if (pm.vendor_id, pm.description, proposed) in rejected_pairs_pmp:
                 continue
             # Tier 6 returned a DIFFERENT canonical → potential drift
