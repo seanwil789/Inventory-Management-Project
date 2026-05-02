@@ -192,6 +192,36 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             except InvalidOperation:
                 pass
 
+        # ── Structured invoice-line schema (Phase 1, 2026-05-02) ──────────
+        # Capture fields that spatial_matcher (PBM/Exc/FA/Del) and parser
+        # already extract but db_write was previously dropping. Each helper
+        # is a small Decimal/Integer coerce — parser output may be float,
+        # int, str, or None. None propagates through.
+        def _to_decimal(raw):
+            if raw in (None, ''):
+                return None
+            try:
+                return Decimal(str(raw))
+            except InvalidOperation:
+                return None
+
+        def _to_int(raw):
+            if raw in (None, ''):
+                return None
+            try:
+                return int(raw)
+            except (TypeError, ValueError):
+                return None
+
+        quantity_val = _to_decimal(item.get('quantity'))
+        purchase_uom_val = (item.get('unit_of_measure') or item.get('purchase_uom') or '')[:10]
+        case_pack_count_val = _to_int(item.get('case_pack_count'))
+        case_pack_unit_size_val = _to_decimal(item.get('case_pack_unit_size'))
+        case_pack_unit_uom_val = (item.get('case_pack_unit_uom') or '')[:10]
+        case_total_weight_lb_val = _to_decimal(item.get('case_total_weight_lb'))
+        count_per_lb_low_val = _to_int(item.get('count_per_lb_low'))
+        count_per_lb_high_val = _to_int(item.get('count_per_lb_high'))
+
         confidence = item.get('confidence', '')
         score = item.get('score')
         match_score = int(score) if score is not None else None
@@ -227,6 +257,15 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             match_score=match_score,
             price_flagged=price_flagged,
             section_hint=(item.get('section') or '')[:60],
+            # Structured invoice-line schema (Phase 1)
+            quantity=quantity_val,
+            purchase_uom=purchase_uom_val,
+            case_pack_count=case_pack_count_val,
+            case_pack_unit_size=case_pack_unit_size_val,
+            case_pack_unit_uom=case_pack_unit_uom_val,
+            case_total_weight_lb=case_total_weight_lb_val,
+            count_per_lb_low=count_per_lb_low_val,
+            count_per_lb_high=count_per_lb_high_val,
         )
 
         if product and parsed_date:
@@ -239,14 +278,20 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         if lookup:
             existing = InvoiceLineItem.objects.filter(**lookup).first()
             if existing:
+                # Fields where a non-None historical value beats a None incoming
+                # value — backfill or prior write may have populated these from
+                # richer sources than the current parser pass produces.
+                preserve_if_none_fields = {
+                    'price_per_pound',
+                    'quantity', 'purchase_uom',
+                    'case_pack_count', 'case_pack_unit_size',
+                    'case_pack_unit_uom', 'case_total_weight_lb',
+                    'count_per_lb_low', 'count_per_lb_high',
+                }
                 for field, value in common_fields.items():
-                    # Preserve price_per_pound when the incoming row
-                    # doesn't have one. Backfill-populated PPP values are
-                    # load-bearing for recipe cost accuracy and shouldn't
-                    # be clobbered by parsers that only emit per_lb for
-                    # catch-weight rows.
-                    if field == 'price_per_pound' and value is None \
-                            and existing.price_per_pound is not None:
+                    if (field in preserve_if_none_fields
+                            and (value is None or value == '')
+                            and getattr(existing, field, None) not in (None, '')):
                         continue
                     setattr(existing, field, value)
                 existing.save()

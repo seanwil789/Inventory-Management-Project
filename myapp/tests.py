@@ -5654,6 +5654,221 @@ class DBWriteDriftDetectionTests(TestCase):
                          'Genuine unmatched must NOT be re-tagged as drift')
 
 
+class DBWriteStructuredFieldsTests(TestCase):
+    """`write_invoice_to_db` Phase 1 of structured invoice-line schema.
+
+    Validates that the 8 structured fields on InvoiceLineItem
+    (quantity, purchase_uom, case_pack_count, case_pack_unit_size,
+    case_pack_unit_uom, case_total_weight_lb, count_per_lb_low,
+    count_per_lb_high) are populated from parser output dicts when present,
+    and stay None/blank when absent. Pure-add migration — existing fields
+    (case_size, unit_price, etc.) keep working the same way.
+    """
+
+    def _import_db_write(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'db_write' in sys.modules:
+            del sys.modules['db_write']
+        import db_write
+        return db_write
+
+    def _setup(self, vendor_name='Sysco'):
+        Vendor.objects.create(name=vendor_name)
+        return Product.objects.create(canonical_name='Test Product',
+                                      category='Drystock')
+
+    def test_structured_fields_populated_when_parser_emits(self):
+        """Burgers 60/5.3 OZ pack — structured fields land when parser
+        provides them. This is the Phase 1 acceptance test: it proves the
+        wiring from parser dict → ILI columns works end-to-end."""
+        product = self._setup('Sysco')
+        items = [{
+            'raw_description': 'F 60 5.3OZ JTM BURGER BEEF SBSDR ANGUS',
+            'canonical': 'Test Product',
+            'sysco_item_code': '4040614',
+            'unit_price': 82.85,
+            'extended_amount': 82.85,
+            'case_size_raw': '60/5.3OZ',
+            'confidence': 'vendor_exact',
+            # Structured fields — parser would supply these post-Phase-2
+            'quantity': 1,
+            'unit_of_measure': 'CASE',
+            'case_pack_count': 60,
+            'case_pack_unit_size': 5.3,
+            'case_pack_unit_uom': 'OZ',
+            'case_total_weight_lb': 19.875,  # 60 × 5.3 / 16
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-01', items, source_file='burgers.jpg')
+
+        ili = InvoiceLineItem.objects.get(sysco_item_code__isnull=False) \
+            if False else InvoiceLineItem.objects.first()
+        # Decimal-tolerant equality (DB round-trips through Decimal)
+        self.assertEqual(ili.quantity, Decimal('1'))
+        self.assertEqual(ili.purchase_uom, 'CASE')
+        self.assertEqual(ili.case_pack_count, 60)
+        self.assertEqual(ili.case_pack_unit_size, Decimal('5.3'))
+        self.assertEqual(ili.case_pack_unit_uom, 'OZ')
+        self.assertEqual(ili.case_total_weight_lb, Decimal('19.875'))
+        # Legacy field still populated for back-compat
+        self.assertEqual(ili.case_size, '60/5.3OZ')
+
+    def test_count_per_lb_fields_for_bacon_shrimp(self):
+        """Per Sean 2026-05-02: bacon is weighed for count purposes —
+        recipe says '2 strips bacon', need (10+14)/2 = 12 strips/lb to cost.
+        Fields land when parser extracts the count grade from raw_description."""
+        product = self._setup('Sysco')
+        items = [{
+            'raw_description': 'BACON LAYFLAT 10/14 SLICE 15LB',
+            'canonical': 'Test Product',
+            'unit_price': 70.35,
+            'case_size_raw': '15LB',
+            'confidence': 'vendor_exact',
+            'quantity': 15,
+            'unit_of_measure': 'LB',
+            'count_per_lb_low': 10,
+            'count_per_lb_high': 14,
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-15', items, source_file='bacon.jpg')
+
+        ili = InvoiceLineItem.objects.first()
+        self.assertEqual(ili.count_per_lb_low, 10)
+        self.assertEqual(ili.count_per_lb_high, 14)
+        self.assertEqual(ili.purchase_uom, 'LB')
+        self.assertEqual(ili.quantity, Decimal('15'))
+
+    def test_structured_fields_stay_null_when_absent(self):
+        """Existing parser output that doesn't include structured fields
+        produces ILI rows with NULL for the new columns. Backward-compat
+        guarantee — the migration is pure-add."""
+        product = self._setup('Farm Art')
+        items = [{
+            'raw_description': 'TOMATOES, CHERRY, 12 CONT',
+            'canonical': 'Test Product',
+            'unit_price': 24.50,
+            'case_size_raw': '12CT',
+            'confidence': 'vendor_exact',
+            # No quantity, no unit_of_measure, no case_pack_*, no count_per_lb_*
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Farm Art', '2026-04-15', items, source_file='tomatoes.jpg')
+
+        ili = InvoiceLineItem.objects.first()
+        self.assertIsNone(ili.quantity)
+        self.assertEqual(ili.purchase_uom, '')   # CharField default is empty string
+        self.assertIsNone(ili.case_pack_count)
+        self.assertIsNone(ili.case_pack_unit_size)
+        self.assertEqual(ili.case_pack_unit_uom, '')
+        self.assertIsNone(ili.case_total_weight_lb)
+        self.assertIsNone(ili.count_per_lb_low)
+        self.assertIsNone(ili.count_per_lb_high)
+        # Legacy field still populated
+        self.assertEqual(ili.case_size, '12CT')
+
+    def test_purchase_uom_falls_back_when_absent(self):
+        """`unit_of_measure` from parser → ILI.purchase_uom. Either key works
+        (`unit_of_measure` is the spatial_matcher convention, `purchase_uom`
+        could come from a future normalizer). Empty string when neither set."""
+        product = self._setup('Exceptional Foods')
+        # Variant 1: parser sends 'unit_of_measure' (matches today's spatial output)
+        items_v1 = [{
+            'raw_description': 'Beef Chuck Flap',
+            'canonical': 'Test Product',
+            'unit_price': 469.31,
+            'extended_amount': 469.31,
+            'case_size_raw': '42.7LB',
+            'confidence': 'vendor_exact',
+            'quantity': 42.7,
+            'unit_of_measure': 'LB',
+            'price_per_unit': 10.99,
+        }]
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Exceptional Foods', '2026-04-15',
+                                items_v1, source_file='exc.jpg')
+        ili = InvoiceLineItem.objects.first()
+        self.assertEqual(ili.purchase_uom, 'LB')
+        self.assertEqual(ili.quantity, Decimal('42.7'))
+
+    def test_upsert_preserves_structured_fields_when_incoming_is_none(self):
+        """Backfill or prior write populated structured fields. Subsequent
+        parser pass that DOESN'T extract them must NOT clobber to None.
+        Mirrors the existing price_per_pound preserve-on-update behavior."""
+        product = self._setup('Sysco')
+
+        # First write — full structured fields
+        dbw = self._import_db_write()
+        dbw.write_invoice_to_db('Sysco', '2026-04-01', [{
+            'raw_description': 'BURGER BEEF',
+            'canonical': 'Test Product',
+            'unit_price': 82.85, 'extended_amount': 82.85,
+            'case_size_raw': '60/5.3OZ', 'confidence': 'vendor_exact',
+            'quantity': 1, 'unit_of_measure': 'CASE',
+            'case_pack_count': 60, 'case_pack_unit_size': 5.3,
+            'case_pack_unit_uom': 'OZ', 'case_total_weight_lb': 19.875,
+        }], source_file='full.jpg')
+
+        # Second write — same (vendor, product, date), no structured fields
+        # (simulates older parser output being replayed). Upsert should
+        # preserve the existing values, not clobber to None.
+        dbw.write_invoice_to_db('Sysco', '2026-04-01', [{
+            'raw_description': 'BURGER BEEF',
+            'canonical': 'Test Product',
+            'unit_price': 85.00, 'extended_amount': 85.00,
+            'case_size_raw': '60/5.3OZ', 'confidence': 'vendor_exact',
+        }], source_file='partial.jpg')
+
+        ili = InvoiceLineItem.objects.get(vendor__name='Sysco', product=product,
+                                          invoice_date=date(2026, 4, 1))
+        # Price updated (this is fresh data)
+        self.assertEqual(ili.unit_price, Decimal('85.00'))
+        # Structured fields preserved (older partial parser pass shouldn't clobber)
+        self.assertEqual(ili.case_pack_count, 60)
+        self.assertEqual(ili.case_pack_unit_size, Decimal('5.3'))
+        self.assertEqual(ili.case_pack_unit_uom, 'OZ')
+        self.assertEqual(ili.purchase_uom, 'CASE')
+
+
+class ProductInventoryClassFieldTests(TestCase):
+    """`Product.inventory_class` + `inventory_unit_descriptor` schema fields.
+    Phase 1 of structured schema migration. Pure additive — existing
+    Products keep working with empty values; populate via curation later."""
+
+    def test_inventory_class_choices(self):
+        """The 3-class enum (weighed / counted_with_weight / counted_with_volume)
+        per Sean's `feedback_inventory_count_classes.md` 2-class methodology
+        extended for cost-calc dispatch."""
+        p = Product.objects.create(canonical_name='TestBacon',
+                                   category='Proteins',
+                                   inventory_class='weighed',
+                                   inventory_unit_descriptor='1# Pack')
+        p.refresh_from_db()
+        self.assertEqual(p.inventory_class, 'weighed')
+        self.assertEqual(p.inventory_unit_descriptor, '1# Pack')
+
+    def test_inventory_class_optional(self):
+        """Existing Products with no inventory_class still load. Empty
+        strings — choices include ('', '— unset —')."""
+        p = Product.objects.create(canonical_name='TestUnclassified',
+                                   category='Drystock')
+        self.assertEqual(p.inventory_class, '')
+        self.assertEqual(p.inventory_unit_descriptor, '')
+
+    def test_inventory_unit_descriptor_for_volume_class(self):
+        """Counted-with-volume products carry vendor-spec unit descriptor
+        (Gal/Qt/Pt) that lands in sheet col G post-Phase-3."""
+        p = Product.objects.create(canonical_name='TestMilk',
+                                   category='Dairy',
+                                   inventory_class='counted_with_volume',
+                                   inventory_unit_descriptor='Gal')
+        self.assertEqual(p.inventory_class, 'counted_with_volume')
+        self.assertEqual(p.inventory_unit_descriptor, 'Gal')
+
+
 class MapperTokenOverlapGateTests(TestCase):
     """`mapper.resolve_item` — token-overlap gate on fuzzy tiers.
 
