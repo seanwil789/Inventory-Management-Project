@@ -10307,3 +10307,143 @@ class ParserGarbleTrackingTests(TestCase):
         out = StringIO()
         call_command('audit_parser_garbles', stdout=out)
         self.assertIn('No garbled rows', out.getvalue())
+
+
+class CrossSourceDedupTests(TestCase):
+    """Same-target dedup across mapper_quarantine + discover_unmapped +
+    drift_audit. Existing PMP wins; same-target proposals from other
+    sources stamp source markers in notes instead of creating duplicates."""
+
+    def setUp(self):
+        from myapp.models import Vendor, Product
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.target = Product.objects.create(canonical_name='Yogurt Test', category='Dairy')
+        self.other = Product.objects.create(canonical_name='Other Test', category='Dairy')
+
+    def test_first_call_creates(self):
+        from myapp.models import ProductMappingProposal
+        pmp, created, converged = ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v,
+            raw_description='YOGURT GREEK 12/4OZ',
+            suggested_product=self.target,
+            source='mapper_quarantine',
+            defaults={'status': 'pending'},
+        )
+        self.assertTrue(created)
+        self.assertFalse(converged)
+        self.assertEqual(pmp.source, 'mapper_quarantine')
+        self.assertIn('[mq]', pmp.notes)
+
+    def test_second_call_same_source_no_convergence(self):
+        from myapp.models import ProductMappingProposal
+        ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='mapper_quarantine',
+            defaults={'status': 'pending'},
+        )
+        # Same source, same target — reuses, no convergence (only 1 source)
+        pmp, created, converged = ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='mapper_quarantine',
+            defaults={'status': 'pending'},
+        )
+        self.assertFalse(created)
+        self.assertFalse(converged, 'same source twice is not convergence')
+
+    def test_different_source_same_target_marks_convergence(self):
+        from myapp.models import ProductMappingProposal
+        # Source 1 creates
+        ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='mapper_quarantine',
+            defaults={'status': 'pending'},
+        )
+        # Source 2 same target — convergence
+        pmp, created, converged = ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='discover_unmapped',
+            defaults={'status': 'pending'},
+        )
+        self.assertFalse(created, 'should reuse existing PMP')
+        self.assertTrue(converged, 'different source same target = convergence')
+        self.assertIn('[mq]', pmp.notes)
+        self.assertIn('[du]', pmp.notes)
+
+    def test_different_target_creates_separate_pmp(self):
+        from myapp.models import ProductMappingProposal
+        # Source 1 — target A
+        pmp_a, _, _ = ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='mapper_quarantine',
+            defaults={'status': 'pending'},
+        )
+        # Source 2 — DIFFERENT target B
+        pmp_b, created_b, converged_b = ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.other, source='drift_audit',
+            defaults={'status': 'pending'},
+        )
+        self.assertTrue(created_b, 'different target = new PMP')
+        self.assertFalse(converged_b)
+        self.assertNotEqual(pmp_a.id, pmp_b.id)
+
+    def test_third_source_marks_three_way_convergence(self):
+        from myapp.models import ProductMappingProposal
+        ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='mapper_quarantine',
+            defaults={'status': 'pending'},
+        )
+        ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='discover_unmapped',
+            defaults={'status': 'pending'},
+        )
+        pmp, created, converged = ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='YOGURT GREEK',
+            suggested_product=self.target, source='drift_audit',
+            defaults={'status': 'pending'},
+        )
+        self.assertFalse(created)
+        self.assertTrue(converged)
+        sources = pmp.converged_sources()
+        self.assertIn('[mq]', sources)
+        self.assertIn('[du]', sources)
+        self.assertIn('[da]', sources)
+        self.assertEqual(len(sources), 3)
+
+    def test_converged_sources_includes_originating(self):
+        """A PMP with NO notes still reports its originating source."""
+        from myapp.models import ProductMappingProposal
+        pmp = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='RAW',
+            suggested_product=self.target, source='discover_unmapped',
+            status='pending', notes='',  # no marker stamped
+        )
+        sources = pmp.converged_sources()
+        self.assertEqual(sources, {'[du]'})
+
+    def test_idempotent_repeated_marker_stamping(self):
+        """If the same source converges twice (unusual but possible),
+        the marker is only added once — no notes spam."""
+        from myapp.models import ProductMappingProposal
+        ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='RAW',
+            suggested_product=self.target, source='mapper_quarantine',
+            defaults={'status': 'pending'},
+        )
+        ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='RAW',
+            suggested_product=self.target, source='discover_unmapped',
+            defaults={'status': 'pending'},
+        )
+        # Repeat the discover_unmapped call
+        ProductMappingProposal.get_or_create_dedup(
+            vendor=self.v, raw_description='RAW',
+            suggested_product=self.target, source='discover_unmapped',
+            defaults={'status': 'pending'},
+        )
+        pmp = ProductMappingProposal.objects.filter(
+            vendor=self.v, raw_description='RAW').first()
+        # [du] should appear exactly once in notes
+        self.assertEqual(pmp.notes.count('[du]'), 1)

@@ -193,14 +193,20 @@ class Command(BaseCommand):
 
             if existing is None:
                 if apply_changes:
-                    ProductMappingProposal.objects.create(
+                    # Cross-source dedup: if some other source already
+                    # proposed this exact target for this raw, reuse
+                    # rather than create a duplicate (multi-source
+                    # convergence is logged via notes marker).
+                    _, was_created, _ = ProductMappingProposal.get_or_create_dedup(
                         vendor=vendor,
                         raw_description=raw_desc,
                         suggested_product=suggested,
-                        score=int(score) if score else None,
-                        confidence_tier=tier,
                         source='discover_unmapped',
-                        status='pending',
+                        defaults=dict(
+                            score=int(score) if score else None,
+                            confidence_tier=tier,
+                            status='pending',
+                        ),
                     )
                 created += 1
             elif existing.status == 'pending':
@@ -226,14 +232,16 @@ class Command(BaseCommand):
                 # Skip if same target (avoid re-suggesting what was declined).
                 if existing.suggested_product != suggested:
                     if apply_changes:
-                        ProductMappingProposal.objects.create(
+                        ProductMappingProposal.get_or_create_dedup(
                             vendor=vendor,
                             raw_description=raw_desc,
                             suggested_product=suggested,
-                            score=int(score) if score else None,
-                            confidence_tier=tier,
                             source='discover_unmapped',
-                            status='pending',
+                            defaults=dict(
+                                score=int(score) if score else None,
+                                confidence_tier=tier,
+                                status='pending',
+                            ),
                         )
                     created += 1
             # else: approved → leave alone (raw is canonicalized)

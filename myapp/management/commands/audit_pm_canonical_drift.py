@@ -246,7 +246,7 @@ class Command(BaseCommand):
             # /mapping-review/ Django queue so they live alongside fuzzy
             # quarantine items. One review surface, one rejection mechanism,
             # one teaching signal.
-            enqueued = 0
+            enqueued = converged = 0
             with transaction.atomic():
                 for p in proposals:
                     target = Product.objects.filter(
@@ -257,21 +257,27 @@ class Command(BaseCommand):
                     pm = ProductMapping.objects.filter(id=p['pm_id']).select_related('vendor').first()
                     if pm is None or pm.vendor is None:
                         continue
-                    _, created = ProductMappingProposal.objects.get_or_create(
+                    # Cross-source dedup — if another source (typically
+                    # mapper_quarantine or discover_unmapped) already
+                    # proposed this same target for this raw, reuse it
+                    # and stamp [da] in notes to log the convergence.
+                    _, created, did_converge = ProductMappingProposal.get_or_create_dedup(
                         vendor=pm.vendor,
                         raw_description=pm.description,
-                        source='drift_audit',
                         suggested_product=target,
-                        defaults={
-                            'score': p.get('score'),
-                            'confidence_tier': f'drift_{p.get("confidence", "")}',
-                            'status': 'pending',
-                            'notes': (f'Audit proposed re-point of pm_id={p["pm_id"]} '
-                                      f'from {p["current"]!r} to {p["proposed"]!r}.'),
-                        },
+                        source='drift_audit',
+                        defaults=dict(
+                            score=p.get('score'),
+                            confidence_tier=f'drift_{p.get("confidence", "")}',
+                            status='pending',
+                            notes=(f'Audit proposed re-point of pm_id={p["pm_id"]} '
+                                   f'from {p["current"]!r} to {p["proposed"]!r}.'),
+                        ),
                     )
                     if created:
                         enqueued += 1
+                    elif did_converge:
+                        converged += 1
             self.stdout.write(self.style.WARNING(
                 f'\nDry-run — re-run with --apply to commit {len(proposals)} re-points.'
             ))
@@ -279,4 +285,9 @@ class Command(BaseCommand):
                 self.stdout.write(self.style.SUCCESS(
                     f'Enqueued {enqueued} new proposal(s) in /mapping-review/ '
                     f'for human review.'
+                ))
+            if converged:
+                self.stdout.write(self.style.SUCCESS(
+                    f'Converged {converged} proposal(s) with existing '
+                    f'same-target rows from other sources (notes stamped).'
                 ))

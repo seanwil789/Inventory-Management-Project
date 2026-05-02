@@ -105,6 +105,14 @@
               {% else %}
                 <span class="text-slate-400">(none)</span>
               {% endif %}
+              {% with convergence=p.converged_sources %}
+                {% if convergence|length >= 2 %}
+                  <span class="ml-1 inline-block px-1.5 py-0.5 bg-emerald-100 text-emerald-800 rounded text-[10px] font-medium"
+                        title="{{ convergence|length }} sources converged on this target">
+                    ✓ {{ convergence|length }}
+                  </span>
+                {% endif %}
+              {% endwith %}
             </td>
             <td class="py-2 px-3 text-right tabular-nums text-xs text-slate-600">
               {% if p.score %}{{ p.score }}{% else %}—{% endif %}

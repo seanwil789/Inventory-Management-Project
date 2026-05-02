@@ -229,6 +229,75 @@ class ProductMappingProposal(models.Model):
 
         return {'ili_updated': ili_updated, 'product_mapping': pm}
 
+    @classmethod
+    def get_or_create_dedup(cls, *, vendor, raw_description, suggested_product,
+                            source: str, defaults: dict | None = None):
+        """Cross-source dedup (Sean 2026-05-02): when ANY existing PMP
+        already proposes this `(vendor, raw_description, suggested_product)`
+        triple — regardless of source — return the existing one with a
+        source-convergence marker appended to its notes. Otherwise
+        create a new PMP with the given source.
+
+        Returns (proposal, created, converged) tuple:
+          proposal:  the PMP (existing or new)
+          created:   True if newly created, False if reused
+          converged: True if reused AND a different source previously
+                     proposed this same target (multi-source signal)
+
+        Source markers in notes use compact tags: [mq], [du], [da] for
+        mapper_quarantine, discover_unmapped, drift_audit.
+        """
+        defaults = dict(defaults or {})
+        marker_map = {
+            'mapper_quarantine': '[mq]',
+            'discover_unmapped': '[du]',
+            'drift_audit': '[da]',
+        }
+        marker = marker_map.get(source, f'[{source[:2]}]')
+
+        existing = cls.objects.filter(
+            vendor=vendor,
+            raw_description=raw_description,
+            suggested_product=suggested_product,
+        ).order_by('id').first()
+
+        if existing is not None:
+            converged = (existing.source != source
+                         and marker not in (existing.notes or ''))
+            if converged:
+                existing.notes = (existing.notes + ' ' if existing.notes else '') + marker
+                existing.save(update_fields=['notes'])
+            return existing, False, converged
+
+        # Create new PMP with originating source marker pre-seeded in notes
+        existing_notes = defaults.pop('notes', '')
+        new_notes = (existing_notes + ' ' if existing_notes else '') + marker
+        new = cls.objects.create(
+            vendor=vendor,
+            raw_description=raw_description,
+            suggested_product=suggested_product,
+            source=source,
+            notes=new_notes,
+            **defaults,
+        )
+        return new, True, False
+
+    def converged_sources(self) -> set[str]:
+        """Read source markers stamped in notes back into a source set.
+        Includes the originating source so the count reflects all paths
+        that converged on this (vendor, raw, suggested) triple."""
+        markers = {'[mq]', '[du]', '[da]'}
+        found = {m for m in markers if m in (self.notes or '')}
+        # Always include the originating source
+        marker_map = {
+            'mapper_quarantine': '[mq]',
+            'discover_unmapped': '[du]',
+            'drift_audit': '[da]',
+        }
+        if self.source in marker_map:
+            found.add(marker_map[self.source])
+        return found
+
     def reject(self, *, reviewer=None, notes: str = '', reason: str = ''):
         """Mark this proposal rejected. `reason` is a categorical key
         from REJECT_REASON_CHOICES; `notes` is free-text supplementary
