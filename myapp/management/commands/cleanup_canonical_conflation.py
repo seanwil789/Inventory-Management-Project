@@ -27,7 +27,7 @@ import re
 
 from django.core.management.base import BaseCommand
 
-from myapp.models import InvoiceLineItem, Product
+from myapp.models import InvoiceLineItem, Product, ProductMapping
 
 
 class Command(BaseCommand):
@@ -81,6 +81,13 @@ class Command(BaseCommand):
             else:
                 repoint_rows.append(ili)
 
+        # Also surface ProductMapping rows that point at this canonical but
+        # don't match keep-tokens — those are the curated mappings that would
+        # re-cause the conflation on future invoices. Don't auto-detach
+        # (mappings are Sean's curation surface), just warn.
+        suspect_pms = [pm for pm in ProductMapping.objects.filter(product=product).select_related('vendor')
+                       if not keep_re.search(pm.description or '')]
+
         self.stdout.write(self.style.MIGRATE_HEADING(
             f'\n=== cleanup_canonical_conflation '
             f'({"APPLY" if apply_writes else "DRY-RUN"}) ===\n'
@@ -110,6 +117,23 @@ class Command(BaseCommand):
                 self.stdout.write(
                     f'  ID={ili.id:5d} {ili.invoice_date} {v[:18]:18s} '
                     f'up={ili.unit_price}  raw={(ili.raw_description or "")[:55]!r}'
+                )
+
+        if suspect_pms:
+            self.stdout.write('')
+            self.stdout.write(self.style.WARNING(
+                f'⚠  {len(suspect_pms)} ProductMapping rows would re-cause '
+                f'this conflation on future invoices.'
+            ))
+            self.stdout.write(
+                'Re-curate via /mapping-review/ or admin to point them at '
+                'the correct canonical:'
+            )
+            for pm in suspect_pms:
+                v = pm.vendor.name if pm.vendor else '(none)'
+                self.stdout.write(
+                    f'  pm_id={pm.id:5d} {v[:18]:18s} supc={pm.supc!r:14s} '
+                    f'desc={pm.description[:60]!r}'
                 )
 
         if apply_writes:

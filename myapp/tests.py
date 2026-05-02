@@ -9649,3 +9649,18 @@ class CleanupCanonicalConflationTests(TestCase):
                      '--keep-tokens', 'X',
                      stdout=out, stderr=err)
         self.assertIn('not found', err.getvalue())
+
+    def test_warns_about_pm_rows_with_mismatched_descriptions(self):
+        """Surfaces ProductMapping rows that would re-cause conflation
+        on future invoices. Don't auto-detach (mappings are Sean's
+        curation surface)."""
+        from myapp.models import ProductMapping
+        # Add a PM with description NOT matching keep-tokens
+        ProductMapping.objects.create(
+            vendor=self.v, product=self.liner,
+            description='SYS CLS TOWEL KITCHEN ROLL',  # no LINER/TRASH
+        )
+        out = self._run('--canonical', 'Liner, Trash Test',
+                        '--keep-tokens', 'LINER,TRASH')
+        self.assertIn('ProductMapping rows would re-cause', out)
+        self.assertIn('TOWEL KITCHEN ROLL', out)
