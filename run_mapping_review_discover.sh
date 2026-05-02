@@ -1,10 +1,22 @@
 #!/bin/bash
-# Mapping Review auto-discover — called by cron daily.
-# Runs discover_unmapped.py --write which finds new unmapped invoice items
-# (seen 2+ times), fuzzy-matches against existing products + Synergy sheet,
-# and pushes suggestions to the Mapping Review tab for Sean's triage.
-# Auto-approves suggestions scoring >=90%; others land blank for review.
-# Uses file locking + log rotation matching run_invoice_batch.sh pattern.
+# Mapping-loop daily cron — populate /mapping-review/ queue with unmapped
+# invoice items so Sean's curation surface stays current.
+#
+# Replaces (2026-05-02) the legacy discover_unmapped.py --write path that
+# pushed suggestions to the Google Sheet's Mapping Review tab. The unified
+# Django queue is now the single review surface; the sheet's Mapping
+# Review tab is retired.
+#
+# What this runs:
+#   populate_mapping_review_from_unmapped --apply
+#     • Walks unmapped ILI rows (product=None)
+#     • Runs mapper to get suggested canonical for each (vendor, raw_desc)
+#     • Creates/updates ProductMappingProposal rows (source='discover_unmapped')
+#     • Re-opens rejected proposals when raw still unmapped AND new
+#       suggestion differs from the rejected target (per Sean's rule:
+#       items without canonicals resurface until one is given)
+#
+# File-lock + log rotation matches run_invoice_batch.sh pattern.
 
 set -e
 
@@ -30,8 +42,8 @@ LOG_DIR="logs"
 mkdir -p "$LOG_DIR"
 LOG_FILE="$LOG_DIR/mapping_review_discover_$(date +%Y%m%d_%H%M%S).log"
 
-echo "=== Mapping Review Discover: $(date) ===" | tee "$LOG_FILE"
-python3 invoice_processor/discover_unmapped.py --write 2>&1 | tee -a "$LOG_FILE"
+echo "=== Mapping Review Discover (Django): $(date) ===" | tee "$LOG_FILE"
+python3 manage.py populate_mapping_review_from_unmapped --apply 2>&1 | tee -a "$LOG_FILE"
 EXIT_CODE=$?
 
 # Keep only the 30 most recent log files
