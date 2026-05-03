@@ -781,6 +781,23 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
             # rows (Romaine 5 heads × $3.46 = $17.33; Cilantro 2 bunches ×
             # $0.99 = $1.98), using `extended` as unit_price overstated
             # per-unit price by qty× and broke calc_iup.
+            #
+            # Line-item math validation (Sean 2026-05-03): qty × unit_price
+            # should ≈ extended_amount. Farm Art has a consistent ~1%
+            # vendor discount across rows (line total = ~99% of qty × U/P)
+            # — that's normal. >5% or >$2 discrepancy = parser bug or OCR
+            # misread; warn so it can be audited.
+            if qty_shipped and unit_price:
+                expected = qty_shipped * unit_price
+                if expected > 0:
+                    diff_pct = abs(extended - expected) / expected * 100
+                    diff_abs = abs(extended - expected)
+                    if diff_pct > 5 and diff_abs > 2:
+                        print(f"  [!] Farm Art line-math anomaly: "
+                              f"{description[:40]!r} qty={qty_shipped} × "
+                              f"unit_price=${unit_price:.2f} = ${expected:.2f} "
+                              f"but extended=${extended:.2f} "
+                              f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
             item = {
                 "raw_description": description,
                 "sysco_item_code": "",

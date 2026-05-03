@@ -538,20 +538,26 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
         vendor_name = ili.vendor.name if ili.vendor else ""
         key = (canonical, vendor_name)
         if key not in seen:
-            # Sean 2026-05-03: separate per-unit price (drives IUP math)
-            # from line total (drives sheet col E "case price"). Pre-fix,
-            # both used extended_amount which was wrong for Farm Art rows
-            # where qty>1 — Cilantro 2 bunches at $1/each had ext=$1.98
-            # but per-unit was $1, and IUP calc that divided ext by 1
-            # gave $1.98/bunch instead of the correct $1/bunch.
+            # Sean 2026-05-03: per-unit price = extended_amount / quantity.
+            # This is the ACTUAL paid per-unit price (accounts for vendor
+            # discounts, billing adjustments, etc.). Falls back to
+            # ili.unit_price (U/P column) only when quantity is missing or
+            # zero — that path mostly applies to Sysco/Exceptional rows
+            # which always invoice as qty=1.
             #
-            # After spatial unit_price fix (commit 0ff4173): ili.unit_price
-            # is always the per-unit price (from invoice U/P column).
-            # ili.extended_amount is the line total (qty × unit_price).
-            per_unit_price = float(ili.unit_price) if ili.unit_price else 0
-            line_total = (float(ili.extended_amount)
-                          if ili.extended_amount and ili.extended_amount > 0
-                          else per_unit_price)
+            # Why prefer ext/qty over U/P column: Farm Art's U/P column is
+            # the catalog list price; line amount has a consistent ~1%
+            # vendor discount applied. ext/qty captures what Sean actually
+            # paid. For costing accuracy (recipe COGs, IUP, P/#), actual
+            # paid > catalog list.
+            ext = float(ili.extended_amount) if ili.extended_amount else 0
+            qty = float(ili.quantity) if ili.quantity and ili.quantity > 0 else 0
+            up_list = float(ili.unit_price) if ili.unit_price else 0
+            if qty > 0 and ext > 0:
+                per_unit_price = round(ext / qty, 4)
+            else:
+                per_unit_price = up_list  # fallback for qty-missing rows
+            line_total = ext if ext > 0 else per_unit_price
             seen[key] = {
                 "canonical":             canonical,
                 "vendor_name":           vendor_name,
