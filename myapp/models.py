@@ -349,6 +349,24 @@ class InvoiceLineItem(models.Model):
         # garbled raws) AND into the audit_parser_garbles queue
         # which surfaces parser bugs for diagnosis.
         ('unmatched_garbled', 'Unmatched (Parser Garble)'),
+        # Phase 3e/3f boundary guards — db_write rejects FK attach when
+        # raw line item's class signal disagrees with Product.inventory_class
+        # (volume vs weighed mismatch). Tags the ILI without an FK so the
+        # row is visible in audits.
+        ('unmatched_class_mismatch', 'Unmatched (Class Mismatch Guard)'),
+        # cleanup_canonical_conflation detach — when raw lacks the
+        # canonical's keep-tokens, FK is detached + tagged here so the
+        # row drops from /mapping-review/ unresolved without re-surfacing
+        # the same conflated suggestion.
+        ('unmatched_repointed', 'Unmatched (Repointed by Cleanup)'),
+        # Fuzzy-quarantine pending tag — db_write quarantines vendor_fuzzy
+        # tier hits with FK detached; ILI gets <tier>_pending while the
+        # PMP awaits human review in /mapping-review/. NOTE: the same
+        # _pending suffix is applied to fuzzy/stripped_fuzzy/subset_match
+        # tiers too (db_write._FUZZY_TIERS) — those variants haven't
+        # accumulated rows yet but WILL when the corresponding tiers fire
+        # into quarantine. Add them to choices when they do.
+        ('vendor_fuzzy_pending', 'Vendor Fuzzy (Quarantined, Pending Review)'),
     ]
 
     vendor          = models.ForeignKey(Vendor, null=True, blank=True, on_delete=models.SET_NULL)
@@ -435,7 +453,7 @@ class InvoiceLineItem(models.Model):
     )
     invoice_date    = models.DateField(null=True, blank=True)
     source_file     = models.CharField(max_length=255, blank=True)  # original filename
-    match_confidence = models.CharField(max_length=20, blank=True, choices=CONFIDENCE_CHOICES)
+    match_confidence = models.CharField(max_length=30, blank=True, choices=CONFIDENCE_CHOICES)
     match_score     = models.IntegerField(null=True, blank=True)  # 0-100 fuzzy score
     price_flagged   = models.BooleanField(default=False)  # True if price anomaly detected
     section_hint    = models.CharField(
