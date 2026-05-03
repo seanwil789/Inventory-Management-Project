@@ -38,6 +38,19 @@ _MONTHLY_TAB_RE = re.compile(
 )
 
 
+def _to_number(s):
+    """Parse a sheet cell ('$12.34', '4', '') → float | None."""
+    if s is None or s == '':
+        return None
+    if isinstance(s, (int, float)):
+        return float(s)
+    s = str(s).strip().replace('$', '').replace(',', '')
+    try:
+        return float(s)
+    except (ValueError, TypeError):
+        return None
+
+
 class Command(BaseCommand):
     help = "Migrate Synergy monthly tab(s) to Phase 4 layout (insert col H, populate F/G/H from DB)."
 
@@ -150,6 +163,8 @@ class Command(BaseCommand):
             products, _ = build_sheet_index(tab)
             self.stdout.write(f'        {len(products)} product rows')
 
+            from synergy_sync import derive_f_count
+
             batch_data = []
             n_set = 0
             for entry in products:
@@ -159,12 +174,21 @@ class Command(BaseCommand):
                 if not p:
                     continue
 
-                # F = latest ILI's case_pack_count
+                # Phase 4b: F = effective units received in latest line.
                 latest = (InvoiceLineItem.objects
-                          .filter(product=p, case_pack_count__isnull=False)
+                          .filter(product=p)
                           .order_by('-invoice_date', '-imported_at').first())
-                f_val = (latest.case_pack_count
-                         if latest and latest.case_pack_count is not None else '')
+                if latest:
+                    item_proxy = {
+                        'inventory_class': p.inventory_class or '',
+                        'quantity': (float(latest.quantity)
+                                     if latest.quantity and latest.quantity > 0 else 0),
+                        'case_pack_count': latest.case_pack_count,
+                        'purchase_uom': latest.purchase_uom or '',
+                    }
+                    f_val = derive_f_count(item_proxy)
+                else:
+                    f_val = ''
                 g_val = ('' if p.inventory_class == 'weighed'
                          else (p.inventory_unit_descriptor or ''))
                 klass = p.inventory_class or ''
@@ -188,8 +212,41 @@ class Command(BaseCommand):
                         f'        ✓ wrote F/G/H for {n_set} rows'))
                 except Exception as e:
                     self.stderr.write(f'  [!] backfill failed: {e}')
+                    continue
             else:
                 self.stdout.write(f'        (dry-run) would write F/G/H for {n_set} rows')
+
+            # Phase 4b: recompute IUP = E / F so the invariant holds for
+            # every row (not just rows touched by the next price-sync).
+            # Reads E + F from the sheet post-backfill, writes J = E/F.
+            if apply_writes:
+                self.stdout.write('  [5/5] Recomputing IUP = E/F across all rows...')
+                from sheets import get_sheet_values
+                e_vals = get_sheet_values(SPREADSHEET_ID, f"'{tab}'!E1:E{products[-1]['row']}") if products else []
+                f_vals = get_sheet_values(SPREADSHEET_ID, f"'{tab}'!F1:F{products[-1]['row']}") if products else []
+                iup_writes = []
+                n_iup = 0
+                for entry in products:
+                    r = entry['row']
+                    e = e_vals[r-1][0] if r-1 < len(e_vals) and e_vals[r-1] else ''
+                    f = f_vals[r-1][0] if r-1 < len(f_vals) and f_vals[r-1] else ''
+                    e_num = _to_number(e)
+                    f_num = _to_number(f)
+                    if e_num is not None and f_num is not None and f_num > 0:
+                        iup = round(e_num / f_num, 4)
+                        iup_writes.append({'range': f"'{tab}'!J{r}",
+                                           'values': [[iup]]})
+                        n_iup += 1
+                if iup_writes:
+                    try:
+                        client.values().batchUpdate(
+                            spreadsheetId=SPREADSHEET_ID,
+                            body={'valueInputOption': 'USER_ENTERED', 'data': iup_writes},
+                        ).execute()
+                        self.stdout.write(self.style.SUCCESS(
+                            f'        ✓ wrote IUP for {n_iup} rows'))
+                    except Exception as e:
+                        self.stderr.write(f'  [!] IUP recompute failed: {e}')
 
         if not apply_writes:
             self.stdout.write(self.style.WARNING(

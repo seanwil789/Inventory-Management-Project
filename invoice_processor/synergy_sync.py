@@ -417,10 +417,33 @@ CATEGORY_TO_SECTION: dict[tuple[str, str], str] = {
 #   H = count-or-weigh flag    ("Ea" for counted_*, "#" for weighed)
 # Counter at inventory time reads H to know whether to count or weigh.
 
-def derive_f_count(item: dict) -> str | int:
-    """F column = number of items per case (case_pack_count)."""
-    cnt = item.get("case_pack_count")
-    return cnt if cnt is not None else ""
+def derive_f_count(item: dict) -> str | int | float:
+    """F column = effective units RECEIVED in this invoice line.
+
+    Sean 2026-05-03 rule: IUP = E / F should hold universally, with no
+    purchase_uom gating logic. To make that work:
+      * CASE purchase  → F = qty × case_pack_count   (inner units in inventory)
+      * EACH/GAL/LB    → F = qty                     (qty individual units bought)
+      * weighed item   → blank                       (counter sees H='#' instead)
+
+    Examples:
+      * Shallot bought 1 GAL (purchase_uom=GAL, qty=1, pack=4)  → F=1
+      * Milk bought 1 CASE (purchase_uom=CASE, qty=1, pack=4)   → F=4
+      * Two cases of yogurt (qty=2, pack=6, purchase_uom=CASE)  → F=12
+    """
+    if item.get("inventory_class") == "weighed":
+        return ""
+    qty = item.get("quantity") or 0
+    pack = item.get("case_pack_count")
+    uom = (item.get("purchase_uom") or "").upper().strip()
+    if uom in ("CASE", "CS") and pack:
+        eff = qty * pack
+    else:
+        eff = qty if qty > 0 else (pack or 1)
+    # Prefer integer when clean
+    if eff and abs(eff - round(eff)) < 0.001:
+        return int(round(eff))
+    return eff if eff else ""
 
 
 def derive_g_units(item: dict) -> str:
@@ -632,6 +655,10 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
                 # G=units of case size, H=Ea/# count-or-weigh flag.
                 "inventory_class":            ili.product.inventory_class or "",
                 "inventory_unit_descriptor":  ili.product.inventory_unit_descriptor or "",
+                # Phase 4b (Sean 2026-05-03): F = effective units received.
+                # Quantity from the line drives F: F = qty × case_pack_count
+                # for CASE purchases, F = qty for per-each (GAL/EACH/LB).
+                "quantity":                   qty,
             }
 
     return list(seen.values())
@@ -869,12 +896,13 @@ def _sync_prices_core(
                 summary["updated"] += 1
                 continue
 
-            # calc_iup gets per-unit price (drives IUP math).
-            # calc_price_per_lb gets per-unit too (it derives $/lb correctly
-            # when given the per-unit price + total weight).
-            iup = calc_iup(unit_price, effective_case_size,
-                           case_pack_count=case_pack_count,
-                           purchase_uom=purchase_uom)
+            # Phase 4b (Sean 2026-05-03): F = effective units received.
+            # IUP = E / F is now the universal rule (no purchase_uom gating).
+            # calc_price_per_lb still drives K column (weighed items).
+            f_val = derive_f_count(item)
+            iup = (round(line_total / f_val, 4)
+                   if isinstance(f_val, (int, float)) and f_val > 0
+                   else None)
             pplb = calc_price_per_lb(unit_price, effective_case_size, sheet_unit,
                                      stored_price_per_lb=stored_ppp,
                                      case_total_weight_lb=case_total_weight_lb)
@@ -885,11 +913,9 @@ def _sync_prices_core(
                 "values": [[line_total]],
             })
             # Phase 4 layout: F=count, G=units of case size, H=Ea/# flag.
-            # item dict carries case_pack_count + inventory_class +
-            # inventory_unit_descriptor (added in load_items_for_month).
             batch_data.append({
                 "range": f"'{tab}'!F{row_num}",
-                "values": [[derive_f_count(item)]],
+                "values": [[f_val]],
             })
             batch_data.append({
                 "range": f"'{tab}'!G{row_num}",
@@ -1482,16 +1508,27 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
             "values": [[unit_price]],
         })
 
-        # Phase 3a structured fields from latest ILI — bypass case_size string
-        # parse when populated. Phase 3b — purchase_uom gates calc_iup.
-        iup = calc_iup(unit_price, case_size,
-                       case_pack_count=latest.case_pack_count,
-                       purchase_uom=latest.purchase_uom)
+        # Phase 4b: F = effective units → IUP = E/F universally.
+        item_proxy = {
+            "inventory_class": (latest.product.inventory_class
+                                if latest.product else ""),
+            "quantity": (float(latest.quantity)
+                         if latest.quantity and latest.quantity > 0 else 0),
+            "case_pack_count": latest.case_pack_count,
+            "purchase_uom": latest.purchase_uom or "",
+        }
+        f_val = derive_f_count(item_proxy)
+        iup = (round(unit_price / f_val, 4)
+               if isinstance(f_val, (int, float)) and f_val > 0 else None)
         pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
                                  stored_price_per_lb=latest.price_per_pound,
                                  case_total_weight_lb=latest.case_total_weight_lb)
 
-        # Phase 4 layout: J=IUP, K=P/#
+        # Phase 4 layout: F=count, J=IUP, K=P/#
+        batch_data.append({
+            "range": f"'{new_tab_name}'!F{row_num}",
+            "values": [[f_val]],
+        })
         if iup is not None:
             batch_data.append({
                 "range": f"'{new_tab_name}'!J{row_num}",
@@ -1628,10 +1665,18 @@ def refresh_stale_carryover(sheet_tab: str = None, dry_run: bool = False) -> dic
 
         case_size = latest.case_size or entry.get("case_size", "")
         latest_vendor = latest.vendor.name if latest.vendor else "?"
-        # Phase 3a structured-field path. Phase 3b — purchase_uom gate.
-        iup = calc_iup(unit_price, case_size,
-                       case_pack_count=latest.case_pack_count,
-                       purchase_uom=latest.purchase_uom)
+        # Phase 4b: F = effective units → IUP = E/F universally.
+        item_proxy = {
+            "inventory_class": (latest.product.inventory_class
+                                if latest.product else ""),
+            "quantity": (float(latest.quantity)
+                         if latest.quantity and latest.quantity > 0 else 0),
+            "case_pack_count": latest.case_pack_count,
+            "purchase_uom": latest.purchase_uom or "",
+        }
+        f_val = derive_f_count(item_proxy)
+        iup = (round(unit_price / f_val, 4)
+               if isinstance(f_val, (int, float)) and f_val > 0 else None)
         pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
                                  stored_price_per_lb=latest.price_per_pound,
                                  case_total_weight_lb=latest.case_total_weight_lb)
@@ -1640,18 +1685,14 @@ def refresh_stale_carryover(sheet_tab: str = None, dry_run: bool = False) -> dic
             print(f"   [DRY RUN] row {row_num}: '{product_name}' → ${unit_price:.2f} "
                   f"from {latest.invoice_date} ({latest_vendor})")
         else:
-            # Phase 4 layout: F=count, J=IUP, K=P/#. F written from
-            # latest.case_pack_count; raw case_size string is no longer
-            # pushed to F.
             batch_data.append({
                 "range": f"'{tab}'!E{row_num}",
                 "values": [[unit_price]],
             })
-            if latest.case_pack_count is not None:
-                batch_data.append({
-                    "range": f"'{tab}'!F{row_num}",
-                    "values": [[latest.case_pack_count]],
-                })
+            batch_data.append({
+                "range": f"'{tab}'!F{row_num}",
+                "values": [[f_val]],
+            })
             batch_data.append({
                 "range": f"'{tab}'!J{row_num}",
                 "values": [[iup if iup is not None else ""]],
