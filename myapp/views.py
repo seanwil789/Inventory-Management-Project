@@ -2659,26 +2659,49 @@ def mapping_review_approve(request, proposal_id: int):
 
 @require_POST
 def mapping_review_reject(request, proposal_id: int):
-    """POST endpoint: reject a proposal. Optional 'notes' POST param.
-    Optional 'reason' POST param — categorical key from
-    REJECT_REASON_CHOICES (Sean 2026-05-02 — structured teaching signal).
+    """POST endpoint: reject a proposal OR re-classify an already-rejected
+    one. Optional 'notes' + 'reason' POST params.
 
-    Side-effect on reason='typo_or_garble': bulk-update underlying ILIs
-    with same (vendor, raw_description) to match_confidence='unmatched_garbled'.
-    Drops them from the /mapping-review/ unresolved filter AND surfaces
-    them in audit_parser_garbles for parser-bug diagnosis."""
+    When status='pending':  rejects with given reason.
+    When status='rejected': updates reason (Sean 2026-05-02 — legacy
+        rejections from before reject_reason field existed need a way to
+        get classified retroactively so they drop out of the unresolved
+        queue).
+
+    Side-effects (apply regardless of pending vs already-rejected, as
+    long as a reason is given):
+      reason='typo_or_garble' →  tag ILIs match_confidence='unmatched_garbled'
+                                 (drops from queue, surfaces in audit_parser_garbles)
+      reason='not_a_product'  →  tag ILIs match_confidence='non_product'
+                                 (drops from queue, removed from product mapping
+                                  metrics)
+    """
     from .models import ProductMappingProposal, InvoiceLineItem
     proposal = get_object_or_404(ProductMappingProposal, id=proposal_id)
-    if proposal.status != 'pending':
-        messages.warning(request, f"Proposal #{proposal.id} already {proposal.status}.")
+    if proposal.status not in ('pending', 'rejected'):
+        messages.warning(request, f"Proposal #{proposal.id} is {proposal.status}; cannot modify.")
         return redirect('mapping_review')
     notes = (request.POST.get('notes') or '').strip()
     reason = (request.POST.get('reason') or '').strip()
-    proposal.reject(
-        reviewer=request.user if request.user.is_authenticated else None,
-        notes=notes,
-        reason=reason,
-    )
+
+    was_pending = (proposal.status == 'pending')
+    if was_pending:
+        proposal.reject(
+            reviewer=request.user if request.user.is_authenticated else None,
+            notes=notes,
+            reason=reason,
+        )
+    else:
+        # Already rejected — just update the reason + append notes.
+        valid_reasons = {k for k, _ in ProductMappingProposal.REJECT_REASON_CHOICES}
+        if reason and reason in valid_reasons:
+            proposal.reject_reason = reason
+        if notes:
+            proposal.notes = (proposal.notes + '\n' if proposal.notes else '') + notes
+        proposal.save(update_fields=['reject_reason', 'notes'])
+
+    # Side-effect tagging — applies whether this was a fresh reject or a
+    # reclassification of a legacy rejection.
     extra = ''
     if reason == 'typo_or_garble':
         n = (InvoiceLineItem.objects
@@ -2687,13 +2710,23 @@ def mapping_review_reject(request, proposal_id: int):
                      product__isnull=True)
              .update(match_confidence='unmatched_garbled'))
         if n:
-            extra = f' — tagged {n} garbled ILI row(s) for parser audit'
+            extra = f' — tagged {n} garbled ILI row(s)'
+    elif reason == 'not_a_product':
+        n = (InvoiceLineItem.objects
+             .filter(vendor=proposal.vendor,
+                     raw_description=proposal.raw_description,
+                     product__isnull=True)
+             .update(match_confidence='non_product'))
+        if n:
+            extra = f' — tagged {n} ILI row(s) as non-product'
+
     label = ''
     if reason:
         label = dict(ProductMappingProposal.REJECT_REASON_CHOICES).get(reason, '')
         if label:
             label = f' ({label})'
-    messages.info(request, f"Rejected proposal #{proposal.id}{label}{extra}.")
+    verb = 'Rejected' if was_pending else 'Reclassified'
+    messages.info(request, f"{verb} proposal #{proposal.id}{label}{extra}.")
     return redirect('mapping_review')
 
 
@@ -2711,8 +2744,12 @@ def mapping_review_create_and_approve(request, proposal_id: int):
     """
     from .models import ProductMappingProposal
     proposal = get_object_or_404(ProductMappingProposal, id=proposal_id)
-    if proposal.status != 'pending':
-        messages.warning(request, f"Proposal #{proposal.id} already {proposal.status}.")
+    # Sean 2026-05-02: rejected proposals can be canonicalized via the
+    # create-new flow — the underlying raw is still unmapped, the
+    # rejection only said "this SUGGESTION was wrong." Approved status
+    # still blocks (raw is already canonicalized; nothing to invent).
+    if proposal.status == 'approved':
+        messages.warning(request, f"Proposal #{proposal.id} already approved.")
         return redirect('mapping_review')
 
     canonical = (request.POST.get('canonical_name') or '').strip()

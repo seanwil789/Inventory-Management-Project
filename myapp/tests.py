@@ -10203,18 +10203,19 @@ class RejectReasonTests(TestCase):
         self.assertEqual(self.pmp.reject_reason, 'not_a_product')
         self.assertEqual(self.pmp.status, 'rejected')
 
-    def test_reject_already_rejected_no_op(self):
-        """Already-rejected proposal shouldn't get re-rejected with new reason."""
+    def test_reject_already_rejected_allows_reason_update(self):
+        """Sean 2026-05-02: re-classifying an already-rejected proposal
+        is now allowed — Sean uses this to triage legacy rejections
+        from before reject_reason existed. Status stays 'rejected'."""
         self.pmp.reject(reason='wrong_canonical')
-        first_reason = self.pmp.reject_reason
-        # Second attempt via view
+        # Re-classify to a different category
         resp = self.client.post(
             f'/mapping-review/{self.pmp.id}/reject/',
             {'reason': 'not_a_product'},
         )
         self.pmp.refresh_from_db()
-        # View redirect with warning; reason unchanged
-        self.assertEqual(self.pmp.reject_reason, first_reason)
+        self.assertEqual(self.pmp.reject_reason, 'not_a_product')
+        self.assertEqual(self.pmp.status, 'rejected')
 
 
 class ParserGarbleTrackingTests(TestCase):
@@ -10447,3 +10448,95 @@ class CrossSourceDedupTests(TestCase):
             vendor=self.v, raw_description='RAW').first()
         # [du] should appear exactly once in notes
         self.assertEqual(pmp.notes.count('[du]'), 1)
+
+
+class ClassifyAlreadyRejectedTests(TestCase):
+    """Sean: legacy rejections from before reject_reason existed clog the
+    unresolved queue. Allow re-classification on already-rejected rows."""
+
+    def setUp(self):
+        from myapp.models import (Vendor, Product, InvoiceLineItem,
+                                   ProductMappingProposal)
+        from django.contrib.auth.models import User
+        self.user = User.objects.create_user(username='r', password='x')
+        self.client.force_login(self.user)
+        self.v, _ = Vendor.objects.get_or_create(name='Sysco')
+        self.prod = Product.objects.create(canonical_name='Test Item', category='Drystock')
+        # ILI for the legacy rejection
+        self.ili = InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date='2026-04-26',
+            raw_description='TRUCK STOP', unit_price=0, extended_amount=0,
+            product=None, match_confidence='unmatched',
+        )
+        # Pre-existing rejected PMP with no reason (legacy)
+        self.pmp = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='TRUCK STOP',
+            source='discover_unmapped', suggested_product=self.prod,
+            status='rejected', reject_reason='',
+        )
+
+    def test_can_classify_legacy_rejection_as_not_a_product(self):
+        from myapp.models import ProductMappingProposal, InvoiceLineItem
+        resp = self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'not_a_product'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.pmp.refresh_from_db()
+        self.assertEqual(self.pmp.reject_reason, 'not_a_product')
+        # ILI tagged as non_product → drops out of unresolved
+        self.ili.refresh_from_db()
+        self.assertEqual(self.ili.match_confidence, 'non_product')
+
+    def test_can_classify_legacy_rejection_as_garble(self):
+        from myapp.models import InvoiceLineItem
+        self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'typo_or_garble'},
+        )
+        self.pmp.refresh_from_db()
+        self.assertEqual(self.pmp.reject_reason, 'typo_or_garble')
+        self.ili.refresh_from_db()
+        self.assertEqual(self.ili.match_confidence, 'unmatched_garbled')
+
+    def test_classified_drops_out_of_unresolved_view(self):
+        # Before classify: shows in unresolved
+        resp = self.client.get('/mapping-review/?status=unresolved')
+        self.assertIn('TRUCK STOP', resp.content.decode())
+        # Classify
+        self.client.post(
+            f'/mapping-review/{self.pmp.id}/reject/',
+            {'reason': 'not_a_product'},
+        )
+        # After: drops from unresolved
+        resp = self.client.get('/mapping-review/?status=unresolved')
+        self.assertNotIn('TRUCK STOP', resp.content.decode())
+
+    def test_already_approved_still_blocked(self):
+        from myapp.models import ProductMappingProposal
+        approved = ProductMappingProposal.objects.create(
+            vendor=self.v, raw_description='APPROVED ROW',
+            source='discover_unmapped', suggested_product=self.prod,
+            status='approved',
+        )
+        resp = self.client.post(
+            f'/mapping-review/{approved.id}/reject/',
+            {'reason': 'not_a_product'},
+        )
+        approved.refresh_from_db()
+        self.assertEqual(approved.status, 'approved')
+        self.assertEqual(approved.reject_reason, '')
+
+    def test_create_new_canonical_works_on_rejected_pmp(self):
+        """Rejected PMP + you create a new canonical = full canonicalization."""
+        resp = self.client.post(
+            f'/mapping-review/{self.pmp.id}/create-and-approve/',
+            {'canonical_name': 'TRUCK STOP Canonical',
+             'category': 'Drystock',
+             'primary_descriptor': '',
+             'secondary_descriptor': ''},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.pmp.refresh_from_db()
+        # Should be approved now
+        self.assertEqual(self.pmp.status, 'approved')

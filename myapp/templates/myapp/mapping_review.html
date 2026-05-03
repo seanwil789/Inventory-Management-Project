@@ -166,9 +166,39 @@
               {% else %}
                 <div class="text-xs text-slate-500">
                   {{ p.get_status_display }}
+                  {% if p.reject_reason %}
+                    <span class="ml-1 px-1.5 py-0.5 bg-amber-100 text-amber-800 rounded text-[10px]"
+                          title="{{ p.get_reject_reason_display }}">
+                      {{ p.reject_reason }}
+                    </span>
+                  {% endif %}
                   {% if p.reviewed_by %} by {{ p.reviewed_by.username }}{% endif %}
                   {% if p.reviewed_at %}<br>{{ p.reviewed_at|date:"M j H:i" }}{% endif %}
                 </div>
+                {% if p.status == 'rejected' %}
+                  <form method="post" action="{% url 'mapping_review_reject' p.id %}" class="inline mt-1 block">
+                    {% csrf_token %}
+                    <select name="reason"
+                            class="border rounded px-1 py-0.5 text-xs"
+                            title="Classify this legacy rejection so it drops out of the unresolved queue">
+                      <option value="">— classify —</option>
+                      <option value="typo_or_garble">Typo / OCR garble</option>
+                      <option value="not_a_product">Not a product</option>
+                      <option value="wrong_canonical">Wrong canonical</option>
+                      <option value="needs_new_canonical">Needs new canonical</option>
+                      <option value="other">Other</option>
+                    </select>
+                    <button type="submit"
+                            class="px-2 py-0.5 bg-amber-600 hover:bg-amber-700 text-white rounded text-xs ml-1">
+                      Tag
+                    </button>
+                  </form>
+                  <button type="button"
+                          onclick="document.getElementById('create-form-{{ p.id }}').classList.toggle('hidden')"
+                          class="px-2 py-0.5 bg-indigo-600 hover:bg-indigo-700 text-white rounded text-xs ml-1 mt-1">
+                    + Create new
+                  </button>
+                {% endif %}
                 {% if p.status == 'approved' and p.suggested_product %}
                   <a href="{% url 'product_edit' p.suggested_product.id %}"
                      class="inline-block mt-1 px-2 py-0.5 bg-slate-200 hover:bg-slate-300 text-slate-800 rounded text-xs">
@@ -185,7 +215,7 @@
             </td>
           </tr>
           {% endif %}
-          {% if p.status == 'pending' %}
+          {% if p.status == 'pending' or p.status == 'rejected' %}
           <tr id="create-form-{{ p.id }}" class="hidden bg-indigo-50/40 border-t-0">
             <td colspan="6" class="px-3 py-3">
               <form method="post" action="{% url 'mapping_review_create_and_approve' p.id %}"
