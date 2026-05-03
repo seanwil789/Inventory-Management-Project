@@ -600,10 +600,17 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
             if not description:
                 description = f"[Exceptional #{code}]"
 
+            # Sean 2026-05-03: same bug pattern as Farm Art — was setting
+            # unit_price = extended (line total) when local `unit_price` is
+            # the actual per-unit value from the U/P column. For catch-weight
+            # this is $/lb; for non-catch-weight CASE/EA it's per-case/per-EA.
+            # Either way, ILI.unit_price should be per-unit and ext is the
+            # line total. Fixed so line-math validation works + downstream
+            # consumers (synergy_sync) get consistent semantics with Farm Art.
             item = {
                 "raw_description": description,
                 "sysco_item_code": "",
-                "unit_price": extended,  # Exceptional "unit_price" is per-line total
+                "unit_price": unit_price,
                 "extended_amount": extended,
                 "case_size_raw": um or "",
                 "section": "",
