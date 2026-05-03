@@ -615,18 +615,39 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
                 "case_size_raw": um or "",
                 "section": "",
             }
-            # Catch-weight: per-unit U/M is "LB" and unit_price is $/lb.
-            # Promote it to price_per_unit; the line total stays as
-            # unit_price/extended_amount so DB dollar totals balance.
+            # Catch-weight: per-unit U/M is "LB" and per-lb price.
+            #
+            # Sean 2026-05-03: when spatial can't find the U/P column token
+            # (band 0.78-0.85 misses it for some catch-weight layouts) the
+            # unit_price defaults to extended — then both fields hold the
+            # line total, NOT the per-lb price. Beef 42.7 Chuck Flap stored
+            # unit_price=$197.53 (= ext) instead of $/lb=$10.98 (= 197.53/17.99).
+            #
+            # Self-correction: for catch-weight rows, derive per-lb from
+            # ext / qty_shipped. This is always reliable when both are present
+            # (qty is the shipped weight, ext is what Sean paid). Overrides the
+            # potentially-wrong U/P column extraction for catch-weight only —
+            # non-catch-weight rows still use the extracted U/P value.
             #
             # Phase 2b: emit structured fields. quantity = shipped lbs (matches
             # Sysco catch-weight convention). purchase_uom = "LB". Also write
             # case_total_weight_lb + the case_pack_* triple (count=1 for
             # single-shipment catch-weight).
-            if per_um == "LB" and qty_shipped is not None:
+            if per_um == "LB" and qty_shipped is not None and qty_shipped > 0:
+                # If unit_price was extracted cleanly from U/P column it
+                # differs from extended (line total); trust it. If it's
+                # suspiciously equal to extended (means U/P column wasn't
+                # extracted — the local var defaulted to extended at line
+                # 581), derive per-lb from ext÷qty as the corrective.
+                final_per_lb = unit_price
+                if abs(unit_price - extended) < 0.01:
+                    derived_per_lb = round(extended / qty_shipped, 4)
+                    if derived_per_lb > 0:
+                        final_per_lb = derived_per_lb
+                item["unit_price"] = final_per_lb
                 item["unit_of_measure"] = "LB"
                 item["purchase_uom"] = "LB"
-                item["price_per_unit"] = unit_price
+                item["price_per_unit"] = final_per_lb
                 item["case_size_raw"] = f"{qty_shipped}LB"
                 item["quantity"] = qty_shipped
                 item["case_total_weight_lb"] = round(qty_shipped, 3)
