@@ -10540,3 +10540,63 @@ class ClassifyAlreadyRejectedTests(TestCase):
         self.pmp.refresh_from_db()
         # Should be approved now
         self.assertEqual(self.pmp.status, 'approved')
+
+
+class AuditSuspectMappingsWriteToReviewTests(TestCase):
+    """Sean 2026-05-02: --write-to-review now enqueues into PMP (suspect_audit
+    source), replaces the legacy sheet-write path."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('audit_suspect_mappings', *args, stdout=out)
+        return out.getvalue()
+
+    def test_write_to_review_enqueues_pmp(self):
+        from myapp.models import (Product, Vendor, InvoiceLineItem,
+                                   ProductMappingProposal)
+        from datetime import date
+        v = Vendor.objects.create(name='Test Sysco')
+        wrong = Product.objects.create(canonical_name='Mop Heads', category='Chemicals')
+        # Create a candidate canonical that fuzzy-matches the raw_desc
+        Product.objects.create(canonical_name='Aprons, Bib White', category='Smallwares')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=wrong,
+            raw_description='Bib Aprons White',
+            unit_price=Decimal('10'), extended_amount=Decimal('10'),
+            invoice_date=date(2026, 4, 15),
+        )
+        self._run('--write-to-review')
+        # PMP enqueued with source='suspect_audit'
+        pmps = ProductMappingProposal.objects.filter(source='suspect_audit')
+        self.assertGreaterEqual(pmps.count(), 1)
+        pmp = pmps.first()
+        self.assertEqual(pmp.vendor, v)
+        self.assertIn('Bib Aprons', pmp.raw_description)
+        # Notes carries the WAS clause
+        self.assertIn('WAS:', pmp.notes)
+        self.assertIn('Mop Heads', pmp.notes)
+        # Source marker [sa] stamped
+        self.assertIn('[sa]', pmp.notes)
+        # Status pending
+        self.assertEqual(pmp.status, 'pending')
+
+    def test_dry_run_does_not_enqueue(self):
+        from myapp.models import (Product, Vendor, InvoiceLineItem,
+                                   ProductMappingProposal)
+        from datetime import date
+        v = Vendor.objects.create(name='Test Sysco')
+        wrong = Product.objects.create(canonical_name='Mop Heads', category='Chemicals')
+        Product.objects.create(canonical_name='Aprons, Bib White', category='Smallwares')
+        InvoiceLineItem.objects.create(
+            vendor=v, product=wrong, raw_description='Bib Aprons White',
+            unit_price=Decimal('10'), extended_amount=Decimal('10'),
+            invoice_date=date(2026, 4, 15),
+        )
+        out = self._run('--write-to-review', '--dry-run')
+        self.assertIn('DRY RUN', out)
+        self.assertEqual(
+            ProductMappingProposal.objects.filter(source='suspect_audit').count(),
+            0,
+        )

@@ -26,17 +26,15 @@ Output:
   - LOW: left for manual mapping or SUPC CSV import
 
 By default, dry-run. With --apply, writes high-confidence mappings
-directly to the local code_map cache (fast iteration) and to Google
-Sheets' Item Mapping tab (persistent; picks up on next mapping refresh).
+to the local code_map cache (fast iteration) and to ProductMapping
+table (persistent; picks up on next mapping refresh). Updated 2026-
+05-02: was Google Sheets Item Mapping tab; sheet retired.
 
-⚠️  DEPRECATED PATH (2026-05-02): the MEDIUM confidence tier writes
-    to the Google Sheet's "Mapping Review" tab (auto-creates it if
-    missing). That tab has been RETIRED in favor of the Django
-    `/mapping-review/` page backed by ProductMappingProposal. If you
-    run this cmd with --apply on Sysco SUPCs, MEDIUM-tier suggestions
-    end up in a sheet surface no one curates. Use `--cache-only` OR
-    raise `--min-score 95` to suppress the MEDIUM-tier sheet write.
-    Refactor to write into ProductMappingProposal pending.
+2026-05-02: MEDIUM confidence tier now enqueues into the Django
+/mapping-review/ queue (ProductMappingProposal, source='supc_recovery')
+instead of the retired sheet's Mapping Review tab. No-context SUPCs
+also enqueue with suggested_product=None so the reviewer can invent
+a canonical inline. Approve via the UI to re-point.
 
 Usage:
   python manage.py recover_sysco_supcs                   # dry-run
@@ -252,117 +250,62 @@ class Command(BaseCommand):
                 no_context_supcs_for_review.append((code, dollars))
             no_context_supcs_for_review.sort(key=lambda x: -x[1])
 
-        # Medium-confidence → Mapping Review tab (independent of --apply)
+        # Medium-confidence → /mapping-review/ Django queue (Sean 2026-05-02:
+        # replaces the legacy sheet write since the Mapping Review tab is
+        # retired). Source='supc_recovery'.
         if opts['write_review'] and (medium_conf or no_context_supcs_for_review):
-            try:
-                from sheets import get_sheets_client, get_sheet_values  # noqa: E402
-                from config import SPREADSHEET_ID  # noqa: E402
-                from invoice_processor.discover_unmapped import (
-                    REVIEW_TAB, _ensure_review_tab_exists, _get_review_sheet_id,
+            from myapp.models import Vendor, Product, ProductMappingProposal
+            sysco, _ = Vendor.objects.get_or_create(name='Sysco')
+
+            enqueued = converged = skipped = 0
+            for code, d, ctx, canon, score, src in medium_conf:
+                target = Product.objects.filter(canonical_name=canon).first()
+                if target is None:
+                    skipped += 1
+                    continue
+                raw_desc = f'[Sysco #{code}] ctx: {ctx[:100]}'
+                notes = (f'SUPC recovery · source={src} · code={code} · '
+                         f'${d:.2f}/row · Top candidate: {canon} ({int(score)})')
+                _, created, did_converge = ProductMappingProposal.get_or_create_dedup(
+                    vendor=sysco,
+                    raw_description=raw_desc,
+                    suggested_product=target,
+                    source='supc_recovery',
+                    defaults=dict(
+                        score=int(score),
+                        confidence_tier=src,  # 'inline' or 'nearby'
+                        status='pending',
+                        notes=notes,
+                    ),
                 )
-            except ImportError as e:
-                self.stderr.write(f'Could not import for review write: {e}')
-            else:
-                client = get_sheets_client()
-                _ensure_review_tab_exists(client)
+                if created: enqueued += 1
+                elif did_converge: converged += 1
 
-                # Dedupe against existing Mapping Review rows (A=Vendor, B=Raw)
-                existing = get_sheet_values(SPREADSHEET_ID, f"'{REVIEW_TAB}'!A:B")
-                existing_keys = set()
-                for row in existing[1:]:
-                    while len(row) < 2:
-                        row.append('')
-                    existing_keys.add((row[0].strip(), row[1].strip()))
+            for code, dollars in no_context_supcs_for_review:
+                raw_desc = f'[Sysco #{code}] (no OCR context)'
+                notes = (f'SUPC recovery · no context · code={code} · '
+                         f'${dollars:.2f}/row · LOOK UP ON SYSCO PORTAL')
+                # No suggested_product (suggested=None signals "human invents")
+                _, created, _ = ProductMappingProposal.get_or_create_dedup(
+                    vendor=sysco,
+                    raw_description=raw_desc,
+                    suggested_product=None,
+                    source='supc_recovery',
+                    defaults=dict(
+                        score=None,
+                        confidence_tier='no_context',
+                        status='pending',
+                        notes=notes,
+                    ),
+                )
+                if created: enqueued += 1
 
-                rows = []
-                for code, d, ctx, canon, score, src in medium_conf:
-                    raw_desc = f'[Sysco #{code}] ctx: {ctx[:100]}'
-                    if ('Sysco', raw_desc) in existing_keys:
-                        continue
-                    notes = (f'SUPC recovery · source={src} · code={code} · '
-                             f'$={d:.2f}/row · Candidates: {canon} ({int(score)})')
-                    rows.append([
-                        'Sysco',                   # A: Vendor
-                        raw_desc,                  # B: Raw Description
-                        canon,                     # C: Suggested Product (prefilled for review)
-                        round(score, 1),           # D: Score
-                        1,                         # E: Count
-                        '',                        # F: Approve? (Y/N) — blank, Sean reviews
-                        f'${d:.2f}',               # G: Avg Price
-                        '',                        # H: Times Seen
-                        notes,                     # I: Notes
-                    ])
-                # No-context SUPCs — col C blank, Sean looks up code on Sysco portal
-                for code, dollars in no_context_supcs_for_review:
-                    raw_desc = f'[Sysco #{code}] (no OCR context)'
-                    if ('Sysco', raw_desc) in existing_keys:
-                        continue
-                    notes = (f'SUPC recovery · source=no-context · code={code} · '
-                             f'$={dollars:.2f}/row · LOOK UP ON SYSCO PORTAL')
-                    rows.append([
-                        'Sysco',                   # A: Vendor
-                        raw_desc,                  # B: Raw Description
-                        '',                        # C: Suggested Product — BLANK, Sean fills
-                        '',                        # D: Score
-                        1,                         # E: Count
-                        '',                        # F: Approve? (Y/N)
-                        f'${dollars:.2f}',         # G: Avg Price
-                        '',                        # H: Times Seen
-                        notes,                     # I: Notes
-                    ])
-                if rows:
-                    # Insert new rows at the TOP (row 2, right below header) so
-                    # fresh suggestions don't require scrolling to the bottom of
-                    # a growing queue. Uses insertDimension + values.update
-                    # rather than append() for the reorder semantics.
-                    sheet_id = _get_review_sheet_id(client)
-                    if sheet_id is None:
-                        self.stderr.write(
-                            f'Could not resolve sheetId for "{REVIEW_TAB}"; '
-                            f'falling back to append.')
-                        client.values().append(
-                            spreadsheetId=SPREADSHEET_ID,
-                            range=f"'{REVIEW_TAB}'!A:I",
-                            valueInputOption='RAW',
-                            insertDataOption='INSERT_ROWS',
-                            body={'values': rows},
-                        ).execute()
-                    else:
-                        # Step 1: insert N blank rows at position 2 (0-indexed=1)
-                        client.batchUpdate(
-                            spreadsheetId=SPREADSHEET_ID,
-                            body={'requests': [{
-                                'insertDimension': {
-                                    'range': {
-                                        'sheetId': sheet_id,
-                                        'dimension': 'ROWS',
-                                        'startIndex': 1,
-                                        'endIndex': 1 + len(rows),
-                                    },
-                                    'inheritFromBefore': False,
-                                }
-                            }]},
-                        ).execute()
-                        # Step 2: write new values into the freshly-inserted rows.
-                        # valueInputOption='RAW' (not USER_ENTERED) because the
-                        # raw_description column carries '[Sysco #NNN]' strings
-                        # that Sheets occasionally (and unpredictably) parses
-                        # as reference-like expressions, returning empty/space.
-                        # RAW stores exactly as given. Numeric columns read back
-                        # as strings but that's what discover_unmapped expects.
-                        end_row = 1 + len(rows)
-                        client.values().update(
-                            spreadsheetId=SPREADSHEET_ID,
-                            range=f"'{REVIEW_TAB}'!A2:I{end_row}",
-                            valueInputOption='RAW',
-                            body={'values': rows},
-                        ).execute()
-                    self.stdout.write(self.style.SUCCESS(
-                        f'\n✔ Inserted {len(rows)} medium-confidence SUPC suggestions '
-                        f'at the TOP of "{REVIEW_TAB}" (newest first, no scroll).'))
-                else:
-                    self.stdout.write(self.style.WARNING(
-                        '\nNo new medium-confidence rows to write (all already in review tab).'))
+            self.stdout.write(self.style.SUCCESS(
+                f'\n✔ Enqueued {enqueued} SUPC-recovery proposal(s) in '
+                f'/mapping-review/?status=unresolved'
+                + (f' (converged {converged} with same-target proposals)' if converged else '')
+                + (f' — skipped {skipped} for missing canonical' if skipped else '')
+            ))
 
         if not opts['apply']:
             self.stdout.write(self.style.WARNING(
@@ -389,42 +332,40 @@ class Command(BaseCommand):
             f'\n✔ Updated {mapping_cache.name}: {before_count} → {len(code_map)} code entries'
         ))
 
-        # 6. Write to Google Sheets Item Mapping tab (persistent)
+        # 6. Write to ProductMapping table (Sean 2026-05-02: replaces the
+        # legacy Item Mapping sheet write — that tab is retired).
         if opts['cache_only']:
             self.stdout.write(self.style.WARNING(
-                'Skipped Google Sheets write (--cache-only). '
+                'Skipped ProductMapping write (--cache-only). '
                 'Changes will revert on next mapping refresh (TTL 1 hour).'
             ))
             return
 
-        try:
-            from sheets import get_sheets_client  # noqa: E402
-            from config import SPREADSHEET_ID, MAPPING_TAB  # noqa: E402
-        except ImportError as e:
-            self.stderr.write(f'Could not import sheets client: {e}')
-            return
+        from myapp.models import Vendor, Product, ProductMapping
+        sysco, _ = Vendor.objects.get_or_create(name='Sysco')
 
-        client = get_sheets_client()
-        rows = []
+        created = updated = skipped = 0
         for code, _d, ctx, canon, _score, _src in high_conf:
-            rows.append([
-                'Sysco',          # A: Vendor
-                ctx[:200],        # B: Raw Description (discovered context)
-                '',               # C: Category (manual)
-                '',               # D: Primary descriptor (manual)
-                '',               # E: Secondary descriptor (manual)
-                canon,             # F: Canonical — the recovered mapping
-                code,              # G: SUPC Code
-            ])
-        client.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f"{MAPPING_TAB}!A:G",
-            valueInputOption='USER_ENTERED',
-            insertDataOption='INSERT_ROWS',
-            body={'values': rows},
-        ).execute()
+            target = Product.objects.filter(canonical_name=canon).first()
+            if target is None:
+                skipped += 1
+                continue
+            # Use SUPC as the description (matches the ProductMapping
+            # convention for code-tier hits — desc serves as fallback when
+            # the same product appears via raw text without SUPC).
+            pm, was_created = ProductMapping.objects.update_or_create(
+                vendor=sysco,
+                description=ctx[:200],
+                defaults={'product': target, 'supc': code},
+            )
+            if was_created:
+                created += 1
+            else:
+                updated += 1
         self.stdout.write(self.style.SUCCESS(
-            f'✔ Appended {len(rows)} rows to "{MAPPING_TAB}" tab in Google Sheets.'
+            f'✔ ProductMapping table: created {created}, updated {updated}'
+            + (f', skipped {skipped} for missing canonical' if skipped else '')
+            + '.'
         ))
         self.stdout.write(
             '\nNext: run `python manage.py reprocess_invoices` to re-map '

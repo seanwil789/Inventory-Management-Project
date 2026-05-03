@@ -110,6 +110,8 @@ class ProductMappingProposal(models.Model):
         ('mapper_quarantine', 'Mapper Quarantine (fuzzy held at write)'),
         ('discover_unmapped', 'Discover Unmapped Scan'),
         ('drift_audit', 'Canonical Drift Audit (PM re-evaluation)'),
+        ('suspect_audit', 'Suspect-Mappings Audit (zero token overlap)'),
+        ('supc_recovery', 'Sysco SUPC Cross-Cache Recovery'),
     ]
     vendor              = models.ForeignKey(Vendor, on_delete=models.CASCADE, related_name='mapping_proposals')
     raw_description     = models.CharField(max_length=500)
@@ -252,6 +254,8 @@ class ProductMappingProposal(models.Model):
             'mapper_quarantine': '[mq]',
             'discover_unmapped': '[du]',
             'drift_audit': '[da]',
+            'suspect_audit': '[sa]',
+            'supc_recovery': '[sr]',
         }
         marker = marker_map.get(source, f'[{source[:2]}]')
 
@@ -286,13 +290,15 @@ class ProductMappingProposal(models.Model):
         """Read source markers stamped in notes back into a source set.
         Includes the originating source so the count reflects all paths
         that converged on this (vendor, raw, suggested) triple."""
-        markers = {'[mq]', '[du]', '[da]'}
+        markers = {'[mq]', '[du]', '[da]', '[sa]', '[sr]'}
         found = {m for m in markers if m in (self.notes or '')}
         # Always include the originating source
         marker_map = {
             'mapper_quarantine': '[mq]',
             'discover_unmapped': '[du]',
             'drift_audit': '[da]',
+            'suspect_audit': '[sa]',
+            'supc_recovery': '[sr]',
         }
         if self.source in marker_map:
             found.add(marker_map[self.source])
