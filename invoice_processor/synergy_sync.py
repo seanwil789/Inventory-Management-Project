@@ -198,10 +198,18 @@ def calc_iup(unit_price: float, case_size: str,
     """
     uom = (purchase_uom or '').upper().strip()
 
-    # Per-unit U/M values: unit_price IS per-unit, no division.
-    _PER_UNIT_UOMS = {'LB', 'LBS', '#', 'EACH', 'EA',
+    # Weighed U/M (LB / KG / OZ / #): IUP isn't meaningful — these items
+    # don't have a fixed "individual unit." Their per-unit price is per-lb
+    # (P/# column), not per-piece. Return None so col I stays empty.
+    _WEIGHED_UOMS = {'LB', 'LBS', '#', 'KG', 'OZ'}
+    if uom in _WEIGHED_UOMS:
+        return None
+
+    # Per-unit countable U/M: unit_price IS the individual-unit price.
+    # No division needed (Farm Art shallot $20/gal, cilantro $1/bunch).
+    _PER_UNIT_UOMS = {'EACH', 'EA',
                       'GAL', 'GALLON', 'QT', 'QUART', 'PT', 'PINT',
-                      'DZ', 'DOZ', 'DOZEN', 'BU', 'BUNCH', 'OZ', 'KG'}
+                      'DZ', 'DOZ', 'DOZEN', 'BU', 'BUNCH'}
     if uom in _PER_UNIT_UOMS:
         return round(unit_price, 4)
 
@@ -530,18 +538,27 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
         vendor_name = ili.vendor.name if ili.vendor else ""
         key = (canonical, vendor_name)
         if key not in seen:
-            # Phase 4: prefer extended_amount (line total = case price for
-            # multi-unit Farm Art / PBM lines like '4 BAG bananas at $2.70 ea'
-            # totaling $10.69). For Sysco / Exceptional, ext == unit so this
-            # is a no-op. The sheet's col E semantics are "case price" and
-            # the line total IS the case price for per-unit-priced vendors.
-            case_price = (float(ili.extended_amount)
+            # Sean 2026-05-03: separate per-unit price (drives IUP math)
+            # from line total (drives sheet col E "case price"). Pre-fix,
+            # both used extended_amount which was wrong for Farm Art rows
+            # where qty>1 — Cilantro 2 bunches at $1/each had ext=$1.98
+            # but per-unit was $1, and IUP calc that divided ext by 1
+            # gave $1.98/bunch instead of the correct $1/bunch.
+            #
+            # After spatial unit_price fix (commit 0ff4173): ili.unit_price
+            # is always the per-unit price (from invoice U/P column).
+            # ili.extended_amount is the line total (qty × unit_price).
+            per_unit_price = float(ili.unit_price) if ili.unit_price else 0
+            line_total = (float(ili.extended_amount)
                           if ili.extended_amount and ili.extended_amount > 0
-                          else float(ili.unit_price))
+                          else per_unit_price)
             seen[key] = {
                 "canonical":             canonical,
                 "vendor_name":           vendor_name,
-                "unit_price":            case_price,
+                # 'unit_price' here = per-unit price (drives calc_iup).
+                # Sheet col E "case price" = line_total (separate field below).
+                "unit_price":            per_unit_price,
+                "line_total":            line_total,
                 "case_size_raw":         ili.case_size or "",
                 "category":              ili.product.category,
                 "primary_descriptor":    ili.product.primary_descriptor,
@@ -690,7 +707,11 @@ def _sync_prices_core(
     for item in items:
         canonical   = item["canonical"]
         vendor_name = item.get("vendor_name", "")
+        # Sean 2026-05-03: per-unit price drives calc_iup;
+        # line_total drives sheet col E "case price". For Sysco/Exceptional
+        # qty=1 rows the two are equal. For Farm Art qty>1 they differ.
         unit_price  = item.get("unit_price")
+        line_total  = item.get("line_total", unit_price)
         case_size   = item.get("case_size_raw", "")
         stored_ppp  = item.get("price_per_pound")
         # Phase 3a structured-field path
@@ -791,10 +812,13 @@ def _sync_prices_core(
 
             if dry_run:
                 print(f"   [DRY RUN] row {row_num}: '{canonical}' → '{row_entry['product']}'"
-                      f" [{vendor_col}] @ ${unit_price:.2f}")
+                      f" [{vendor_col}] @ ${line_total:.2f}")
                 summary["updated"] += 1
                 continue
 
+            # calc_iup gets per-unit price (drives IUP math).
+            # calc_price_per_lb gets per-unit too (it derives $/lb correctly
+            # when given the per-unit price + total weight).
             iup = calc_iup(unit_price, effective_case_size,
                            case_pack_count=case_pack_count,
                            purchase_uom=purchase_uom)
@@ -802,9 +826,10 @@ def _sync_prices_core(
                                      stored_price_per_lb=stored_ppp,
                                      case_total_weight_lb=case_total_weight_lb)
 
+            # Col E gets line_total (case price = what Sean paid for the line).
             batch_data.append({
                 "range": f"'{tab}'!E{row_num}",
-                "values": [[unit_price]],
+                "values": [[line_total]],
             })
             if case_size:
                 batch_data.append({
