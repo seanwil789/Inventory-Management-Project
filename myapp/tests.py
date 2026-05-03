@@ -9132,17 +9132,27 @@ class FarmArtPackExtractorTests(TestCase):
         self.assertEqual(out['case_pack_unit_uom'], 'QT')
 
     def test_bare_count_unit(self):
+        """Count units (CT/EA/DOZ/BU): N is the count of units in the case.
+        '9CT' = 9 melons per case → case_pack_count=9, case_pack_unit_size=1.
+        Earlier this test asserted count=1, size=9 — that worked downstream
+        only because calc_iup's legacy fallback re-parsed case_size string.
+        Per Sean 2026-05-03: corrected so writer can read case_pack_count
+        directly without falling back to string parse."""
         from invoice_processor.parser import _extract_farmart_pack
         out = _extract_farmart_pack('MELONS , CANTALOUPES , 9CT . NO HALF')
-        self.assertEqual(out['case_pack_count'], 1)
-        self.assertEqual(out['case_pack_unit_size'], '9')
+        self.assertEqual(out['case_pack_count'], 9)
+        self.assertEqual(out['case_pack_unit_size'], '1')
         self.assertEqual(out['case_pack_unit_uom'], 'CT')
+        self.assertEqual(out['unit_of_measure'], 'CASE')
 
     def test_bare_with_dash_separator(self):
+        """15 DOZ eggs = 15 dozens per case → case_pack_count=15."""
         from invoice_processor.parser import _extract_farmart_pack
         out = _extract_farmart_pack('EGGS XL LOOSE , WHITE , 15 - DOZ * LOCAL * NO SPLITS')
-        self.assertEqual(out['case_pack_unit_size'], '15')
+        self.assertEqual(out['case_pack_count'], 15)
+        self.assertEqual(out['case_pack_unit_size'], '1')
         self.assertEqual(out['case_pack_unit_uom'], 'DOZ')
+        self.assertEqual(out['unit_of_measure'], 'DZ')
 
     def test_bushel(self):
         """Bushel — recognized uom, no LB conversion."""

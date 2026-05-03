@@ -216,9 +216,33 @@ _FARMART_UOM_NORMALIZE: dict[str, str] = {
     'FL OZ': 'FL_OZ', 'FLOZ': 'FL_OZ',
 }
 
+# Map pack-unit → purchase_uom (drives synergy_sync writer's F+G logic).
+# Per Sean's binary insight (2026-05-03): U/M = LB → weighed (F=weight, G=#);
+# everything else → counted (F=count, G=descriptor). The descriptor comes
+# from this mapping for self-describing units (GAL, DZ, EACH) or from
+# Product.inventory_unit_descriptor for opaque CASE units.
+#
+# Special cases:
+#   BU defaults to EACH because the Farm Art catalog skews toward bunches
+#   (60 BU cilantro, 24 BU mustard greens). Bushel-container produce
+#   (Pepper Poblano, Tomatillos) uses the BUSHEL keyword which the parser
+#   doesn't currently extract — those fall through to inventory_class.
+_FARMART_UOM_TO_PURCHASE_UOM: dict[str, str] = {
+    'LB':    'LB',     # weighed
+    'OZ':    'CASE',   # small container, counted
+    'GAL':   'GAL',    # volume container
+    'QT':    'QT',
+    'PT':    'PT',
+    'FL_OZ': 'CASE',
+    'CT':    'CASE',   # count case (e.g. 9CT cantaloupe = 9 melons/case)
+    'DOZ':   'DZ',
+    'EA':    'EACH',
+    'BU':    'EACH',   # bunch (e.g. 60 BU cilantro)
+}
+
 
 def _build_pack_dict(count: int, size_str: str, uom_raw: str) -> dict:
-    """Assemble the structured fields + canonical case_size_raw."""
+    """Assemble the structured fields + canonical case_size_raw + purchase_uom."""
     uom_key = uom_raw.upper().replace('  ', ' ').strip()
     uom = _FARMART_UOM_NORMALIZE.get(uom_key, uom_key)
     out = {
@@ -226,6 +250,7 @@ def _build_pack_dict(count: int, size_str: str, uom_raw: str) -> dict:
         'case_pack_count': count,
         'case_pack_unit_size': size_str,
         'case_pack_unit_uom': uom,
+        'unit_of_measure': _FARMART_UOM_TO_PURCHASE_UOM.get(uom, 'CASE'),
     }
     factor = _PACK_UOM_TO_LB.get(uom)
     if factor is not None:
@@ -261,14 +286,25 @@ def _extract_farmart_pack(raw_desc: str) -> dict:
         size = m.group(2)
         uom = m.group(3)
         return _build_pack_dict(count, size, uom)
-    # Pattern 2: bare N-UNIT (count=1, size in N)
+    # Pattern 2: bare N-UNIT
     m = _FARMART_PACK_BARE_RE.search(raw_desc)
     if m:
-        size = m.group(1)
-        uom = m.group(2)
-        # Skip if size has a leading zero of a fraction (e.g. 0.5) — those
-        # are typically bagged subdivisions, not pack counts.
-        return _build_pack_dict(1, size, uom)
+        n_str = m.group(1)
+        uom_raw = m.group(2)
+        uom_norm = _FARMART_UOM_NORMALIZE.get(
+            uom_raw.upper().replace('  ', ' '), uom_raw.upper()
+        )
+        # Count units (CT, EA, DOZ, BU): N is the COUNT of units in the case
+        # ("9CT" = 9 count items per case, "60 BU" = 60 bunches per case).
+        # Weight/volume units (LB, OZ, GAL, QT, PT): N is the SIZE of a
+        # 1-unit case ("30 LB" = 1 case of 30 lb, "4 OZ" = 1 case of 4 oz).
+        # Schema reflects: case_pack_count = units per case;
+        # case_pack_unit_size = size of each unit.
+        if uom_norm in ('CT', 'EA', 'DOZ', 'BU'):
+            count = int(float(n_str))
+            return _build_pack_dict(count, '1', uom_raw)
+        else:
+            return _build_pack_dict(1, n_str, uom_raw)
     # Pattern 3: N# (pound symbol)
     m = _FARMART_PACK_HASH_RE.search(raw_desc)
     if m:
