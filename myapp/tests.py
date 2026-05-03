@@ -9137,13 +9137,16 @@ class FarmArtPackExtractorTests(TestCase):
         Earlier this test asserted count=1, size=9 — that worked downstream
         only because calc_iup's legacy fallback re-parsed case_size string.
         Per Sean 2026-05-03: corrected so writer can read case_pack_count
-        directly without falling back to string parse."""
+        directly without falling back to string parse.
+
+        Note: purchase_uom is intentionally NOT emitted — see _build_pack_dict
+        docstring. Per-case vs per-unit ordering can't be inferred from text."""
         from invoice_processor.parser import _extract_farmart_pack
         out = _extract_farmart_pack('MELONS , CANTALOUPES , 9CT . NO HALF')
         self.assertEqual(out['case_pack_count'], 9)
         self.assertEqual(out['case_pack_unit_size'], '1')
         self.assertEqual(out['case_pack_unit_uom'], 'CT')
-        self.assertEqual(out['unit_of_measure'], 'CASE')
+        self.assertNotIn('unit_of_measure', out)
 
     def test_bare_with_dash_separator(self):
         """15 DOZ eggs = 15 dozens per case → case_pack_count=15."""
@@ -9152,7 +9155,7 @@ class FarmArtPackExtractorTests(TestCase):
         self.assertEqual(out['case_pack_count'], 15)
         self.assertEqual(out['case_pack_unit_size'], '1')
         self.assertEqual(out['case_pack_unit_uom'], 'DOZ')
-        self.assertEqual(out['unit_of_measure'], 'DZ')
+        self.assertNotIn('unit_of_measure', out)
 
     def test_bushel(self):
         """Bushel — recognized uom, no LB conversion."""

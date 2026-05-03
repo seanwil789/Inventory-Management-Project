@@ -216,33 +216,26 @@ _FARMART_UOM_NORMALIZE: dict[str, str] = {
     'FL OZ': 'FL_OZ', 'FLOZ': 'FL_OZ',
 }
 
-# Map pack-unit → purchase_uom (drives synergy_sync writer's F+G logic).
-# Per Sean's binary insight (2026-05-03): U/M = LB → weighed (F=weight, G=#);
-# everything else → counted (F=count, G=descriptor). The descriptor comes
-# from this mapping for self-describing units (GAL, DZ, EACH) or from
-# Product.inventory_unit_descriptor for opaque CASE units.
+# Reverted 2026-05-03: don't infer purchase_uom from raw_description multi-pack.
+# A pattern like "4/1GAL" is ambiguous — could be "1 case of 4 gallons" (per-case
+# ordering, e.g. Milk/Cream/OJ) OR "1 gallon, with 4-gal pack info as catalog
+# reference" (per-unit ordering, e.g. peeled Shallot). The actual invoice U/M
+# column distinguishes them but isn't recoverable from raw_description text.
 #
-# Special cases:
-#   BU defaults to EACH because the Farm Art catalog skews toward bunches
-#   (60 BU cilantro, 24 BU mustard greens). Bushel-container produce
-#   (Pepper Poblano, Tomatillos) uses the BUSHEL keyword which the parser
-#   doesn't currently extract — those fall through to inventory_class.
-_FARMART_UOM_TO_PURCHASE_UOM: dict[str, str] = {
-    'LB':    'LB',     # weighed
-    'OZ':    'CASE',   # small container, counted
-    'GAL':   'GAL',    # volume container
-    'QT':    'QT',
-    'PT':    'PT',
-    'FL_OZ': 'CASE',
-    'CT':    'CASE',   # count case (e.g. 9CT cantaloupe = 9 melons/case)
-    'DOZ':   'DZ',
-    'EA':    'EACH',
-    'BU':    'EACH',   # bunch (e.g. 60 BU cilantro)
-}
+# Spatial extraction (`match_farmart_spatial`) reads the actual U/M column when
+# DocAI bbox layout is reliable. Text-only rows without spatial U/M stay
+# purchase_uom='' and the synergy_sync writer falls through to
+# Product.inventory_class. This is the trust-preserving design — better no
+# inference than a wrong inference per `feedback_trust_as_primary_requirement.md`.
 
 
 def _build_pack_dict(count: int, size_str: str, uom_raw: str) -> dict:
-    """Assemble the structured fields + canonical case_size_raw + purchase_uom."""
+    """Assemble the structured fields + canonical case_size_raw.
+
+    NOTE: does NOT emit purchase_uom — that signal must come from the invoice's
+    actual U/M column (extracted by spatial_matcher.match_farmart_spatial) or
+    stay empty. Inferring U/M from raw_description multi-pack format is
+    unreliable (per-case vs per-unit ordering is indistinguishable from text)."""
     uom_key = uom_raw.upper().replace('  ', ' ').strip()
     uom = _FARMART_UOM_NORMALIZE.get(uom_key, uom_key)
     out = {
@@ -250,7 +243,6 @@ def _build_pack_dict(count: int, size_str: str, uom_raw: str) -> dict:
         'case_pack_count': count,
         'case_pack_unit_size': size_str,
         'case_pack_unit_uom': uom,
-        'unit_of_measure': _FARMART_UOM_TO_PURCHASE_UOM.get(uom, 'CASE'),
     }
     factor = _PACK_UOM_TO_LB.get(uom)
     if factor is not None:
