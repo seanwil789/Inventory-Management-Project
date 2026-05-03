@@ -17,7 +17,7 @@ Single-operator today (Wentworth kitchen, ~45 residents, 4 meals/day). Architect
 - **WhiteNoise + Gunicorn** for production serving
 - **cron** for pipeline scheduling (hourly batch, daily refresh, weekly sync)
 
-704 tests, ~110s suite runtime. Test discipline notes in `.claude/memory` (shared separately).
+716 tests, ~95s suite runtime. Test discipline notes in `.claude/memory` (shared separately).
 
 Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via Tailscale; the Chromebook is the dev host. The Pi has been the authoritative cron + DB host since the 2026-04-26-28 cutover.
 
@@ -71,7 +71,7 @@ Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via T
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ PRESENTATION   views.py (~80 views, 3836 lines) + 44 templates   │
+│ PRESENTATION   views.py (~60 views, 3,836 lines) + 44 templates  │
 │                LoginRequiredMiddleware on all views except        │
 │                /display/ (kiosk mode for wall-mounted panel)      │
 ├──────────────────────────────────────────────────────────────────┤
@@ -84,7 +84,7 @@ Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via T
 │                                   derivation; MealService save   │
 │                                   → learned-popularity recompute │
 ├──────────────────────────────────────────────────────────────────┤
-│ DATA           15 models · 63 migrations · Django ORM            │
+│ DATA           15 models · 66 migrations · Django ORM            │
 │                SQLite file (Postgres-ready via env var)          │
 ├──────────────────────────────────────────────────────────────────┤
 │ INGESTION      invoice_processor/  — 28 modules                  │
@@ -151,13 +151,13 @@ Vendor ──┐
 
 ### Volume (Pi production, 2026-05-02)
 - 2,821 InvoiceLineItems across 2025-06 → today, 7 vendors
-- 553 Products, 2,033 ProductMappings (~86% mapping coverage post-quarantine guards)
+- 553 Products, 2,069 ProductMappings (~94% mapping coverage post-quarantine guards)
 - 88 Recipes, 587 RecipeIngredients
 - 1,119 YieldReferences, 96 StandardPortionReferences
 - 282 Menus across the active biweekly cycles
 - 37 MenuFreetextComponents, 28 Census rows
-- 622 ProductMappingProposals (528 approved / 7 rejected / 87 pending) — drift_audit unification active
-- 704 tests passing in ~110s (local)
+- 754 ProductMappingProposals (609 approved / 75 rejected / 70 pending) — drift_audit unification active
+- 716 tests passing in ~95s (local)
 
 ### What's in flight
 Active workstream is bottom-up refinement of the data foundations: parser → DB schema → cost calc → consumers, in that order. The cost calculator is the load-bearing metric (it exercises every layer); its coverage drives order-guide accuracy, sheet correctness, and COGs dashboard trust.
@@ -168,11 +168,11 @@ The next benchmark is the **May 31 perpetual-inventory reconciliation**: Sean au
 
 ### Known gaps worth discussing with an architect
 1. **No transaction boundaries in `db_write.py`** — a batch that crashes midway can leave half an invoice written. Idempotent upsert mitigates but doesn't eliminate.
-2. **View tests are smoke-only.** 704 tests concentrate on parser/mapper/cost_utils/integrations. Views get one GET-returns-200 check each.
+2. **View tests are smoke-only.** 716 tests concentrate on parser/mapper/cost_utils/integrations. Views get one GET-returns-200 check each.
 3. **No real-time push layer.** Kitchen display polls `/display/` every 60s. Fine for single-kitchen; future multi-tenant product needs SSE or WebSocket.
 4. **Single-tenant schema.** Menu/Census/InvoiceLineItem have no property/tenant FK. Documented scaling posture: SQLite holds until ~20 customers, then Postgres; job queue (Celery+Redis) at ~50; load balancer at ~200.
 5. **Budget sync cron is scheduled but producing no logs** — blocked on OneDrive Graph API credential drop. Admin consent was granted 2026-04-24; awaiting Client/Tenant ID + Secret from IT.
-6. **Sheet retirement progress (2026-05-02):** Mapping Review tab fully retired (no code path); Data Sheets tab retired (db_write replaced append_to_data_sheet); Item Mapping tab semi-retired (DB primary, sheet fallback only when ProductMapping empty + audit surface for Sean per locked memory). 2,033 ProductMappings (up from 1,790). Synergy monthly tab remains load-bearing.
+6. **Sheet retirement complete (2026-05-02):** Mapping Review + Data Sheets + Item Mapping tabs all DELETED. `mapper._load_from_sheet` retired; emits clear-error on empty PM table. Codebase has zero sheet-write paths outside Synergy monthly tabs. Sole remaining sheet surface is the Synergy monthly tab (load-bearing — Sean's audit + month-end inventory + IUP/P# math). 2,069 ProductMappings (up from 1,790).
 7. **Two memory roots, only one indexed.** User-scope `~/.claude/projects/-home-seanwil789/memory/` (40 files, fully indexed in `MEMORY.md`). Project-scope `~/.claude/projects/-home-seanwil789-my-saas/memory/` (62 files, minimal index). Decision pending.
 
 ---
@@ -233,16 +233,16 @@ myapp/                    Main application
   taxonomy.py             Locked naming + descriptor convention (~907 lines)
   calendar_utils.py       Biweekly anchor math (~17 lines)
   signals.py              3 receivers (menu, m2m, mealservice) — 138 lines
-  views.py                ~70 view functions (~3,740 lines)
+  views.py                ~60 view functions (~3,836 lines)
   urls.py                 60 URL routes
   forms.py                Custom forms (~208 lines)
   consumption_utils.py    Per-Product date-range consumption engine (~232 lines)
   admin.py                Admin registration for all models (~141 lines)
-  tests.py                704 tests (~10,542 lines)
+  tests.py                716 tests (~10,812 lines)
   yield_parsing/          Per-section parsers for Book of Yields PDF
   templates/myapp/        44 HTMX + Tailwind templates
-  management/commands/    58 commands (imports, audits, backfills)
-  migrations/             63 migrations (latest: 0064)
+  management/commands/    59 commands (imports, audits, backfills)
+  migrations/             66 migrations (latest: 0066)
 
 invoice_processor/        Pipeline modules (non-Django, 28 files)
   batch.py                Cron entry — Drive inbox → full pipeline (~530 lines)

@@ -4,7 +4,7 @@ Guidance for Claude Code working in this repository.
 
 ## What this is
 
-`my-saas` is a Django 5.2 application running food operations for a sober-living kitchen (Wentworth, ~45 residents, 4 meals/day). It's a **mature mid-prototype**, not a skeleton — see `README.md` for the architecture diagram and current volumes (2,821 ILI, 553 Products, 88 Recipes, 282 Menus, 704 tests as of 2026-05-02).
+`my-saas` is a Django 5.2 application running food operations for a sober-living kitchen (Wentworth, ~45 residents, 4 meals/day). It's a **mature mid-prototype**, not a skeleton — see `README.md` for the architecture diagram and current volumes (2,821 ILI, 553 Products, 88 Recipes, 282 Menus, 716 tests as of 2026-05-02).
 
 The system covers: invoice OCR pipeline (DocAI + 6 vendor parsers + spatial matcher), product/canonical mapping with human-in-the-loop review, recipe/menu authoring + version history, perpetual inventory + variance reporting, kitchen-display and dashboard surfaces, and Google Sheets/OneDrive integration adapters.
 
@@ -34,7 +34,7 @@ The `SessionStart` hook in `.claude/settings.local.json` injects the project sco
 # Activate virtualenv
 source .venv/bin/activate
 
-# Tests (~110s, expect 704 passing)
+# Tests (~95s, expect 716 passing)
 python manage.py test myapp
 
 # Pipeline operations (dry-run conventions throughout)
@@ -50,7 +50,7 @@ tailscale ssh sean@kitchen-pi-1 "cd ~/my-saas && .venv/bin/python -c \"...\""
 ## Architecture
 
 - `myproject/` — Django scaffold (settings, root URL conf, WSGI/ASGI)
-- `myapp/` — Main application (15 models, ~80 views, 58 management commands, 63 migrations, 44 templates, 704 tests)
+- `myapp/` — Main application (15 models, ~60 views, 59 management commands, 66 migrations, 44 templates, 716 tests)
 - `invoice_processor/` — Non-Django pipeline modules (28 files: parser, mapper, spatial_matcher, docai, db_write, synergy_sync, budget_sync, etc.)
 - `myapp/yield_parsing/` — Per-section parsers for Book of Yields PDF
 - `docs/` — Pi migration runbook, IT access request, deployment notes
