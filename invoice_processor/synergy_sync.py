@@ -33,16 +33,22 @@ from sheets import get_sheets_client, get_sheet_values
 from config import SPREADSHEET_ID, ACTIVE_SHEET_TAB
 
 # ── Column indices (1-indexed, matching Synergy sheet layout) ─────────────────
+# Phase 4 layout (Sean 2026-05-03): inserted COUNT_FLAG between UNIT and ON_HAND.
+# F = case_pack_count (number of items in case)
+# G = units of case size (e.g., "5.3 oz Container", "1 Gal")
+# H = "Ea" (count) or "#" (weigh) — counter-time flag
+# I = On Hand   J = IUP   K = P/#  (all shifted right by one column from prior layout)
 COL_SUB_CATEGORY = 1   # A
 COL_PRODUCT      = 2   # B
 COL_VENDOR       = 3   # C
 COL_LOCATION     = 4   # D
 COL_UNIT_PRICE   = 5   # E  — case price (what was paid for the full case)
-COL_CASE_SIZE    = 6   # F
-COL_UNIT         = 7   # G
-COL_ON_HAND      = 8   # H
-COL_IUP          = 9   # I  — Individual Unit Price (case price ÷ units per case)
-COL_PRICE_PER_LB = 10  # J  — Price per pound
+COL_CASE_SIZE    = 6   # F  — case_pack_count (count, not raw case_size string)
+COL_UNIT         = 7   # G  — units of case size (per-item description)
+COL_COUNT_FLAG   = 8   # H  — "Ea" or "#"
+COL_ON_HAND      = 9   # I
+COL_IUP          = 10  # J  — Individual Unit Price (case price ÷ units per case)
+COL_PRICE_PER_LB = 11  # K  — Price per pound
 
 # Rows to skip when building the product index (header/divider row markers).
 _SKIP_PRODUCTS = {"product", "sub category", ""}
@@ -403,6 +409,40 @@ CATEGORY_TO_SECTION: dict[tuple[str, str], str] = {
 
 
 # ─────────────────────────────────────────────────────────────────────────────
+# F/G/H column derivation (Sean 2026-05-03)
+# ─────────────────────────────────────────────────────────────────────────────
+# Sheet layout post-migration:
+#   F = case size count        (case_pack_count, e.g., 12 for "12/5.3OZ")
+#   G = units of case size     (e.g., "5.3 oz Container", "1 Gal", "")
+#   H = count-or-weigh flag    ("Ea" for counted_*, "#" for weighed)
+# Counter at inventory time reads H to know whether to count or weigh.
+
+def derive_f_count(item: dict) -> str | int:
+    """F column = number of items per case (case_pack_count)."""
+    cnt = item.get("case_pack_count")
+    return cnt if cnt is not None else ""
+
+
+def derive_g_units(item: dict) -> str:
+    """G column = descriptive units of one item in the case.
+    Blank for weighed products (no per-case unit; H='#' carries the signal).
+    """
+    if item.get("inventory_class") == "weighed":
+        return ""
+    return item.get("inventory_unit_descriptor") or ""
+
+
+def derive_h_flag(item: dict) -> str:
+    """H column = 'Ea' (count) or '#' (weigh). Drives counter behavior."""
+    klass = item.get("inventory_class") or ""
+    if klass == "weighed":
+        return "#"
+    if klass.startswith("counted_"):
+        return "Ea"
+    return ""
+
+
+# ─────────────────────────────────────────────────────────────────────────────
 # 1.  Sheet index builder
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -417,15 +457,16 @@ def build_sheet_index(sheet_tab: str) -> tuple[list[dict], list[dict]]:
     Skips header rows (row 1) and blank / sub-category-only divider rows.
     Fills section names forward so every product row knows its section.
     """
-    raw = get_sheet_values(SPREADSHEET_ID, f"'{sheet_tab}'!A:G")
+    # Read through col H to capture new COUNT_FLAG column (Phase 4 layout).
+    raw = get_sheet_values(SPREADSHEET_ID, f"'{sheet_tab}'!A:H")
 
     products: list[dict] = []
     sections: list[dict] = []
     current_section = ""
 
     for i, row in enumerate(raw, start=1):
-        # Pad to at least 7 columns
-        while len(row) < 7:
+        # Pad to at least 8 columns (A..H)
+        while len(row) < 8:
             row.append("")
 
         sub_cat   = row[COL_SUB_CATEGORY - 1].strip()
@@ -433,6 +474,7 @@ def build_sheet_index(sheet_tab: str) -> tuple[list[dict], list[dict]]:
         vendor    = row[COL_VENDOR   - 1].strip()
         case_size = row[COL_CASE_SIZE - 1].strip() if len(row) >= COL_CASE_SIZE else ""
         unit      = row[COL_UNIT - 1].strip() if len(row) >= COL_UNIT else ""
+        count_flag = row[COL_COUNT_FLAG - 1].strip() if len(row) >= COL_COUNT_FLAG else ""
 
         # Row 1 is always the column header row — skip
         if i == 1:
@@ -459,6 +501,7 @@ def build_sheet_index(sheet_tab: str) -> tuple[list[dict], list[dict]]:
             "vendor":  vendor,
             "case_size": case_size,
             "unit":    unit,
+            "count_flag": count_flag,
         })
 
     # Close last section
@@ -585,6 +628,10 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
                 # case_pack_count; LB/EACH/GAL/QT/etc. → unit_price already
                 # per-unit (no division).
                 "purchase_uom":          ili.purchase_uom or "",
+                # Phase 4 (Sean 2026-05-03): F+G+H sheet layout. F=count,
+                # G=units of case size, H=Ea/# count-or-weigh flag.
+                "inventory_class":            ili.product.inventory_class or "",
+                "inventory_unit_descriptor":  ili.product.inventory_unit_descriptor or "",
             }
 
     return list(seen.values())
@@ -837,24 +884,34 @@ def _sync_prices_core(
                 "range": f"'{tab}'!E{row_num}",
                 "values": [[line_total]],
             })
-            if case_size:
-                batch_data.append({
-                    "range": f"'{tab}'!F{row_num}",
-                    "values": [[case_size]],
-                })
-            # Always write I and J — clear the cell when calc returns None.
-            # Otherwise stale derived values from a prior sync (back when
-            # calc_price_per_lb was over-eager on bare '1' / '1/1' case sizes)
-            # persist on the sheet and reproduce the misleading E==J symptom.
-            # Manually-entered I/J on rows that get a fresh price write are
-            # also wiped — preserving their accuracy is the caller's job
-            # (re-enter after sync, or skip the sync for that row).
+            # Phase 4 layout: F=count, G=units of case size, H=Ea/# flag.
+            # item dict carries case_pack_count + inventory_class +
+            # inventory_unit_descriptor (added in load_items_for_month).
             batch_data.append({
-                "range": f"'{tab}'!I{row_num}",
+                "range": f"'{tab}'!F{row_num}",
+                "values": [[derive_f_count(item)]],
+            })
+            batch_data.append({
+                "range": f"'{tab}'!G{row_num}",
+                "values": [[derive_g_units(item)]],
+            })
+            batch_data.append({
+                "range": f"'{tab}'!H{row_num}",
+                "values": [[derive_h_flag(item)]],
+            })
+            # Always write J (IUP) and K (P/#) — clear the cell when calc
+            # returns None. Otherwise stale derived values from a prior sync
+            # (back when calc_price_per_lb was over-eager on bare '1' / '1/1'
+            # case sizes) persist on the sheet and reproduce the misleading
+            # E==K symptom. Manually-entered J/K on rows that get a fresh
+            # price write are also wiped — preserving their accuracy is the
+            # caller's job (re-enter after sync, or skip the sync for that row).
+            batch_data.append({
+                "range": f"'{tab}'!J{row_num}",
                 "values": [[iup if iup is not None else ""]],
             })
             batch_data.append({
-                "range": f"'{tab}'!J{row_num}",
+                "range": f"'{tab}'!K{row_num}",
                 "values": [[pplb if pplb is not None else ""]],
             })
 
@@ -892,21 +949,23 @@ def _sync_prices_core(
 
 def sync_metadata_to_sheet(sheet_tab: str = None, dry_run: bool = False) -> dict:
     """
-    Push vendor (col C) and case size (col F) from DB to the Synergy sheet.
+    Push vendor (col C), case-pack count (col F), units of case size (col G),
+    and Ea/# count-or-weigh flag (col H) from DB to the Synergy sheet.
     DB is the source of truth.
 
     For each product row on the sheet:
       - Vendor: most frequent vendor from InvoiceLineItem for that product
-      - Case size: most recent invoice's case_size for that product
+      - F (count): latest ILI's case_pack_count
+      - G (units): product.inventory_unit_descriptor (blank for weighed)
+      - H (flag):  product.inventory_class → 'Ea' / '#'
 
-    Only overwrites blank cells or cells with known-bad data. Does NOT
-    overwrite vendor/case_size that are already filled (to preserve manual edits).
-    Pass overwrite=True to force overwrite all.
+    Only overwrites blank/bad vendor cells. F/G/H are always pushed (DB
+    is authoritative; manual edits to those columns are not preserved).
 
     Returns summary dict with counts.
     """
     _bootstrap_django()
-    from myapp.models import InvoiceLineItem
+    from myapp.models import InvoiceLineItem, Product
     from django.db.models import Count
 
     tab = sheet_tab or ACTIVE_SHEET_TAB
@@ -983,37 +1042,46 @@ def sync_metadata_to_sheet(sheet_tab: str = None, dry_run: bool = False) -> dict
                 })
             vendors_updated += 1
 
-        # --- Case size sync ---
-        should_update_case = (
-            not current_case_size
-            or _BAD_CASE_SIZE_SHEET_RE.match(current_case_size)
-        )
-        if should_update_case:
-            # Find most recent GOOD case size from DB
-            candidates = (
-                InvoiceLineItem.objects
-                .filter(
-                    product__canonical_name__iexact=product_name,
-                    case_size__isnull=False,
-                )
-                .exclude(case_size='')
-                .order_by('-invoice_date', '-imported_at')
-            )
-            latest = None
-            for candidate in candidates[:10]:
-                if not _BAD_CASE_SIZE_DB_RE.match(candidate.case_size):
-                    latest = candidate
-                    break
+        # --- F/G/H sync: case-pack count + units + Ea/# flag ---
+        product = (Product.objects
+                   .filter(canonical_name__iexact=product_name).first())
+        if product:
+            # F: latest ILI's case_pack_count
+            latest_pack = (InvoiceLineItem.objects
+                           .filter(product=product,
+                                   case_pack_count__isnull=False)
+                           .order_by('-invoice_date', '-imported_at')
+                           .first())
+            f_val = (latest_pack.case_pack_count
+                     if latest_pack and latest_pack.case_pack_count is not None
+                     else "")
+            g_val = ("" if product.inventory_class == "weighed"
+                     else (product.inventory_unit_descriptor or ""))
+            klass = product.inventory_class or ""
+            if klass == "weighed":
+                h_val = "#"
+            elif klass.startswith("counted_"):
+                h_val = "Ea"
+            else:
+                h_val = ""
 
-            if latest and latest.case_size:
-                if dry_run:
-                    print(f"   [DRY RUN] row {row_num}: '{product_name}' case → {latest.case_size}")
-                else:
-                    batch_data.append({
-                        "range": f"'{tab}'!F{row_num}",
-                        "values": [[latest.case_size]],
-                    })
-                case_sizes_updated += 1
+            if dry_run:
+                print(f"   [DRY RUN] row {row_num}: '{product_name}' "
+                      f"F={f_val} G={g_val!r} H={h_val!r}")
+            else:
+                batch_data.append({
+                    "range": f"'{tab}'!F{row_num}",
+                    "values": [[f_val]],
+                })
+                batch_data.append({
+                    "range": f"'{tab}'!G{row_num}",
+                    "values": [[g_val]],
+                })
+                batch_data.append({
+                    "range": f"'{tab}'!H{row_num}",
+                    "values": [[h_val]],
+                })
+            case_sizes_updated += 1
 
     # Flush writes
     if batch_data and not dry_run:
@@ -1173,17 +1241,33 @@ def insert_new_items(
 
         # Insert after the last product row of the section
         insert_row = (section["end_row"] or section["start_row"]) + 1
+        # Phase 4 layout (Sean 2026-05-03):
+        #   F: case_pack_count (number of items in case)
+        #   G: inventory_unit_descriptor (units of each item)
+        #   H: 'Ea' or '#' (count-or-weigh flag from inventory_class)
+        #   I: On Hand (was H)  J: IUP (was I)  K: P/# (was J)
+        f_val = item.get("case_pack_count") or ""
+        g_val = ("" if item.get("inventory_class") == "weighed"
+                 else (item.get("inventory_unit_descriptor") or ""))
+        klass = item.get("inventory_class") or ""
+        if klass == "weighed":
+            h_val = "#"
+        elif klass.startswith("counted_"):
+            h_val = "Ea"
+        else:
+            h_val = ""
         new_row_values = [
             "",          # A: Sub Category (blank for non-header rows)
             canonical,   # B: Product
             vendor,      # C: Vendor
             "",          # D: Location
             unit_price,  # E: Unit Price
-            case_size,   # F: Case Size
-            "",          # G: Unit
-            "",          # H: On Hand
-            "",          # I: IUP
-            "",          # J: P/#
+            f_val,       # F: Case Size (count)
+            g_val,       # G: Unit (units of case size)
+            h_val,       # H: Ea / # flag
+            "",          # I: On Hand
+            "",          # J: IUP
+            "",          # K: P/#
         ]
         insertions.append((insert_row, new_row_values))
 
@@ -1202,7 +1286,7 @@ def insert_new_items(
         try:
             # Insert a blank row, then write values into it
             _insert_row_in_sheet(client, tab, insert_row)
-            range_addr = f"'{tab}'!A{insert_row}:J{insert_row}"
+            range_addr = f"'{tab}'!A{insert_row}:K{insert_row}"
             client.values().update(
                 spreadsheetId=SPREADSHEET_ID,
                 range=range_addr,
@@ -1346,16 +1430,17 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
         },
     ).execute()
 
-    # Clear Unit Price (E), On Hand (H), IUP (I), and P/# (J) — skip row 1 (header)
+    # Clear Unit Price (E), On Hand (I), IUP (J), and P/# (K) — skip row 1 (header)
+    # Phase 4 layout: I=On Hand, J=IUP, K=P/#
     print(f"   Clearing prices, IUP, P/#, and on-hand quantities...")
     client.values().batchClear(
         spreadsheetId=SPREADSHEET_ID,
         body={
             "ranges": [
                 f"'{new_tab_name}'!E2:E",
-                f"'{new_tab_name}'!H2:H",
                 f"'{new_tab_name}'!I2:I",
                 f"'{new_tab_name}'!J2:J",
+                f"'{new_tab_name}'!K2:K",
             ]
         },
     ).execute()
@@ -1406,14 +1491,15 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
                                  stored_price_per_lb=latest.price_per_pound,
                                  case_total_weight_lb=latest.case_total_weight_lb)
 
+        # Phase 4 layout: J=IUP, K=P/#
         if iup is not None:
             batch_data.append({
-                "range": f"'{new_tab_name}'!I{row_num}",
+                "range": f"'{new_tab_name}'!J{row_num}",
                 "values": [[iup]],
             })
         if pplb is not None:
             batch_data.append({
-                "range": f"'{new_tab_name}'!J{row_num}",
+                "range": f"'{new_tab_name}'!K{row_num}",
                 "values": [[pplb]],
             })
         carried += 1
@@ -1554,21 +1640,24 @@ def refresh_stale_carryover(sheet_tab: str = None, dry_run: bool = False) -> dic
             print(f"   [DRY RUN] row {row_num}: '{product_name}' → ${unit_price:.2f} "
                   f"from {latest.invoice_date} ({latest_vendor})")
         else:
+            # Phase 4 layout: F=count, J=IUP, K=P/#. F written from
+            # latest.case_pack_count; raw case_size string is no longer
+            # pushed to F.
             batch_data.append({
                 "range": f"'{tab}'!E{row_num}",
                 "values": [[unit_price]],
             })
-            if case_size:
+            if latest.case_pack_count is not None:
                 batch_data.append({
                     "range": f"'{tab}'!F{row_num}",
-                    "values": [[case_size]],
+                    "values": [[latest.case_pack_count]],
                 })
             batch_data.append({
-                "range": f"'{tab}'!I{row_num}",
+                "range": f"'{tab}'!J{row_num}",
                 "values": [[iup if iup is not None else ""]],
             })
             batch_data.append({
-                "range": f"'{tab}'!J{row_num}",
+                "range": f"'{tab}'!K{row_num}",
                 "values": [[pplb if pplb is not None else ""]],
             })
             print(f"   [✓] row {row_num}: '{product_name}' → ${unit_price:.2f} "
