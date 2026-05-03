@@ -17,7 +17,9 @@ Single-operator today (Wentworth kitchen, ~45 residents, 4 meals/day). Architect
 - **WhiteNoise + Gunicorn** for production serving
 - **cron** for pipeline scheduling (hourly batch, daily refresh, weekly sync)
 
-316 tests, ~43s suite runtime. Test discipline notes in `.claude/memory` (shared separately).
+704 tests, ~110s suite runtime. Test discipline notes in `.claude/memory` (shared separately).
+
+Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via Tailscale; the Chromebook is the dev host. The Pi has been the authoritative cron + DB host since the 2026-04-26-28 cutover.
 
 ---
 
@@ -69,7 +71,7 @@ Single-operator today (Wentworth kitchen, ~45 residents, 4 meals/day). Architect
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ PRESENTATION   views.py (69 views, 3007 lines) + 35 templates    │
+│ PRESENTATION   views.py (~80 views, 3836 lines) + 44 templates   │
 │                LoginRequiredMiddleware on all views except        │
 │                /display/ (kiosk mode for wall-mounted panel)      │
 ├──────────────────────────────────────────────────────────────────┤
@@ -82,17 +84,17 @@ Single-operator today (Wentworth kitchen, ~45 residents, 4 meals/day). Architect
 │                                   derivation; MealService save   │
 │                                   → learned-popularity recompute │
 ├──────────────────────────────────────────────────────────────────┤
-│ DATA           15 models · 23 migrations · Django ORM            │
+│ DATA           15 models · 63 migrations · Django ORM            │
 │                SQLite file (Postgres-ready via env var)          │
 ├──────────────────────────────────────────────────────────────────┤
-│ INGESTION      invoice_processor/  — 23 modules, ~10.7K LOC      │
+│ INGESTION      invoice_processor/  — 28 modules                  │
 │                Pipeline:  drive → docai → parser → mapper →      │
 │                           db_write                                │
 │                Siblings:  synergy_sync, budget_sync, csv_ingest  │
 │                Utilities: discover_unmapped, learn_from_reviews, │
 │                           reprocess_{archive,jpgs}, audit_*      │
 │                                                                   │
-│                myapp/management/commands/ — 29 commands for      │
+│                myapp/management/commands/ — 44 commands for      │
 │                imports, audits, backfills, and derivations       │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -141,32 +143,37 @@ Vendor ──┐
 - **`Product.default_case_size`** — fallback case size when the invoice line's case_size is missing or OCR-mangled. Populated by `infer_product_default_case_sizes` from historical mode; curated further via migration 0023 for high-value products.
 - **`Recipe.level`** (recipe / composed_dish / meal) — solves a real matcher bug: "Shrimp Pesto Pasta" was fuzzy-matching to "Pesto" (a sub-recipe). The matcher now only considers `composed_dish` and `meal` rows as menu link candidates.
 - **`Recipe.parent_recipe` + `version_number`** — the kitchen's actual Word Doc convention (`Biscuits V2 4 13 2026.docx`) formalized as immutable version history. Past versions stay queryable; menu links pin to a specific version.
-- **`YieldReference`** — 1,103 rows from *Book of Yields 8e* (Lynch, Wiley). Per-section parsers in `myapp/yield_parsing/` handle the 20 sections' different column layouts. Feeds the yield% step of the cost calc: 1 lb raw chicken breast ≠ 1 lb edible portion.
+- **`YieldReference`** — 1,119 rows from *Book of Yields 8e* (Lynch, Wiley). Per-section parsers in `myapp/yield_parsing/` handle the 20 sections' different column layouts. Feeds the yield% step of the cost calc: 1 lb raw chicken breast ≠ 1 lb edible portion.
 
 ---
 
 ## Current state
 
-### Volume
-- 1,757 InvoiceLineItems across 2025-06 → 2026-04, 7 vendors
-- 511 Products, 291 ProductMappings
-- 83 Recipes, 562 RecipeIngredients (95% linked to Products, 74% have quantities)
-- 1,103 YieldReferences, 96 StandardPortionReferences
-- 50 Menus across the active biweekly cycles
-- 316 tests passing in 43s
+### Volume (Pi production, 2026-05-02)
+- 2,821 InvoiceLineItems across 2025-06 → today, 7 vendors
+- 553 Products, 2,033 ProductMappings (~86% mapping coverage post-quarantine guards)
+- 88 Recipes, 587 RecipeIngredients
+- 1,119 YieldReferences, 96 StandardPortionReferences
+- 282 Menus across the active biweekly cycles
+- 37 MenuFreetextComponents, 28 Census rows
+- 622 ProductMappingProposals (528 approved / 7 rejected / 87 pending) — drift_audit unification active
+- 704 tests passing in ~110s (local)
 
 ### What's in flight
-Active workstream is a bottom-up refinement of recipe cost accuracy. The cost calculator is the load-bearing metric: it exercises every layer (parser → ILI → Product → RecipeIngredient → cost_utils), and its coverage drives order-guide accuracy, sheet correctness, and COGs dashboard trust.
+Active workstream is bottom-up refinement of the data foundations: parser → DB schema → cost calc → consumers, in that order. The cost calculator is the load-bearing metric (it exercises every layer); its coverage drives order-guide accuracy, sheet correctness, and COGs dashboard trust.
 
-Recent progress: recipe-cost coverage moved from 19.3% to 57.0% in a single session via five shipped phases (weight extraction from description, curated product defaults, density expansion for spices/produce, `doz`/`#10 can` unit support, multi-candidate case-size dispatch). Next phase wires `RecipeIngredient.yield_ref` linking to unlock the remaining ~80 piece-unit RIs ('medium', 'each', 'cloves', 'large').
+Recent progress: recipe-cost coverage moved from 19.3% to 57.0% via the cost-accuracy push (Apr 22), then convention migration + Pi cutover (Apr 25-26) lifted mapping coverage from 87% to 95%. Mapper regression today reads 0% drift against the 782-row ground-truth replay.
+
+The next benchmark is the **May 31 perpetual-inventory reconciliation**: Sean authors May menus in-app (Apr 30 = baseline count; May 1-31 = real authoring + consumption tracking; May 31 = first real variance report).
 
 ### Known gaps worth discussing with an architect
 1. **No transaction boundaries in `db_write.py`** — a batch that crashes midway can leave half an invoice written. Idempotent upsert mitigates but doesn't eliminate.
-2. **View tests are smoke-only.** 316 tests concentrate on parser/mapper/cost_utils/integrations. Views get one GET-returns-200 check each.
+2. **View tests are smoke-only.** 704 tests concentrate on parser/mapper/cost_utils/integrations. Views get one GET-returns-200 check each.
 3. **No real-time push layer.** Kitchen display polls `/display/` every 60s. Fine for single-kitchen; future multi-tenant product needs SSE or WebSocket.
 4. **Single-tenant schema.** Menu/Census/InvoiceLineItem have no property/tenant FK. Documented scaling posture: SQLite holds until ~20 customers, then Postgres; job queue (Celery+Redis) at ~50; load balancer at ~200.
-5. **Budget sync cron is scheduled but producing no logs** — likely blocked on an upstream OneDrive Graph API admin consent that hasn't been granted yet.
-6. **Mapper regression check surfaces current drift** (1.1%, two real regressions) — safeguards any mapper change with a ground-truth replay.
+5. **Budget sync cron is scheduled but producing no logs** — blocked on OneDrive Graph API credential drop. Admin consent was granted 2026-04-24; awaiting Client/Tenant ID + Secret from IT.
+6. **Sheet retirement progress (2026-05-02):** Mapping Review tab fully retired (no code path); Data Sheets tab retired (db_write replaced append_to_data_sheet); Item Mapping tab semi-retired (DB primary, sheet fallback only when ProductMapping empty + audit surface for Sean per locked memory). 2,033 ProductMappings (up from 1,790). Synergy monthly tab remains load-bearing.
+7. **Two memory roots, only one indexed.** User-scope `~/.claude/projects/-home-seanwil789/memory/` (40 files, fully indexed in `MEMORY.md`). Project-scope `~/.claude/projects/-home-seanwil789-my-saas/memory/` (62 files, minimal index). Decision pending.
 
 ---
 
@@ -192,7 +199,7 @@ python manage.py createsuperuser
 python manage.py runserver
 
 # Tests
-python manage.py test myapp                    # full suite, ~43s
+python manage.py test myapp                    # full suite, ~96s
 python manage.py test myapp.tests.IngredientCostTests   # narrow to a class
 
 # Pipeline commands (dry-run conventions throughout)
@@ -221,30 +228,35 @@ myproject/                Django project scaffold
   urls.py                 Root routing (admin, auth, myapp)
 
 myapp/                    Main application
-  models.py               15 models end-to-end (~600 lines)
-  cost_utils.py           Cost calculation dispatch + density tables (~580 lines)
-  calendar_utils.py       Biweekly anchor math (~20 lines)
-  signals.py              3 receivers (menu, m2m, mealservice)
-  views.py                69 view functions (~3000 lines)
-  urls.py                 44 URL routes
-  admin.py                Admin registration for all models
-  tests.py                316 tests (~3800 lines)
+  models.py               15 models end-to-end (~806 lines)
+  cost_utils.py           Cost calculation dispatch + density tables (~817 lines)
+  taxonomy.py             Locked naming + descriptor convention (~907 lines)
+  calendar_utils.py       Biweekly anchor math (~17 lines)
+  signals.py              3 receivers (menu, m2m, mealservice) — 138 lines
+  views.py                ~70 view functions (~3,740 lines)
+  urls.py                 60 URL routes
+  forms.py                Custom forms (~208 lines)
+  consumption_utils.py    Per-Product date-range consumption engine (~232 lines)
+  admin.py                Admin registration for all models (~141 lines)
+  tests.py                704 tests (~10,542 lines)
   yield_parsing/          Per-section parsers for Book of Yields PDF
-  templates/myapp/        35 HTMX + Tailwind templates
-  management/commands/    29 commands (imports, audits, backfills)
-  migrations/             23 migrations
+  templates/myapp/        44 HTMX + Tailwind templates
+  management/commands/    58 commands (imports, audits, backfills)
+  migrations/             63 migrations (latest: 0064)
 
-invoice_processor/        Pipeline modules (non-Django)
-  batch.py                Cron entry — Drive inbox → full pipeline (~500 lines)
-  parser.py               6 vendor dialects (~2200 lines, the crown-jewel file)
-  mapper.py               7-tier match cascade (~600 lines)
-  docai.py                Document AI wrapper (~840 lines)
-  db_write.py             Upsert layer — the boundary between pipeline and ORM
-  synergy_sync.py         Google Sheets push for the operator's monthly tab
-  budget_sync.py          OneDrive xlsx push (scheduled but blocked on consent)
-  discover_unmapped.py    Fuzzy-suggestion generator for the review workflow
+invoice_processor/        Pipeline modules (non-Django, 28 files)
+  batch.py                Cron entry — Drive inbox → full pipeline (~530 lines)
+  parser.py               6 vendor dialects (~2,574 lines, the crown-jewel file)
+  mapper.py               7-tier match cascade (~1,002 lines)
+  spatial_matcher.py      2D bbox matching for Sysco + 4 other vendors (~691 lines)
+  docai.py                Document AI wrapper (~906 lines)
+  db_write.py             Upsert + quarantine layer — pipeline/ORM boundary (~292 lines)
+  synergy_sync.py         Google Sheets push for the operator's monthly tab (~1,506 lines)
+  budget_sync.py          OneDrive xlsx push (scheduled; blocked on credential drop)
+  discover_unmapped.py    Fuzzy-suggestion generator for the review workflow (~1,054 lines)
   learn_from_reviews.py   Self-modifying rule learner from operator decisions
   reprocess_archive.py    Full-archive replay for parser-change validation
+  abbreviations.py        Vendor shorthand expansion (~187 lines, ~75 entries)
 
 run_*.sh                  Cron wrappers (flock, log rotation, venv activation)
 

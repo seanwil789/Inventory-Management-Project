@@ -29,6 +29,15 @@ By default, dry-run. With --apply, writes high-confidence mappings
 directly to the local code_map cache (fast iteration) and to Google
 Sheets' Item Mapping tab (persistent; picks up on next mapping refresh).
 
+⚠️  DEPRECATED PATH (2026-05-02): the MEDIUM confidence tier writes
+    to the Google Sheet's "Mapping Review" tab (auto-creates it if
+    missing). That tab has been RETIRED in favor of the Django
+    `/mapping-review/` page backed by ProductMappingProposal. If you
+    run this cmd with --apply on Sysco SUPCs, MEDIUM-tier suggestions
+    end up in a sheet surface no one curates. Use `--cache-only` OR
+    raise `--min-score 95` to suppress the MEDIUM-tier sheet write.
+    Refactor to write into ProductMappingProposal pending.
+
 Usage:
   python manage.py recover_sysco_supcs                   # dry-run
   python manage.py recover_sysco_supcs --apply           # write cache + sheet

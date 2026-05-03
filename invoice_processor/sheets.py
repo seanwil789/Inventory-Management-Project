@@ -121,7 +121,14 @@ DATA_SHEET_TAB = "Data Sheets"
 
 def append_to_data_sheet(vendor: str, invoice_date: str, items: list[dict],
                          skip_if_exists: bool = False) -> int:
-    """
+    """DEPRECATED 2026-04-19. Replaced by `invoice_processor/db_write.py`
+    which writes the same data to the InvoiceLineItem table. The 'Data
+    Sheets' tab in the spreadsheet is no longer being written to and
+    holds frozen historical data only.
+
+    Function kept as a rosetta-stone reference for the pre-DB pattern
+    (column shapes + dedup logic). No live caller as of 2026-05-02.
+
     Append raw line items to the Data Sheets transaction log.
     Columns: Vendor | Category | Item Description | Unit Price | Unit | Invoice Date
 

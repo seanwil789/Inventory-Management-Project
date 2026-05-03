@@ -6,6 +6,18 @@ least one 3+letter word in common between its canonical name and the
 invoice description. When it doesn't, the ProductMapping row that
 produced the match is probably wrong.
 
+⚠️  DEPRECATED OUTPUT MODE (--write-to-review, 2026-05-02):
+    The legacy `--write-to-review` mode pushes corrections to the
+    Google Sheet's "Mapping Review" tab. That sheet tab has been
+    RETIRED — the unified curation surface is the Django
+    `/mapping-review/` page (ProductMappingProposal table), populated
+    daily by `populate_mapping_review_from_unmapped`. Running this
+    cmd with --write-to-review still works (it auto-recreates the
+    tab if missing) but writes to a surface no one curates.
+
+    Default (read-only) mode is still useful for token-overlap
+    diagnostics — runs against current ILI/PM state, prints findings.
+
 Known examples in production data (2026-04):
   - "Mop Heads" ← "Bib Aprons - White"  (Linen product wrong-mapped)
   - "White Bread" ← "Club White"          (PBM product wrong-mapped)
