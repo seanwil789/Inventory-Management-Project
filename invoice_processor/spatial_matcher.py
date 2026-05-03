@@ -782,22 +782,65 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
             # $0.99 = $1.98), using `extended` as unit_price overstated
             # per-unit price by qty× and broke calc_iup.
             #
-            # Line-item math validation (Sean 2026-05-03): qty × unit_price
-            # should ≈ extended_amount. Farm Art has a consistent ~1%
-            # vendor discount across rows (line total = ~99% of qty × U/P)
-            # — that's normal. >5% or >$2 discrepancy = parser bug or OCR
-            # misread; warn so it can be audited.
+            # Line-item math validation + qty self-correction (Sean 2026-05-03):
+            # qty × unit_price should ≈ extended_amount. Farm Art has a
+            # consistent ~1% vendor discount across rows (line total = ~99%
+            # of qty × U/P) — that's normal. When >5% AND >$2 discrepancy:
+            #
+            #   ext + U/P are the trustworthy signals (ext = what Sean paid;
+            #   U/P = catalog list per-unit price). The qty extracted from
+            #   spatial is the unreliable one — Farm Art OCR sometimes
+            #   captures qty_ordered ≠ qty_shipped, or misreads digits.
+            #
+            #   Derive qty_corrected = round(ext / U/P) and use it when
+            #   it lands on a clean small integer (1-50). The ratio almost
+            #   always rounds cleanly when this is a real qty-extraction bug
+            #   (POTATOES 16.73/16.90=0.99→1; PARSLEY 6.93/1.40=4.95→5).
+            #
+            #   Only apply self-correction when:
+            #     - The derived qty is between 1 and 50 (sane range)
+            #     - The derived qty differs from spatial qty (no point otherwise)
+            #     - After correction, line-math passes within 5% (sanity)
             if qty_shipped and unit_price:
                 expected = qty_shipped * unit_price
                 if expected > 0:
                     diff_pct = abs(extended - expected) / expected * 100
                     diff_abs = abs(extended - expected)
                     if diff_pct > 5 and diff_abs > 2:
-                        print(f"  [!] Farm Art line-math anomaly: "
-                              f"{description[:40]!r} qty={qty_shipped} × "
-                              f"unit_price=${unit_price:.2f} = ${expected:.2f} "
-                              f"but extended=${extended:.2f} "
-                              f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
+                        # Try qty self-correction
+                        derived_qty_raw = extended / unit_price
+                        derived_qty = round(derived_qty_raw)
+                        if (1 <= derived_qty <= 50
+                                and derived_qty != qty_shipped
+                                and abs(derived_qty_raw - derived_qty) < 0.10):
+                            # Verify correction passes line-math
+                            corrected_expected = derived_qty * unit_price
+                            corrected_diff_pct = (
+                                abs(extended - corrected_expected)
+                                / corrected_expected * 100
+                            )
+                            if corrected_diff_pct < 5:
+                                print(f"  [✓] Farm Art qty self-corrected: "
+                                      f"{description[:40]!r} "
+                                      f"qty {qty_shipped}→{derived_qty} "
+                                      f"(ext=${extended:.2f} / U/P=${unit_price:.2f} "
+                                      f"= {derived_qty_raw:.2f})")
+                                qty_shipped = float(derived_qty)
+                            else:
+                                print(f"  [!] Farm Art line-math anomaly "
+                                      f"(self-correction failed): "
+                                      f"{description[:40]!r} qty={qty_shipped} × "
+                                      f"unit_price=${unit_price:.2f} = ${expected:.2f} "
+                                      f"but extended=${extended:.2f} "
+                                      f"(derived qty {derived_qty_raw:.2f} "
+                                      f"didn't round cleanly)")
+                        else:
+                            print(f"  [!] Farm Art line-math anomaly "
+                                  f"(can't self-correct): "
+                                  f"{description[:40]!r} qty={qty_shipped} × "
+                                  f"unit_price=${unit_price:.2f} = ${expected:.2f} "
+                                  f"but extended=${extended:.2f} "
+                                  f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
             item = {
                 "raw_description": description,
                 "sysco_item_code": "",
