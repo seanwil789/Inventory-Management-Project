@@ -663,6 +663,22 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
                 if um:
                     item["purchase_uom"] = um
 
+                # Sean 2026-05-03 phase B: catch-weight rows where per_um
+                # extraction missed "LB" still get the same unit_price=ext
+                # bug signature. When qty_shipped > 1 AND unit_price ≈
+                # extended, derive per-unit from ext÷qty_shipped. Catches
+                # Beef Philly, Bacon Applewood, Ground Turkey Sage Pattie
+                # — all catch-weight with per_um not detected.
+                #
+                # Gate qty_shipped > 1 (not > 0): when qty_shipped=1 and
+                # unit_price=ext, that's a legitimate single-unit case
+                # where ext IS the per-unit price (no division needed).
+                if (qty_shipped is not None and qty_shipped > 1
+                        and abs(unit_price - extended) < 0.01):
+                    derived_per_unit = round(extended / qty_shipped, 4)
+                    if derived_per_unit > 0 and derived_per_unit != unit_price:
+                        item["unit_price"] = derived_per_unit
+
             # Phase 3 #6: count-per-lb (BACON L/O 10/14, SHRIMP 21/25)
             try:
                 from parser import _extract_count_per_lb
