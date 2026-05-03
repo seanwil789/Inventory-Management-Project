@@ -312,27 +312,59 @@ def _extract_row_item(row: list[dict], anchor: dict,
 def _validate_line_math(vendor: str, description: str,
                          qty: float, unit_price: float, extended: float,
                          tolerance_pct: float = 5.0,
-                         tolerance_abs: float = 2.0) -> dict:
+                         tolerance_abs: float = 2.0,
+                         try_self_correct: bool = False) -> dict:
     """Check qty × unit_price ≈ extended. Log anomaly when both >tolerance_pct
     AND >tolerance_abs (avoids noise on rounding/discount under either bar).
 
-    Returns {ok: bool, diff_pct: float, diff_abs: float, expected: float}.
+    When try_self_correct=True and math fails, attempts to derive a corrected
+    qty from extended / unit_price. If the ratio rounds to a clean small
+    integer (1-50, within 0.10 of integer), returns it as 'corrected_qty'
+    in the result. Caller decides whether to apply.
+
+    Returns dict:
+      ok: bool             — True when math passes within tolerance
+      diff_pct: float      — percent discrepancy
+      diff_abs: float      — absolute discrepancy in dollars
+      expected: float      — qty × unit_price
+      corrected_qty: float — set only when self-correction succeeds
     """
+    out = {'ok': True, 'diff_pct': 0, 'diff_abs': 0, 'expected': 0}
     if not (qty and unit_price and extended) or qty <= 0 or unit_price <= 0:
-        return {'ok': True, 'diff_pct': 0, 'diff_abs': 0, 'expected': 0}
+        return out
     expected = qty * unit_price
     if expected <= 0:
-        return {'ok': True, 'diff_pct': 0, 'diff_abs': 0, 'expected': 0}
+        return out
     diff_abs = abs(extended - expected)
     diff_pct = diff_abs / expected * 100
     ok = not (diff_pct > tolerance_pct and diff_abs > tolerance_abs)
-    if not ok:
-        print(f"  [!] {vendor} line-math anomaly: {description[:40]!r} "
-              f"qty={qty} × unit_price=${unit_price:.2f} = ${expected:.2f} "
-              f"but extended=${extended:.2f} "
-              f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
-    return {'ok': ok, 'diff_pct': diff_pct, 'diff_abs': diff_abs,
-            'expected': expected}
+    out.update({'ok': ok, 'diff_pct': diff_pct, 'diff_abs': diff_abs,
+                'expected': expected})
+    if ok:
+        return out
+
+    # Math failed — try self-correction if requested
+    if try_self_correct:
+        derived_raw = extended / unit_price
+        derived = round(derived_raw)
+        if (1 <= derived <= 50
+                and derived != qty
+                and abs(derived_raw - derived) < 0.10):
+            corrected_expected = derived * unit_price
+            corrected_diff_pct = abs(extended - corrected_expected) / corrected_expected * 100
+            if corrected_diff_pct < tolerance_pct:
+                out['corrected_qty'] = float(derived)
+                print(f"  [✓] {vendor} qty self-corrected: "
+                      f"{description[:40]!r} qty {qty}→{derived} "
+                      f"(ext=${extended:.2f} / U/P=${unit_price:.2f} "
+                      f"= {derived_raw:.2f})")
+                return out
+
+    print(f"  [!] {vendor} line-math anomaly: {description[:40]!r} "
+          f"qty={qty} × unit_price=${unit_price:.2f} = ${expected:.2f} "
+          f"but extended=${extended:.2f} "
+          f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
+    return out
 
 
 def match_sysco_spatial(pages: list[dict]) -> list[dict]:
@@ -471,12 +503,19 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
             }
             if qty is not None:
                 item["quantity"] = qty
-            _validate_line_math(
+            # PBM has the same qty self-correction pattern as Farm Art —
+            # 5 of 6 anomalies in test sample had ext/up rounding cleanly
+            # to a small integer (Brioche Buns qty 2→1, White Pita qty 3→1,
+            # Plain Bagels qty 2→3, Club White qty 5→3, etc.).
+            check = _validate_line_math(
                 'PBM', item.get('raw_description', ''),
                 item.get('quantity') or 0,
                 item.get('unit_price') or 0,
                 item.get('extended_amount') or 0,
+                try_self_correct=True,
             )
+            if 'corrected_qty' in check:
+                item['quantity'] = check['corrected_qty']
             items.append(item)
     return items
 
@@ -687,6 +726,17 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
             if not description:
                 continue  # Row with no desc and no code — probably fee row
 
+            # Sean 2026-05-03: skip surcharge / delivery-fee rows.
+            # Delaware spatial extracts these with default unit_price=$1.00
+            # but actual ext varies ($0.76 for fuel surcharge), so they
+            # always fail line-math validation. They're not real product
+            # lines — mapper would tag as non_product anyway.
+            desc_lower = description.lower()
+            if any(p in desc_lower for p in
+                   ('fuel surcharge', 'surcharge', 'delivery fee',
+                    'delivery cha', 'fuelsurcharge')):
+                continue
+
             # Phase 2 polish: Delaware items are sold per-piece (towels,
             # mops, aprons billed by count). Default purchase_uom='EA'.
             del_item = {
@@ -848,65 +898,16 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
             # $0.99 = $1.98), using `extended` as unit_price overstated
             # per-unit price by qty× and broke calc_iup.
             #
-            # Line-item math validation + qty self-correction (Sean 2026-05-03):
-            # qty × unit_price should ≈ extended_amount. Farm Art has a
-            # consistent ~1% vendor discount across rows (line total = ~99%
-            # of qty × U/P) — that's normal. When >5% AND >$2 discrepancy:
-            #
-            #   ext + U/P are the trustworthy signals (ext = what Sean paid;
-            #   U/P = catalog list per-unit price). The qty extracted from
-            #   spatial is the unreliable one — Farm Art OCR sometimes
-            #   captures qty_ordered ≠ qty_shipped, or misreads digits.
-            #
-            #   Derive qty_corrected = round(ext / U/P) and use it when
-            #   it lands on a clean small integer (1-50). The ratio almost
-            #   always rounds cleanly when this is a real qty-extraction bug
-            #   (POTATOES 16.73/16.90=0.99→1; PARSLEY 6.93/1.40=4.95→5).
-            #
-            #   Only apply self-correction when:
-            #     - The derived qty is between 1 and 50 (sane range)
-            #     - The derived qty differs from spatial qty (no point otherwise)
-            #     - After correction, line-math passes within 5% (sanity)
-            if qty_shipped and unit_price:
-                expected = qty_shipped * unit_price
-                if expected > 0:
-                    diff_pct = abs(extended - expected) / expected * 100
-                    diff_abs = abs(extended - expected)
-                    if diff_pct > 5 and diff_abs > 2:
-                        # Try qty self-correction
-                        derived_qty_raw = extended / unit_price
-                        derived_qty = round(derived_qty_raw)
-                        if (1 <= derived_qty <= 50
-                                and derived_qty != qty_shipped
-                                and abs(derived_qty_raw - derived_qty) < 0.10):
-                            # Verify correction passes line-math
-                            corrected_expected = derived_qty * unit_price
-                            corrected_diff_pct = (
-                                abs(extended - corrected_expected)
-                                / corrected_expected * 100
-                            )
-                            if corrected_diff_pct < 5:
-                                print(f"  [✓] Farm Art qty self-corrected: "
-                                      f"{description[:40]!r} "
-                                      f"qty {qty_shipped}→{derived_qty} "
-                                      f"(ext=${extended:.2f} / U/P=${unit_price:.2f} "
-                                      f"= {derived_qty_raw:.2f})")
-                                qty_shipped = float(derived_qty)
-                            else:
-                                print(f"  [!] Farm Art line-math anomaly "
-                                      f"(self-correction failed): "
-                                      f"{description[:40]!r} qty={qty_shipped} × "
-                                      f"unit_price=${unit_price:.2f} = ${expected:.2f} "
-                                      f"but extended=${extended:.2f} "
-                                      f"(derived qty {derived_qty_raw:.2f} "
-                                      f"didn't round cleanly)")
-                        else:
-                            print(f"  [!] Farm Art line-math anomaly "
-                                  f"(can't self-correct): "
-                                  f"{description[:40]!r} qty={qty_shipped} × "
-                                  f"unit_price=${unit_price:.2f} = ${expected:.2f} "
-                                  f"but extended=${extended:.2f} "
-                                  f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
+            # Use the shared validation helper with try_self_correct=True.
+            # When math fails AND ext/unit_price rounds to a clean small
+            # integer, the helper returns corrected_qty — we apply it to
+            # qty_shipped before constructing the item dict.
+            check = _validate_line_math(
+                'Farm Art', description, qty_shipped, unit_price, extended,
+                try_self_correct=True,
+            )
+            if 'corrected_qty' in check:
+                qty_shipped = check['corrected_qty']
             item = {
                 "raw_description": description,
                 "sysco_item_code": "",
