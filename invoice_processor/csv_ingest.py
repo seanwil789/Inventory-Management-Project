@@ -1,5 +1,4 @@
-"""
-Sysco CSV ingestion — updates the Item Mapping code library from a Sysco
+"""Sysco CSV ingestion — updates the SUPC mapping library from a Sysco
 portal CSV export without replacing the OCR invoice workflow.
 
 CSV row types:
@@ -8,20 +7,34 @@ CSV row types:
   P = product line     (SUPC | case_qty | split_qty | cust# | pack | brand | description | ...)
 
 For each P row the ingestor:
-  1. Skips SUPCs already in the code map.
-  2. Tries an exact then fuzzy description match against existing mapping rows
-     — if found, writes the SUPC into column G of that row.
-  3. If no match, appends a stub row (vendor + description + SUPC, blank canonical)
-     so it surfaces in the next run's unmatched report for manual naming.
+  1. Skips SUPCs already present in any ProductMapping.
+  2. Tries an exact then fuzzy description match against existing
+     ProductMapping rows — if found, writes the SUPC into that row.
+  3. If no match, enqueues a ProductMappingProposal stub (vendor=Sysco,
+     desc=CSV text, supc set, suggested_product=None) so Sean canonicalizes
+     it via /mapping-review/'s create-and-approve flow.
 
 Returns a summary dict so batch.py can log the results.
+
+Sean 2026-05-02: refactored from sheet-write (Item Mapping tab) to
+ProductMapping + ProductMappingProposal — the sheet's Item Mapping
+tab is retired.
 """
 import csv
-import re
 import os
+import re
+
+# Bootstrap Django (csv_ingest is called from batch.py which is non-Django entry)
+import django
+import sys
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+os.environ.setdefault('DJANGO_SETTINGS_MODULE', 'myproject.settings')
+try:
+    django.setup()
+except Exception:
+    pass  # already set up by caller
+
 from rapidfuzz import process, fuzz
-from sheets import get_sheet_values, get_sheets_client
-from config import SPREADSHEET_ID, MAPPING_TAB
 
 FUZZY_THRESHOLD = 75
 
@@ -45,10 +58,15 @@ def _parse_csv(path: str) -> list[dict]:
 
 
 def ingest_csv(path: str, dry_run: bool = False) -> dict:
+    """Process one Sysco CSV file and update SUPC bindings.
+    Returns summary: {matched, added, skipped, total}.
+
+    matched = SUPC backfilled into an existing ProductMapping row
+    added   = ProductMappingProposal stub created for Sean's review
+    skipped = SUPC already in code_map / existing PM
     """
-    Process one Sysco CSV file and update Item Mapping.
-    Returns summary: {matched, added, skipped, total}
-    """
+    from myapp.models import Vendor, ProductMapping, ProductMappingProposal
+
     print(f"   Parsing CSV: {os.path.basename(path)}")
     items = _parse_csv(path)
     if not items:
@@ -57,24 +75,25 @@ def ingest_csv(path: str, dry_run: bool = False) -> dict:
 
     print(f"   Found {len(items)} product rows.")
 
-    # ── Load current mapping ─────────────────────────────────────────────────
-    mapping_rows = get_sheet_values(SPREADSHEET_ID, f'{MAPPING_TAB}!A:G')
-    desc_to_row = {}   # raw_desc_upper -> 1-based sheet row
-    code_set    = set()
+    sysco, _ = Vendor.objects.get_or_create(name='Sysco')
 
-    for i, row in enumerate(mapping_rows[1:], start=2):
-        while len(row) < 7:
-            row.append('')
-        d = row[1].strip().upper()
-        c = row[6].strip()
+    # Load current ProductMapping state.
+    # desc_to_pm: normalized-desc -> PM (for matching CSV desc to existing row)
+    # code_set:   SUPCs already curated (skip the CSV entry entirely)
+    pms = list(ProductMapping.objects.filter(vendor=sysco)
+                                       .select_related('product'))
+    desc_to_pm = {}
+    code_set = set()
+    for pm in pms:
+        d = (pm.description or '').strip().upper()
         if d:
-            desc_to_row[d] = i
-        if c:
-            code_set.add(c)
+            desc_to_pm[d] = pm
+        if pm.supc:
+            code_set.add(pm.supc.strip())
 
-    # ── Match each CSV item ──────────────────────────────────────────────────
-    code_updates = []   # (row_index, supc)
-    stub_rows    = []   # new rows to append
+    # Match each CSV item
+    code_updates = []   # (PM, supc) — backfill SUPC on existing row
+    stub_creates = []   # CSV item dicts for new ProductMappingProposal stubs
     skipped      = 0
 
     for item in items:
@@ -87,60 +106,60 @@ def ingest_csv(path: str, dry_run: bool = False) -> dict:
             continue
 
         # Exact match
-        if norm in desc_to_row:
-            code_updates.append((desc_to_row[norm], supc))
+        if norm in desc_to_pm:
+            code_updates.append((desc_to_pm[norm], supc))
             continue
 
         # Fuzzy match
-        result = process.extractOne(norm, desc_to_row.keys(), scorer=fuzz.token_sort_ratio)
+        result = process.extractOne(norm, desc_to_pm.keys(),
+                                    scorer=fuzz.token_sort_ratio)
         if result and result[1] >= FUZZY_THRESHOLD:
-            code_updates.append((desc_to_row[result[0]], supc))
+            code_updates.append((desc_to_pm[result[0]], supc))
             continue
 
-        # No match — add stub
-        stub_rows.append([
-            'Sysco',    # vendor
-            desc,       # item_description  (clean CSV text, not garbled OCR)
-            '',         # category          (blank — user fills in)
-            '',         # primary_descriptor
-            '',         # secondary_descriptor
-            '',         # canonical_name    (blank — user fills in)
-            supc,       # sysco_item_code
-        ])
+        # No match — stub for /mapping-review/
+        stub_creates.append(item)
 
-    # ── Apply updates ────────────────────────────────────────────────────────
     if dry_run:
-        print(f"   [DRY RUN] Would update {len(code_updates)} existing rows, "
-              f"add {len(stub_rows)} stubs, skip {skipped} already-mapped.")
-        return {'matched': len(code_updates), 'added': len(stub_rows),
+        print(f"   [DRY RUN] Would update {len(code_updates)} existing PM rows, "
+              f"add {len(stub_creates)} stubs, skip {skipped} already-mapped.")
+        return {'matched': len(code_updates), 'added': len(stub_creates),
                 'skipped': skipped, 'total': len(items)}
 
-    client = get_sheets_client()
-
+    # Apply: update existing PMs with SUPC
+    for pm, supc in code_updates:
+        pm.supc = supc
+        pm.save(update_fields=['supc'])
     if code_updates:
-        data = [{'range': f'{MAPPING_TAB}!G{row_i}', 'values': [[supc]]}
-                for row_i, supc in code_updates]
-        client.values().batchUpdate(
-            spreadsheetId=SPREADSHEET_ID,
-            body={'valueInputOption': 'USER_ENTERED', 'data': data},
-        ).execute()
-        print(f"   [✓] Matched {len(code_updates)} SUPC codes to existing rows.")
+        print(f"   [✓] Backfilled SUPC on {len(code_updates)} existing ProductMapping rows.")
 
-    if stub_rows:
-        client.values().append(
-            spreadsheetId=SPREADSHEET_ID,
-            range=f'{MAPPING_TAB}!A:G',
-            valueInputOption='USER_ENTERED',
-            insertDataOption='INSERT_ROWS',
-            body={'values': stub_rows},
-        ).execute()
-        print(f"   [✓] Added {len(stub_rows)} new stub rows (canonical name needed).")
-        print(f"       Open the '{MAPPING_TAB}' tab and fill in column F for:")
-        for row in stub_rows:
-            print(f"       SUPC {row[6]}  {row[1]}")
-
+    # Apply: create stub ProductMappingProposals for new SUPCs.
+    # source='discover_unmapped' since the semantic is "found this from
+    # an external data source, needs canonicalization." suggested_product=
+    # None means the create-and-approve flow lets Sean invent a canonical.
+    new_proposals = 0
+    for item in stub_creates:
+        notes = (f"Sysco CSV import · SUPC {item['supc']} · brand={item['brand']} "
+                 f"· pack={item['pack']}")
+        _, created, _ = ProductMappingProposal.get_or_create_dedup(
+            vendor=sysco,
+            raw_description=item['desc'],
+            suggested_product=None,
+            source='discover_unmapped',
+            defaults=dict(
+                score=None,
+                confidence_tier='csv_stub',
+                status='pending',
+                notes=notes,
+            ),
+        )
+        if created:
+            new_proposals += 1
+    if new_proposals:
+        print(f"   [✓] Enqueued {new_proposals} new SUPC stub(s) in /mapping-review/.")
+        print(f"       (canonical name needed; visible at /mapping-review/?status=unresolved)")
     if skipped:
-        print(f"   [–] Skipped {skipped} SUPCs already in the mapping.")
+        print(f"   [–] Skipped {skipped} SUPCs already in ProductMapping.")
 
-    return {'matched': len(code_updates), 'added': len(stub_rows),
+    return {'matched': len(code_updates), 'added': new_proposals,
             'skipped': skipped, 'total': len(items)}

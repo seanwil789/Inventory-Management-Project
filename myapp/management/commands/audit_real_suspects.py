@@ -283,9 +283,8 @@ class Command(BaseCommand):
             '    to push to the auto_repoint tier where the live mapper\n'
             '    has a different (correct) canonical at a trusted tier.\n'
             "  - For mismaps the mapper can't auto-resolve: open\n"
-            '    /mapping-review/ and fix manually, OR edit the Item\n'
-            '    Mapping sheet col F + run `cleanup_mappings.py --apply`\n'
-            '    + `manage.py reprocess_invoices`.'))
+            '    /mapping-review/?status=unresolved and approve/reject\n'
+            '    via the UI; reasons feed the teaching signal.'))
 
     def _classify_filter(self, raw: str, cleaned: str, canonical: str,
                          stem_fn) -> str:

@@ -180,10 +180,9 @@ class Command(BaseCommand):
                 f'\n  Full report written to {opts["json"]} ({len(out)} entries)'))
 
         self.stdout.write(self.style.WARNING(
-            '\nFix path: find each raw_description in the Google Sheets "Item Mapping"\n'
-            'tab and correct the canonical (column F). Then `python invoice_processor/\n'
-            'cleanup_mappings.py --apply` + `python manage.py reprocess_invoices` to\n'
-            'pick up corrections.'))
+            '\nFix path: re-run with --write-to-review to enqueue suspects '
+            'into /mapping-review/?status=unresolved. Approve to commit '
+            'a re-point; reject + reason to teach the system.'))
 
         if opts['write_to_review']:
             self._write_corrections_to_review(filtered, dry_run=opts['dry_run'])

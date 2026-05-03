@@ -7072,29 +7072,27 @@ class MapperLoadFromDBTests(TestCase):
         self.assertContains(r, 'Sheet/DB Drift')
         self.assertContains(r, 'BBRLCLS CHEESE AMER')
 
-    def test_load_mappings_falls_back_to_sheet_when_db_empty(self):
-        """Catastrophe protection: if ProductMapping is empty (pre-backfill,
-        fresh install), load_mappings falls back to sheet so the pipeline
-        doesn't go dark waiting for someone to run sync_item_mapping."""
+    def test_load_mappings_emits_clear_error_when_db_empty(self):
+        """Sean 2026-05-02: the sheet fallback was retired (Item Mapping
+        tab deleted). load_mappings now emits a recovery-hint error
+        instead of silently falling back to a deleted sheet tab."""
         from unittest.mock import patch
+        from io import StringIO
         # Empty DB ProductMapping
         self.assertEqual(ProductMapping.objects.count(), 0)
         mapper = self._import_mapper()
-        # Patch the sheet path to return one row
-        sentinel_rows = [
-            ['vendor', 'item_description', 'category', 'pri', 'sec', 'canonical_name', 'supc'],
-            ['Sysco', 'TESTROW', 'Drystock', '', '', 'TestCanonical', '999'],
-        ]
-        # Also patch the cache file path so we don't read a stale cache
-        import os, tempfile
+        import os, tempfile, sys
         with tempfile.TemporaryDirectory() as tmpdir:
             cache_path = os.path.join(tmpdir, 'item_mappings.json')
+            captured = StringIO()
             with patch.object(mapper, 'MAPPING_CACHE_PATH', cache_path), \
-                 patch.object(mapper, 'get_sheet_values', return_value=sentinel_rows):
+                 patch.object(sys, 'stdout', captured):
                 cache = mapper.load_mappings(force_refresh=True)
-        # Should have fallen back to sheet
-        self.assertEqual(cache['desc_map'].get('TESTROW'), 'TestCanonical')
-        self.assertEqual(cache['code_map'].get('999'), 'TestCanonical')
+        # Cache returns empty maps (no fallback)
+        self.assertEqual(cache['desc_map'], {})
+        self.assertEqual(cache['code_map'], {})
+        # And a clear recovery-hint message was printed
+        self.assertIn('ProductMapping table is empty', captured.getvalue())
 
 
 class FuzzyQuarantineTests(TestCase):
@@ -10600,3 +10598,115 @@ class AuditSuspectMappingsWriteToReviewTests(TestCase):
             ProductMappingProposal.objects.filter(source='suspect_audit').count(),
             0,
         )
+
+
+class CsvIngestRefactorTests(TestCase):
+    """Sean 2026-05-02: csv_ingest now writes to ProductMapping +
+    ProductMappingProposal (was: Item Mapping sheet tab)."""
+
+    def setUp(self):
+        from myapp.models import Vendor
+        Vendor.objects.get_or_create(name='Sysco')
+
+    def _write_csv(self, rows):
+        import tempfile, os
+        fd, path = tempfile.mkstemp(suffix='.csv')
+        with os.fdopen(fd, 'w') as f:
+            for r in rows:
+                f.write(','.join(r) + '\n')
+        return path
+
+    def test_supc_backfill_to_existing_pm(self):
+        """CSV row with desc matching existing PM → SUPC written to that PM."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..',
+                                          'invoice_processor'))
+        from csv_ingest import ingest_csv
+        from myapp.models import Vendor, Product, ProductMapping
+        sysco = Vendor.objects.get(name='Sysco')
+        prod = Product.objects.create(canonical_name='Test Yogurt', category='Dairy')
+        pm = ProductMapping.objects.create(
+            vendor=sysco, product=prod,
+            description='YOGURT GREEK 12/4OZ',
+        )
+        csv_path = self._write_csv([
+            ['P', '1234567', '1', '1', 'cust', '12/4 OZ', 'Brand X', 'YOGURT GREEK 12/4OZ'],
+        ])
+        try:
+            summary = ingest_csv(csv_path)
+            self.assertEqual(summary['matched'], 1)
+            self.assertEqual(summary['added'], 0)
+            pm.refresh_from_db()
+            self.assertEqual(pm.supc, '1234567')
+        finally:
+            os.unlink(csv_path)
+
+    def test_unmatched_csv_creates_pmp_stub(self):
+        """CSV row with no PM match → ProductMappingProposal stub created."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..',
+                                          'invoice_processor'))
+        from csv_ingest import ingest_csv
+        from myapp.models import ProductMappingProposal
+        csv_path = self._write_csv([
+            ['P', '9999999', '1', '1', 'cust', '6/32 OZ', 'Brand Z', 'NEW WIDGET XYZ'],
+        ])
+        try:
+            summary = ingest_csv(csv_path)
+            self.assertEqual(summary['matched'], 0)
+            self.assertEqual(summary['added'], 1)
+            pmp = ProductMappingProposal.objects.filter(
+                raw_description='NEW WIDGET XYZ',
+            ).first()
+            self.assertIsNotNone(pmp)
+            self.assertEqual(pmp.source, 'discover_unmapped')
+            self.assertEqual(pmp.confidence_tier, 'csv_stub')
+            self.assertIn('SUPC 9999999', pmp.notes)
+            self.assertIsNone(pmp.suggested_product)  # blank for human-invent
+        finally:
+            os.unlink(csv_path)
+
+    def test_already_mapped_supc_skipped(self):
+        """CSV row with SUPC already in ProductMapping → skip."""
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..',
+                                          'invoice_processor'))
+        from csv_ingest import ingest_csv
+        from myapp.models import Vendor, Product, ProductMapping
+        sysco = Vendor.objects.get(name='Sysco')
+        prod = Product.objects.create(canonical_name='Existing', category='Drystock')
+        ProductMapping.objects.create(
+            vendor=sysco, product=prod,
+            description='EXISTING ITEM', supc='5555555',
+        )
+        csv_path = self._write_csv([
+            ['P', '5555555', '1', '1', 'cust', '1 EA', 'Brand', 'DIFFERENT DESC'],
+        ])
+        try:
+            summary = ingest_csv(csv_path)
+            self.assertEqual(summary['skipped'], 1)
+            self.assertEqual(summary['matched'], 0)
+            self.assertEqual(summary['added'], 0)
+        finally:
+            os.unlink(csv_path)
+
+    def test_dry_run_does_not_write(self):
+        import sys, os
+        sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..',
+                                          'invoice_processor'))
+        from csv_ingest import ingest_csv
+        from myapp.models import ProductMappingProposal
+        csv_path = self._write_csv([
+            ['P', '7777777', '1', '1', 'cust', '1', 'Brand', 'NEW ITEM DRY'],
+        ])
+        try:
+            summary = ingest_csv(csv_path, dry_run=True)
+            self.assertEqual(summary['added'], 1)  # would have added
+            # but NO PMP actually created
+            self.assertEqual(
+                ProductMappingProposal.objects.filter(
+                    raw_description='NEW ITEM DRY').count(),
+                0,
+            )
+        finally:
+            os.unlink(csv_path)

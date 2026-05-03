@@ -390,46 +390,10 @@ def _load_from_db() -> dict:
     return cache
 
 
-def _load_from_sheet() -> dict:
-    """Legacy sheet-loading path. Kept as a fallback for the rare case
-    where the DB ProductMapping table is empty (pre-backfill, fresh
-    install, or DB corruption). After Step 1 of the sheet→DB migration
-    this path is not the default — _load_from_db is."""
-    cache = {"code_map": {}, "desc_map": {}, "vendor_desc_map": {}, "category_map": {}}
-
-    try:
-        rows = get_sheet_values(SPREADSHEET_ID, f"{MAPPING_TAB}!A:G")
-    except Exception:
-        rows = []
-
-    for row in rows[1:]:  # skip header row
-        while len(row) < 7:
-            row.append("")
-        vendor     = row[0].strip()
-        raw_desc   = re.sub(r'\s+', ' ', re.sub(r'[/\\]', ' ', row[1].strip())).upper()
-        category   = row[2].strip()
-        primary    = row[3].strip()
-        secondary  = row[4].strip()
-        canonical  = row[5].strip()
-        item_code  = row[6].strip()
-
-        if not canonical:
-            continue
-        if item_code:
-            cache["code_map"][item_code] = canonical
-        if raw_desc:
-            cache["desc_map"][raw_desc] = canonical
-            if vendor:
-                vendor_key = vendor.upper()
-                cache["vendor_desc_map"].setdefault(vendor_key, {})[raw_desc] = canonical
-        if category:
-            cache.setdefault("category_map", {})[canonical] = {
-                "category":            category,
-                "primary_descriptor":  primary,
-                "secondary_descriptor": secondary,
-            }
-
-    return cache
+# _load_from_sheet() retired 2026-05-02 — the Google Sheet's "Item Mapping"
+# tab was deleted. ProductMapping table (DB) is the sole source of truth.
+# load_mappings() emits a clear error when the table is empty rather than
+# silently falling back to a deleted sheet tab.
 
 
 def load_mappings(force_refresh: bool = False) -> dict:
@@ -458,13 +422,19 @@ def load_mappings(force_refresh: bool = False) -> dict:
 
     cache = _load_from_db()
 
-    # Catastrophe fallback: ProductMapping empty (pre-backfill or fresh
-    # install). Read from sheet so the pipeline doesn't go dark while
-    # someone runs sync_item_mapping_from_sheet.
+    # ProductMapping empty (pre-backfill, fresh install, DB corruption).
+    # Sean 2026-05-02: the sheet's Item Mapping tab has been retired, so
+    # the legacy sheet fallback is no longer viable — _load_from_sheet
+    # would read a deleted tab and return empty. Better to fail loud with
+    # a recovery hint than silently produce zero mappings.
     if not cache["desc_map"] and not cache["code_map"]:
-        print("  [!] ProductMapping empty — falling back to sheet read. "
-              "Run `manage.py sync_item_mapping_from_sheet --apply` to populate.")
-        cache = _load_from_sheet()
+        print("  [!] ProductMapping table is empty. Mapping will not work "
+              "until restored. Recovery options:\n"
+              "      1. Restore from a recent DB backup\n"
+              "      2. Re-run sync_item_mapping_from_sheet against an old\n"
+              "         sheet snapshot (if you have one)\n"
+              "      3. Re-curate from invoice history via discover_unmapped\n"
+              "         + /mapping-review/")
 
     os.makedirs(os.path.dirname(MAPPING_CACHE_PATH), exist_ok=True)
     with open(MAPPING_CACHE_PATH, "w") as f:
