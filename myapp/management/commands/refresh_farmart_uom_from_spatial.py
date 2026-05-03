@@ -156,8 +156,13 @@ class Command(BaseCommand):
                     # Has different value; preserve unless --reset cleared first
                     ili_unchanged += 1
                     continue
-                # Update purchase_uom + structured pack fields from spatial
+                # Update purchase_uom + structured pack fields + per-unit
+                # price/qty from spatial. Sean 2026-05-03: unit_price was
+                # being stored as the line amount (extended) rather than
+                # the actual U/P column value — fixed in spatial_matcher
+                # and corrected here for historical rows.
                 if apply_writes:
+                    from decimal import Decimal
                     ili.purchase_uom = uom
                     if item.get('case_pack_count') is not None:
                         ili.case_pack_count = item['case_pack_count']
@@ -167,10 +172,20 @@ class Command(BaseCommand):
                         ili.case_pack_unit_uom = item['case_pack_unit_uom']
                     if item.get('case_total_weight_lb') is not None:
                         ili.case_total_weight_lb = item['case_total_weight_lb']
+                    # Price + qty fields — only populated by spatial when
+                    # the corresponding columns extracted cleanly. None
+                    # values preserved (don't clobber existing).
+                    if item.get('unit_price') is not None:
+                        ili.unit_price = Decimal(str(item['unit_price']))
+                    if item.get('extended_amount') is not None:
+                        ili.extended_amount = Decimal(str(item['extended_amount']))
+                    if item.get('quantity') is not None:
+                        ili.quantity = Decimal(str(item['quantity']))
                     ili.save(update_fields=[
                         'purchase_uom', 'case_pack_count',
                         'case_pack_unit_size', 'case_pack_unit_uom',
                         'case_total_weight_lb',
+                        'unit_price', 'extended_amount', 'quantity',
                     ])
                 ili_updated += 1
                 per_uom[uom] += 1

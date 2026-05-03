@@ -775,10 +775,16 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
             # `_extract_farmart_pack` parses "4/1GAL", "9CT", "15DOZ", "5#"
             # tokens out of the description into structured fields — closes
             # the 0% case_pack_count gap for Farm Art's 556 ILI rows.
+            # Sean 2026-05-03: unit_price MUST be the per-unit price from the
+            # U/P column, not the line amount. For qty=1 rows the two are
+            # equal (modulo rounding) so the bug was invisible. For qty>1
+            # rows (Romaine 5 heads × $3.46 = $17.33; Cilantro 2 bunches ×
+            # $0.99 = $1.98), using `extended` as unit_price overstated
+            # per-unit price by qty× and broke calc_iup.
             item = {
                 "raw_description": description,
                 "sysco_item_code": "",
-                "unit_price": extended,
+                "unit_price": unit_price,
                 "extended_amount": extended,
                 "case_size_raw": "",
                 "section": "",
