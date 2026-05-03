@@ -659,11 +659,23 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
 #   x=0.90  extended amount
 
 _FARM_ITEM_CODE_RE = re.compile(r'^[A-Z]{2,10}\d?$')
-# U/M values observed across Farm Art invoices: EACH/CASE/LB/EA/DZ are common.
-# Sean 2026-05-03: GAL/QT/PT/CT/BU also appear (Shallot=GAL, Heavy Cream=CASE
-# at GAL pack, Cantaloupe=EACH at CT pack, etc.). Extended regex to catch them.
+# U/M extraction regex — captures the actual U/M column value (in the U/M
+# x-band). Sean 2026-05-03 extended to include GAL/QT/PT/CT/BU/DOZ which
+# appear on real Farm Art invoices (Shallot=GAL, Heavy Cream at gallon
+# pack=CASE, etc.).
 _FARM_UM_RE = re.compile(
     r'^(EACH|CASE|LB|EA|DZ|OZ|PK|BG|CTN|GAL|QT|PT|CT|BU|DOZ)$',
+    re.IGNORECASE,
+)
+# Description-token noise filter — narrower set than _FARM_UM_RE.
+# These tokens appear in description text as business-note words (e.g.
+# "NO HALF CASE" suffix) and should be stripped from raw_description.
+# CRITICALLY does NOT include GAL/QT/PT/CT/BU/DOZ — those appear in
+# descriptions as legitimate size indicators ("4 / 1 - GAL", "12/1 QT")
+# and stripping them changes raw_description shape, breaking matching
+# against existing ILI rows during retroactive spatial re-extracts.
+_FARM_DESC_NOISE_RE = re.compile(
+    r'^(EACH|CASE|EA|CTN|PK|BG|DZ)$',
     re.IGNORECASE,
 )
 _FARM_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,4}$')
@@ -737,11 +749,15 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
             um = um_toks[0]["text"].upper() if um_toks else ""
 
             # Description: everything in the desc x-band that isn't COOL
-            # (country name) or a recognizable numeric/UM token.
+            # (country name) or a recognizable numeric/noise token.
+            # Uses _FARM_DESC_NOISE_RE (narrower than _FARM_UM_RE) so size
+            # tokens like GAL/QT in description text stay (e.g. "4 / 1 - GAL"
+            # for Shallot). Only business-note words like CASE/EACH get
+            # filtered as noise.
             desc_toks = [t for t in row if _in_x(t, _FARM_DESC_X)
                          and not _FARM_PRICE_RE.fullmatch(t["text"])
                          and not _FARM_DEC_RE.fullmatch(t["text"])
-                         and not _FARM_UM_RE.fullmatch(t["text"])]
+                         and not _FARM_DESC_NOISE_RE.fullmatch(t["text"])]
             description = " ".join(t["text"] for t in desc_toks).strip()
             # Strip leading comma if desc starts with one (OCR noise)
             description = re.sub(r'^,\s*', '', description)
