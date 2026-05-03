@@ -667,15 +667,18 @@ _FARM_UM_RE = re.compile(
     r'^(EACH|CASE|LB|EA|DZ|OZ|PK|BG|CTN|GAL|QT|PT|CT|BU|DOZ)$',
     re.IGNORECASE,
 )
-# Description-token noise filter — narrower set than _FARM_UM_RE.
-# These tokens appear in description text as business-note words (e.g.
-# "NO HALF CASE" suffix) and should be stripped from raw_description.
-# CRITICALLY does NOT include GAL/QT/PT/CT/BU/DOZ — those appear in
-# descriptions as legitimate size indicators ("4 / 1 - GAL", "12/1 QT")
-# and stripping them changes raw_description shape, breaking matching
-# against existing ILI rows during retroactive spatial re-extracts.
+# Description-token noise filter — backward-compat with the original
+# spatial extraction. These tokens get stripped from desc when they
+# appear in the desc x-band. MUST match the original _FARM_UM_RE
+# (pre-2026-05-03 expansion) so retroactive spatial re-extracts produce
+# raw_description identical to what was originally stored.
+#
+# Critically does NOT include GAL/QT/PT/CT/BU/DOZ — those appear as
+# legitimate size indicators in desc text ("4 / 1 - GAL" Shallot,
+# "12/1 QT" Heavy Cream) and the original spatial code preserved them
+# (because the original U/M regex didn't include them either).
 _FARM_DESC_NOISE_RE = re.compile(
-    r'^(EACH|CASE|EA|CTN|PK|BG|DZ)$',
+    r'^(EACH|CASE|LB|EA|DZ|OZ|PK|BG|CTN)$',
     re.IGNORECASE,
 )
 _FARM_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,4}$')
