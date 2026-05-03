@@ -739,12 +739,15 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
                             and _FARM_DEC_RE.fullmatch(t["text"])
                             and t != qty_ord_toks[0]]
             qty_shipped = float(qty_shp_toks[0]["text"]) if qty_shp_toks else qty_ord
-            # Sean 2026-05-02: skip rows where BOTH qty_shipped and extended
-            # are zero. Farm Art uses zz prefix for out-of-stock items; the
-            # row appears on invoice paperwork but with qty=0 + price=0.
+            # Sean 2026-05-02: skip rows where extended (billed amount) is 0.
+            # Farm Art uses zz prefix for out-of-stock items; the row appears
+            # on invoice paperwork but with no money paid. ext=0 means the
+            # line wasn't billed regardless of qty value (some "ordered but
+            # not delivered" rows have qty>0 but ext=0 — zz BAKING YEAST,
+            # zz SPICE CUMIN, etc.). No money paid = no ILI row needed.
             # Note: zz alone isn't disqualifying — fulfilled-substitution
-            # zz items have real qty + price and should generate ILI rows.
-            if qty_shipped == 0 and extended == 0:
+            # zz items have real qty + ext and should generate ILI rows.
+            if extended == 0:
                 continue
 
             um_toks = [t for t in row if _in_x(t, _FARM_UM_X)
