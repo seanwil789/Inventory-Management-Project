@@ -169,24 +169,58 @@ def parse_total_weight_lbs(case_size: str) -> float | None:
 
 
 def calc_iup(unit_price: float, case_size: str,
-             case_pack_count: int | None = None) -> float | None:
+             case_pack_count: int | None = None,
+             purchase_uom: str | None = None) -> float | None:
     """
-    Compute Individual Unit Price = unit_price / units_per_case.
-    Returns None if the case size cannot be parsed or unit count is 1
-    (no subdivision meaningful).
+    Compute Individual Unit Price = price per individual unit (per-jar,
+    per-bottle, per-piece — the smallest unit Sean tracks at month-end).
 
-    Phase 3a (2026-05-02): when `case_pack_count` is provided (from
-    InvoiceLineItem.case_pack_count after structured-schema migration),
-    use it directly — bypasses the case_size string parsing entirely.
-    Falls back to legacy parse_unit_count(case_size) when the structured
-    field is null (rows pre-backfill, or vendors whose parser doesn't
-    yet emit case_pack_*).
+    Phase 3b (Sean 2026-05-03): the `purchase_uom` signal gates whether
+    unit_price is case-level or per-unit:
+      - purchase_uom in ('CASE', 'CS') → unit_price is CASE-level.
+        IUP = unit_price / case_pack_count.
+        Examples: Sysco yogurt $36 case / 12 cups = $3/cup;
+                  Farm Art milk $46.73 case / 4 gal = $11.68/gal.
+      - purchase_uom in ('LB', 'EACH', 'EA', 'GAL', 'QT', 'PT', 'DZ',
+        'DOZ', 'BU', 'OZ', etc.) → unit_price is ALREADY per-unit.
+        IUP = unit_price (no division).
+        Examples: Farm Art shallot $20/gal (purchase_uom=GAL);
+                  Farm Art bunches $1.98/case-of-60-bunches but
+                  invoiced per-bunch when purchase_uom=EACH.
+
+    When purchase_uom is missing/unknown:
+      - Falls back to legacy behavior (divide by case_pack_count if > 1)
+        for backward compat. This produced wrong IUP for per-unit-priced
+        items where U/M signal was missing — once spatial U/M extraction
+        reaches high coverage, the fallback should rarely fire.
+
+    Returns None when count cannot be determined.
     """
-    # Structured path — load-bearing for fixing the Beef Chuck Flap
-    # cascade + similar string-parse failures.
+    uom = (purchase_uom or '').upper().strip()
+
+    # Per-unit U/M values: unit_price IS per-unit, no division.
+    _PER_UNIT_UOMS = {'LB', 'LBS', '#', 'EACH', 'EA',
+                      'GAL', 'GALLON', 'QT', 'QUART', 'PT', 'PINT',
+                      'DZ', 'DOZ', 'DOZEN', 'BU', 'BUNCH', 'OZ', 'KG'}
+    if uom in _PER_UNIT_UOMS:
+        return round(unit_price, 4)
+
+    # Case-level U/M: divide by case_pack_count for per-unit price.
+    _CASE_UOMS = {'CASE', 'CS', 'CTN', 'PK', 'BG'}
+    if uom in _CASE_UOMS:
+        if case_pack_count is not None and case_pack_count > 1:
+            return round(unit_price / case_pack_count, 4)
+        # Case U/M but no pack count — fall through to legacy parse
+        count = parse_unit_count(case_size)
+        if count is not None and count > 1:
+            return round(unit_price / count, 4)
+        return None
+
+    # No purchase_uom signal — legacy behavior (assume case-level).
+    # This produces wrong IUP for per-unit-priced items where U/M is
+    # missing; closing the U/M coverage gap is the real fix.
     if case_pack_count is not None and case_pack_count > 1:
         return round(unit_price / case_pack_count, 4)
-    # Legacy string path
     count = parse_unit_count(case_size)
     if count is None or count <= 1:
         return None
@@ -523,6 +557,11 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
                 "case_total_weight_lb":  (float(ili.case_total_weight_lb)
                                           if ili.case_total_weight_lb is not None
                                           else None),
+                # Phase 3b (Sean 2026-05-03): purchase_uom gates calc_iup
+                # case-level vs per-unit interpretation. CASE → divide by
+                # case_pack_count; LB/EACH/GAL/QT/etc. → unit_price already
+                # per-unit (no division).
+                "purchase_uom":          ili.purchase_uom or "",
             }
 
     return list(seen.values())
@@ -657,6 +696,8 @@ def _sync_prices_core(
         # Phase 3a structured-field path
         case_pack_count = item.get("case_pack_count")
         case_total_weight_lb = item.get("case_total_weight_lb")
+        # Phase 3b — purchase_uom drives calc_iup case-vs-per-unit gate
+        purchase_uom = item.get("purchase_uom", "")
 
         # Step 1: find all sheet rows whose product name fuzzy-matches
         all_matches = process.extract(
@@ -755,7 +796,8 @@ def _sync_prices_core(
                 continue
 
             iup = calc_iup(unit_price, effective_case_size,
-                           case_pack_count=case_pack_count)
+                           case_pack_count=case_pack_count,
+                           purchase_uom=purchase_uom)
             pplb = calc_price_per_lb(unit_price, effective_case_size, sheet_unit,
                                      stored_price_per_lb=stored_ppp,
                                      case_total_weight_lb=case_total_weight_lb)
@@ -1325,9 +1367,10 @@ def create_month_sheet(year: int, month: int, dry_run: bool = False) -> str:
         })
 
         # Phase 3a structured fields from latest ILI — bypass case_size string
-        # parse when populated.
+        # parse when populated. Phase 3b — purchase_uom gates calc_iup.
         iup = calc_iup(unit_price, case_size,
-                       case_pack_count=latest.case_pack_count)
+                       case_pack_count=latest.case_pack_count,
+                       purchase_uom=latest.purchase_uom)
         pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
                                  stored_price_per_lb=latest.price_per_pound,
                                  case_total_weight_lb=latest.case_total_weight_lb)
@@ -1468,9 +1511,10 @@ def refresh_stale_carryover(sheet_tab: str = None, dry_run: bool = False) -> dic
 
         case_size = latest.case_size or entry.get("case_size", "")
         latest_vendor = latest.vendor.name if latest.vendor else "?"
-        # Phase 3a structured-field path
+        # Phase 3a structured-field path. Phase 3b — purchase_uom gate.
         iup = calc_iup(unit_price, case_size,
-                       case_pack_count=latest.case_pack_count)
+                       case_pack_count=latest.case_pack_count,
+                       purchase_uom=latest.purchase_uom)
         pplb = calc_price_per_lb(unit_price, case_size, sheet_unit,
                                  stored_price_per_lb=latest.price_per_pound,
                                  case_total_weight_lb=latest.case_total_weight_lb)
