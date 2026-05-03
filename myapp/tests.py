@@ -10710,3 +10710,103 @@ class CsvIngestRefactorTests(TestCase):
             )
         finally:
             os.unlink(csv_path)
+
+
+class MigrateNegativeMatchesTests(TestCase):
+    """Sean 2026-05-02: legacy negative_matches.json → rejected PMPs."""
+
+    def setUp(self):
+        from myapp.models import Vendor, Product
+        self.v, _ = Vendor.objects.get_or_create(name='Farm Art')
+        self.target = Product.objects.create(canonical_name='Broccoli Rabe',
+                                              category='Produce')
+
+    def _write_json(self, triples):
+        import tempfile, json, os
+        fd, path = tempfile.mkstemp(suffix='.json')
+        with os.fdopen(fd, 'w') as f:
+            json.dump(triples, f)
+        return path
+
+    def _run(self, json_path, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('migrate_negative_matches', '--path', json_path,
+                     *args, stdout=out)
+        return out.getvalue()
+
+    def test_creates_rejected_pmp_per_triple(self):
+        from myapp.models import ProductMappingProposal
+        path = self._write_json([
+            ['Farm Art', 'BROCCOLI, CROWNS, 20 LB', 'Broccoli Rabe'],
+        ])
+        try:
+            self._run(path, '--apply')
+            pmp = ProductMappingProposal.objects.filter(
+                vendor=self.v, raw_description='BROCCOLI, CROWNS, 20 LB',
+            ).first()
+            self.assertIsNotNone(pmp)
+            self.assertEqual(pmp.status, 'rejected')
+            self.assertEqual(pmp.reject_reason, 'wrong_canonical')
+            self.assertEqual(pmp.suggested_product, self.target)
+        finally:
+            import os; os.unlink(path)
+
+    def test_dry_run_does_not_write(self):
+        from myapp.models import ProductMappingProposal
+        path = self._write_json([
+            ['Farm Art', 'CUT, BROCCOLI, FLORETTES', 'Broccoli Rabe'],
+        ])
+        try:
+            out = self._run(path)
+            self.assertIn('Dry-run', out)
+            self.assertEqual(ProductMappingProposal.objects.count(), 0)
+        finally:
+            import os; os.unlink(path)
+
+    def test_wildcard_entries_skipped(self):
+        from myapp.models import ProductMappingProposal
+        path = self._write_json([
+            ['Farm Art', 'BROCCOLI*', 'Broccoli Rabe'],
+        ])
+        try:
+            out = self._run(path, '--apply')
+            self.assertIn('wildcards:', out)
+            self.assertEqual(ProductMappingProposal.objects.count(), 0)
+        finally:
+            import os; os.unlink(path)
+
+    def test_unknown_vendor_skipped(self):
+        path = self._write_json([
+            ['NoSuchVendor', 'X', 'Broccoli Rabe'],
+        ])
+        try:
+            out = self._run(path, '--apply')
+            self.assertIn('unknown vendor', out)
+        finally:
+            import os; os.unlink(path)
+
+    def test_missing_canonical_skipped(self):
+        path = self._write_json([
+            ['Farm Art', 'X', 'No Such Canonical'],
+        ])
+        try:
+            out = self._run(path, '--apply')
+            self.assertIn('no canonical', out)
+        finally:
+            import os; os.unlink(path)
+
+    def test_idempotent_re_run(self):
+        from myapp.models import ProductMappingProposal
+        path = self._write_json([
+            ['Farm Art', 'BROCCOLI', 'Broccoli Rabe'],
+        ])
+        try:
+            self._run(path, '--apply')
+            count_before = ProductMappingProposal.objects.count()
+            self._run(path, '--apply')
+            count_after = ProductMappingProposal.objects.count()
+            self.assertEqual(count_before, count_after)
+        finally:
+            import os; os.unlink(path)
