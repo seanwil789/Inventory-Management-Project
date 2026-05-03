@@ -659,13 +659,23 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
 #   x=0.90  extended amount
 
 _FARM_ITEM_CODE_RE = re.compile(r'^[A-Z]{2,10}\d?$')
-_FARM_UM_RE = re.compile(r'^(EACH|CASE|LB|EA|DZ|OZ|PK|BG|CTN)$', re.IGNORECASE)
+# U/M values observed across Farm Art invoices: EACH/CASE/LB/EA/DZ are common.
+# Sean 2026-05-03: GAL/QT/PT/CT/BU also appear (Shallot=GAL, Heavy Cream=CASE
+# at GAL pack, Cantaloupe=EACH at CT pack, etc.). Extended regex to catch them.
+_FARM_UM_RE = re.compile(
+    r'^(EACH|CASE|LB|EA|DZ|OZ|PK|BG|CTN|GAL|QT|PT|CT|BU|DOZ)$',
+    re.IGNORECASE,
+)
 _FARM_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,4}$')
 _FARM_DEC_RE = re.compile(r'^\d+\.\d{3}$')  # qty format "1.000"
 
 _FARM_QTY_ORD_X   = (0.04, 0.11)
 _FARM_QTY_SHP_X   = (0.10, 0.16)
-_FARM_UM_X        = (0.14, 0.20)
+# U/M column observed at x=0.133 on the 2026-05-01 invoice (just LEFT of the
+# original 0.14-0.20 band). Loosened lower bound to 0.12 so tokens at x=0.13
+# get captured. Overlaps with qty_shp band but disambiguated by regex
+# (qty_shp matches '1.000', U/M matches alpha tokens).
+_FARM_UM_X        = (0.12, 0.20)
 _FARM_CODE_X      = (0.18, 0.28)
 _FARM_DESC_X      = (0.26, 0.68)
 _FARM_COOL_X      = (0.68, 0.80)
