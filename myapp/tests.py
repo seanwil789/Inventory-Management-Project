@@ -69,6 +69,31 @@ class SmokeTests(AuthedTestCase):
         finally:
             wkday_menu.delete()
 
+    def test_calendar_renders_seven_days_with_weekend_service(self):
+        """Sean 2026-05-03: calendar must show Mon-Sun. Weekends serve
+        lunch+dinner only — breakfast cells render as 'no service'."""
+        from myapp.calendar_utils import biweekly_start_for, served_slots_for
+        bw_start = biweekly_start_for(date.today())  # Monday
+        sat = bw_start + timedelta(days=5)
+        sun = bw_start + timedelta(days=6)
+        # served_slots_for unit check
+        assert served_slots_for(sat) == {'lunch', 'dinner'}, served_slots_for(sat)
+        assert 'cold_breakfast' in served_slots_for(bw_start)  # weekday
+        # Place a Sat dinner menu to verify rendering
+        m = Menu.objects.create(
+            date=sat, meal_slot='dinner', recipe=self.r1,
+            dish_freetext='Sat Dinner Test',
+        )
+        try:
+            r = self.client.get(reverse('calendar_current'))
+            self.assertEqual(r.status_code, 200)
+            self.assertContains(r, 'Saturday')
+            self.assertContains(r, 'Sunday')
+            self.assertContains(r, 'no service')  # weekend breakfast cells
+            self.assertContains(r, 'Sat Dinner Test')  # weekend dinner shows
+        finally:
+            m.delete()
+
     def test_cogs_dashboard_200(self):
         self.assertEqual(self.client.get(reverse('cogs_dashboard')).status_code, 200)
 

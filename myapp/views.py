@@ -90,19 +90,26 @@ def _menu_cost(menu: Menu, headcount: int | None) -> Decimal | None:
 
 
 def _build_week(start: date, menu_map, census_map, protein_map):
-    """protein_map: {(date, slot): protein_str}"""
-    days = [start + timedelta(days=i) for i in range(5)]  # Mon-Fri
+    """protein_map: {(date, slot): protein_str}.
+    Sean 2026-05-03: now Mon-Sun (7 days). Sat/Sun serve lunch+dinner
+    only — breakfast cells are flagged is_no_service so the template
+    can render them as "—" / disabled instead of an empty placeholder
+    that looks like a missing menu."""
+    from .calendar_utils import served_slots_for
+    days = [start + timedelta(days=i) for i in range(7)]
     rows = []
     for slot_key, slot_label in MEAL_SLOT_LABELS:
         cells = []
         for day in days:
+            no_service = slot_key not in served_slots_for(day)
             menu = menu_map.get((day, slot_key))
             census = census_map.get(day)
             headcount = census.headcount if census else None
             cost = _menu_cost(menu, headcount) if menu else None
             conflicts = _menu_conflict_set(menu) if menu else []
             cell = {'date': day, 'slot': slot_key, 'menu': menu, 'warnings': [],
-                    'cost': cost, 'menu_conflicts': conflicts}
+                    'cost': cost, 'menu_conflicts': conflicts,
+                    'is_no_service': no_service}
             if menu:
                 mine = protein_map.get((day, slot_key), '')
                 if mine:
@@ -143,13 +150,17 @@ def _build_week(start: date, menu_map, census_map, protein_map):
         'census': census_map.get(d),
         'cost':   day_totals[i],
     } for i, d in enumerate(days)]
-    # Per-day stack for mobile layout: each day gets all 4 meal slots inline
+    # Per-day stack for mobile layout: each day gets its served meal slots inline.
+    # Weekends (Sat/Sun) skip breakfast slots — cleaner card UI.
     mobile_days = []
     for i, d in enumerate(days):
-        mobile_days.append({
-            'header': day_headers[i],
-            'slots':  [(row['slot_label'], row['cells'][i]) for row in rows],
-        })
+        slots = []
+        for row in rows:
+            cell = row['cells'][i]
+            if cell.get('is_no_service'):
+                continue
+            slots.append((row['slot_label'], cell))
+        mobile_days.append({'header': day_headers[i], 'slots': slots})
     return {'start': start, 'day_headers': day_headers, 'rows': rows,
             'mobile_days': mobile_days, 'week_total': week_total}
 

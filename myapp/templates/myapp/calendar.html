@@ -50,8 +50,12 @@
         <tr class="hover:bg-slate-50">
           <th class="p-2 text-xs font-semibold text-slate-600 text-left border-b border-r bg-slate-50">{{ row.slot_label }}</th>
           {% for cell in row.cells %}
-          <td class="p-2 border-b align-top {% if cell.date == today %}bg-amber-50/50{% endif %}">
-            {% include "myapp/_cell_content.html" with cell=cell %}
+          <td class="p-2 border-b align-top {% if cell.date == today %}bg-amber-50/50{% endif %} {% if cell.is_no_service %}bg-slate-100 text-slate-400{% endif %}">
+            {% if cell.is_no_service %}
+              <div class="text-center text-xs text-slate-400">— no service —</div>
+            {% else %}
+              {% include "myapp/_cell_content.html" with cell=cell %}
+            {% endif %}
           </td>
           {% endfor %}
         </tr>
@@ -61,7 +65,7 @@
       <tfoot>
         <tr class="bg-slate-50 border-t-2 border-slate-300">
           <th class="p-2 text-xs font-semibold text-slate-600 text-right">Week total</th>
-          <td colspan="5" class="p-2 text-sm font-mono text-emerald-700 font-semibold">
+          <td colspan="7" class="p-2 text-sm font-mono text-emerald-700 font-semibold">
             ${{ week.week_total|floatformat:2 }}
             <span class="text-xs text-slate-500 ml-2">priced portions only</span>
           </td>
