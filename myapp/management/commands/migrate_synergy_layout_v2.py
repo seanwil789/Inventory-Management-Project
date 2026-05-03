@@ -106,6 +106,39 @@ class Command(BaseCommand):
         for tab, sheet_id in targets:
             self.stdout.write(self.style.MIGRATE_HEADING(f'\n--- {tab} ---'))
 
+            # Step 0: force col F to NUMBER format. Sheets auto-detects
+            # bare numbers like "24" as dates ("1/23" = Jan 23) when the
+            # column was previously holding strings like "24/1LB". Pinning
+            # the format prevents that interpretation regardless of what
+            # gets written.
+            if apply_writes:
+                try:
+                    client.batchUpdate(
+                        spreadsheetId=SPREADSHEET_ID,
+                        body={'requests': [{
+                            'repeatCell': {
+                                'range': {
+                                    'sheetId': sheet_id,
+                                    'startRowIndex': 1,
+                                    'startColumnIndex': 5,
+                                    'endColumnIndex': 6,
+                                },
+                                'cell': {
+                                    'userEnteredFormat': {
+                                        'numberFormat': {
+                                            'type': 'NUMBER',
+                                            'pattern': '0',
+                                        }
+                                    }
+                                },
+                                'fields': 'userEnteredFormat.numberFormat',
+                            }
+                        }]}
+                    ).execute()
+                    self.stdout.write('  [0/5] Col F format → NUMBER (integer)')
+                except Exception as e:
+                    self.stderr.write(f'  [!] format request failed: {e}')
+
             # Step 1: insert column at position H (index 7, 0-based)
             if not skip_insert:
                 if apply_writes:
