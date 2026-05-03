@@ -53,18 +53,24 @@ class Command(BaseCommand):
                 n_skipped += 1
                 continue
 
-            rounded = round(ratio)
+            # Snap to integer with two acceptance bands:
+            # 1. Standard: |ratio - round(ratio)| ≤ tol (default 0.05)
+            # 2. Discount band: fractional part ≥ 0.93 → snap UP to ceiling
+            #    (Farm Art's ~1% discount makes qty=N show as ratio ~N-0.05)
+            from math import floor, ceil
+            frac = ratio - floor(ratio)
+            if frac >= 0.93:
+                rounded = ceil(ratio)
+            elif frac <= tol:
+                rounded = floor(ratio) if floor(ratio) >= 1 else 1
+            elif abs(ratio - round(ratio)) <= tol:
+                rounded = round(ratio)
+            else:
+                skip_reasons['not_integer'] += 1
+                n_skipped += 1
+                continue
             if rounded < 1:
-                rounded = 1  # 0.99 → 1
-            if abs(ratio - rounded) > tol:
-                # Not close enough to an integer
-                # Allow 0.95-1.05 → 1 specifically (the discount band)
-                if 0.95 <= ratio < 1.05:
-                    rounded = 1
-                else:
-                    skip_reasons['not_integer'] += 1
-                    n_skipped += 1
-                    continue
+                rounded = 1
 
             if apply_writes:
                 ili.quantity = Decimal(str(rounded))
