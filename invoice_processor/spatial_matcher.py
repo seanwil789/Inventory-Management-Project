@@ -299,6 +299,42 @@ def _extract_row_item(row: list[dict], anchor: dict,
     return item
 
 
+# ── Line-item math validation helper (Sean 2026-05-03) ─────────────────────
+#
+# Per Sean's completeness LAW: validate every parsed line. qty × unit_price
+# should ≈ extended_amount within tolerance. When math fails, surface the
+# anomaly so it can be audited (real billing variance, parser bug, OCR
+# misread). This helper is vendor-agnostic — call from each match_*_spatial
+# function with the extracted (qty, unit_price, extended) triple.
+#
+# Returns dict with diagnostic info (also logs to stdout when anomaly found).
+
+def _validate_line_math(vendor: str, description: str,
+                         qty: float, unit_price: float, extended: float,
+                         tolerance_pct: float = 5.0,
+                         tolerance_abs: float = 2.0) -> dict:
+    """Check qty × unit_price ≈ extended. Log anomaly when both >tolerance_pct
+    AND >tolerance_abs (avoids noise on rounding/discount under either bar).
+
+    Returns {ok: bool, diff_pct: float, diff_abs: float, expected: float}.
+    """
+    if not (qty and unit_price and extended) or qty <= 0 or unit_price <= 0:
+        return {'ok': True, 'diff_pct': 0, 'diff_abs': 0, 'expected': 0}
+    expected = qty * unit_price
+    if expected <= 0:
+        return {'ok': True, 'diff_pct': 0, 'diff_abs': 0, 'expected': 0}
+    diff_abs = abs(extended - expected)
+    diff_pct = diff_abs / expected * 100
+    ok = not (diff_pct > tolerance_pct and diff_abs > tolerance_abs)
+    if not ok:
+        print(f"  [!] {vendor} line-math anomaly: {description[:40]!r} "
+              f"qty={qty} × unit_price=${unit_price:.2f} = ${expected:.2f} "
+              f"but extended=${extended:.2f} "
+              f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
+    return {'ok': ok, 'diff_pct': diff_pct, 'diff_abs': diff_abs,
+            'expected': expected}
+
+
 def match_sysco_spatial(pages: list[dict]) -> list[dict]:
     """Extract Sysco invoice items from per-page bounding-box layout.
 
@@ -327,6 +363,13 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
             sec_clean = re.sub(r'[*\s]+', ' ', sec).strip()
             item = _extract_row_item(row, anchor, sec_clean)
             if item:
+                # Validate qty × unit_price ≈ extended (vendor-agnostic check)
+                _validate_line_math(
+                    'Sysco', item.get('raw_description', ''),
+                    item.get('quantity') or 0,
+                    item.get('unit_price') or 0,
+                    item.get('extended_amount') or 0,
+                )
                 items.append(item)
     return items
 
@@ -428,6 +471,12 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
             }
             if qty is not None:
                 item["quantity"] = qty
+            _validate_line_math(
+                'PBM', item.get('raw_description', ''),
+                item.get('quantity') or 0,
+                item.get('unit_price') or 0,
+                item.get('extended_amount') or 0,
+            )
             items.append(item)
     return items
 
@@ -556,6 +605,16 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
                     item["count_per_lb_high"] = cpl[1]
             except Exception:
                 pass
+            # Validate qty × unit_price ≈ extended. Note: Exceptional sets
+            # unit_price=extended for catch-weight rows (item totals match
+            # by design); validation will pass trivially in those cases.
+            # For non-catch-weight per-CASE rows it does the real check.
+            _validate_line_math(
+                'Exceptional', item.get('raw_description', ''),
+                item.get('quantity') or 0,
+                item.get('unit_price') or 0,
+                item.get('extended_amount') or 0,
+            )
             items.append(item)
     return items
 
@@ -630,7 +689,7 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
 
             # Phase 2 polish: Delaware items are sold per-piece (towels,
             # mops, aprons billed by count). Default purchase_uom='EA'.
-            items.append({
+            del_item = {
                 "raw_description": description,
                 "sysco_item_code": "",
                 "unit_price": unit_price,
@@ -640,7 +699,11 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
                 "quantity": qty,
                 "purchase_uom": "EA",
                 "unit_of_measure": "EA",
-            })
+            }
+            _validate_line_math(
+                'Delaware', description, qty, unit_price, amount,
+            )
+            items.append(del_item)
     return items
 
 
