@@ -10848,3 +10848,154 @@ class MigrateNegativeMatchesTests(TestCase):
             self.assertEqual(count_before, count_after)
         finally:
             import os; os.unlink(path)
+
+
+class ImportVendorPriceListTests(TestCase):
+    """Sean 2026-05-05: ingest vendor order-guide CSV → VendorPriceList rows."""
+
+    def setUp(self):
+        from myapp.models import Vendor
+        self.v, _ = Vendor.objects.get_or_create(name='Farm Art')
+
+    def _write_csv(self, rows, header=None):
+        import tempfile, csv, os
+        header = header or ['Item Number', 'Display Name', 'Unit', 'Price']
+        fd, path = tempfile.mkstemp(suffix='.csv')
+        with os.fdopen(fd, 'w', newline='') as f:
+            w = csv.writer(f)
+            w.writerow(header)
+            for r in rows:
+                w.writerow(r)
+        return path
+
+    def _run(self, csv_path, *args, vendor='Farm Art'):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('import_vendor_price_list',
+                     '--vendor', vendor, '--csv', csv_path, *args,
+                     stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_creates_nothing(self):
+        from myapp.models import VendorPriceList
+        path = self._write_csv([['EGS', 'EGGPLANT, 22 LB', 'CASE', '37.50']])
+        try:
+            out = self._run(path)
+            self.assertIn('Dry-run', out)
+            self.assertEqual(VendorPriceList.objects.count(), 0)
+        finally:
+            import os; os.unlink(path)
+
+    def test_apply_creates_row(self):
+        from myapp.models import VendorPriceList
+        from decimal import Decimal
+        path = self._write_csv([['EGS', 'EGGPLANT, 22 LB', 'CASE', '37.50']])
+        try:
+            self._run(path, '--apply', '--ach-discount', '0.01')
+            entry = VendorPriceList.objects.get(vendor=self.v, sku='EGS', unit='CASE')
+            self.assertEqual(entry.list_price, Decimal('37.50'))
+            self.assertEqual(entry.ach_discount_pct, Decimal('0.0100'))
+            self.assertEqual(entry.ach_price, Decimal('37.1250'))
+            self.assertEqual(entry.raw_description, 'EGGPLANT, 22 LB')
+        finally:
+            import os; os.unlink(path)
+
+    def test_multiple_units_per_sku(self):
+        """Same SKU at CASE / HALF_CASE / LB → 3 separate rows."""
+        from myapp.models import VendorPriceList
+        path = self._write_csv([
+            ['EGS', 'EGGPLANT, 22 LB', 'CASE', '37.50'],
+            ['EGS', 'EGGPLANT, 22 LB', 'HALF_CASE', '23.80'],
+            ['EGS', 'EGGPLANT, 22 LB', 'LB', '2.80'],
+        ])
+        try:
+            self._run(path, '--apply')
+            entries = VendorPriceList.objects.filter(vendor=self.v, sku='EGS')
+            self.assertEqual(entries.count(), 3)
+            units = sorted(entries.values_list('unit', flat=True))
+            self.assertEqual(units, ['CASE', 'HALF_CASE', 'LB'])
+        finally:
+            import os; os.unlink(path)
+
+    def test_idempotent_reapply(self):
+        from myapp.models import VendorPriceList
+        path = self._write_csv([['EGS', 'EGGPLANT', 'CASE', '37.50']])
+        try:
+            self._run(path, '--apply')
+            count_before = VendorPriceList.objects.count()
+            out = self._run(path, '--apply')
+            count_after = VendorPriceList.objects.count()
+            self.assertEqual(count_before, count_after)
+            self.assertIn('unchanged:   1', out)
+        finally:
+            import os; os.unlink(path)
+
+    def test_price_change_updates_row(self):
+        from myapp.models import VendorPriceList
+        from decimal import Decimal
+        path1 = self._write_csv([['EGS', 'EGGPLANT', 'CASE', '37.50']])
+        path2 = self._write_csv([['EGS', 'EGGPLANT', 'CASE', '40.00']])
+        try:
+            self._run(path1, '--apply')
+            self._run(path2, '--apply')
+            entry = VendorPriceList.objects.get(vendor=self.v, sku='EGS', unit='CASE')
+            self.assertEqual(entry.list_price, Decimal('40.00'))
+            self.assertEqual(VendorPriceList.objects.count(), 1)  # updated, not duplicated
+        finally:
+            import os; os.unlink(path1); os.unlink(path2)
+
+    def test_stale_entries_retained(self):
+        """SKUs in DB but not in current CSV are reported, not deleted."""
+        from myapp.models import VendorPriceList
+        path1 = self._write_csv([
+            ['EGS', 'EGGPLANT', 'CASE', '37.50'],
+            ['CAU', 'CAULIFLOWER', 'CASE', '77.50'],
+        ])
+        path2 = self._write_csv([['EGS', 'EGGPLANT', 'CASE', '37.50']])  # no CAU
+        try:
+            self._run(path1, '--apply')
+            out = self._run(path2, '--apply')
+            self.assertIn('stale (in DB, not in CSV): 1', out)
+            self.assertEqual(VendorPriceList.objects.count(), 2)  # CAU retained
+        finally:
+            import os; os.unlink(path1); os.unlink(path2)
+
+    def test_unknown_vendor_raises(self):
+        from django.core.management.base import CommandError
+        path = self._write_csv([['EGS', 'EGGPLANT', 'CASE', '37.50']])
+        try:
+            with self.assertRaises(CommandError):
+                self._run(path, vendor='NoSuchVendor')
+        finally:
+            import os; os.unlink(path)
+
+    def test_missing_csv_raises(self):
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError):
+            self._run('/nonexistent/path.csv')
+
+    def test_bad_column_raises_with_message(self):
+        from django.core.management.base import CommandError
+        path = self._write_csv([['x', 'y', 'z']],
+                               header=['SKU', 'Desc', 'Cost'])  # missing Unit
+        try:
+            with self.assertRaises(CommandError) as ctx:
+                self._run(path, '--apply')
+            self.assertIn('missing columns', str(ctx.exception))
+        finally:
+            import os; os.unlink(path)
+
+    def test_skips_rows_with_missing_fields(self):
+        from myapp.models import VendorPriceList
+        path = self._write_csv([
+            ['EGS', 'EGGPLANT', 'CASE', '37.50'],
+            ['', 'NO SKU', 'CASE', '10.00'],            # skipped
+            ['ABC', '', 'CASE', '5.00'],                  # skipped
+            ['DEF', 'OK', 'CASE', 'not-a-number'],        # skipped
+        ])
+        try:
+            self._run(path, '--apply')
+            self.assertEqual(VendorPriceList.objects.count(), 1)
+        finally:
+            import os; os.unlink(path)

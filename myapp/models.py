@@ -1050,3 +1050,58 @@ class StandardPortionReference(models.Model):
 # ProductMappingProposal (status='rejected' + source='drift_audit').
 # The previous CanonicalDriftRejection model was load-bearing for ~30
 # minutes between phase 1 of the unification and this retirement.
+
+
+class VendorPriceList(models.Model):
+    """Vendor-quoted list price for a SKU at a given order unit.
+
+    Sourced from vendor-distributed order guides (e.g. Farm Art's default
+    order guide CSV). Distinct from `ProductMapping` — this captures
+    PRICE per unit, not raw_description → canonical Product mapping.
+    Same SKU can appear at multiple units (CASE / HALF_CASE / EACH / LB)
+    with different list prices, exposing the vendor's sub-case premium.
+
+    Companion to ProductMapping for cost-calc + price-audit:
+        ProductMapping → which Product is this SKU?
+        VendorPriceList → what does this SKU cost per unit?
+
+    `ach_discount_pct` captures vendor-specific payment-method discount
+    (Farm Art applies 1% for ACH); `ach_price` is computed at read time.
+    `captured_at` lets future re-ingests track price drift over time
+    (current model overwrites on (vendor, sku, unit) — promote to
+    historical-mode by adding captured_at to unique_together).
+    """
+    vendor          = models.ForeignKey(Vendor, on_delete=models.CASCADE,
+                                        related_name='price_list_entries')
+    sku             = models.CharField(max_length=40, db_index=True,
+                                       help_text="Vendor's SKU code (e.g. 'EGS', 'ID12')")
+    raw_description = models.CharField(max_length=500,
+                                       help_text="Vendor's display name; matches "
+                                                 "ProductMapping.description on invoices")
+    unit            = models.CharField(max_length=30,
+                                       help_text="Order unit: CASE / HALF_CASE / EACH / "
+                                                 "LB / BAG / BOX / FLAT / BUSHEL / KILOGRAM "
+                                                 "/ GALLON / CLAMSHELL_BOX / UNIT / etc. "
+                                                 "Vendor-specific vocabulary.")
+    list_price      = models.DecimalField(max_digits=8, decimal_places=2)
+    ach_discount_pct = models.DecimalField(max_digits=5, decimal_places=4,
+                                           default=0,
+                                           help_text="Decimal e.g. 0.01 = 1% ACH discount.")
+    captured_at     = models.DateField(help_text="Date the source order guide was captured.")
+    source_file     = models.CharField(max_length=200, blank=True)
+
+    class Meta:
+        constraints = [
+            models.UniqueConstraint(fields=['vendor', 'sku', 'unit'],
+                                    name='uniq_vendor_sku_unit'),
+        ]
+        indexes = [models.Index(fields=['vendor', 'sku'])]
+        ordering = ['vendor', 'sku', 'unit']
+
+    @property
+    def ach_price(self):
+        """List price × (1 - ach_discount_pct). The price Sean pays per unit."""
+        return self.list_price * (1 - self.ach_discount_pct)
+
+    def __str__(self):
+        return f"{self.vendor.name}/{self.sku}/{self.unit} ${self.list_price}"
