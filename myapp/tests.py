@@ -10999,3 +10999,97 @@ class ImportVendorPriceListTests(TestCase):
             self.assertEqual(VendorPriceList.objects.count(), 1)
         finally:
             import os; os.unlink(path)
+
+
+class AuditVendorPriceDriftTests(TestCase):
+    """Sean 2026-05-05: ILI unit_price vs VendorPriceList list_price audit."""
+
+    def setUp(self):
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import Vendor, Product, VendorPriceList
+        self.vendor, _ = Vendor.objects.get_or_create(name='Farm Art')
+        self.eggplant = Product.objects.create(canonical_name='Eggplant',
+                                                category='Produce')
+        # 3-tier price catalog: CASE, HALF_CASE, LB
+        for unit, price in [('CASE', '37.50'), ('HALF_CASE', '23.80'), ('LB', '2.80')]:
+            VendorPriceList.objects.create(
+                vendor=self.vendor, sku='EGS',
+                raw_description='EGGPLANT, SICILIAN, 22 LB',
+                unit=unit, list_price=Decimal(price),
+                ach_discount_pct=Decimal('0.01'),
+                captured_at=date(2026, 5, 5),
+            )
+
+    def _ili(self, raw_desc, unit_price, days_ago=5):
+        from datetime import date, timedelta
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        return InvoiceLineItem.objects.create(
+            vendor=self.vendor, product=self.eggplant,
+            raw_description=raw_desc,
+            unit_price=Decimal(str(unit_price)),
+            invoice_date=date.today() - timedelta(days=days_ago),
+            source_file='test.jpg',
+        )
+
+    def _run(self, *args, vendor='Farm Art'):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('audit_vendor_price_drift', '--vendor', vendor, *args, stdout=out)
+        return out.getvalue()
+
+    def test_aligned_when_actual_matches_expected_within_tolerance(self):
+        # CASE list $37.50 × 0.99 ACH = $37.125 expected
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('37.13'))
+        out = self._run('--days', '30')
+        self.assertIn('aligned         : 1', out)
+        self.assertIn('off (drift)     : 0', out)
+
+    def test_picks_closest_unit_option_among_multiple(self):
+        # Should match the LB tier ($2.80 × 0.99 = $2.772), not CASE/HALF_CASE
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('2.77'))
+        out = self._run('--days', '30')
+        self.assertIn('aligned         : 1', out)
+
+    def test_off_when_actual_diverges_beyond_tolerance(self):
+        # $50 doesn't match any of CASE/HALF_CASE/LB after ACH
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('50.00'))
+        out = self._run('--days', '30', '--tolerance', '0.02')
+        self.assertIn('off (drift)     : 1', out)
+
+    def test_no_match_when_raw_desc_not_in_price_list(self):
+        from decimal import Decimal
+        self._ili('UNKNOWN ITEM 12 LB', Decimal('10.00'))
+        out = self._run('--days', '30')
+        self.assertIn('no SKU in list  : 1', out)
+
+    def test_window_filter_excludes_old_ilis(self):
+        # ILI from 60 days ago, looking back only 30 days
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('2.77'), days_ago=60)
+        out = self._run('--days', '30')
+        self.assertIn('ILIs analyzed:    0', out)
+
+    def test_skips_zero_priced_ilis(self):
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('0'))
+        out = self._run('--days', '30')
+        self.assertIn('ILIs analyzed:    0', out)
+
+    def test_unknown_vendor_raises(self):
+        from django.core.management.base import CommandError
+        with self.assertRaises(CommandError):
+            self._run(vendor='NoSuchVendor')
+
+    def test_no_pricelist_raises(self):
+        from django.core.management.base import CommandError
+        from myapp.models import Vendor
+        Vendor.objects.create(name='Empty Vendor')
+        with self.assertRaises(CommandError) as ctx:
+            self._run(vendor='Empty Vendor')
+        self.assertIn('No VendorPriceList', str(ctx.exception))
