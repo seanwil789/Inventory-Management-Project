@@ -11021,14 +11021,20 @@ class AuditVendorPriceDriftTests(TestCase):
                 captured_at=date(2026, 5, 5),
             )
 
-    def _ili(self, raw_desc, unit_price, days_ago=5):
+    def _ili(self, raw_desc, unit_price, qty=1, ext=None, days_ago=5):
+        """Create an ILI. Defaults: qty=1, ext=qty*unit_price (math_holds)."""
         from datetime import date, timedelta
         from decimal import Decimal
         from myapp.models import InvoiceLineItem
+        up = Decimal(str(unit_price))
+        if ext is None:
+            ext = Decimal(str(qty)) * up
         return InvoiceLineItem.objects.create(
             vendor=self.vendor, product=self.eggplant,
             raw_description=raw_desc,
-            unit_price=Decimal(str(unit_price)),
+            unit_price=up,
+            extended_amount=Decimal(str(ext)),
+            quantity=Decimal(str(qty)),
             invoice_date=date.today() - timedelta(days=days_ago),
             source_file='test.jpg',
         )
@@ -11041,35 +11047,35 @@ class AuditVendorPriceDriftTests(TestCase):
         return out.getvalue()
 
     def test_aligned_when_actual_matches_expected_within_tolerance(self):
-        # CASE list $37.50 × 0.99 ACH = $37.125 expected
+        # CASE list $37.50 × 0.99 ACH = $37.125 expected; qty=1 so math_holds
         from decimal import Decimal
         self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('37.13'))
         out = self._run('--days', '30')
-        self.assertIn('aligned         : 1', out)
-        self.assertIn('off (drift)     : 0', out)
+        self.assertIn('aligned                 :    1', out)
+        self.assertIn('drift                   :    0', out)
+        self.assertIn('math_holds              :    1', out)
 
     def test_picks_closest_unit_option_among_multiple(self):
         # Should match the LB tier ($2.80 × 0.99 = $2.772), not CASE/HALF_CASE
         from decimal import Decimal
         self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('2.77'))
         out = self._run('--days', '30')
-        self.assertIn('aligned         : 1', out)
+        self.assertIn('aligned                 :    1', out)
 
     def test_off_when_actual_diverges_beyond_tolerance(self):
         # $50 doesn't match any of CASE/HALF_CASE/LB after ACH
         from decimal import Decimal
         self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('50.00'))
         out = self._run('--days', '30', '--tolerance', '0.02')
-        self.assertIn('off (drift)     : 1', out)
+        self.assertIn('drift                   :    1', out)
 
     def test_no_match_when_raw_desc_not_in_price_list(self):
         from decimal import Decimal
         self._ili('UNKNOWN ITEM 12 LB', Decimal('10.00'))
         out = self._run('--days', '30')
-        self.assertIn('no SKU in list  : 1', out)
+        self.assertIn('no_csv                  :    1', out)
 
     def test_window_filter_excludes_old_ilis(self):
-        # ILI from 60 days ago, looking back only 30 days
         from decimal import Decimal
         self._ili('EGGPLANT, SICILIAN, 22 LB', Decimal('2.77'), days_ago=60)
         out = self._run('--days', '30')
@@ -11093,6 +11099,42 @@ class AuditVendorPriceDriftTests(TestCase):
         with self.assertRaises(CommandError) as ctx:
             self._run(vendor='Empty Vendor')
         self.assertIn('No VendorPriceList', str(ctx.exception))
+
+    # New: math-pattern classification
+
+    def test_classifies_parser_suspect_qty_gt_1_up_eq_ext(self):
+        # qty=4 bags, up=$10.69 = ext (parser bug pattern). Real per-unit $2.67.
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB',
+                  unit_price=Decimal('10.69'), qty=4, ext=Decimal('10.69'))
+        out = self._run('--days', '30')
+        self.assertIn('parser_suspect          :    1', out)
+
+    def test_classifies_ach_holds_when_ext_is_99pct_of_qty_times_up(self):
+        # qty=2, up=$10, ext=$19.80 = 2*10*0.99 — ACH applied at line level
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB',
+                  unit_price=Decimal('10.00'), qty=2, ext=Decimal('19.80'))
+        out = self._run('--days', '30')
+        self.assertIn('ach_holds               :    1', out)
+
+    def test_classifies_qty_anomaly_for_2x_ratio(self):
+        # qty=1, up=$10, ext=$20 — ratio 2.0, qty captured at half real
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB',
+                  unit_price=Decimal('10.00'), qty=1, ext=Decimal('20.00'))
+        out = self._run('--days', '30')
+        self.assertIn('qty_anomaly             :    1', out)
+
+    def test_top_drift_surfaces_drift_in_math_holds(self):
+        # math_holds row at +233% drift should appear in top drift
+        # qty=1, up=$3.00, ext=$3.00; CSV LB at $0.90
+        from decimal import Decimal
+        self._ili('EGGPLANT, SICILIAN, 22 LB', unit_price=Decimal('3.00'))
+        out = self._run('--days', '30', '--threshold', '0.15')
+        self.assertIn('Top', out)
+        # Either show in top-drift list OR drift bucket > 0
+        self.assertIn('drift                   :    1', out)
 
 
 class NormalizeDescTests(TestCase):
@@ -11165,6 +11207,8 @@ class NormalizeDescTests(TestCase):
             vendor=vendor, product=prod,
             raw_description='PEPPERS , RED , 11 # X FANCY',  # OCR form
             unit_price=Decimal('32.18'),  # = $32.50 × 0.99
+            extended_amount=Decimal('32.18'),
+            quantity=Decimal('1'),
             invoice_date=date.today() - timedelta(days=5),
             source_file='test.jpg',
         )
@@ -11172,5 +11216,5 @@ class NormalizeDescTests(TestCase):
         call_command('audit_vendor_price_drift', '--vendor', 'Farm Art',
                      '--days', '30', stdout=out)
         out_str = out.getvalue()
-        self.assertIn('aligned         : 1', out_str)
-        self.assertIn('no SKU in list  : 0', out_str)
+        self.assertIn('aligned                 :    1', out_str)
+        self.assertIn('no_csv                  :    0', out_str)
