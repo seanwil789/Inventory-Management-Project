@@ -11093,3 +11093,84 @@ class AuditVendorPriceDriftTests(TestCase):
         with self.assertRaises(CommandError) as ctx:
             self._run(vendor='Empty Vendor')
         self.assertIn('No VendorPriceList', str(ctx.exception))
+
+
+class NormalizeDescTests(TestCase):
+    """The normalization helper that absorbs OCR-spacing + vendor annotations."""
+
+    def _norm(self, s):
+        from myapp.management.commands.audit_vendor_price_drift import normalize_desc
+        return normalize_desc(s)
+
+    def test_collapses_ocr_spacing_around_commas(self):
+        self.assertEqual(
+            self._norm('PEPPERS , RED , 11 # X FANCY'),
+            self._norm('PEPPERS, RED, 11# X FANCY'),
+        )
+
+    def test_collapses_spacing_around_periods_and_slashes(self):
+        self.assertEqual(
+            self._norm('DAIRY MILK 2% , 4 / 1 - GAL'),
+            self._norm('DAIRY MILK 2%, 4/1-GAL'),
+        )
+
+    def test_strips_local_annotation(self):
+        self.assertEqual(
+            self._norm('DAIRY MILK 2%, 4/1-GAL *LOCAL'),
+            self._norm('DAIRY MILK 2%, 4/1-GAL'),
+        )
+
+    def test_strips_no_split_annotation(self):
+        self.assertEqual(
+            self._norm('CARROTS, JUMBO, 50 LB **NO SPLIT'),
+            self._norm('CARROTS, JUMBO, 50 LB'),
+        )
+
+    def test_strips_no_half_cases_annotation(self):
+        self.assertEqual(
+            self._norm('MELONS, HONEYDEWS, JUMBO 5CT. * NO HALF CASES'),
+            self._norm('MELONS, HONEYDEWS, JUMBO 5CT.'),
+        )
+
+    def test_idempotent(self):
+        s = 'PEPPERS, RED, 11# X FANCY'
+        self.assertEqual(self._norm(s), self._norm(self._norm(s)))
+
+    def test_handles_empty(self):
+        self.assertEqual(self._norm(''), '')
+        self.assertEqual(self._norm(None), '')
+
+    def test_audit_resolves_ocr_spaced_ili(self):
+        """End-to-end: OCR-spaced ILI raw_description matches CSV-canonical
+        VendorPriceList entry via normalization."""
+        from datetime import date, timedelta
+        from decimal import Decimal
+        from myapp.models import (Vendor, Product, VendorPriceList,
+                                   InvoiceLineItem)
+        from io import StringIO
+        from django.core.management import call_command
+
+        vendor, _ = Vendor.objects.get_or_create(name='Farm Art')
+        prod = Product.objects.create(canonical_name='Bell Pepper, Red',
+                                      category='Produce')
+        VendorPriceList.objects.create(
+            vendor=vendor, sku='PR11',
+            raw_description='PEPPERS, RED, 11# X FANCY',  # CSV form
+            unit='CASE', list_price=Decimal('32.50'),
+            ach_discount_pct=Decimal('0.01'),
+            captured_at=date(2026, 5, 5),
+        )
+        # ILI with OCR-spaced description — common DocAI artifact
+        InvoiceLineItem.objects.create(
+            vendor=vendor, product=prod,
+            raw_description='PEPPERS , RED , 11 # X FANCY',  # OCR form
+            unit_price=Decimal('32.18'),  # = $32.50 × 0.99
+            invoice_date=date.today() - timedelta(days=5),
+            source_file='test.jpg',
+        )
+        out = StringIO()
+        call_command('audit_vendor_price_drift', '--vendor', 'Farm Art',
+                     '--days', '30', stdout=out)
+        out_str = out.getvalue()
+        self.assertIn('aligned         : 1', out_str)
+        self.assertIn('no SKU in list  : 0', out_str)

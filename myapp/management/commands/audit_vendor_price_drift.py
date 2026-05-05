@@ -25,6 +25,7 @@ Usage:
     python manage.py audit_vendor_price_drift --vendor "Farm Art" --days 14
     python manage.py audit_vendor_price_drift --vendor "Farm Art" --tolerance 0.05
 """
+import re
 from datetime import date, timedelta
 from decimal import Decimal
 from collections import defaultdict
@@ -33,6 +34,43 @@ from django.core.management.base import BaseCommand, CommandError
 from django.db.models import Q
 
 from myapp.models import Vendor, InvoiceLineItem, VendorPriceList
+
+
+# Vendor-annotation suffixes the matcher should ignore. Order matters —
+# longer patterns first so e.g. "*NO SPLITS*" matches before "*NO SPLIT".
+_ANNOTATION_PATTERNS = [
+    r'\*+\s*NO\s*SPLITS?\s*\*+',     # *NO SPLITS*, **NO SPLIT**
+    r'\*+\s*NO\s*HALF\s*CASES?',     # * NO HALF CASES
+    r'\*+\s*NO\s*SPLITS?',           # *NO SPLIT, **NO SPLITS
+    r'\*+\s*LOCAL\s*\*?',            # *LOCAL, **LOCAL
+    r'"LOCAL"?',                     # "LOCAL (DocAI sometimes adds quotes)
+    r'\bNO\s*SPLITS?\b',             # bare "NO SPLIT" with no asterisk
+]
+
+
+def normalize_desc(s):
+    """Normalize a vendor description for matching.
+
+    Goal: ILI raw_description (potentially OCR-spaced or carrying
+    vendor annotation markers) should normalize to the same string as
+    the corresponding VendorPriceList.raw_description from the CSV.
+
+    Steps:
+      1. Uppercase
+      2. Strip vendor annotation suffixes (*LOCAL, *NO SPLITS, etc.)
+      3. Strip whitespace around all punctuation
+      4. Collapse multiple spaces, trim
+    """
+    if not s:
+        return ''
+    s = s.upper().strip()
+    for pat in _ANNOTATION_PATTERNS:
+        s = re.sub(pat, '', s, flags=re.IGNORECASE)
+    # Strip spaces around punctuation
+    s = re.sub(r'\s*([,./#"*()\-])\s*', r'\1', s)
+    # Collapse remaining whitespace
+    s = re.sub(r'\s+', ' ', s)
+    return s.strip(' .,*"')
 
 
 def _classify(actual, expected_options, tolerance, ach_pct):
@@ -82,14 +120,17 @@ class Command(BaseCommand):
         except Vendor.DoesNotExist:
             raise CommandError(f"Vendor not found: {opts['vendor']!r}")
 
-        # Build VendorPriceList lookup keyed on raw_description
-        # Each desc → list of (unit, expected_price)
+        # Build VendorPriceList lookup keyed on NORMALIZED raw_description
+        # so OCR-spaced ILIs ("PEPPERS , RED , 11 # X FANCY") and CSV
+        # canonicals ("PEPPERS, RED, 11# X FANCY") collide on the same key.
         price_lookup = defaultdict(list)
         ach_pct = Decimal('0')
         for entry in VendorPriceList.objects.filter(vendor=vendor):
             ach_pct = entry.ach_discount_pct  # assume uniform per vendor
             expected = entry.list_price * (1 - entry.ach_discount_pct)
-            price_lookup[entry.raw_description].append((entry.unit, expected))
+            price_lookup[normalize_desc(entry.raw_description)].append(
+                (entry.unit, expected)
+            )
 
         if not price_lookup:
             raise CommandError(f"No VendorPriceList entries for {vendor.name}. "
@@ -106,7 +147,7 @@ class Command(BaseCommand):
         # Classify
         buckets = {'aligned': [], 'ach_aligned': [], 'off': [], 'no_match': []}
         for ili in ilis:
-            opts_for_ili = price_lookup.get(ili.raw_description, [])
+            opts_for_ili = price_lookup.get(normalize_desc(ili.raw_description), [])
             best_unit, best_expected, diff_pct, cls = _classify(
                 ili.unit_price, opts_for_ili,
                 opts['tolerance'], ach_pct,
