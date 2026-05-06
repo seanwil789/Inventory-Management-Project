@@ -11378,3 +11378,203 @@ class EstimateTiltTests(TestCase):
         tilt, n = estimate_tilt(tokens)
         self.assertIsNone(tilt)
         self.assertEqual(n, 0)
+
+
+class RankPairFarmartTests(TestCase):
+    """Rank-pair v2 extraction for Farm Art invoices.
+
+    Validates the algorithm that survives sub-degree photo tilt by anchoring on
+    column-token rank rather than y-cluster. See `project_spatial_drift_finding.md`
+    for the empirical motivation.
+    """
+
+    def _tok(self, text, x, y, w=0.01, h=0.005):
+        return {'text': text,
+                'x_min': x - w / 2, 'x_max': x + w / 2,
+                'y_min': y - h / 2, 'y_max': y + h / 2}
+
+    def _build_invoice(self, lines, tilt=0.0, layout='wide',
+                       desc_words_per_row=None):
+        """Synthesize a Farm Art invoice with N line items.
+
+        Args:
+            lines: list of (qty, unit_price, ext_amount, desc_str)
+            tilt: y-shift between qty column and price columns. 0 = no tilt;
+                positive = price columns y-shifted DOWN relative to qty (typical
+                photo tilt direction).
+            layout: 'wide' (qty=0.07, unit=0.85, ext=0.95 — 2/6 layout) or
+                    'narrow' (qty=0.07, unit=0.77, ext=0.85 — 3/6 layout).
+        """
+        if layout == 'wide':
+            x_qty, x_unit, x_ext = 0.07, 0.85, 0.95
+        else:
+            x_qty, x_unit, x_ext = 0.07, 0.77, 0.85
+        x_desc_start = 0.20
+        tokens = []
+        # Pad token count so detect_layout_farmart has enough signal:
+        # need >= 3 qty tokens AND >= 4 price tokens (with > 0.6 x — both unit
+        # and ext columns satisfy that).
+        if len(lines) < 3:
+            raise ValueError("Need at least 3 lines for layout detection")
+
+        for i, (qty, unit, ext, desc) in enumerate(lines):
+            y_row = 0.20 + i * 0.025
+            tokens.append(self._tok(f"{qty:.3f}", x_qty, y_row))
+            y_price = y_row + tilt
+            tokens.append(self._tok(f"{unit:.2f}", x_unit, y_price))
+            if ext is not None:
+                tokens.append(self._tok(f"{ext:.2f}", x_ext, y_price))
+            # Description tokens — sit on the y-line interpolated from qty (low x,
+            # low y) to unit (high x, high y) under tilt.
+            words = desc.split()
+            if desc_words_per_row is not None:
+                words = words[:desc_words_per_row]
+            for j, w in enumerate(words):
+                x_word = x_desc_start + j * 0.05
+                # interpolate y between qty (xL, yL=y_row) and unit (xR, y_price)
+                interp_y = y_row + tilt * (x_word - x_qty) / (x_unit - x_qty)
+                tokens.append(self._tok(w, x_word, interp_y))
+        return [{'tokens': tokens}]
+
+    def test_detect_layout_returns_config_when_sufficient_tokens(self):
+        from invoice_processor.rank_pair import detect_layout_farmart
+        pages = self._build_invoice([
+            (1.0, 5.50, 5.45, "APPLES"),
+            (2.0, 3.10, 6.14, "BANANAS"),
+            (3.0, 2.20, 6.53, "CARROTS"),
+            (1.0, 7.80, 7.72, "DATES"),
+        ], layout='wide')
+        cfg = detect_layout_farmart(pages[0]['tokens'])
+        self.assertIsNotNone(cfg)
+        self.assertIn('qty_x', cfg)
+        self.assertIn('unit_x', cfg)
+        self.assertIn('ext_x', cfg)
+        # qty_x should bracket the qty column at 0.07
+        self.assertLess(cfg['qty_x'][0], 0.07)
+        self.assertGreater(cfg['qty_x'][1], 0.07)
+
+    def test_detect_layout_returns_none_on_thin_data(self):
+        from invoice_processor.rank_pair import detect_layout_farmart
+        # Only 1 qty + 1 price token — below threshold (need >= 3 qty)
+        tokens = [self._tok("1.000", 0.07, 0.3),
+                  self._tok("5.50", 0.85, 0.3)]
+        self.assertIsNone(detect_layout_farmart(tokens))
+
+    def test_extracts_untilted_invoice_correctly(self):
+        from invoice_processor.rank_pair import extract_farmart_rank
+        pages = self._build_invoice([
+            (1.0, 5.50, 5.45, "APPLES"),
+            (2.0, 3.10, 6.14, "BANANAS"),
+            (3.0, 2.20, 6.53, "CARROTS"),
+            (1.0, 7.80, 7.72, "DATES"),
+        ], tilt=0.0, layout='wide')
+        rows = extract_farmart_rank(pages)
+        self.assertEqual(len(rows), 4)
+        self.assertEqual(rows[0]['qty'], 1.0)
+        self.assertAlmostEqual(rows[0]['unit_price'], 5.50)
+        self.assertAlmostEqual(rows[0]['extended_amount'], 5.45)
+        self.assertEqual(rows[0]['raw_description'], "APPLES")
+        self.assertFalse(rows[0]['ambiguous'])
+
+    def test_survives_uniform_photo_tilt(self):
+        """Critical: tilt that breaks y-cluster row-binding shouldnt break rank-pair.
+
+        Tilt of -0.020 between desc and price columns is the empirical magnitude
+        observed on Farm Art 3/6 (Sean photo-verified). Y-cluster matchers bind
+        prices to row N+1 because the price column's y-shift exceeds the row
+        tolerance. Rank-pair is invariant to uniform tilt because each column's
+        rank order is preserved.
+        """
+        from invoice_processor.rank_pair import extract_farmart_rank
+        pages = self._build_invoice([
+            (1.0, 5.50, 5.45, "APPLES"),
+            (2.0, 3.10, 6.14, "BANANAS"),
+            (3.0, 2.20, 6.53, "CARROTS"),
+            (1.0, 7.80, 7.72, "DATES"),
+        ], tilt=-0.020, layout='wide')
+        rows = extract_farmart_rank(pages)
+        self.assertEqual(len(rows), 4)
+        # Each row's prices must still belong to its OWN qty + description
+        for i, expected in enumerate([
+            (1.0, 5.50, 5.45, "APPLES"),
+            (2.0, 3.10, 6.14, "BANANAS"),
+            (3.0, 2.20, 6.53, "CARROTS"),
+            (1.0, 7.80, 7.72, "DATES"),
+        ]):
+            self.assertEqual(rows[i]['qty'], expected[0])
+            self.assertAlmostEqual(rows[i]['unit_price'], expected[1])
+            self.assertAlmostEqual(rows[i]['extended_amount'], expected[2])
+            self.assertEqual(rows[i]['raw_description'], expected[3])
+
+    def test_extracts_narrow_layout_template(self):
+        """Verifies auto-layout-detection works on the second Farm Art template."""
+        from invoice_processor.rank_pair import extract_farmart_rank
+        pages = self._build_invoice([
+            (1.0, 5.50, 5.45, "APPLES"),
+            (2.0, 3.10, 6.14, "BANANAS"),
+            (3.0, 2.20, 6.53, "CARROTS"),
+            (1.0, 7.80, 7.72, "DATES"),
+        ], tilt=-0.015, layout='narrow')
+        rows = extract_farmart_rank(pages)
+        self.assertEqual(len(rows), 4)
+        self.assertAlmostEqual(rows[0]['unit_price'], 5.50)
+        self.assertEqual(rows[0]['raw_description'], "APPLES")
+
+    def test_ambiguous_flag_fires_on_wide_description_spread(self):
+        """A row whose description y-spread exceeds 1.5x tolerance gets flagged."""
+        from invoice_processor.rank_pair import extract_farmart_rank
+        pages = self._build_invoice([
+            (1.0, 5.50, 5.45, "APPLES"),
+            (2.0, 3.10, 6.14, "BANANAS"),
+            (3.0, 2.20, 6.53, "CARROTS"),
+        ], tilt=0.0, layout='wide')
+        # Inject a stray description token at a y far from any row's interp line.
+        pages[0]['tokens'].append(self._tok("STRAY", 0.40, 0.215))
+        rows = extract_farmart_rank(pages)
+        self.assertEqual(len(rows), 3)
+        # Row 0 sits at y≈0.20; the stray at 0.215 is 0.015 away — outside the
+        # 0.008 desc tolerance, so it is NOT picked up at all. Confirm row 0
+        # is unambiguous and STRAY isn't in its description.
+        self.assertFalse(rows[0]['ambiguous'])
+        self.assertNotIn("STRAY", rows[0]['raw_description'])
+
+    def test_ext_picker_skips_savings_column_at_different_y(self):
+        """Savings/discount column (right of ext) often shows $0.00 on a parallel
+        y sub-line. The ext picker must not pair to those tokens.
+        """
+        from invoice_processor.rank_pair import extract_farmart_rank
+        pages = self._build_invoice([
+            (1.0, 5.50, 5.45, "APPLES"),
+            (2.0, 3.10, 6.14, "BANANAS"),
+            (3.0, 2.20, 6.53, "CARROTS"),
+        ], tilt=0.0, layout='wide')
+        # Inject a $0.00 "savings" token for row 0 at a y far enough from row 0
+        # to test the y_tol logic. Place it 0.020 below row 0's price y — outside
+        # the 0.010 ext_y_tol.
+        pages[0]['tokens'].append(self._tok("0.00", 0.95, 0.220))
+        rows = extract_farmart_rank(pages)
+        # Row 0's ext should still be 5.45, not 0.00
+        self.assertAlmostEqual(rows[0]['extended_amount'], 5.45)
+
+    def test_returns_empty_when_layout_undetectable(self):
+        """Thin OCR cache (e.g., partial-page capture) should return [], not crash.
+        Caller falls back to legacy spatial_matcher.
+        """
+        from invoice_processor.rank_pair import extract_farmart_rank
+        # Single token — far below detect_layout's minimum
+        pages = [{'tokens': [self._tok("1.000", 0.07, 0.3)]}]
+        self.assertEqual(extract_farmart_rank(pages), [])
+
+    def test_diagnostic_summary_counts_correctly(self):
+        from invoice_processor.rank_pair import extract_farmart_rank, diagnostic_summary
+        pages = self._build_invoice([
+            (1.0, 5.50, 5.45, "APPLES"),    # 1*5.50*0.99 = 5.445 ≈ 5.45 ✓
+            (2.0, 3.10, 6.14, "BANANAS"),   # 2*3.10*0.99 = 6.138 ≈ 6.14 ✓
+            (3.0, 99.99, 6.53, "BAD"),      # 3*99.99*0.99 ≠ 6.53 ✗ (math fail)
+        ], tilt=0.0, layout='wide')
+        rows = extract_farmart_rank(pages)
+        s = diagnostic_summary(rows)
+        self.assertEqual(s['row_count'], 3)
+        self.assertEqual(s['ach_pass'], 2)
+        self.assertEqual(s['ach_fail'], 1)
+        self.assertEqual(s['ach_no_ext'], 0)
