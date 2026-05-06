@@ -462,12 +462,25 @@ class InvoiceLineItem(models.Model):
                   "'CHEMICAL & JANITORIAL'). Used to categorize unknown-code "
                   "rows where the OCR dropped the description column.",
     )
+    # Self-healing raw descriptions architecture (`project_self_healing_raw_descriptions.md`):
+    # canonical SKU identity decoupled from historical price evidence. The FK identifies
+    # WHICH vendor catalog SKU this transaction is for; the price/qty/ext fields above
+    # remain immutable historical records of what was charged (`feedback_event_driven_pricing.md`
+    # LAW). Null when no canonical match exists yet — surfaces in mapping-review for
+    # human resolution. ON DELETE SET NULL preserves history if a catalog SKU is removed.
+    canonical_vendor_pricelist = models.ForeignKey(
+        'VendorPriceList', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='attached_invoice_lines',
+        help_text="Canonical vendor SKU this line item represents. "
+                  "Identity pointer; does NOT replace historical price fields.",
+    )
     imported_at     = models.DateTimeField(auto_now_add=True)
 
     class Meta:
         indexes = [
             models.Index(fields=['vendor', 'invoice_date']),
             models.Index(fields=['product', 'invoice_date']),
+            models.Index(fields=['canonical_vendor_pricelist', 'invoice_date']),
         ]
 
     def __str__(self):

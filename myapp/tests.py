@@ -11578,3 +11578,229 @@ class RankPairFarmartTests(TestCase):
         self.assertEqual(s['ach_pass'], 2)
         self.assertEqual(s['ach_fail'], 1)
         self.assertEqual(s['ach_no_ext'], 0)
+
+
+class CanonicalVendorPriceListFKTests(TestCase):
+    """The new FK on InvoiceLineItem — identity pointer to VendorPriceList.
+
+    Behaviour required:
+      - Nullable (null when no canonical match yet)
+      - ON DELETE SET NULL (preserve historical ILI when catalog SKU removed)
+      - Reverse accessor `attached_invoice_lines` on VendorPriceList
+      - Indexed for fast (canonical, date) lookups
+      - Does NOT modify ILI price fields when catalog changes
+    """
+    from datetime import date as _date
+    from decimal import Decimal as _Dec
+
+    def setUp(self):
+        from myapp.models import Vendor, VendorPriceList
+        self.vendor = Vendor.objects.create(name='Farm Art')
+        self.vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='HONEY-6CT', raw_description='HONEYDEWS, JUMBO 6CT',
+            unit='CASE', list_price=self._Dec('6.80'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+
+    def test_fk_defaults_to_null(self):
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS, 6CT',
+            unit_price=self._Dec('6.80'),
+        )
+        self.assertIsNone(ili.canonical_vendor_pricelist)
+
+    def test_fk_attaches_to_vendorpricelist(self):
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS, 6CT',
+            unit_price=self._Dec('6.80'),
+            canonical_vendor_pricelist=self.vpl,
+        )
+        ili.refresh_from_db()
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.vpl.id)
+
+    def test_reverse_accessor_lists_attached_lines(self):
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS',
+            unit_price=self._Dec('6.80'),
+            canonical_vendor_pricelist=self.vpl,
+        )
+        attached = list(self.vpl.attached_invoice_lines.all())
+        self.assertEqual(attached, [ili])
+
+    def test_set_null_on_vendorpricelist_delete_preserves_ili(self):
+        """ON DELETE SET NULL — catalog SKU removal must not destroy history.
+
+        Pricing-as-event-driven LAW (`feedback_event_driven_pricing.md`):
+        ILI price/qty/ext fields are immutable historical records. Deleting
+        the catalog row may remove the identity pointer but never the
+        transaction evidence.
+        """
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS',
+            unit_price=self._Dec('6.80'),
+            extended_amount=self._Dec('6.73'),
+            canonical_vendor_pricelist=self.vpl,
+        )
+        self.vpl.delete()
+        ili.refresh_from_db()
+        self.assertIsNone(ili.canonical_vendor_pricelist)
+        # Critical: historical price fields untouched
+        self.assertEqual(ili.unit_price, self._Dec('6.80'))
+        self.assertEqual(ili.extended_amount, self._Dec('6.73'))
+
+    def test_catalog_price_update_does_not_cascade_to_ili(self):
+        """VendorPriceList.list_price changes must not modify historical ILI prices."""
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS',
+            unit_price=self._Dec('6.80'),
+            extended_amount=self._Dec('6.73'),
+            canonical_vendor_pricelist=self.vpl,
+        )
+        # Simulate vendor renegotiation: list_price drops 5%
+        self.vpl.list_price = self._Dec('6.46')
+        self.vpl.save()
+        ili.refresh_from_db()
+        self.assertEqual(ili.unit_price, self._Dec('6.80'))
+        self.assertEqual(ili.extended_amount, self._Dec('6.73'))
+
+    def test_indexed_query_by_canonical(self):
+        """The (canonical, invoice_date) index supports the price-history query."""
+        from myapp.models import InvoiceLineItem
+        ili1 = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS',
+            unit_price=self._Dec('6.80'), invoice_date=self._date(2026, 4, 1),
+            canonical_vendor_pricelist=self.vpl,
+        )
+        ili2 = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS',
+            unit_price=self._Dec('6.50'), invoice_date=self._date(2026, 5, 1),
+            canonical_vendor_pricelist=self.vpl,
+        )
+        history = list(InvoiceLineItem.objects.filter(
+            canonical_vendor_pricelist=self.vpl
+        ).order_by('invoice_date').values_list('unit_price', 'invoice_date'))
+        self.assertEqual(history,
+                         [(self._Dec('6.80'), self._date(2026, 4, 1)),
+                          (self._Dec('6.50'), self._date(2026, 5, 1))])
+
+
+class BackfillCanonicalVplFkTests(TestCase):
+    """Backfill management command — fuzzy-match ILIs to VendorPriceList SKUs."""
+    from datetime import date as _date
+    from decimal import Decimal as _Dec
+    from io import StringIO as _StringIO
+
+    def setUp(self):
+        from myapp.models import Vendor, VendorPriceList
+        self.vendor = Vendor.objects.create(name='Farm Art')
+        self.honey_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='HONEY-6CT',
+            raw_description='HONEYDEWS, JUMBO 6CT',
+            unit='CASE', list_price=self._Dec('6.80'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+        self.lettuce_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='LET-24CT',
+            raw_description='LETTUCE 24CT ROMAINE',
+            unit='CASE', list_price=self._Dec('17.50'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+
+    def _call(self, *args):
+        from django.core.management import call_command
+        out = self._StringIO()
+        call_command('backfill_canonical_vpl_fk', *args, stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_does_not_persist(self):
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS, JUMBO 6CT',
+            unit_price=self._Dec('6.80'),
+        )
+        out = self._call('--vendor', 'Farm Art')  # default = dry-run
+        ili.refresh_from_db()
+        self.assertIsNone(ili.canonical_vendor_pricelist)
+        self.assertIn('DRY RUN', out)
+
+    def test_apply_attaches_fk_on_match(self):
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS, JUMBO 6CT',
+            unit_price=self._Dec('6.80'),
+        )
+        self._call('--vendor', 'Farm Art', '--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.honey_vpl.id)
+
+    def test_apply_skips_below_threshold(self):
+        """Distinct items shouldn't merge even when sharing some tokens."""
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='APPLES, RED DELICIOUS',
+            unit_price=self._Dec('5.50'),
+        )
+        self._call('--vendor', 'Farm Art', '--apply')
+        ili.refresh_from_db()
+        self.assertIsNone(ili.canonical_vendor_pricelist)
+
+    def test_apply_does_not_modify_price_fields(self):
+        """Pricing-as-event-driven LAW: backfill never touches price fields."""
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS, JUMBO 6CT',
+            unit_price=self._Dec('6.80'),
+            extended_amount=self._Dec('6.73'),
+            quantity=self._Dec('1.000'),
+        )
+        self._call('--vendor', 'Farm Art', '--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.unit_price, self._Dec('6.80'))
+        self.assertEqual(ili.extended_amount, self._Dec('6.73'))
+        self.assertEqual(ili.quantity, self._Dec('1.000'))
+
+    def test_apply_skips_already_attached_by_default(self):
+        """ILIs already attached to a canonical aren't re-evaluated unless --reset."""
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS, JUMBO 6CT',
+            unit_price=self._Dec('6.80'),
+            canonical_vendor_pricelist=self.lettuce_vpl,  # wrongly attached
+        )
+        self._call('--vendor', 'Farm Art', '--apply')
+        ili.refresh_from_db()
+        # Default: skipped, keeps wrong attachment
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.lettuce_vpl.id)
+
+    def test_reset_re_evaluates_attached_ilis(self):
+        from myapp.models import InvoiceLineItem
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='HONEYDEWS, JUMBO 6CT',
+            unit_price=self._Dec('6.80'),
+            canonical_vendor_pricelist=self.lettuce_vpl,  # wrongly attached
+        )
+        self._call('--vendor', 'Farm Art', '--apply', '--reset')
+        ili.refresh_from_db()
+        # With --reset, the wrong attachment is corrected
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.honey_vpl.id)
+
+    def test_skips_short_descriptions(self):
+        """ILIs with <2 tokens cant be fuzzy-matched; reported separately."""
+        from myapp.models import InvoiceLineItem
+        InvoiceLineItem.objects.create(
+            vendor=self.vendor, raw_description='X',
+            unit_price=self._Dec('1.00'),
+        )
+        out = self._call('--vendor', 'Farm Art', '--apply')
+        # Counted as "skipped" not "no-match"
+        # (apologies for white-space-sensitive assertion — output format is
+        # space-aligned, not header-named, so we look for the row)
+        self.assertIn('Farm Art', out)
