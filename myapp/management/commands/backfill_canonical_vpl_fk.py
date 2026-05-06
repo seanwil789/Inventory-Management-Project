@@ -20,74 +20,18 @@ Usage:
     python manage.py backfill_canonical_vpl_fk --vendor "Farm Art" --apply
     python manage.py backfill_canonical_vpl_fk --apply --threshold 0.55
 """
-import re
 from collections import Counter
 
 from django.core.management.base import BaseCommand
 from django.db import transaction
 
+from invoice_processor.canonical_match import (
+    tokenize as _tokenize,
+    jaccard as _jaccard,
+    find_canonical_match,
+    build_candidate_index,
+)
 from myapp.models import InvoiceLineItem, Vendor, VendorPriceList
-
-
-_TOKEN_RE = re.compile(r"[A-Z][A-Z]+|\d+(?:[/.,-]\d+)*%?")
-
-# Normalize whitespace inside compound tokens BEFORE tokenizing. Without this,
-# parser variants like "4 / 1 - GAL" tokenize to {"4", "1", "GAL"} while the
-# catalog's "4/1-GAL" tokenizes to {"4/1-GAL", "GAL"} — they share only "GAL"
-# and Jaccard collapses despite identical semantic content. Empirical inspection
-# on Pi (2026-05-06) showed 38+ of 82 unmatched ILIs were this false-negative
-# pattern.
-#
-# Strategy: any '/' or '-' surrounded by whitespace AND alphanumeric on both
-# sides gets its whitespace collapsed. Iterate until stable to handle chained
-# patterns like "1-1 / 9 - LB" → "1-1/9-LB".
-# Lookbehind/lookahead so word chars stay unconsumed — adjacent matches don't
-# steal each other's anchors. Pattern: word boundary, optional space, operator,
-# optional space, word boundary. Replacement collapses the spaces but leaves
-# the surrounding word chars in place.
-_OPERATOR_SPACE_RE = re.compile(r"(?<=\w)\s+([/-])\s*(?=\w)|(?<=\w)\s*([/-])\s+(?=\w)")
-_PERCENT_SPACE_RE = re.compile(r"(\d+)\s+%")  # "2 %" → "2%"
-
-
-def _normalize_tokens(s: str) -> str:
-    """Collapse whitespace inside numeric/compound tokens for stable matching.
-
-    Lookaround (lookbehind/lookahead) means adjacent matches don't share
-    consumed characters, so chained patterns like "1-1 / 9 - LB" collapse in a
-    single pass instead of needing iteration.
-    """
-    if not s:
-        return ""
-    # Either capture group is non-empty depending on which alternation matched
-    out = _OPERATOR_SPACE_RE.sub(lambda m: m.group(1) or m.group(2), s)
-    out = _PERCENT_SPACE_RE.sub(r"\1%", out)
-    return out
-
-
-def _tokenize(s: str) -> frozenset:
-    if not s:
-        return frozenset()
-    return frozenset(_TOKEN_RE.findall(_normalize_tokens(s).upper()))
-
-
-def _jaccard(a: frozenset, b: frozenset) -> float:
-    if not a or not b:
-        return 0.0
-    return len(a & b) / len(a | b)
-
-
-def best_match(ili_tokens: frozenset, candidates: list[tuple[VendorPriceList, frozenset]],
-               threshold: float) -> tuple[VendorPriceList | None, float]:
-    """Return (best_vpl, score) above threshold, or (None, best_score_seen)."""
-    best_vpl, best_s = None, 0.0
-    for vpl, vpl_tokens in candidates:
-        s = _jaccard(ili_tokens, vpl_tokens)
-        if s > best_s:
-            best_s = s
-            best_vpl = vpl
-    if best_s < threshold:
-        return (None, best_s)
-    return (best_vpl, best_s)
 
 
 class Command(BaseCommand):
@@ -143,10 +87,10 @@ class Command(BaseCommand):
         per_vendor_unmatched_samples = []
 
         for vendor in vendors:
-            vpl_qs = list(VendorPriceList.objects.filter(vendor=vendor))
-            if not vpl_qs:
+            candidates = build_candidate_index(vendor)
+            if not candidates:
                 continue
-            candidates = [(vpl, _tokenize(vpl.raw_description)) for vpl in vpl_qs]
+            vpl_qs = [c[0] for c in candidates]
 
             ilis_qs = InvoiceLineItem.objects.filter(vendor=vendor)
             if not opts["reset"]:
@@ -164,7 +108,8 @@ class Command(BaseCommand):
                         skipped_count += 1
                         continue
                     # Use review_threshold as the lower floor for any candidate
-                    best_vpl, score = best_match(toks, candidates, review_threshold)
+                    best_vpl, score = find_canonical_match(
+                        ili.raw_description or "", candidates, review_threshold)
                     if best_vpl is None:
                         no_match_count += 1
                         if len(unmatched_samples) < 5:

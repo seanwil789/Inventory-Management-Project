@@ -231,6 +231,16 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         except ValueError:
             pass
 
+    # Phase 4a (Sean 2026-05-06): self-healing canonical FK alongside dedup.
+    # Build the VendorPriceList candidate index ONCE per call to amortize the
+    # tokenize cost across all incoming rows. Empty list when the vendor has
+    # no catalog yet — the FK assignment becomes a no-op for that vendor.
+    # See `project_self_healing_raw_descriptions.md` + `feedback_event_driven_pricing.md`.
+    vpl_candidates = []
+    if vendor is not None:
+        from invoice_processor.canonical_match import build_candidate_index
+        vpl_candidates = build_candidate_index(vendor)
+
     written = 0
     for item in items:
         canonical = item.get('canonical')
@@ -483,6 +493,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                     # invoice for the same product on the same day.
                     unit_price=common_fields.get('unit_price'),
                 ).first()
+        target_ili = None
         if parsed_date:
             if existing:
                 # Fields where a non-None historical value beats a None incoming
@@ -502,18 +513,36 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                         continue
                     setattr(existing, field, value)
                 existing.save()
+                target_ili = existing
             else:
-                InvoiceLineItem.objects.create(
+                target_ili = InvoiceLineItem.objects.create(
                     vendor=vendor,
                     invoice_date=parsed_date,
                     **common_fields,
                 )
         else:
-            InvoiceLineItem.objects.create(
+            target_ili = InvoiceLineItem.objects.create(
                 vendor=vendor,
                 invoice_date=parsed_date,
                 **common_fields,
             )
+
+        # Phase 4a (Sean 2026-05-06): assign canonical FK alongside dedup.
+        # Audit-only — does not change dedup behavior. Populates the FK on
+        # every write (including updates) when a confident match exists.
+        # Pricing-as-event-driven LAW (`feedback_event_driven_pricing.md`):
+        # this only sets identity; never modifies price/qty/ext fields.
+        # Skip if FK already set — preserves manual corrections from
+        # mapping-review (don't overwrite human-confirmed mappings).
+        if (target_ili is not None
+                and target_ili.canonical_vendor_pricelist_id is None
+                and vpl_candidates):
+            from invoice_processor.canonical_match import find_canonical_match
+            best_vpl, _score = find_canonical_match(
+                raw_desc, vpl_candidates)
+            if best_vpl is not None:
+                target_ili.canonical_vendor_pricelist = best_vpl
+                target_ili.save(update_fields=['canonical_vendor_pricelist'])
 
         # Track C orphan cleanup: a pre-existing placeholder row
         # '[Sysco #NNN]' for the same (vendor, date, SUPC) is superseded

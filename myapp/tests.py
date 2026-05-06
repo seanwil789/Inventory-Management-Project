@@ -11911,3 +11911,116 @@ class BackfillCanonicalVplFkTests(TestCase):
                          '--threshold', '0.55',
                          '--review-threshold', '0.70')
         self.assertIn('must be <=', out)
+
+
+class DbWriteCanonicalFkTests(TestCase):
+    """Phase 4a: db_write assigns canonical FK on ingestion (audit-only mode).
+
+    Behaviour required:
+      - New ILI gets FK populated when a catalog match exists (≥0.65)
+      - Updated ILI gets FK populated if it was previously null
+      - Already-attached FK is NOT overwritten (preserves manual corrections)
+      - No FK assignment when vendor has no VendorPriceList catalog
+      - Price fields NEVER modified by FK lookup (event-driven pricing LAW)
+    """
+    from datetime import date as _date
+    from decimal import Decimal as _Dec
+
+    def setUp(self):
+        from myapp.models import Vendor, VendorPriceList
+        self.vendor = Vendor.objects.create(name='Farm Art')
+        self.honey_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='HON',
+            raw_description='MELONS, HONEYDEWS, JUMBO 5CT',
+            unit='CASE', list_price=self._Dec('6.80'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+        self.lettuce_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='RMH',
+            raw_description='LETTUCE, ROMAINE HEARTS 12/3LB',
+            unit='BAG', list_price=self._Dec('17.50'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+
+    def _call_write(self, items, date='2026-05-06'):
+        from invoice_processor.db_write import write_invoice_to_db
+        return write_invoice_to_db('Farm Art', date, items, source_file='test.pdf')
+
+    def test_new_ili_gets_canonical_fk(self):
+        """A new ingestion creates ILI with FK populated when catalog matches."""
+        from myapp.models import InvoiceLineItem
+        self._call_write([{
+            'raw_description': 'MELONS, HONEYDEWS, JUMBO 5CT',
+            'unit_price': self._Dec('6.80'),
+            'extended_amount': self._Dec('6.73'),
+        }])
+        ili = InvoiceLineItem.objects.get(vendor=self.vendor)
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.honey_vpl.id)
+
+    def test_no_fk_when_no_catalog_match(self):
+        """ILI with raw_description below threshold gets null FK."""
+        from myapp.models import InvoiceLineItem
+        self._call_write([{
+            'raw_description': 'ZAMBONI, GRAPEFRUIT, LARGE',
+            'unit_price': self._Dec('5.00'),
+            'extended_amount': self._Dec('4.95'),
+        }])
+        ili = InvoiceLineItem.objects.get(vendor=self.vendor)
+        self.assertIsNone(ili.canonical_vendor_pricelist)
+
+    def test_existing_fk_not_overwritten(self):
+        """Manual corrections from mapping-review must survive re-ingestion.
+
+        If an ILI already has a canonical FK (likely set by a human via
+        mapping-review), a subsequent ingestion of the same line MUST NOT
+        overwrite it — even if the algorithm would have picked a different SKU.
+        """
+        from myapp.models import InvoiceLineItem
+        # First write: gets the lettuce FK auto-assigned
+        self._call_write([{
+            'raw_description': 'LETTUCE, ROMAINE HEARTS 12/3LB',
+            'unit_price': self._Dec('17.50'),
+            'extended_amount': self._Dec('17.33'),
+        }])
+        ili = InvoiceLineItem.objects.get(vendor=self.vendor)
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.lettuce_vpl.id)
+        # Manually correct to a different VPL (simulating mapping-review)
+        ili.canonical_vendor_pricelist = self.honey_vpl
+        ili.save()
+        # Re-ingest the same line — FK should NOT change back
+        self._call_write([{
+            'raw_description': 'LETTUCE, ROMAINE HEARTS 12/3LB',
+            'unit_price': self._Dec('17.50'),
+            'extended_amount': self._Dec('17.33'),
+        }])
+        ili.refresh_from_db()
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.honey_vpl.id)
+
+    def test_price_fields_never_modified_by_fk_lookup(self):
+        """Event-driven pricing LAW: FK lookup is identity-only."""
+        from myapp.models import InvoiceLineItem
+        self._call_write([{
+            'raw_description': 'MELONS, HONEYDEWS, JUMBO 5CT',
+            'unit_price': self._Dec('6.80'),
+            'extended_amount': self._Dec('6.73'),
+        }])
+        ili = InvoiceLineItem.objects.get(vendor=self.vendor)
+        self.assertEqual(ili.unit_price, self._Dec('6.80'))
+        self.assertEqual(ili.extended_amount, self._Dec('6.73'))
+        # FK is set; prices unchanged
+        self.assertEqual(ili.canonical_vendor_pricelist_id, self.honey_vpl.id)
+
+    def test_no_op_when_vendor_has_no_catalog(self):
+        """Vendor without VendorPriceList entries — no FK assignment, no error."""
+        from myapp.models import Vendor, InvoiceLineItem
+        Vendor.objects.create(name='Sysco')  # no VPL entries
+        from invoice_processor.db_write import write_invoice_to_db
+        write_invoice_to_db('Sysco', '2026-05-06', [{
+            'raw_description': 'CHOBANI YOGURT BLUEBERRY',
+            'unit_price': self._Dec('22.99'),
+            'extended_amount': self._Dec('22.99'),
+        }])
+        ili = InvoiceLineItem.objects.get(raw_description='CHOBANI YOGURT BLUEBERRY')
+        self.assertIsNone(ili.canonical_vendor_pricelist)
