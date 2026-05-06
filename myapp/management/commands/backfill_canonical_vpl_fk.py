@@ -96,8 +96,15 @@ class Command(BaseCommand):
     def add_arguments(self, parser):
         parser.add_argument("--vendor", default=None,
                             help="Restrict to a single vendor (default: all vendors with VPL)")
-        parser.add_argument("--threshold", type=float, default=0.55,
-                            help="Jaccard threshold for FK attach (default 0.55)")
+        parser.add_argument("--threshold", type=float, default=0.65,
+                            help="Auto-attach Jaccard threshold (default 0.65). "
+                                 "Empirical sampling on Pi 2026-05-06 showed 0.55-0.65 "
+                                 "band has ~40%% false-positive rate (size/format "
+                                 "discriminator failures); 0.65+ has ~99%% accuracy.")
+        parser.add_argument("--review-threshold", type=float, default=0.55,
+                            help="Borderline floor (default 0.55). Matches between "
+                                 "review-threshold and threshold are surfaced as a "
+                                 "review queue, not auto-attached.")
         parser.add_argument("--apply", action="store_true",
                             help="Apply changes (default: dry-run, no DB writes)")
         parser.add_argument("--reset", action="store_true",
@@ -105,6 +112,11 @@ class Command(BaseCommand):
 
     def handle(self, *args, **opts):
         threshold = opts["threshold"]
+        review_threshold = opts["review_threshold"]
+        if review_threshold > threshold:
+            self.stdout.write(self.style.ERROR(
+                "--review-threshold must be <= --threshold"))
+            return
         apply_changes = opts["apply"]
 
         if opts["vendor"]:
@@ -118,13 +130,16 @@ class Command(BaseCommand):
             vendors = list(Vendor.objects.filter(price_list_entries__isnull=False).distinct())
 
         mode = "APPLY" if apply_changes else "DRY RUN"
-        self.stdout.write(f"Backfill canonical FK [{mode}] threshold={threshold:.2f}")
+        self.stdout.write(
+            f"Backfill canonical FK [{mode}] auto-attach >= {threshold:.2f}, "
+            f"review-queue {review_threshold:.2f}-{threshold:.2f}")
         self.stdout.write("")
-        self.stdout.write("{:<35} {:>6} {:>6} {:>8} {:>9} {:>9}".format(
-            "vendor", "ILIs", "VPL", "skipped", "matched", "no-match"))
-        self.stdout.write("-" * 80)
+        self.stdout.write("{:<35} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}".format(
+            "vendor", "ILIs", "VPL", "skipped", "attached", "review", "no-match"))
+        self.stdout.write("-" * 88)
 
-        global_matched = global_no_match = global_skipped = 0
+        global_attached = global_review = global_no_match = global_skipped = 0
+        per_vendor_review_samples = []
         per_vendor_unmatched_samples = []
 
         for vendor in vendors:
@@ -138,7 +153,8 @@ class Command(BaseCommand):
                 ilis_qs = ilis_qs.filter(canonical_vendor_pricelist__isnull=True)
             ilis = list(ilis_qs)
 
-            matched_count = no_match_count = skipped_count = 0
+            attached_count = review_count = no_match_count = skipped_count = 0
+            review_samples = []
             unmatched_samples = []
 
             with transaction.atomic():
@@ -147,39 +163,71 @@ class Command(BaseCommand):
                     if len(toks) < 2:
                         skipped_count += 1
                         continue
-                    best_vpl, score = best_match(toks, candidates, threshold)
+                    # Use review_threshold as the lower floor for any candidate
+                    best_vpl, score = best_match(toks, candidates, review_threshold)
                     if best_vpl is None:
                         no_match_count += 1
                         if len(unmatched_samples) < 5:
                             unmatched_samples.append(
                                 (ili.raw_description or "", score))
                         continue
-                    matched_count += 1
+                    if score < threshold:
+                        # Borderline: surface for review, do NOT auto-attach
+                        review_count += 1
+                        if len(review_samples) < 10:
+                            review_samples.append(
+                                (ili, best_vpl, score))
+                        continue
+                    attached_count += 1
                     if apply_changes:
                         ili.canonical_vendor_pricelist = best_vpl
                         ili.save(update_fields=["canonical_vendor_pricelist"])
                 if not apply_changes:
                     transaction.set_rollback(True)
 
-            self.stdout.write("{:<35} {:>6} {:>6} {:>8} {:>9} {:>9}".format(
+            self.stdout.write("{:<35} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}".format(
                 vendor.name[:33],
                 InvoiceLineItem.objects.filter(vendor=vendor).count(),
-                len(vpl_qs), skipped_count, matched_count, no_match_count))
+                len(vpl_qs), skipped_count, attached_count, review_count, no_match_count))
 
-            global_matched += matched_count
+            global_attached += attached_count
+            global_review += review_count
             global_no_match += no_match_count
             global_skipped += skipped_count
+            if review_samples:
+                per_vendor_review_samples.append((vendor.name, review_samples))
             if unmatched_samples:
                 per_vendor_unmatched_samples.append((vendor.name, unmatched_samples))
 
-        self.stdout.write("-" * 80)
-        self.stdout.write("{:<35} {:>6} {:>6} {:>8} {:>9} {:>9}".format(
-            "TOTAL", "—", "—", global_skipped, global_matched, global_no_match))
+        self.stdout.write("-" * 88)
+        self.stdout.write("{:<35} {:>6} {:>6} {:>8} {:>8} {:>8} {:>8}".format(
+            "TOTAL", "—", "—", global_skipped, global_attached, global_review,
+            global_no_match))
 
-        # Show unmatched samples per vendor — these need attention
+        # Borderline review queue — these score in [review_threshold, threshold).
+        # Likely correct but need human verification (size/format discriminator
+        # failures cluster here, e.g. PEPPERS RED 15# vs catalog 11#).
+        if per_vendor_review_samples:
+            self.stdout.write("")
+            self.stdout.write(
+                f"REVIEW QUEUE (score {review_threshold:.2f}-{threshold:.2f}, "
+                f"NOT auto-attached):")
+            for vname, samples in per_vendor_review_samples[:5]:
+                self.stdout.write(f"  [{vname}]")
+                for ili, vpl, score in samples:
+                    self.stdout.write(
+                        f"    score={score:.3f}  ILI: "
+                        f"{(ili.raw_description or '')[:60]}")
+                    self.stdout.write(
+                        f"                 catalog: "
+                        f"{(vpl.raw_description or '')[:60]}  (sku={vpl.sku})")
+
+        # Below review_threshold — no plausible canonical, queue for mapping-review.
         if per_vendor_unmatched_samples:
             self.stdout.write("")
-            self.stdout.write("Sample unmatched ILIs (would queue for mapping-review):")
+            self.stdout.write(
+                f"Sample unmatched ILIs (score < {review_threshold:.2f}, "
+                f"queue for mapping-review):")
             for vname, samples in per_vendor_unmatched_samples[:5]:
                 self.stdout.write(f"  [{vname}]")
                 for raw, score in samples:

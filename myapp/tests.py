@@ -11874,3 +11874,40 @@ class BackfillCanonicalVplFkTests(TestCase):
         self._call('--vendor', 'Farm Art', '--apply')
         ili.refresh_from_db()
         self.assertEqual(ili.canonical_vendor_pricelist_id, eggplant_vpl.id)
+
+    def test_borderline_band_queued_not_attached(self):
+        """Scores in [review_threshold, threshold) are review-queued, not auto-attached.
+
+        Empirical sampling (Pi 2026-05-06): 0.55-0.65 band has ~40% false-positive
+        rate from size/format discriminator failures (PEPPERS 15# matched to 11#,
+        YOGURT PLAIN matched to YOGURT VANILLA, etc.). Auto-attaching at 0.55
+        would corrupt drift detection on those ILIs.
+        """
+        from myapp.models import InvoiceLineItem, VendorPriceList
+        # Catalog has only "PEPPERS RED 11# X FANCY" — when ILI says "15#",
+        # Jaccard lands in 0.55-0.65 (one differing token).
+        VendorPriceList.objects.create(
+            vendor=self.vendor, sku='PPR-11',
+            raw_description='PEPPERS, RED, 11# X FANCY',
+            unit='CASE', list_price=self._Dec('17.50'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+        ili_15 = InvoiceLineItem.objects.create(
+            vendor=self.vendor,
+            raw_description='PEPPERS, RED, 15# X FANCY',  # 15# not 11#
+            unit_price=self._Dec('27.23'),
+        )
+        out = self._call('--vendor', 'Farm Art', '--apply')
+        ili_15.refresh_from_db()
+        # Default thresholds: 0.65 attach, 0.55 review-floor.
+        # Score = ~0.60 → review queue, not auto-attached.
+        self.assertIsNone(ili_15.canonical_vendor_pricelist)
+        self.assertIn('REVIEW QUEUE', out)
+
+    def test_review_threshold_must_be_le_threshold(self):
+        """Reject incoherent settings: --review-threshold > --threshold."""
+        out = self._call('--vendor', 'Farm Art',
+                         '--threshold', '0.55',
+                         '--review-threshold', '0.70')
+        self.assertIn('must be <=', out)
