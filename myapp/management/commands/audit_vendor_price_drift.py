@@ -147,17 +147,35 @@ class Command(BaseCommand):
                     .filter(vendor=vendor, invoice_date__gte=cutoff,
                             unit_price__isnull=False)
                     .exclude(unit_price=0)
+                    .select_related('canonical_vendor_pricelist')
                     .order_by('-invoice_date'))
 
         # Per-row classification + drift
-        rows = []  # (ili, math_class, real_per_unit, csv_unit, csv_expected, diff_pct, drift_class)
+        rows = []  # (ili, math_class, real_per_unit, csv_unit, csv_expected, diff_pct, drift_class, lookup_path)
         math_counts = Counter()
         drift_counts = Counter()
+        lookup_path_counts = Counter()  # 'fk' / 'normalize_desc' / 'no_match'
 
         for ili in ilis:
             math_class, real_pu = classify_math(ili)
             math_counts[math_class] += 1
-            options = price_lookup.get(normalize_desc(ili.raw_description), [])
+
+            # Phase 4 consumer (Sean 2026-05-06): prefer canonical FK lookup
+            # when populated. Indexed FK is faster + more reliable than
+            # fuzzy raw_description matching. Falls back to the normalize_desc
+            # path when FK is null (pre-backfill rows + below-threshold matches).
+            options = []
+            lookup_path = 'no_match'
+            if ili.canonical_vendor_pricelist_id is not None:
+                vpl = ili.canonical_vendor_pricelist
+                expected = vpl.list_price * (1 - vpl.ach_discount_pct)
+                options = [(vpl.unit, expected)]
+                lookup_path = 'fk'
+            else:
+                options = price_lookup.get(normalize_desc(ili.raw_description), [])
+                lookup_path = 'normalize_desc' if options else 'no_match'
+            lookup_path_counts[lookup_path] += 1
+
             csv_unit, csv_expected, diff_pct = best_csv_match(real_pu or 0, options)
             if not options:
                 drift_class = 'no_csv'
@@ -168,7 +186,8 @@ class Command(BaseCommand):
             else:
                 drift_class = 'drift'
             drift_counts[drift_class] += 1
-            rows.append((ili, math_class, real_pu, csv_unit, csv_expected, diff_pct, drift_class))
+            rows.append((ili, math_class, real_pu, csv_unit, csv_expected,
+                         diff_pct, drift_class, lookup_path))
 
         total = len(rows)
 
@@ -197,12 +216,20 @@ class Command(BaseCommand):
             pct = 100 * n / total if total else 0
             self.stdout.write(f"  {dc:24s}: {n:4d} ({pct:5.1f}%)")
 
+        # Lookup-path distribution — proves the FK is doing work
+        self.stdout.write("")
+        self.stdout.write("=== Lookup path (canonical FK vs raw_description fallback) ===")
+        for lp in ('fk', 'normalize_desc', 'no_match'):
+            n = lookup_path_counts[lp]
+            pct = 100 * n / total if total else 0
+            self.stdout.write(f"  {lp:24s}: {n:4d} ({pct:5.1f}%)")
+
         # 2-D matrix
         self.stdout.write("")
         self.stdout.write("=== Math × Drift cross-tab ===")
         self.stdout.write(f"  {'':24s} {'aligned':>9s} {'drift':>9s} {'no_csv':>9s}")
         cross = defaultdict(lambda: Counter())
-        for _, mc, _, _, _, _, dc in rows:
+        for _, mc, _, _, _, _, dc, _ in rows:
             cross[mc][dc] += 1
         for mc in ('math_holds', 'ach_holds', 'parser_suspect', 'qty_anomaly', 'unknown'):
             row = cross[mc]
@@ -216,7 +243,7 @@ class Command(BaseCommand):
         threshold_pct = opts['threshold'] * 100
         big_drift = [r for r in rows if r[5] is not None and abs(r[5]) >= threshold_pct]
         big_drift.sort(key=lambda r: -abs(r[5]))
-        for ili, mc, real_pu, csv_unit, csv_expected, diff_pct, _ in big_drift[:opts['show']]:
+        for ili, mc, real_pu, csv_unit, csv_expected, diff_pct, _, _ in big_drift[:opts['show']]:
             desc = (ili.raw_description or '')[:36]
             prod = (ili.product.canonical_name if ili.product else '(unmapped)')[:18]
             self.stdout.write(
@@ -233,7 +260,7 @@ class Command(BaseCommand):
             self.stdout.write(f"=== Math anomalies — {len(anomalies)} rows ===")
             self.stdout.write("(parser_suspect: up==ext, qty>1 — possibly fixable)")
             self.stdout.write("(qty_anomaly: ratio ≈ 0.5x/2x/4x — qty captured wrong)")
-            for ili, mc, real_pu, csv_unit, csv_expected, diff_pct, dc in sorted(
+            for ili, mc, real_pu, csv_unit, csv_expected, diff_pct, dc, _ in sorted(
                     anomalies, key=lambda r: r[1]):
                 desc = (ili.raw_description or '')[:38]
                 csv_str = (f"CSV {csv_unit:>10s} ${csv_expected:>5.2f} ({diff_pct:+5.1f}%)"
