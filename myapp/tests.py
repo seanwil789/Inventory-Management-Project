@@ -11341,3 +11341,40 @@ class AuditSpatialDriftSuspectsTests(TestCase):
         n_default = int(re.search(r'medians.+?:\s*(\d+)', out_default).group(1))
         n_low = int(re.search(r'medians.+?:\s*(\d+)', out_low).group(1))
         self.assertGreater(n_low, n_default)
+
+
+class EstimateTiltTests(TestCase):
+    """Tilt estimation helper for audit_invoice_tilt."""
+
+    def _tok(self, text, x, y):
+        return {'text': text, 'x_min': x - 0.005, 'x_max': x + 0.005,
+                'y_min': y - 0.003, 'y_max': y + 0.003}
+
+    def test_returns_zero_for_untilted_layout(self):
+        """Untilted: qty and price tokens at consistent same y per row."""
+        from myapp.management.commands.audit_invoice_tilt import estimate_tilt
+        tokens = []
+        for i, y in enumerate([0.30, 0.32, 0.34, 0.36]):
+            tokens.append(self._tok(f'{i+1}.000', 0.10, y))
+            tokens.append(self._tok(f'{(i+1)*5}.00', 0.85, y))
+        tilt, n = estimate_tilt(tokens)
+        self.assertEqual(n, 4)
+        self.assertAlmostEqual(tilt, 0.0, places=4)
+
+    def test_detects_consistent_tilt(self):
+        """Tilted: price y consistently 0.005 below qty y → returns +0.005."""
+        from myapp.management.commands.audit_invoice_tilt import estimate_tilt
+        tokens = []
+        for i, y in enumerate([0.30, 0.32, 0.34, 0.36]):
+            tokens.append(self._tok(f'{i+1}.000', 0.10, y))
+            tokens.append(self._tok(f'{(i+1)*5}.00', 0.85, y + 0.005))
+        tilt, n = estimate_tilt(tokens)
+        self.assertEqual(n, 4)
+        self.assertAlmostEqual(tilt, 0.005, places=4)
+
+    def test_returns_none_when_too_few_tokens(self):
+        from myapp.management.commands.audit_invoice_tilt import estimate_tilt
+        tokens = [self._tok('1.000', 0.10, 0.3), self._tok('5.00', 0.85, 0.3)]
+        tilt, n = estimate_tilt(tokens)
+        self.assertIsNone(tilt)
+        self.assertEqual(n, 0)
