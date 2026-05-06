@@ -11218,3 +11218,126 @@ class NormalizeDescTests(TestCase):
         out_str = out.getvalue()
         self.assertIn('aligned                 :    1', out_str)
         self.assertIn('no_csv                  :    0', out_str)
+
+
+class AuditSpatialDriftSuspectsTests(TestCase):
+    """Sean 2026-05-05: detect spatial_matcher drift via swap-fingerprint."""
+
+    def setUp(self):
+        from datetime import date, timedelta
+        from decimal import Decimal
+        from myapp.models import Vendor, Product, InvoiceLineItem
+        self.v, _ = Vendor.objects.get_or_create(name='Farm Art')
+        self.cabbage = Product.objects.create(canonical_name='Cabbage', category='Produce')
+        self.melon = Product.objects.create(canonical_name='Melon', category='Produce')
+
+        # Establish medians: 4 historical invoices each at consistent prices
+        for i in range(4):
+            d = date.today() - timedelta(days=30 + i * 5)
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.cabbage,
+                raw_description='CABBAGE, GREEN, 35LB',
+                unit_price=Decimal('5.00'), extended_amount=Decimal('5.00'),
+                quantity=Decimal('1'), invoice_date=d,
+                source_file=f'old_{i}.jpg',
+            )
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.melon,
+                raw_description='MELON, JUMBO',
+                unit_price=Decimal('40.00'), extended_amount=Decimal('40.00'),
+                quantity=Decimal('1'), invoice_date=d,
+                source_file=f'old_{i}.jpg',
+            )
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('audit_spatial_drift_suspects', *args, stdout=out)
+        return out.getvalue()
+
+    def test_no_drift_clean_data(self):
+        """All ILIs near median → no flagged, no swap pairs."""
+        out = self._run()
+        self.assertIn('Total swap-pair candidates: 0', out)
+
+    def test_detects_swap_pair(self):
+        """Cabbage ILI at $40 + Melon ILI at $5 on same invoice → swap-pair."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.cabbage,
+            raw_description='CABBAGE, GREEN, 35LB',
+            unit_price=Decimal('40.00'),
+            extended_amount=Decimal('40.00'),
+            quantity=Decimal('1'), invoice_date=date.today(),
+            source_file='drifted.jpg',
+        )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.melon,
+            raw_description='MELON, JUMBO',
+            unit_price=Decimal('5.00'),
+            extended_amount=Decimal('5.00'),
+            quantity=Decimal('1'), invoice_date=date.today(),
+            source_file='drifted.jpg',
+        )
+        out = self._run()
+        self.assertIn('Total swap-pair candidates: 1', out)
+        self.assertIn('CABBAGE', out)
+        self.assertIn('MELON', out)
+
+    def test_no_swap_when_only_one_flagged(self):
+        """Single off-row without a swap partner doesn't qualify as pair."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.cabbage,
+            raw_description='CABBAGE, GREEN, 35LB',
+            unit_price=Decimal('25.00'),
+            extended_amount=Decimal('25.00'),
+            quantity=Decimal('1'), invoice_date=date.today(),
+            source_file='lone.jpg',
+        )
+        out = self._run()
+        self.assertIn('Total swap-pair candidates: 0', out)
+
+    def test_vendor_filter(self):
+        """--vendor scopes to one vendor."""
+        from myapp.models import Vendor
+        Vendor.objects.create(name='OtherVendor')
+        out = self._run('--vendor', 'OtherVendor')
+        self.assertIn('Total swap-pair candidates: 0', out)
+
+    def test_unknown_vendor_reports_error(self):
+        out = self._run('--vendor', 'NoSuchVendor')
+        self.assertIn('Vendor not found', out)
+
+    def test_min_history_filter(self):
+        """--min-history controls when (vendor, product) gets a median."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import Product, InvoiceLineItem
+        sparse = Product.objects.create(canonical_name='Sparse', category='Produce')
+        for i in range(2):
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=sparse,
+                raw_description='SPARSE',
+                unit_price=Decimal('10.00'),
+                extended_amount=Decimal('10.00'),
+                quantity=Decimal('1'),
+                invoice_date=date.today(),
+                source_file=f'sparse_{i}.jpg',
+            )
+        out_default = self._run()
+        out_low = self._run('--min-history', '2')
+        # default n=3 excludes sparse; low n=2 includes it
+        self.assertIn('product medians', out_default)
+        self.assertIn('product medians', out_low)
+        # Verify min-history shows different counts
+        # Extract the count from output
+        import re
+        n_default = int(re.search(r'medians.+?:\s*(\d+)', out_default).group(1))
+        n_low = int(re.search(r'medians.+?:\s*(\d+)', out_low).group(1))
+        self.assertGreater(n_low, n_default)
