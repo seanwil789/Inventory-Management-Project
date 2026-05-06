@@ -472,20 +472,39 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             count_per_lb_high=count_per_lb_high_val,
         )
 
-        # Phase 2 #2 (Sean 2026-05-02): tighten upsert key to also match by
-        # (vendor, raw_description, invoice_date). The previous (vendor,
-        # product, date) lookup missed when product=NULL at original write
-        # (fuzzy quarantine path) and was attached later via /mapping-review/
-        # — the next reprocess wrote a duplicate. Walking BOTH keys here
-        # finds the existing row regardless of which path it came from.
+        # Phase 4b (Sean 2026-05-06): canonical-FK-based primary dedup.
+        # Compute the FK that THIS row would resolve to. When (vendor,
+        # source_file, canonical_FK, date) finds an existing row, that's the
+        # SAME line — even if raw_description varies between parser runs
+        # (the duplicate-ingestion bug found 2026-05-06: 5 partial extractions
+        # of 290f7f produced 28 ILIs because raw_description differed).
+        # Falls back to the existing keys when FK can't help (vendor lacks
+        # catalog, raw_description has no plausible match, or empty source_file).
+        # See `project_self_healing_raw_descriptions.md`.
+        incoming_fk = None
+        if vpl_candidates:
+            from invoice_processor.canonical_match import find_canonical_match
+            incoming_fk, _ = find_canonical_match(raw_desc, vpl_candidates)
+
         existing = None
         if parsed_date:
-            # Primary key: raw_description match (stable across mapping changes)
-            existing = InvoiceLineItem.objects.filter(
-                vendor=vendor, raw_description=raw_desc, invoice_date=parsed_date
-            ).first()
-            # Secondary key: product match (when raw differs slightly between
-            # parses but the same canonical resolved). Only if first didn't hit.
+            # Primary key: canonical FK + source_file (collapses parser-variant
+            # whitespace + annotation duplicates within the same invoice).
+            if incoming_fk is not None and source_file:
+                existing = InvoiceLineItem.objects.filter(
+                    vendor=vendor,
+                    canonical_vendor_pricelist=incoming_fk,
+                    source_file=source_file,
+                    invoice_date=parsed_date,
+                ).first()
+            # Fallback 1: raw_description match (stable across mapping changes;
+            # finds rows with no FK assigned yet — pre-Phase-4a era data).
+            if existing is None:
+                existing = InvoiceLineItem.objects.filter(
+                    vendor=vendor, raw_description=raw_desc, invoice_date=parsed_date
+                ).first()
+            # Fallback 2: product match (when raw differs slightly between
+            # parses but the same canonical resolved).
             if existing is None and product:
                 existing = InvoiceLineItem.objects.filter(
                     vendor=vendor, product=product, invoice_date=parsed_date,
@@ -527,22 +546,18 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 **common_fields,
             )
 
-        # Phase 4a (Sean 2026-05-06): assign canonical FK alongside dedup.
-        # Audit-only — does not change dedup behavior. Populates the FK on
-        # every write (including updates) when a confident match exists.
-        # Pricing-as-event-driven LAW (`feedback_event_driven_pricing.md`):
-        # this only sets identity; never modifies price/qty/ext fields.
-        # Skip if FK already set — preserves manual corrections from
-        # mapping-review (don't overwrite human-confirmed mappings).
+        # Phase 4a (Sean 2026-05-06): assign canonical FK on the resolved row.
+        # `incoming_fk` was already computed above for dedup; reuse it here
+        # rather than re-tokenizing. Pricing-as-event-driven LAW
+        # (`feedback_event_driven_pricing.md`): this only sets identity;
+        # never modifies price/qty/ext fields. Skip if FK already set —
+        # preserves manual corrections from mapping-review (don't overwrite
+        # human-confirmed mappings).
         if (target_ili is not None
                 and target_ili.canonical_vendor_pricelist_id is None
-                and vpl_candidates):
-            from invoice_processor.canonical_match import find_canonical_match
-            best_vpl, _score = find_canonical_match(
-                raw_desc, vpl_candidates)
-            if best_vpl is not None:
-                target_ili.canonical_vendor_pricelist = best_vpl
-                target_ili.save(update_fields=['canonical_vendor_pricelist'])
+                and incoming_fk is not None):
+            target_ili.canonical_vendor_pricelist = incoming_fk
+            target_ili.save(update_fields=['canonical_vendor_pricelist'])
 
         # Track C orphan cleanup: a pre-existing placeholder row
         # '[Sysco #NNN]' for the same (vendor, date, SUPC) is superseded

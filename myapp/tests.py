@@ -12024,3 +12024,126 @@ class DbWriteCanonicalFkTests(TestCase):
         }])
         ili = InvoiceLineItem.objects.get(raw_description='CHOBANI YOGURT BLUEBERRY')
         self.assertIsNone(ili.canonical_vendor_pricelist)
+
+
+class DbWriteCanonicalDedupTests(TestCase):
+    """Phase 4b: dedup primary key pivots to (vendor, source_file, FK, date).
+
+    Validates the duplicate-ingestion bug fix: parser-variant whitespace +
+    annotation differences in raw_description no longer create duplicate ILIs
+    when the same canonical SKU is recognized in both runs.
+    """
+    from datetime import date as _date
+    from decimal import Decimal as _Dec
+
+    def setUp(self):
+        from myapp.models import Vendor, VendorPriceList
+        self.vendor = Vendor.objects.create(name='Farm Art')
+        self.milk_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='MIL2',
+            raw_description='DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            unit='CASE', list_price=self._Dec('9.90'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+
+    def test_dedup_collapses_parser_variant_raw_descriptions(self):
+        """Two ingestion runs of the same source_file with different
+        raw_description spellings of the same SKU should produce ONE ILI
+        (the duplicate-ingestion bug fix).
+        """
+        from myapp.models import InvoiceLineItem
+        from invoice_processor.db_write import write_invoice_to_db
+
+        # Run 1: tight whitespace formatting
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            'unit_price': self._Dec('9.90'),
+            'extended_amount': self._Dec('9.80'),
+        }], source_file='hash_abc123.pdf')
+
+        # Run 2: parser-variant spaced whitespace, same source
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY MILK 2 % , 4 / 1 - GAL * LOCAL',
+            'unit_price': self._Dec('9.90'),
+            'extended_amount': self._Dec('9.80'),
+        }], source_file='hash_abc123.pdf')
+
+        # Should produce exactly ONE ILI, not two
+        ilis = list(InvoiceLineItem.objects.filter(vendor=self.vendor))
+        self.assertEqual(len(ilis), 1)
+        self.assertEqual(ilis[0].canonical_vendor_pricelist_id, self.milk_vpl.id)
+
+    def test_different_source_files_collapse_via_raw_description_fallback(self):
+        """Documents pre-existing dedup behavior: when canonical FK matches an
+        existing row from a DIFFERENT source_file, Phase 4b's primary key
+        misses (different source_file), but the raw_description fallback
+        catches it and treats them as the same line.
+
+        This is pre-Phase-4b behavior; Phase 4b is intentionally additive
+        (FK-key lookup BEFORE existing logic, not replacing it). Same-day-
+        multiple-invoices-from-same-vendor is a real but rare edge case
+        that the existing dedup also collapses; not in scope here.
+        """
+        from myapp.models import InvoiceLineItem
+        from invoice_processor.db_write import write_invoice_to_db
+
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            'unit_price': self._Dec('9.90'),
+            'extended_amount': self._Dec('9.80'),
+        }], source_file='invoice_A.pdf')
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            'unit_price': self._Dec('9.90'),
+            'extended_amount': self._Dec('9.80'),
+        }], source_file='invoice_B.pdf')
+        # Identical raw_description + same date → existing fallback collapses.
+        # Phase 4b doesn't widen this; it stays one ILI per (vendor, raw, date).
+        self.assertEqual(InvoiceLineItem.objects.filter(vendor=self.vendor).count(), 1)
+
+    def test_falls_back_to_raw_description_when_no_catalog_match(self):
+        """When raw_description has no plausible canonical, the existing
+        (vendor, raw_description, date) primary key still drives dedup —
+        existing behavior preserved for unmatched items.
+        """
+        from myapp.models import InvoiceLineItem
+        from invoice_processor.db_write import write_invoice_to_db
+
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'OFF_CATALOG_ITEM_X',
+            'unit_price': self._Dec('5.00'),
+            'extended_amount': self._Dec('4.95'),
+        }], source_file='inv.pdf')
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'OFF_CATALOG_ITEM_X',  # same raw_desc
+            'unit_price': self._Dec('5.50'),  # price changed in re-ingest
+            'extended_amount': self._Dec('5.45'),
+        }], source_file='inv.pdf')
+        # Same raw_description + same source = one ILI (updated)
+        ilis = list(InvoiceLineItem.objects.filter(vendor=self.vendor))
+        self.assertEqual(len(ilis), 1)
+        self.assertEqual(ilis[0].unit_price, self._Dec('5.50'))
+        self.assertIsNone(ilis[0].canonical_vendor_pricelist)
+
+    def test_dedup_works_even_when_source_file_empty(self):
+        """Ingestions without source_file (legacy/manual) still dedup via
+        the raw_description fallback — regression guard against breaking
+        the existing path.
+        """
+        from myapp.models import InvoiceLineItem
+        from invoice_processor.db_write import write_invoice_to_db
+
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            'unit_price': self._Dec('9.90'),
+            'extended_amount': self._Dec('9.80'),
+        }], source_file='')  # no source_file
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            'unit_price': self._Dec('9.90'),
+            'extended_amount': self._Dec('9.80'),
+        }], source_file='')  # no source_file
+        # raw_description fallback collapses these to one ILI
+        ilis = list(InvoiceLineItem.objects.filter(vendor=self.vendor))
+        self.assertEqual(len(ilis), 1)
