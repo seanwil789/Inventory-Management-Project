@@ -11850,3 +11850,27 @@ class BackfillCanonicalVplFkTests(TestCase):
         self._call('--vendor', 'Farm Art', '--apply')
         ili.refresh_from_db()
         self.assertEqual(ili.canonical_vendor_pricelist_id, milk_vpl.id)
+
+    def test_normalizes_chained_operator_spacing(self):
+        """'1-1 / 9 BUSHEL' must match catalog '1-1/9 BUSHEL'.
+
+        Empirical (Pi 2026-05-06): 'EGGPLANT, FANCY, 1-1 / 9 BUSHEL' (parser
+        variant) failed match against 'EGGPLANT, FANCY, 1-1/9 BUSHEL' (catalog)
+        because the chained operator pattern needed multi-pass collapse.
+        """
+        from myapp.models import InvoiceLineItem, VendorPriceList
+        eggplant_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='EGGPL-FCY',
+            raw_description='EGGPLANT, FANCY, 1-1/9 BUSHEL',
+            unit='BUSHEL', list_price=self._Dec('25.50'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor,
+            raw_description='EGGPLANT , FANCY , 1-1 / 9 BUSHEL',
+            unit_price=self._Dec('25.50'),
+        )
+        self._call('--vendor', 'Farm Art', '--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.canonical_vendor_pricelist_id, eggplant_vpl.id)

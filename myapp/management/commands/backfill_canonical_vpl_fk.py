@@ -34,23 +34,32 @@ _TOKEN_RE = re.compile(r"[A-Z][A-Z]+|\d+(?:[/.,-]\d+)*%?")
 # Normalize whitespace inside compound tokens BEFORE tokenizing. Without this,
 # parser variants like "4 / 1 - GAL" tokenize to {"4", "1", "GAL"} while the
 # catalog's "4/1-GAL" tokenizes to {"4/1-GAL", "GAL"} — they share only "GAL"
-# and Jaccard collapses despite identical semantic content. The empirical
-# unmatched-inspection on Pi (2026-05-06) showed 38+ of 82 unmatched ILIs were
-# this same false-negative pattern.
-_COMPOUND_NUMERIC_RE = re.compile(
-    r"(\d+)\s*([/-])\s*(\d+)"  # "4 / 1" → "4/1", "10-22" stays
-)
+# and Jaccard collapses despite identical semantic content. Empirical inspection
+# on Pi (2026-05-06) showed 38+ of 82 unmatched ILIs were this false-negative
+# pattern.
+#
+# Strategy: any '/' or '-' surrounded by whitespace AND alphanumeric on both
+# sides gets its whitespace collapsed. Iterate until stable to handle chained
+# patterns like "1-1 / 9 - LB" → "1-1/9-LB".
+# Lookbehind/lookahead so word chars stay unconsumed — adjacent matches don't
+# steal each other's anchors. Pattern: word boundary, optional space, operator,
+# optional space, word boundary. Replacement collapses the spaces but leaves
+# the surrounding word chars in place.
+_OPERATOR_SPACE_RE = re.compile(r"(?<=\w)\s+([/-])\s*(?=\w)|(?<=\w)\s*([/-])\s+(?=\w)")
 _PERCENT_SPACE_RE = re.compile(r"(\d+)\s+%")  # "2 %" → "2%"
 
 
 def _normalize_tokens(s: str) -> str:
-    """Collapse whitespace inside numeric/compound tokens for stable matching."""
+    """Collapse whitespace inside numeric/compound tokens for stable matching.
+
+    Lookaround (lookbehind/lookahead) means adjacent matches don't share
+    consumed characters, so chained patterns like "1-1 / 9 - LB" collapse in a
+    single pass instead of needing iteration.
+    """
     if not s:
         return ""
-    out = s
-    # Run twice to catch chained patterns like "1-1 / 9" → "1-1/9"
-    for _ in range(2):
-        out = _COMPOUND_NUMERIC_RE.sub(r"\1\2\3", out)
+    # Either capture group is non-empty depending on which alternation matched
+    out = _OPERATOR_SPACE_RE.sub(lambda m: m.group(1) or m.group(2), s)
     out = _PERCENT_SPACE_RE.sub(r"\1%", out)
     return out
 
