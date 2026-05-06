@@ -31,11 +31,34 @@ from myapp.models import InvoiceLineItem, Vendor, VendorPriceList
 
 _TOKEN_RE = re.compile(r"[A-Z][A-Z]+|\d+(?:[/.,-]\d+)*%?")
 
+# Normalize whitespace inside compound tokens BEFORE tokenizing. Without this,
+# parser variants like "4 / 1 - GAL" tokenize to {"4", "1", "GAL"} while the
+# catalog's "4/1-GAL" tokenizes to {"4/1-GAL", "GAL"} — they share only "GAL"
+# and Jaccard collapses despite identical semantic content. The empirical
+# unmatched-inspection on Pi (2026-05-06) showed 38+ of 82 unmatched ILIs were
+# this same false-negative pattern.
+_COMPOUND_NUMERIC_RE = re.compile(
+    r"(\d+)\s*([/-])\s*(\d+)"  # "4 / 1" → "4/1", "10-22" stays
+)
+_PERCENT_SPACE_RE = re.compile(r"(\d+)\s+%")  # "2 %" → "2%"
+
+
+def _normalize_tokens(s: str) -> str:
+    """Collapse whitespace inside numeric/compound tokens for stable matching."""
+    if not s:
+        return ""
+    out = s
+    # Run twice to catch chained patterns like "1-1 / 9" → "1-1/9"
+    for _ in range(2):
+        out = _COMPOUND_NUMERIC_RE.sub(r"\1\2\3", out)
+    out = _PERCENT_SPACE_RE.sub(r"\1%", out)
+    return out
+
 
 def _tokenize(s: str) -> frozenset:
     if not s:
         return frozenset()
-    return frozenset(_TOKEN_RE.findall(s.upper()))
+    return frozenset(_TOKEN_RE.findall(_normalize_tokens(s).upper()))
 
 
 def _jaccard(a: frozenset, b: frozenset) -> float:

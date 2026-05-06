@@ -11804,3 +11804,49 @@ class BackfillCanonicalVplFkTests(TestCase):
         # (apologies for white-space-sensitive assertion — output format is
         # space-aligned, not header-named, so we look for the row)
         self.assertIn('Farm Art', out)
+
+    def test_normalizes_whitespace_in_compound_tokens(self):
+        """Parser-variant whitespace shouldn't break match.
+
+        Empirical (Pi 2026-05-06): 38+ unmatched ILIs were character-identical
+        to catalog entries except for spacing inside numeric/compound tokens
+        like '4 / 1 - GAL' (parser) vs '4/1-GAL' (catalog).
+        """
+        from myapp.models import InvoiceLineItem
+        # Catalog: "SHALLOTS, PEELED, 4/1-GAL" already exists (no — set up new VPL)
+        from myapp.models import VendorPriceList
+        shallot_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='SHAL-PL-G',
+            raw_description='SHALLOTS, PEELED, 4/1-GAL',
+            unit='GALLON', list_price=self._Dec('21.10'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+        # ILI from parser with spaced numeric tokens
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor,
+            raw_description='SHALLOTS , PEELED , 4 / 1 - GAL',
+            unit_price=self._Dec('21.10'),
+        )
+        self._call('--vendor', 'Farm Art', '--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.canonical_vendor_pricelist_id, shallot_vpl.id)
+
+    def test_normalizes_percent_spacing(self):
+        """'2 %' must match catalog '2%'."""
+        from myapp.models import InvoiceLineItem, VendorPriceList
+        milk_vpl = VendorPriceList.objects.create(
+            vendor=self.vendor, sku='MILK-2-G',
+            raw_description='DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            unit='GALLON', list_price=self._Dec('9.90'),
+            ach_discount_pct=self._Dec('0.0100'),
+            captured_at=self._date(2026, 5, 1),
+        )
+        ili = InvoiceLineItem.objects.create(
+            vendor=self.vendor,
+            raw_description='DAIRY MILK 2 % , 4 / 1 - GAL * LOCAL',
+            unit_price=self._Dec('9.90'),
+        )
+        self._call('--vendor', 'Farm Art', '--apply')
+        ili.refresh_from_db()
+        self.assertEqual(ili.canonical_vendor_pricelist_id, milk_vpl.id)
