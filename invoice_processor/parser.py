@@ -2824,6 +2824,107 @@ def _fallback_parse(text: str) -> list[dict]:
 # Public entry point
 # ---------------------------------------------------------------------------
 
+# Farm Art rank-pair description cleanup. Spatial extraction knows column
+# boundaries and natively excludes U/M and COOL columns; rank-pair's
+# description band is wider so it picks up these tokens. Stripping them
+# keeps Jaccard match against the VendorPriceList catalog above the 0.65
+# attach threshold (without strip, "CASE MILW DAIRY MILK WHOLE..." scores
+# 0.60 vs catalog "DAIRY MILK WHOLE, 4/1-GAL *LOCAL" — falls into review
+# queue rather than auto-attach). Empirical band-width data per
+# audit_rank_pair_shadow on Pi 2026-05-06.
+#
+# Item codes (MILW, MILSOY, GARP, BRU, etc.) are NOT stripped — risk of
+# false-positive removal of product nouns like "EGGS"/"DAIRY" is too
+# high without a curated allow-list. Multi-char codes survive Jaccard
+# (single noise token doesn't drop a 5-of-5-token match below threshold).
+_FARMART_LEADING_UM = re.compile(
+    r"^(CASE|EACH|BAG|BOX|DOZ|JAR|HALF|CS|EA)\b\s*",
+    re.IGNORECASE,
+)
+_FARMART_TRAILING_COOL = re.compile(
+    r"\s+(United States|Peru|Mexico|Canada|Netherlands|Honduras|"
+    r"Costa Rica|Guatemala|Spain|Italy|Portugal|Belgium|Israel|"
+    r"Chile|Argentina|Dominican Republic|Ecuador|Brazil|France)\s*$",
+    re.IGNORECASE,
+)
+
+
+def _clean_farmart_rank_desc(desc: str) -> str:
+    """Strip column-noise tokens from rank-pair raw_descriptions.
+
+    Removes:
+      - Leading U/M word (CASE/EACH/BAG/etc.) at start
+      - Trailing COOL country name (United States/Peru/Mexico/etc.) at end
+
+    Leaves item codes intact (the false-positive risk on real product
+    nouns is too high without a curated allow-list). Multi-char codes
+    survive Jaccard match against the catalog as a single tolerable
+    noise token.
+    """
+    if not desc:
+        return desc
+    s = _FARMART_LEADING_UM.sub("", desc)
+    s = _FARMART_TRAILING_COOL.sub("", s)
+    return s.strip()
+
+
+def _try_rank_pair_farmart(pages: list[dict] | None) -> list[dict] | None:
+    """Rank-pair v2 extraction for Farm Art, sub-degree photo tilt resilient.
+
+    Returns extracted items if layout detected (89% of cached invoices per
+    audit_rank_pair_shadow on Pi 2026-05-06), else None so callers fall back
+    to the legacy y-cluster spatial extractor.
+
+    Eliminates the 13.9% drift-cascade rate that y-cluster row binding silently
+    produces under sub-degree photo tilt — described in
+    project_spatial_drift_finding.md and validated by audit_rank_pair_shadow.
+
+    Output shape matches existing match_farmart_spatial / _parse_farmart so
+    downstream db_write / mapper / synergy_sync are unchanged. Pack tokens
+    (4/1GAL, 9CT, 15DOZ, 5#) are extracted from raw_description via
+    _extract_farmart_pack — same pattern the text path uses.
+
+    Ambiguous rows (description y-spread exceeds 1.5x tolerance — typically
+    when neighbor-row content bleeds into the description band) are flagged
+    needs_review so mapping-review surfaces them rather than silently trusting
+    a possibly-mashed description.
+    """
+    if not pages:
+        return None
+    try:
+        from rank_pair import extract_farmart_rank
+    except Exception:
+        return None
+    rows = extract_farmart_rank(pages)
+    if not rows:
+        return None
+    items = []
+    for r in rows:
+        ext = r.get("extended_amount")
+        # Match text-path behavior — exclude zero-extended rows. These are
+        # zz/undelivered items: the line appears on the invoice document
+        # but with $0.00 ext because the item didn't ship. _parse_farmart
+        # filters via `best_pp["amount"] > 0`; spatial filters via its
+        # qty_shipped vs qty_ordered comparison. Rank-pair otherwise
+        # creates false ILI rows that pollute the mapping-review queue.
+        if ext is None or ext <= 0:
+            continue
+        clean_desc = _clean_farmart_rank_desc(r["raw_description"])
+        item = {
+            "raw_description": clean_desc,
+            "quantity": r["qty"],
+            "unit_price": r["unit_price"],
+            "extended_amount": ext,
+            "case_size_raw": "",
+            "purchase_uom": r.get("purchase_uom") or "",
+        }
+        item.update(_extract_farmart_pack(clean_desc))
+        if r.get("ambiguous"):
+            item["needs_review"] = True
+        items.append(item)
+    return items
+
+
 def _try_spatial(vendor: str, pages: list[dict] | None,
                  min_items: int | None = None) -> list[dict] | None:
     """When DocAI layout data (pages[].tokens[]) is present, dispatch to
@@ -2929,13 +3030,22 @@ def parse_invoice(text: str, vendor: str = None,
         "Delaware County Linen": _parse_delaware_linen,
     }
 
-    # Run BOTH spatial and text parsers, pick whichever extracts more
-    # items. Spatial usually wins for clean OCR (Sysco column-dump,
-    # Exceptional, PBM digital), but on layouts where the spatial
-    # row-cluster or x-band detection misses items (Farm Art multi-page
-    # produce invoices have shown 6/16 spatial vs 16/16 text), we fall
-    # back to text. Text parsers are also where invoice_total comes from,
-    # so we always need to run them anyway.
+    # Try rank-pair v2 first for vendors with a rank-pair extractor.
+    # When rank-pair detects layout it wins on CORRECTNESS, not row count —
+    # it eliminates the 13.9% drift-cascade rate that y-cluster spatial
+    # extraction silently produces under sub-degree photo tilt
+    # (project_spatial_drift_finding.md). Falls through to spatial+text
+    # picker when rank-pair declines (no layout / thin OCR).
+    rank_pair_items = None
+    if vendor in ("Farm Art", "FarmArt"):
+        rank_pair_items = _try_rank_pair_farmart(pages)
+
+    # Run spatial + text in parallel for the fallback picker. Spatial usually
+    # wins for clean OCR (Sysco column-dump, Exceptional, PBM digital), but
+    # on layouts where spatial row-cluster or x-band detection misses items
+    # (Farm Art multi-page produce invoices have shown 6/16 spatial vs 16/16
+    # text), we fall back to text. Text parsers are also where invoice_total
+    # comes from, so we always need to run them anyway.
     invoice_total = None
     spatial_items = _try_spatial(vendor, pages)
 
@@ -2950,9 +3060,13 @@ def parse_invoice(text: str, vendor: str = None,
     except Exception:
         text_items = []
 
-    # Pick the source with more items. Tie-breaker: prefer spatial (it's
-    # the path tuned for clean DocAI bounding-box layouts).
-    if spatial_items is not None and len(spatial_items) >= len(text_items):
+    # Picker priority:
+    #   1. rank-pair v2 — wins on CORRECTNESS when layout detected
+    #   2. spatial — when row count >= text (legacy primary path)
+    #   3. text — fallback for thin OCR / unknown layouts
+    if rank_pair_items is not None:
+        items = rank_pair_items
+    elif spatial_items is not None and len(spatial_items) >= len(text_items):
         items = spatial_items
     else:
         items = text_items
