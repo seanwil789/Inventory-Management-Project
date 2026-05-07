@@ -490,13 +490,32 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         if parsed_date:
             # Primary key: canonical FK + source_file (collapses parser-variant
             # whitespace + annotation duplicates within the same invoice).
+            #
+            # Tolerant of multi-photo +N suffix variants. `reprocess_ocr_cache`
+            # uses 'HASH+N' format for merged multi-photo invoices (per
+            # reprocess_ocr_cache.py:174); `reprocess_invoices` uses bare 'HASH'.
+            # Both paths target the same logical invoice, so dedup must find
+            # rows across both formats (otherwise reprocess creates duplicates
+            # — observed 2026-05-07: hash 6bfe607e431e had 41 DB rows for
+            # 16 truth lines because old rows had +1 suffix and new rows
+            # bare hash).
             if incoming_fk is not None and source_file:
+                # Try exact match first
                 existing = InvoiceLineItem.objects.filter(
                     vendor=vendor,
                     canonical_vendor_pricelist=incoming_fk,
                     source_file=source_file,
                     invoice_date=parsed_date,
                 ).first()
+                # If exact misses, try suffix-tolerant lookup
+                if existing is None:
+                    bare_hash = source_file.split('+', 1)[0]
+                    existing = InvoiceLineItem.objects.filter(
+                        vendor=vendor,
+                        canonical_vendor_pricelist=incoming_fk,
+                        source_file__startswith=bare_hash,
+                        invoice_date=parsed_date,
+                    ).first()
             # Fallback 1: raw_description match (stable across mapping changes;
             # finds rows with no FK assigned yet — pre-Phase-4a era data).
             if existing is None:
