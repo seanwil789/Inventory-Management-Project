@@ -424,20 +424,48 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
         # rank-pair competitive-y rule). Default 1 when not found.
         # Surfaced 2026-05-07 by Sean: PURLIFE WATER row had qty=2 on paper
         # but extraction hardcoded qty=1 (extended_amount $8.99 vs paper $17.98).
+        # Sysco line layout:
+        #   non-catch-weight: [LINE#] [QTY] [CS|EA|DZ|...] [description...]
+        #   catch-weight:     [Ω]    [QTY] [CS]           [WEIGHT] [LB] [desc]
+        # The qty column position shifts based on whether the row is catch-
+        # weight, but the QTY token is always directly left of the unit-code
+        # token (CS/EA/DZ/etc.). Anchor on that unit code and pick the
+        # nearest 1-2 digit token to its left within ~0.04 x-distance.
+        unit_codes = {"CS", "EA", "DZ", "LB", "GA", "PK", "BG", "RL", "PT", "QT"}
         qty_int = 1
-        for t in qty_pool:
-            dy_self = abs(_y_mid(t) - y_supc)
-            min_other = min(
-                (abs(_y_mid(t) - _y_mid(other_supc))
-                 for j, other_supc in enumerate(supcs) if j != k),
-                default=float("inf"),
-            )
-            if dy_self < min_other and dy_self < _SYSCO_DESC_Y_TOL:
+        unit_anchor = next(
+            (t for t in tokens
+             if (t.get("text") or "").upper() in unit_codes
+             and _x_mid(t) < 0.20
+             and abs(_y_mid(t) - y_supc) < _SYSCO_DESC_Y_TOL),
+            None,
+        )
+        if unit_anchor is not None:
+            anchor_x = _x_mid(unit_anchor)
+            qty_candidates = []
+            for t in qty_pool:
+                dy_self = abs(_y_mid(t) - y_supc)
+                min_other = min(
+                    (abs(_y_mid(t) - _y_mid(other_supc))
+                     for j, other_supc in enumerate(supcs) if j != k),
+                    default=float("inf"),
+                )
+                if dy_self >= min_other or dy_self >= _SYSCO_DESC_Y_TOL:
+                    continue
+                t_x = _x_mid(t)
+                # qty must be immediately LEFT of the unit code, within ~0.04
+                # of it; further-left tokens are line numbers, right-side
+                # tokens are catch-weight values.
+                if t_x >= anchor_x or anchor_x - t_x > 0.04:
+                    continue
                 try:
-                    qty_int = int(t["text"])
-                    break
+                    qty_candidates.append((t, int(t["text"])))
                 except ValueError:
                     pass
+            if qty_candidates:
+                # Closest to anchor wins (rightmost in the eligible band).
+                qty_candidates.sort(key=lambda c: anchor_x - _x_mid(c[0]))
+                qty_int = qty_candidates[0][1]
 
         # NEW: Find extended_amount. When qty>1, ext is a separate 2-decimal
         # token RIGHT of unit_price (Sysco's "EXTENDED" column). Validated
