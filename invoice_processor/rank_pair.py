@@ -280,8 +280,23 @@ def extract_sysco_rank(pages: list[dict]) -> list[dict]:
 
     Output shape matches spatial_matcher.match_sysco_spatial — same fields
     + same units — so downstream pipeline doesn't differentiate.
+
+    Multi-page handling: each page has independent y∈[0,1], so flattening
+    across pages produces false "two SUPCs at same y" collisions that break
+    competitive-y assignment. We extract per-page and concatenate.
     """
-    tokens = _flatten_tokens(pages)
+    all_rows: list[dict] = []
+    for page in pages or []:
+        tokens = page.get("tokens") or []
+        if not tokens:
+            continue
+        all_rows.extend(_extract_sysco_rank_one_page(tokens))
+    return all_rows
+
+
+def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
+    """Single-page rank-pair extraction. Caller (extract_sysco_rank) iterates
+    pages and concatenates results."""
     cfg = detect_layout_sysco(tokens)
     if cfg is None:
         return []
