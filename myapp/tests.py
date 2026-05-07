@@ -12657,3 +12657,339 @@ class DbWriteCanonicalDedupTests(TestCase):
         # raw_description fallback collapses these to one ILI
         ilis = list(InvoiceLineItem.objects.filter(vendor=self.vendor))
         self.assertEqual(len(ilis), 1)
+
+
+class ExtractSyscoFeesTests(TestCase):
+    """Validation-tool fee extractor: pulls fuel surcharge / CC processing /
+    tax from Sysco totals block by token-position proximity.
+    """
+
+    @staticmethod
+    def _tok(text, x, y, w=0.05, h=0.014):
+        return {
+            'text': text,
+            'x_min': x - w / 2,
+            'x_max': x + w / 2,
+            'y_min': y - h / 2,
+            'y_max': y + h / 2,
+        }
+
+    def _sysco_totals_tokens(self):
+        """Mirror the actual 4/06 cache layout (bce6b92e):
+
+        Page totals block (right side x≈0.74, vertical pitch ~0.014):
+            y=0.3242  106.85   (SUPPLY GROUP TOTAL)
+            y=0.3350  CREDIT CARD label  (left, x≈0.35)
+            y=0.3377  18.09             (CC processing value)
+            y=0.3485  FUEL SURCHARGE label (left, x≈0.34)
+            y=0.3513  8.95              (fuel surcharge value)
+            y=0.870   TAX label (left)
+            y=0.877   37.63 (tax value)
+        """
+        T = self._tok
+        return [
+            T('106.85', 0.736, 0.3242),
+            T('CREDIT', 0.331, 0.3350),
+            T('CARD', 0.373, 0.3355),
+            T('18.09', 0.7395, 0.3377),
+            T('FUEL', 0.310, 0.3485),
+            T('SURCHARGE', 0.363, 0.3492),
+            T('8.95', 0.743, 0.3513),
+            # bottom totals block
+            T('TAX', 0.734, 0.871),
+            T('37.63', 0.827, 0.877),
+            T('788.78', 0.831, 0.905),
+        ]
+
+    def test_extracts_fuel_cc_tax(self):
+        from myapp.management.commands.validate_extraction import (
+            extract_sysco_fees,
+        )
+        pages = [{'tokens': self._sysco_totals_tokens()}]
+        fees = extract_sysco_fees(pages)
+        # Token y-proximity binds CREDIT CARD to 18.09 and FUEL to 8.95.
+        self.assertEqual(fees, {
+            'fuel_surcharge': 8.95,
+            'cc_processing': 18.09,
+            'tax': 37.63,
+        })
+
+    def test_does_not_pick_up_group_total_as_cc(self):
+        """The SUPPLY GROUP TOTAL ($106.85) sits one row above the CREDIT CARD
+        label. A loose y-tolerance would mistakenly bind it as the CC value;
+        guard against regression.
+        """
+        from myapp.management.commands.validate_extraction import (
+            extract_sysco_fees,
+        )
+        pages = [{'tokens': self._sysco_totals_tokens()}]
+        fees = extract_sysco_fees(pages)
+        self.assertNotEqual(fees.get('cc_processing'), 106.85)
+
+    def test_no_fees_for_empty_pages(self):
+        from myapp.management.commands.validate_extraction import (
+            extract_sysco_fees,
+        )
+        self.assertEqual(extract_sysco_fees([]), {})
+        self.assertEqual(extract_sysco_fees([{'tokens': []}]), {})
+
+    def test_only_uses_last_page(self):
+        """Multi-page invoices: totals are on the last page, so prior pages'
+        token noise should not leak in.
+        """
+        from myapp.management.commands.validate_extraction import (
+            extract_sysco_fees,
+        )
+        T = self._tok
+        # First page has misleading FUEL/CREDIT tokens with wrong amounts.
+        page0 = [
+            T('FUEL', 0.31, 0.5), T('SURCHARGE', 0.36, 0.5),
+            T('999.99', 0.74, 0.5),
+        ]
+        pages = [{'tokens': page0}, {'tokens': self._sysco_totals_tokens()}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees['fuel_surcharge'], 8.95)
+        self.assertNotEqual(fees['fuel_surcharge'], 999.99)
+
+    def test_partial_match_returns_only_found(self):
+        """Invoice with no fuel surcharge but with tax → returns just tax."""
+        from myapp.management.commands.validate_extraction import (
+            extract_sysco_fees,
+        )
+        T = self._tok
+        pages = [{'tokens': [
+            T('TAX', 0.734, 0.871),
+            T('25.00', 0.827, 0.877),
+        ]}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees, {'tax': 25.00})
+
+
+class ValidateExtractionGroupingTests(TestCase):
+    """Multi-photo aggregation: caches are grouped by invoice number so a
+    multi-page Sysco invoice gets one combined report instead of N
+    per-photo reports.
+    """
+
+    def test_extract_invoice_number_sysco(self):
+        from myapp.management.commands.validate_extraction import (
+            extract_invoice_number,
+        )
+        # Mirrors actual OCR raw_text shape: pipe-delimited columns.
+        raw = (
+            'CONFIDENTIAL PROPERTY OF SYSCO | INVOICE NUMBER | 775793805 | PAGE\n'
+            'INVOICE NUMBER | 775793805 | PAGE | 0\n'
+        )
+        self.assertEqual(extract_invoice_number(raw, 'Sysco'), '775793805')
+
+    def test_extract_invoice_number_no_match(self):
+        from myapp.management.commands.validate_extraction import (
+            extract_invoice_number,
+        )
+        self.assertIsNone(extract_invoice_number('', 'Sysco'))
+        self.assertIsNone(extract_invoice_number(None, 'Sysco'))
+        self.assertIsNone(extract_invoice_number('no number here', 'Sysco'))
+
+    def test_extract_invoice_number_unknown_vendor(self):
+        """Unknown vendors return None — extend per-vendor when sample lands."""
+        from myapp.management.commands.validate_extraction import (
+            extract_invoice_number,
+        )
+        raw = 'INVOICE NUMBER | 775793805'
+        self.assertIsNone(extract_invoice_number(raw, 'OtherVendor'))
+
+    def test_is_last_page_marker(self):
+        from myapp.management.commands.validate_extraction import (
+            is_last_page, is_continued_page,
+        )
+        self.assertTrue(is_last_page('TAX 37.63 INVOICE TOTAL 788.78\nLAST PAGE\n'))
+        self.assertFalse(is_last_page('CONT. ON PAGE 2\n'))
+        self.assertFalse(is_last_page(''))
+        self.assertTrue(is_continued_page('CONT. ON PAGE 2\n'))
+        self.assertTrue(is_continued_page('CONTINUED ON PAGE 2'))
+        self.assertFalse(is_continued_page('LAST PAGE\n'))
+
+    def test_pick_totals_cache_prefers_last_page_with_total(self):
+        from myapp.management.commands.validate_extraction import (
+            pick_totals_cache,
+        )
+        # Group: one LAST PAGE cache without total, one cache w/ total but
+        # no LAST marker. Should prefer the cache with a total.
+        group = [
+            {'is_last_page': True, 'cache_name': 'a', 'result': {'invoice_total': None}},
+            {'is_last_page': False, 'cache_name': 'b', 'result': {'invoice_total': 100.0}},
+        ]
+        primary = pick_totals_cache(group)
+        self.assertEqual(primary['cache_name'], 'b')
+
+    def test_pick_totals_cache_picks_last_with_total_over_higher_partial(self):
+        from myapp.management.commands.validate_extraction import (
+            pick_totals_cache,
+        )
+        # Realistic 2-page scenario: page1 returns a partial GROUP TOTAL
+        # of 50.0; page2 (LAST) returns the actual invoice total 75.0.
+        # LAST + total beats higher non-LAST.
+        group = [
+            {'is_last_page': False, 'cache_name': 'p1', 'result': {'invoice_total': 50.0}},
+            {'is_last_page': True, 'cache_name': 'p2', 'result': {'invoice_total': 75.0}},
+        ]
+        primary = pick_totals_cache(group)
+        self.assertEqual(primary['cache_name'], 'p2')
+
+    def test_pick_totals_cache_picks_highest_when_no_last_marker(self):
+        from myapp.management.commands.validate_extraction import (
+            pick_totals_cache,
+        )
+        # No cache has LAST PAGE marker — pick the one with highest total.
+        # The partial GROUP TOTAL on a non-totals page is always less than
+        # the invoice total on the totals page.
+        group = [
+            {'is_last_page': False, 'cache_name': 'p1', 'result': {'invoice_total': 30.0}},
+            {'is_last_page': False, 'cache_name': 'p2', 'result': {'invoice_total': 100.0}},
+            {'is_last_page': False, 'cache_name': 'p3', 'result': {'invoice_total': 40.0}},
+        ]
+        primary = pick_totals_cache(group)
+        self.assertEqual(primary['cache_name'], 'p2')
+
+    def test_pick_totals_cache_returns_none_when_no_totals(self):
+        from myapp.management.commands.validate_extraction import (
+            pick_totals_cache,
+        )
+        group = [
+            {'is_last_page': False, 'cache_name': 'p1', 'result': {'invoice_total': None}},
+            {'is_last_page': False, 'cache_name': 'p2', 'result': {'invoice_total': None}},
+        ]
+        self.assertIsNone(pick_totals_cache(group))
+
+
+class ValidateExtractionEndToEndTests(TestCase):
+    """End-to-end test: synthesize 2 cache JSON files for one invoice (one
+    'page 1' continued, one 'last page' with totals) and confirm the command
+    aggregates them into a single reconciled report.
+    """
+
+    def setUp(self):
+        import tempfile
+        import json as _json
+        self.tmpdir = tempfile.mkdtemp()
+        self.addCleanup(__import__('shutil').rmtree, self.tmpdir, True)
+
+        T = ExtractSyscoFeesTests._tok
+
+        def _supc(supc, x, y):
+            return [
+                T(supc, x, y),
+                T('1', 0.10, y),
+            ]
+
+        def _price(amt, y):
+            return T(amt, 0.62, y)
+
+        def _ext(amt, y):
+            return T(amt, 0.95, y)
+
+        # Page 1 of 2: 2 items, "CONT. ON PAGE" marker, no totals.
+        page1_tokens = (
+            _supc('1111111', 0.55, 0.30) + [_price('10.00', 0.30), _ext('10.00', 0.30)]
+            + _supc('2222222', 0.55, 0.32) + [_price('20.00', 0.32), _ext('20.00', 0.32)]
+        )
+        page1_cache = {
+            'vendor': 'Sysco',
+            'invoice_date': '2026-04-06',
+            'invoice_number': None,  # parser may not extract
+            'pages': [{'tokens': page1_tokens}],
+            'raw_text': (
+                'INVOICE NUMBER | 999000111 | PAGE\n'
+                'INVOICE NUMBER | 999000111 | PAGE | 0\n'
+                'CONT. ON PAGE 2\n'
+            ),
+        }
+
+        # Page 2 of 2: 1 item + fees + totals + "LAST PAGE" marker.
+        page2_tokens = (
+            _supc('3333333', 0.55, 0.20) + [_price('30.00', 0.20), _ext('30.00', 0.20)]
+            # Fees (mirror real Sysco totals block layout)
+            + [
+                T('CREDIT', 0.331, 0.335),
+                T('CARD', 0.373, 0.336),
+                T('5.00', 0.74, 0.338),
+                T('FUEL', 0.310, 0.348),
+                T('SURCHARGE', 0.363, 0.349),
+                T('2.50', 0.74, 0.351),
+                T('TAX', 0.734, 0.871),
+                T('5.00', 0.827, 0.877),
+                T('72.50', 0.831, 0.905),  # invoice total — printed lowest
+            ]
+        )
+        page2_cache = {
+            'vendor': 'Sysco',
+            'invoice_date': '2026-04-06',
+            'invoice_number': None,
+            'pages': [{'tokens': page2_tokens}],
+            'raw_text': (
+                'INVOICE NUMBER | 999000111 | PAGE\n'
+                'INVOICE NUMBER | 999000111 | PAGE | 0\n'
+                'TAX 5.00 INVOICE TOTAL 72.50\nLAST PAGE\n'
+            ),
+        }
+
+        for name, payload in [
+            ('aaa1111111111111111111111111111111111111111111111111111111111111_docai_ocr.json', page1_cache),
+            ('bbb2222222222222222222222222222222222222222222222222222222222222_docai_ocr.json', page2_cache),
+        ]:
+            from pathlib import Path as _P
+            (_P(self.tmpdir) / name).write_text(_json.dumps(payload))
+
+    def test_aggregates_two_caches_into_one_invoice(self):
+        from io import StringIO
+        from django.core.management import call_command
+
+        out = StringIO()
+        call_command(
+            'validate_extraction',
+            '--vendor', 'Sysco',
+            '--cache-dir', self.tmpdir,
+            stdout=out,
+        )
+        report = out.getvalue()
+        # One logical invoice processed, 2 cache files.
+        self.assertIn('Processed 1 logical invoices (2 cache files)', report)
+        # Group identified by invoice_number.
+        self.assertIn('Invoice #999000111', report)
+        # Page count visible.
+        self.assertIn('2 cache files', report)
+        # LAST PAGE marker recorded.
+        self.assertIn('LAST', report)
+
+    def test_warns_when_no_totals_page_anywhere(self):
+        """If no cache has a LAST PAGE marker AND parse_invoice can't pull
+        a total from any cache, the report should warn that the totals
+        photo is missing or uncaptured."""
+        import json as _json
+        from pathlib import Path as _P
+        # Wipe BOTH the LAST PAGE marker and the totals tokens from page2
+        # so parse_invoice can't find a total anywhere.
+        page2_path = _P(self.tmpdir) / 'bbb2222222222222222222222222222222222222222222222222222222222222_docai_ocr.json'
+        page2 = _json.loads(page2_path.read_text())
+        page2['raw_text'] = (
+            'INVOICE NUMBER | 999000111 | PAGE\n'
+            'INVOICE NUMBER | 999000111 | PAGE | 0\n'
+        )
+        # Strip totals tokens from page2 — keep only the item line.
+        page2['pages'][0]['tokens'] = [
+            t for t in page2['pages'][0]['tokens']
+            if t['text'] not in ('TAX', '5.00', '72.50', 'CREDIT', 'CARD',
+                                 'FUEL', 'SURCHARGE', '2.50')
+        ]
+        page2_path.write_text(_json.dumps(page2))
+
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command(
+            'validate_extraction',
+            '--vendor', 'Sysco',
+            '--cache-dir', self.tmpdir,
+            stdout=out,
+        )
+        self.assertIn('No totals page identified', out.getvalue())
