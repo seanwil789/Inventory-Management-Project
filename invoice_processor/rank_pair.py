@@ -118,8 +118,26 @@ def extract_farmart_rank(pages: list[dict]) -> list[dict]:
 
     Empty list when layout can't be detected (caller should fall back to the
     legacy y-cluster matcher in those cases — typically thin OCR caches).
+
+    Multi-page handling: each page has independent y∈[0,1]. Flattening pages
+    cross-contaminates descriptions across cache boundaries (a row on page 1
+    at y=0.4 picks up description tokens that belong to page 2's row at
+    y=0.4). Per-page extraction prevents this. Surfaced 2026-05-07 during
+    Farm Art 2026-05-05 merged validation — rows 3, 4, 5 had mashed
+    descriptions until per-page handling was added.
     """
-    tokens = _flatten_tokens(pages)
+    all_rows: list[dict] = []
+    for page in pages or []:
+        page_tokens = page.get("tokens") or []
+        if not page_tokens:
+            continue
+        all_rows.extend(_extract_farmart_rank_one_page(page_tokens))
+    return all_rows
+
+
+def _extract_farmart_rank_one_page(tokens: list[dict]) -> list[dict]:
+    """Single-page rank-pair extraction. Caller (extract_farmart_rank)
+    iterates pages and concatenates results."""
     cfg = detect_layout_farmart(tokens)
     if cfg is None:
         return []
