@@ -1,5 +1,5 @@
 """Collapse duplicate ILI rows that share (vendor, canonical_vendor_pricelist,
-invoice_date) but have different source_file variants (HASH vs HASH+N).
+invoice_date) AND share a common source_file hash prefix.
 
 Surfaced 2026-05-07: reprocess_ocr_cache writes 'HASH+N' source_file for
 multi-photo merge; reprocess_invoices writes bare 'HASH' for single-pass.
@@ -10,10 +10,16 @@ duplicates across the two formats.
 The db_write tolerant-prefix lookup (commit 35ef5e1) prevents NEW duplicates.
 This command cleans up existing ones.
 
-Conservative dedup logic — only collapses groups where ALL rows have
-IDENTICAL qty / unit_price / extended_amount. Groups with value variance
-get reported for manual review (those represent drift cascades, not just
-source_file format drift).
+**SAFETY CONSTRAINTS** — only collapses groups where:
+    1. ALL rows share the same source_file HASH PREFIX (after stripping +N).
+       This means same OCR cache content → same physical invoice.
+       Skips JPG-vs-HASH and PDF-vs-HASH cross-format pairs (those need
+       data-merge logic to preserve product FK from older mapped rows
+       before the unmapped rank-pair-era rows get the keep slot).
+    2. ALL rows have IDENTICAL qty / unit_price / extended_amount.
+       Variance groups skipped — they represent drift-cascade fixes
+       where rank-pair has correct values and old rows have wrong ones,
+       requiring per-row decisions.
 
 Picker for which row to keep within a true-dup group:
     1. Bare-hash source_file beats HASH+N (matches new convention)
@@ -22,12 +28,27 @@ Picker for which row to keep within a true-dup group:
     3. Most recent updated_at (newest write usually has best data)
     4. Lowest id (deterministic tiebreaker)
 """
+import re
 from collections import defaultdict
 from django.core.management.base import BaseCommand
 from django.db import transaction
 from django.db.models import Count
 
 from myapp.models import InvoiceLineItem, Vendor
+
+
+_HASH_RE = re.compile(r'^([0-9a-f]{12,})(\+\d+)?$')
+
+
+def _hash_prefix(source_file: str) -> str | None:
+    """Return the bare hash prefix if source_file is a HASH or HASH+N
+    cache reference. Returns None for JPG / PDF / other formats so they
+    don't collide with hash-based source_files in the dedup grouping.
+    """
+    if not source_file:
+        return None
+    m = _HASH_RE.match(source_file.strip())
+    return m.group(1) if m else None
 
 
 _STRUCTURED_FIELDS = (
@@ -97,13 +118,25 @@ class Command(BaseCommand):
         # Identify groups with > 1 row
         dup_groups = {k: v for k, v in groups.items() if len(v) > 1}
 
-        true_dup_count = 0
-        variance_count = 0
+        true_dup_count = 0      # Pattern A: same hash prefix, identical values
+        variance_count = 0      # Same hash prefix, different qty/up/ext
+        cross_source_count = 0  # Different source types (JPG/PDF vs HASH) — skipped
         true_dup_extras = 0
         true_dup_examples = []
         variance_examples = []
+        cross_source_examples = []
 
         for key, rows in dup_groups.items():
+            # Constraint 1: all rows must share a common hash prefix
+            prefixes = {_hash_prefix(r.source_file) for r in rows}
+            if None in prefixes or len(prefixes) > 1:
+                # Cross-source-type pair (JPG vs HASH, etc.) — skip for now;
+                # Option 2 will handle these with data-merge logic.
+                cross_source_count += 1
+                if len(cross_source_examples) < 5:
+                    cross_source_examples.append((key, rows))
+                continue
+            # Constraint 2: identical qty/up/ext
             qtys = {ili.quantity for ili in rows}
             ups = {ili.unit_price for ili in rows}
             exts = {ili.extended_amount for ili in rows}
@@ -127,10 +160,14 @@ class Command(BaseCommand):
         self.stdout.write(f'Groups w/ duplicates: {len(dup_groups)}')
         self.stdout.write(self.style.SUCCESS(
             f'  TRUE DUPS (collapse): {true_dup_count} groups, '
-            f'{true_dup_extras} extra rows to delete'))
+            f'{true_dup_extras} extra rows to delete '
+            f'(same hash prefix, identical values)'))
         self.stdout.write(self.style.WARNING(
             f'  VARIANCE (skip):      {variance_count} groups '
-            f'(values differ — likely drift-cascade fixes; manual review)'))
+            f'(same hash prefix, different qty/up/ext — drift-cascade review)'))
+        self.stdout.write(self.style.WARNING(
+            f'  CROSS-SOURCE (skip):  {cross_source_count} groups '
+            f'(JPG/PDF vs HASH — needs data-merge logic to preserve product FK)'))
 
         if true_dup_examples:
             self.stdout.write('')
@@ -155,15 +192,33 @@ class Command(BaseCommand):
                                       f'qty={ili.quantity} up={ili.unit_price} '
                                       f'ext={ili.extended_amount}')
 
+        if cross_source_examples:
+            self.stdout.write('')
+            self.stdout.write('Sample cross-source-type groups (skipped — Option 2 territory):')
+            for key, rows in cross_source_examples[:5]:
+                v_id, fk_id, dt = key
+                self.stdout.write(f'  v={v_id} fk={fk_id} date={dt}: '
+                                  f'{len(rows)} rows from different source types')
+                for ili in rows[:3]:
+                    prod = ili.product.canonical_name if ili.product else '(unmapped)'
+                    self.stdout.write(f'    id={ili.id} sf={ili.source_file!r} '
+                                      f'qty={ili.quantity} up={ili.unit_price} '
+                                      f'product={prod[:25]}')
+
         if not opts['apply']:
             self.stdout.write(self.style.WARNING(
                 '\nDry-run — re-run with --apply to delete loser rows.'))
             return
 
-        # Apply
+        # Apply — only collapse rows that pass BOTH gates
         deleted = 0
         with transaction.atomic():
             for key, rows in dup_groups.items():
+                # Gate 1: same hash prefix
+                prefixes = {_hash_prefix(r.source_file) for r in rows}
+                if None in prefixes or len(prefixes) > 1:
+                    continue
+                # Gate 2: identical qty/up/ext
                 qtys = {ili.quantity for ili in rows}
                 ups = {ili.unit_price for ili in rows}
                 exts = {ili.extended_amount for ili in rows}
