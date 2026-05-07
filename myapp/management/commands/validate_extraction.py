@@ -126,7 +126,15 @@ def extract_sysco_fees(pages):
 
 
 _SYSCO_INV_NUM_RE = re.compile(
-    r'INVOICE\s*NUMBER\s*\|?\s*\|?\s*(\d{6,12})',
+    # Sysco invoice numbers are 9 digits (e.g. 775263771). DocAI sometimes
+    # interleaves the customer code (6-digit, e.g. 815579) between the
+    # "INVOICE NUMBER" label and the actual invoice number when splitting
+    # multi-column header into stacked text. Non-greedy `[\s\S]{0,200}?`
+    # skips over any intervening junk (whitespace, customer code, page
+    # number, etc.) until the first 9-digit run — that's the invoice
+    # number. The 9-digit constraint ignores 6-digit customer codes,
+    # 4-digit route codes, and 7-digit manifest numbers.
+    r'INVOICE\s*NUMBER[\s\S]{0,200}?(\d{9})',
     re.IGNORECASE,
 )
 
@@ -134,8 +142,11 @@ _SYSCO_INV_NUM_RE = re.compile(
 def extract_invoice_number(raw_text, vendor):
     """Return invoice number for a cache, or None if not found.
 
-    Sysco prints `INVOICE NUMBER | 775793805` at the top of every page. Other
-    vendors are not yet wired (extend per-vendor as needed).
+    Sysco prints `INVOICE NUMBER` followed by the 9-digit number at the top
+    of every page. The OCR sometimes renders this as one inline string
+    (`INVOICE NUMBER | 775263771`) and sometimes splits the label and value
+    across separate lines — both forms are handled. Other vendors are not
+    yet wired (extend per-vendor as needed).
     """
     if not raw_text:
         return None

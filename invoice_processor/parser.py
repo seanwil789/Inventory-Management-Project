@@ -1548,6 +1548,31 @@ def _parse_sysco(text: str) -> list[dict]:
                     print(f"  [✓] Sysco invoice total from LAST PAGE: ${invoice_total:.2f}")
                 break
 
+    # Method 2b: Stacked-layout fallback. Some Sysco invoices print SUB
+    # TOTAL / TAX TOTAL / INVOICE TOTAL labels at the very bottom of the
+    # page, with the corresponding values in a separate column much higher
+    # on the page (DocAI flattens this multi-column layout into stacked
+    # OCR text where labels and values are 20+ lines apart). When LAST
+    # PAGE is present AND the INVOICE TOTAL label was found AND neither
+    # of the above methods bound a value, scan the entire page for the
+    # largest bare-decimal ≥ $50 — that's the invoice total. (Sub total,
+    # tax, GROUP TOTALs, and individual line ext amounts are all strictly
+    # less than the invoice total, so max-on-page is safe.)
+    has_last_page = any(re.match(r'^\s*LAST PAGE\s*$', l, re.IGNORECASE)
+                        for l in lines)
+    if invoice_total is None and has_last_page and label_positions:
+        nums = []
+        for line in lines:
+            m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', line)
+            if m:
+                val = float(m.group(1).replace(",", ""))
+                if val >= 50.0:
+                    nums.append(val)
+        if nums:
+            invoice_total = max(nums)
+            print(f"  [✓] Sysco invoice total from page-wide scan "
+                  f"(stacked-totals layout): ${invoice_total:.2f}")
+
     # Method 2: Fall back to GROUP TOTAL sums (partial pages)
     if invoice_total is None:
         group_totals = []
