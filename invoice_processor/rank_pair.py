@@ -258,11 +258,17 @@ def detect_layout_sysco(tokens: list[dict]) -> dict | None:
     Returns config with x-bands for SUPC anchor + price column, or None
     when token distribution doesn't have enough signal (thin OCR cache,
     header-only page, etc.).
+
+    Initial SUPC filter [0.40, 0.78] is intentionally wider than the
+    typical x≈0.57 SUPC band — captures variant invoices where the
+    column landed further right (e.g. cache 3b25a37a61d531 2026-03-30:
+    SUPCs at x=0.69 instead of 0.57). Excludes invoice-number tokens
+    at x≈0.84 in the header.
     """
     supc_xs = sorted(
         _x_mid(t) for t in tokens
         if _SUPC_RE.fullmatch(t.get("text") or "")
-        and 0.40 <= _x_mid(t) <= 0.68
+        and 0.40 <= _x_mid(t) <= 0.78
     )
     if len(supc_xs) < 3:
         return None
