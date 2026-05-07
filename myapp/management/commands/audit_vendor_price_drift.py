@@ -247,7 +247,7 @@ class Command(BaseCommand):
             desc = (ili.raw_description or '')[:36]
             prod = (ili.product.canonical_name if ili.product else '(unmapped)')[:18]
             self.stdout.write(
-                f"  {ili.invoice_date}  qty={ili.quantity:>5}  up=${ili.unit_price:>6.2f}  "
+                f"  {ili.invoice_date}  qty={ili.quantity if ili.quantity is not None else '   ?':>5}  up=${ili.unit_price or 0:>6.2f}  "
                 f"real=${real_pu:>6.2f}  vs CSV {csv_unit or '?':>10s} "
                 f"${csv_expected or 0:>6.2f}  {diff_pct:+7.1f}%  "
                 f"[{mc:13s}]  {desc:36s}  → {prod}"
@@ -266,7 +266,8 @@ class Command(BaseCommand):
                 csv_str = (f"CSV {csv_unit:>10s} ${csv_expected:>5.2f} ({diff_pct:+5.1f}%)"
                            if csv_unit else "no CSV match")
                 self.stdout.write(
-                    f"  [{mc:13s}] {ili.invoice_date} qty={ili.quantity:>5} "
-                    f"up=${ili.unit_price:>6.2f} ext=${ili.extended_amount or 0:>6.2f} "
+                    f"  [{mc:13s}] {ili.invoice_date} "
+                    f"qty={ili.quantity if ili.quantity is not None else '   ?':>5} "
+                    f"up=${ili.unit_price or 0:>6.2f} ext=${ili.extended_amount or 0:>6.2f} "
                     f"real=${real_pu or 0:>6.2f}  {csv_str}  {desc}"
                 )
