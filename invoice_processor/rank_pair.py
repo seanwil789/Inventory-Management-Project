@@ -359,6 +359,15 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
         and _SYSCO_PRICE_RE.fullmatch(t.get("text") or "")
     ]
 
+    # Pool of digit-only tokens in the qty column (x < 0.17). Used to find
+    # qty per row by competitive-y (same rank-pair principle as descriptions).
+    # Sysco prints "1 CS" / "2 CS" / "3 EA" — we want the leading integer.
+    qty_pool = [
+        t for t in tokens
+        if _x_mid(t) < _SYSCO_QTY_DROP_X_MAX
+        and re.fullmatch(r"\d{1,2}", t.get("text") or "")
+    ]
+
     rows: list[dict] = []
     for k, supc in enumerate(supcs):
         y_supc = _y_mid(supc)
@@ -410,6 +419,56 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
                 except ValueError:
                     pass
 
+        # NEW: Extract qty from the left column. Sysco prints "1 CS" / "2 CS"
+        # at x<0.17. Pick the digit token closest in y to THIS supc (same
+        # rank-pair competitive-y rule). Default 1 when not found.
+        # Surfaced 2026-05-07 by Sean: PURLIFE WATER row had qty=2 on paper
+        # but extraction hardcoded qty=1 (extended_amount $8.99 vs paper $17.98).
+        qty_int = 1
+        for t in qty_pool:
+            dy_self = abs(_y_mid(t) - y_supc)
+            min_other = min(
+                (abs(_y_mid(t) - _y_mid(other_supc))
+                 for j, other_supc in enumerate(supcs) if j != k),
+                default=float("inf"),
+            )
+            if dy_self < min_other and dy_self < _SYSCO_DESC_Y_TOL:
+                try:
+                    qty_int = int(t["text"])
+                    break
+                except ValueError:
+                    pass
+
+        # NEW: Find extended_amount. When qty>1, ext is a separate 2-decimal
+        # token RIGHT of unit_price (Sysco's "EXTENDED" column). Validated
+        # by qty × unit_price ≈ ext within 5% / $2 tolerance.
+        ext_f = unit_f * qty_int  # default fallback (compute from qty × unit)
+        if qty_int > 1:
+            best_ext_dy = float("inf")
+            for t in candidates_2dec:
+                if _x_mid(t) <= _x_mid(unit_t) + 0.04:
+                    continue  # must be RIGHT of unit_price
+                dy_self = abs(_y_mid(t) - y_supc)
+                min_other = min(
+                    (abs(_y_mid(t) - _y_mid(other_supc))
+                     for j, other_supc in enumerate(supcs) if j != k),
+                    default=float("inf"),
+                )
+                if dy_self >= min_other or dy_self >= _SYSCO_DESC_Y_TOL:
+                    continue
+                try:
+                    cand_ext = float(t["text"].lstrip("$").rstrip("*"))
+                except ValueError:
+                    continue
+                # Validate: matches qty × unit_price within tolerance
+                expected = qty_int * unit_f
+                if expected > 0:
+                    diff_pct = abs(cand_ext - expected) / expected
+                    if diff_pct < 0.05 or abs(cand_ext - expected) < 2.0:
+                        if dy_self < best_ext_dy:
+                            best_ext_dy = dy_self
+                            ext_f = cand_ext
+
         # Description tokens for this row: left-of-SUPC tokens whose y is
         # closer to THIS supc's y than to any other supc's y.
         desc_toks = []
@@ -440,10 +499,10 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
             "raw_description":  desc or f"[Sysco #{supc['text']}]",
             "sysco_item_code":  supc["text"],
             "unit_price":       unit_f,
-            "extended_amount":  unit_f,  # Sysco line ext = unit_price (1 case)
+            "extended_amount":  ext_f,
             "case_size_raw":    "",
             "section":          "",      # caller assigns from section headers
-            "quantity":         1,
+            "quantity":         qty_int,
             "unit_of_measure":  "CASE",
             "ambiguous":        ambiguous,
         }
