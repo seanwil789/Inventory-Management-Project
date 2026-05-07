@@ -9047,6 +9047,185 @@ class DedupInvoiceLineItemsCommandTests(TestCase):
         self.assertEqual(InvoiceLineItem.objects.filter(raw_description='RAW').count(), 2)
 
 
+class DedupCanonicalFkGroupsTests(TestCase):
+    """`dedup_canonical_fk_groups` — cleanup duplicate ILIs created by
+    HASH vs HASH+N source_file format drift between reprocess paths."""
+
+    def _run(self, *args):
+        from io import StringIO
+        from django.core.management import call_command
+        out = StringIO()
+        call_command('dedup_canonical_fk_groups', *args, stdout=out)
+        return out.getvalue()
+
+    def setUp(self):
+        super().setUp()
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import (Vendor, Product, VendorPriceList,
+                                   InvoiceLineItem)
+        self.v = Vendor.objects.create(name='Farm Art')
+        self.p = Product.objects.create(canonical_name='Test Carrot',
+                                        category='Produce')
+        self.vpl = VendorPriceList.objects.create(
+            vendor=self.v, sku='CAR', raw_description='CARROTS, JUMBO 50LB',
+            unit='CASE', list_price=Decimal('41.60'),
+            ach_discount_pct=Decimal('0.01'),
+            captured_at=date(2026, 5, 1),
+        )
+
+    def test_pattern_a_collapses_hash_vs_hash_plus_n(self):
+        """HASH and HASH+1 source_file variants for same canonical+date+
+        identical values → keeper kept, loser deleted."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        # HASH+1 row (older multi-photo merge format)
+        old = InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CARROTS',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='abc123def456+1',
+            canonical_vendor_pricelist=self.vpl,
+        )
+        # Bare HASH row (newer single-pass format)
+        new = InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CARROTS, JUMBO',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='abc123def456',
+            canonical_vendor_pricelist=self.vpl,
+        )
+        self._run('--apply')
+        # Should be 1 row (whichever picker chose)
+        remaining = list(InvoiceLineItem.objects.filter(vendor=self.v))
+        self.assertEqual(len(remaining), 1)
+
+    def test_cross_source_skipped_without_merge_flag(self):
+        """JPG vs HASH source_file pair skipped by default — Option 2 opt-in."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CARROTS',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='20260505_120000.jpg',
+            product=self.p,  # JPG row has product mapped
+            canonical_vendor_pricelist=self.vpl,
+        )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CR CARROTS, JUMBO',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='abc123def456',
+            product=None,  # HASH row no product (rank-pair desc didn't match mapper)
+            canonical_vendor_pricelist=self.vpl,
+        )
+        self._run('--apply')  # no --merge-cross-source
+        # Both rows survive — cross-source skipped
+        remaining = list(InvoiceLineItem.objects.filter(vendor=self.v))
+        self.assertEqual(len(remaining), 2)
+
+    def test_merge_cross_source_preserves_product_fk(self):
+        """With --merge-cross-source, JPG vs HASH cross-source pair collapses,
+        and the product FK from the JPG (loser) transfers to the keeper if
+        keeper had no product. Critical: dedup must NOT lose the mapping."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        # Loser (JPG): mapped product, older format
+        InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CARROTS',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='20260505_120000.jpg',
+            product=self.p,  # has mapping
+            canonical_vendor_pricelist=self.vpl,
+        )
+        # Keeper-candidate (HASH): no product, newer format
+        InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CR CARROTS, JUMBO',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='abc123def456',
+            product=None,  # missing
+            canonical_vendor_pricelist=self.vpl,
+            case_pack_count=1,           # has structured field HASH row got
+            case_pack_unit_uom='LB',
+        )
+        self._run('--apply', '--merge-cross-source')
+        # 1 row remains
+        remaining = list(InvoiceLineItem.objects.filter(vendor=self.v))
+        self.assertEqual(len(remaining), 1)
+        # Picker chose row with product FK → keeper has product=self.p
+        keeper = remaining[0]
+        self.assertEqual(keeper.product, self.p,
+                         'Picker must keep the row with product FK mapped')
+
+    def test_merge_transfers_structured_fields_to_keeper(self):
+        """If keeper is the JPG row (has product FK) but loser HASH has
+        structured pack fields, those transfer to keeper."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        # Keeper (JPG): mapped product, older format, NO structured fields
+        keeper = InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CARROTS',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='20260505_120000.jpg',
+            product=self.p,
+            canonical_vendor_pricelist=self.vpl,
+        )
+        # Loser (HASH): no product, but has structured pack fields
+        InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CR CARROTS',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='abc123def456',
+            product=None,
+            canonical_vendor_pricelist=self.vpl,
+            case_pack_count=1,
+            case_pack_unit_size=Decimal('50'),
+            case_pack_unit_uom='LB',
+            case_total_weight_lb=Decimal('50'),
+        )
+        self._run('--apply', '--merge-cross-source')
+        keeper.refresh_from_db()
+        # Structured fields transferred from loser to keeper
+        self.assertEqual(keeper.case_pack_count, 1)
+        self.assertEqual(keeper.case_pack_unit_uom, 'LB')
+        self.assertEqual(keeper.case_total_weight_lb, Decimal('50'))
+        # Product FK preserved (keeper already had it)
+        self.assertEqual(keeper.product, self.p)
+
+    def test_variance_groups_never_collapsed(self):
+        """Different qty/up/ext → variance group → never auto-collapsed
+        even with --merge-cross-source. Manual review required."""
+        from datetime import date
+        from decimal import Decimal
+        from myapp.models import InvoiceLineItem
+        InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CARROTS',
+            unit_price=Decimal('41.60'), extended_amount=Decimal('41.18'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='abc123def456+1',
+            canonical_vendor_pricelist=self.vpl,
+        )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, raw_description='CARROTS, JUMBO',
+            unit_price=Decimal('45.00'),  # different price
+            extended_amount=Decimal('44.55'),
+            quantity=Decimal('1'), invoice_date=date(2026, 5, 5),
+            source_file='abc123def456',
+            canonical_vendor_pricelist=self.vpl,
+        )
+        self._run('--apply', '--merge-cross-source')
+        # Both rows survive — variance not collapsed
+        self.assertEqual(InvoiceLineItem.objects.filter(vendor=self.v).count(), 2)
+
+
 class CleanupOrphanProductsTests(TestCase):
     """Pure-orphan listing + targeted-delete safety."""
 

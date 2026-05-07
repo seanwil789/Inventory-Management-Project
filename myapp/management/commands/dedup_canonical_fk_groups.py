@@ -58,6 +58,17 @@ _STRUCTURED_FIELDS = (
     'quantity', 'purchase_uom',
 )
 
+# Fields the merge transfers from loser → keeper when keeper is empty.
+# Excludes raw_description (descriptions are extractor-format-specific and
+# the keeper's choice is intentional via picker), source_file (keeper's
+# slot is what stays), and id/created_at (DB-managed).
+_MERGE_FIELDS = _STRUCTURED_FIELDS + (
+    'product_id',                       # transfer mapping if keeper unmapped
+    'canonical_vendor_pricelist_id',    # transfer FK if keeper missing
+    'match_confidence', 'match_score', 'match_reason',
+    'section_hint',
+)
+
 
 def _structured_score(ili) -> int:
     return sum(
@@ -70,18 +81,46 @@ def _pick_keeper(rows):
     """Choose which row to keep from a true-dup group.
 
     Returns (keeper, [losers]).
+
+    Priority:
+      1. Has product FK (preserves mappings — most-load-bearing field for
+         downstream cost/category reports). Surfaced 2026-05-07: cross-source
+         pairs where old JPG row had product FK and new HASH row didn't —
+         picker without this priority would keep HASH and lose the mapping.
+      2. Bare-hash source format (matches new HASH convention)
+      3. Most structured fields populated
+      4. Most recent updated_at (newest write usually has latest data)
+      5. Lowest id (deterministic tiebreaker)
     """
     def sort_key(ili):
-        # Lower is better (sorted ascending — first wins)
         bare_hash = '+' not in (ili.source_file or '')
         return (
-            0 if bare_hash else 1,           # bare hash first
-            -_structured_score(ili),          # more structured fields first
+            0 if ili.product_id else 1,       # product FK first
+            0 if bare_hash else 1,            # bare hash second
+            -_structured_score(ili),           # more structured fields
             -(ili.updated_at.timestamp() if getattr(ili, 'updated_at', None) else 0),
-            ili.id,                           # deterministic tiebreaker
+            ili.id,                            # deterministic tiebreaker
         )
     sorted_rows = sorted(rows, key=sort_key)
     return sorted_rows[0], sorted_rows[1:]
+
+
+def _merge_loser_into_keeper(keeper, loser) -> list[str]:
+    """Copy any populated loser fields into keeper's empty fields.
+
+    Non-destructive — never overwrites a populated keeper field. Returns
+    the list of field names actually transferred (for logging).
+    """
+    transferred = []
+    for f in _MERGE_FIELDS:
+        loser_val = getattr(loser, f, None)
+        if loser_val in (None, '', 0):
+            continue
+        keeper_val = getattr(keeper, f, None)
+        if keeper_val in (None, '', 0):
+            setattr(keeper, f, loser_val)
+            transferred.append(f)
+    return transferred
 
 
 class Command(BaseCommand):
@@ -94,6 +133,12 @@ class Command(BaseCommand):
                             help='Delete loser rows (default: dry-run)')
         parser.add_argument('--show', type=int, default=20,
                             help='Number of group examples to print')
+        parser.add_argument('--merge-cross-source', action='store_true',
+                            help='Also collapse cross-source-type groups (JPG/PDF '
+                                 'vs HASH) with identical qty/up/ext, merging '
+                                 'product FK + structured fields from losers '
+                                 'into keeper before delete. Off by default — '
+                                 'explicit opt-in required.')
 
     def handle(self, *args, **opts):
         qs = (InvoiceLineItem.objects
@@ -126,29 +171,43 @@ class Command(BaseCommand):
         variance_examples = []
         cross_source_examples = []
 
+        cross_merge_count = 0   # cross-source with identical values, mergeable
+        cross_merge_extras = 0
+        cross_merge_examples = []
+
         for key, rows in dup_groups.items():
-            # Constraint 1: all rows must share a common hash prefix
-            prefixes = {_hash_prefix(r.source_file) for r in rows}
-            if None in prefixes or len(prefixes) > 1:
-                # Cross-source-type pair (JPG vs HASH, etc.) — skip for now;
-                # Option 2 will handle these with data-merge logic.
-                cross_source_count += 1
-                if len(cross_source_examples) < 5:
-                    cross_source_examples.append((key, rows))
-                continue
-            # Constraint 2: identical qty/up/ext
             qtys = {ili.quantity for ili in rows}
             ups = {ili.unit_price for ili in rows}
             exts = {ili.extended_amount for ili in rows}
-            if len(qtys) == 1 and len(ups) == 1 and len(exts) == 1:
-                true_dup_count += 1
-                true_dup_extras += len(rows) - 1
-                if len(true_dup_examples) < opts['show']:
-                    true_dup_examples.append((key, rows))
+            values_identical = (len(qtys) == 1 and len(ups) == 1
+                                and len(exts) == 1)
+
+            prefixes = {_hash_prefix(r.source_file) for r in rows}
+            same_hash = (None not in prefixes and len(prefixes) == 1)
+
+            if same_hash:
+                # Pattern A territory
+                if values_identical:
+                    true_dup_count += 1
+                    true_dup_extras += len(rows) - 1
+                    if len(true_dup_examples) < opts['show']:
+                        true_dup_examples.append((key, rows))
+                else:
+                    variance_count += 1
+                    if len(variance_examples) < 10:
+                        variance_examples.append((key, rows))
             else:
-                variance_count += 1
-                if len(variance_examples) < 10:
-                    variance_examples.append((key, rows))
+                # Cross-source-type
+                if values_identical:
+                    # Mergeable under --merge-cross-source
+                    cross_merge_count += 1
+                    cross_merge_extras += len(rows) - 1
+                    if len(cross_merge_examples) < 5:
+                        cross_merge_examples.append((key, rows))
+                else:
+                    cross_source_count += 1
+                    if len(cross_source_examples) < 5:
+                        cross_source_examples.append((key, rows))
 
         self.stdout.write(self.style.WARNING(
             f'\n=== dedup_canonical_fk_groups '
@@ -165,9 +224,16 @@ class Command(BaseCommand):
         self.stdout.write(self.style.WARNING(
             f'  VARIANCE (skip):      {variance_count} groups '
             f'(same hash prefix, different qty/up/ext — drift-cascade review)'))
+        merge_label = ('CROSS-SOURCE MERGE'
+                       if opts.get('merge_cross_source') else
+                       'CROSS-SOURCE MERGE (skip; pass --merge-cross-source)')
+        self.stdout.write(self.style.SUCCESS(
+            f'  {merge_label}: {cross_merge_count} groups, '
+            f'{cross_merge_extras} extra rows '
+            f'(JPG/PDF vs HASH, identical values — merges product FK + structured fields)'))
         self.stdout.write(self.style.WARNING(
-            f'  CROSS-SOURCE (skip):  {cross_source_count} groups '
-            f'(JPG/PDF vs HASH — needs data-merge logic to preserve product FK)'))
+            f'  CROSS-SOURCE VARIANCE (skip): {cross_source_count} groups '
+            f'(different sources, value variance — manual review)'))
 
         if true_dup_examples:
             self.stdout.write('')
@@ -192,13 +258,27 @@ class Command(BaseCommand):
                                       f'qty={ili.quantity} up={ili.unit_price} '
                                       f'ext={ili.extended_amount}')
 
+        if cross_merge_examples:
+            self.stdout.write('')
+            self.stdout.write('Sample cross-source MERGE candidates (identical values across sources):')
+            for key, rows in cross_merge_examples[:5]:
+                v_id, fk_id, dt = key
+                keeper, losers = _pick_keeper(rows)
+                self.stdout.write(f'  v={v_id} fk={fk_id} date={dt}: '
+                                  f'keep id={keeper.id} sf={keeper.source_file!r} '
+                                  f'product={(keeper.product.canonical_name if keeper.product else "(unmapped)")[:20]}')
+                for l in losers:
+                    prod = l.product.canonical_name if l.product else '(unmapped)'
+                    self.stdout.write(f'    delete id={l.id} sf={l.source_file!r} '
+                                      f'product={prod[:20]}')
+
         if cross_source_examples:
             self.stdout.write('')
-            self.stdout.write('Sample cross-source-type groups (skipped — Option 2 territory):')
+            self.stdout.write('Sample cross-source VARIANCE groups (skipped — manual review):')
             for key, rows in cross_source_examples[:5]:
                 v_id, fk_id, dt = key
                 self.stdout.write(f'  v={v_id} fk={fk_id} date={dt}: '
-                                  f'{len(rows)} rows from different source types')
+                                  f'{len(rows)} rows different sources + variance')
                 for ili in rows[:3]:
                     prod = ili.product.canonical_name if ili.product else '(unmapped)'
                     self.stdout.write(f'    id={ili.id} sf={ili.source_file!r} '
@@ -210,23 +290,42 @@ class Command(BaseCommand):
                 '\nDry-run — re-run with --apply to delete loser rows.'))
             return
 
-        # Apply — only collapse rows that pass BOTH gates
+        # Apply — collapse Pattern A always; cross-source merge requires opt-in
         deleted = 0
+        merged_with_transfer = 0
+        merge_cs = opts.get('merge_cross_source', False)
         with transaction.atomic():
             for key, rows in dup_groups.items():
-                # Gate 1: same hash prefix
-                prefixes = {_hash_prefix(r.source_file) for r in rows}
-                if None in prefixes or len(prefixes) > 1:
-                    continue
-                # Gate 2: identical qty/up/ext
                 qtys = {ili.quantity for ili in rows}
                 ups = {ili.unit_price for ili in rows}
                 exts = {ili.extended_amount for ili in rows}
                 if not (len(qtys) == 1 and len(ups) == 1 and len(exts) == 1):
-                    continue
-                keeper, losers = _pick_keeper(rows)
-                for l in losers:
-                    l.delete()
-                    deleted += 1
+                    continue  # variance — never auto-collapse
+
+                prefixes = {_hash_prefix(r.source_file) for r in rows}
+                same_hash = (None not in prefixes and len(prefixes) == 1)
+
+                if same_hash:
+                    # Pattern A — straight delete, no merge needed (same hash
+                    # means same OCR cache, same data on both sides)
+                    keeper, losers = _pick_keeper(rows)
+                    for l in losers:
+                        l.delete()
+                        deleted += 1
+                elif merge_cs:
+                    # Cross-source — merge before delete
+                    keeper, losers = _pick_keeper(rows)
+                    transferred_any = False
+                    for l in losers:
+                        transferred = _merge_loser_into_keeper(keeper, l)
+                        if transferred:
+                            transferred_any = True
+                        l.delete()
+                        deleted += 1
+                    if transferred_any:
+                        keeper.save()
+                        merged_with_transfer += 1
         self.stdout.write(self.style.SUCCESS(
-            f'\nDeleted {deleted} duplicate ILI rows.'))
+            f'\nDeleted {deleted} duplicate ILI rows.'
+            + (f' Merged data on {merged_with_transfer} keepers.'
+               if merge_cs else '')))
