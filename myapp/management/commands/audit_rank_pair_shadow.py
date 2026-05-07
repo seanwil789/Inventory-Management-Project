@@ -35,12 +35,21 @@ from django.core.management.base import BaseCommand
 from invoice_processor.rank_pair import (
     detect_layout_farmart,
     extract_farmart_rank,
+    detect_layout_sysco,
+    extract_sysco_rank,
     diagnostic_summary,
     _x_mid,
     _y_mid,
     _QTY_RE,
     _PRICE_RE,
 )
+
+
+_VENDOR_DISPATCH = {
+    "Farm Art": (detect_layout_farmart, extract_farmart_rank),
+    "FarmArt": (detect_layout_farmart, extract_farmart_rank),
+    "Sysco": (detect_layout_sysco, extract_sysco_rank),
+}
 from myapp.models import Vendor, InvoiceLineItem
 
 _DESC_TOKEN_RE = re.compile(r"[A-Z]+")
@@ -62,6 +71,12 @@ def _categorize(ili, rp_rows: list[dict]) -> tuple[str, int | None, int | None]:
     if not rp_rows:
         return ("NO_MATCH", None, None)
 
+    # Sysco rank-pair rows use 'quantity' field; Farm Art uses 'qty'
+    def _rp_qty(rp):
+        if 'qty' in rp:
+            return float(rp.get('qty') or 0)
+        return float(rp.get('quantity') or 0)
+
     db_qty = float(ili.quantity or 0)
     db_unit = float(ili.unit_price or 0)
     db_desc = ili.raw_description or ""
@@ -75,7 +90,7 @@ def _categorize(ili, rp_rows: list[dict]) -> tuple[str, int | None, int | None]:
 
     best_pair_idx = None
     for i, rp in enumerate(rp_rows):
-        if (abs(rp["qty"] - db_qty) < 0.01
+        if (abs(_rp_qty(rp) - db_qty) < 0.01
                 and abs(rp["unit_price"] - db_unit) < 0.01):
             best_pair_idx = i
             break
@@ -90,6 +105,10 @@ def _categorize(ili, rp_rows: list[dict]) -> tuple[str, int | None, int | None]:
 
 
 def _compute_tilt(tokens: list[dict], cfg: dict) -> float | None:
+    # Sysco layout has no qty_x band — return None for tilt.
+    if "qty_x" not in cfg or "unit_x" not in cfg:
+        return None
+
     qtys = sorted(
         [t for t in tokens
          if cfg["qty_x"][0] <= _x_mid(t) <= cfg["qty_x"][1]
@@ -114,7 +133,7 @@ class Command(BaseCommand):
 
     def add_arguments(self, parser):
         parser.add_argument("--vendor", default="Farm Art",
-                            help="Vendor name (only Farm Art supported in this iteration)")
+                            help="Vendor name (Farm Art or Sysco)")
         parser.add_argument("--hash", default=None,
                             help="Restrict to a single source_file hash prefix")
         parser.add_argument("--limit", type=int, default=None,
@@ -128,10 +147,12 @@ class Command(BaseCommand):
         cache_dir = (Path(opts["cache_dir"]) if opts["cache_dir"]
                      else Path(settings.BASE_DIR) / ".ocr_cache")
         vendor_name = opts["vendor"]
-        if vendor_name != "Farm Art":
+        if vendor_name not in _VENDOR_DISPATCH:
             self.stdout.write(self.style.WARNING(
-                f"Vendor '{vendor_name}' not supported yet. Only Farm Art."))
+                f"Vendor '{vendor_name}' not supported. Available: "
+                f"{sorted(_VENDOR_DISPATCH.keys())}"))
             return
+        detect_layout_fn, extract_rank_fn = _VENDOR_DISPATCH[vendor_name]
         try:
             vendor = Vendor.objects.get(name=vendor_name)
         except Vendor.DoesNotExist:
@@ -173,13 +194,13 @@ class Command(BaseCommand):
                 agg["files_no_layout"] += 1
                 continue
 
-            cfg = detect_layout_farmart(tokens)
+            cfg = detect_layout_fn(tokens)
             if cfg is None:
                 agg["files_no_layout"] += 1
                 continue
             agg["files_with_layout"] += 1
 
-            rp_rows = extract_farmart_rank(pages)
+            rp_rows = extract_rank_fn(pages)
             summary = diagnostic_summary(rp_rows)
             agg["rp_rows_total"] += summary["row_count"]
             ach_total["pass"] += summary["ach_pass"]

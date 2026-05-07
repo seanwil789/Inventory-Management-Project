@@ -2868,6 +2868,57 @@ def _clean_farmart_rank_desc(desc: str) -> str:
     return s.strip()
 
 
+def _try_rank_pair_sysco(pages: list[dict] | None) -> list[dict] | None:
+    """Rank-pair v2 extraction for Sysco — anchored on SUPC code rank,
+    eliminates y-cluster row drift cascades.
+
+    Sysco produces ~8 visible swap-pair drift cases per audit_spatial_drift_suspects
+    on Pi (CHOBANI YOGURT desc bound to EGG SHELL price, etc.). Rank-pair
+    binds prices/descriptions to SUPC anchor by RANK rather than y-tolerance,
+    so adjacent-row tilt doesn't cross-bind.
+
+    Returns None when layout undetectable (thin OCR cache, header-only page).
+    Output shape matches spatial_matcher.match_sysco_spatial.
+    """
+    if not pages:
+        return None
+    try:
+        from rank_pair import extract_sysco_rank
+    except Exception:
+        return None
+    rows = extract_sysco_rank(pages)
+    if not rows:
+        return None
+    items = []
+    for r in rows:
+        # Forward all extractor fields; downstream will populate section_hint
+        # via parser's section detection on raw_text.
+        item = dict(r)
+        # Pack-size extraction lives in spatial_matcher's _extract_row_item
+        # for Sysco; redo it here using the same parser helpers so structured
+        # pack fields populate.
+        try:
+            # Try to extract pack size from the raw_description
+            from spatial_matcher import _SUPC_RE as _SM_SUPC_RE  # reuse pre-compiled
+        except Exception:
+            pass
+        # Phase 2a: structured pack fields. Best-effort — use _normalize_pack_size
+        # path same way spatial does. _structured_pack_from_case_size handles
+        # empty case_size by returning blank dict.
+        try:
+            item.update(_structured_pack_from_case_size(item.get("case_size_raw") or ""))
+            cpl = _extract_count_per_lb(item["raw_description"])
+            if cpl is not None:
+                item["count_per_lb_low"] = cpl[0]
+                item["count_per_lb_high"] = cpl[1]
+        except Exception:
+            pass
+        if r.get("ambiguous"):
+            item["needs_review"] = True
+        items.append(item)
+    return items
+
+
 def _try_rank_pair_farmart(pages: list[dict] | None) -> list[dict] | None:
     """Rank-pair v2 extraction for Farm Art, sub-degree photo tilt resilient.
 
@@ -3032,13 +3083,15 @@ def parse_invoice(text: str, vendor: str = None,
 
     # Try rank-pair v2 first for vendors with a rank-pair extractor.
     # When rank-pair detects layout it wins on CORRECTNESS, not row count —
-    # it eliminates the 13.9% drift-cascade rate that y-cluster spatial
+    # it eliminates the y-cluster drift-cascade rate that legacy spatial
     # extraction silently produces under sub-degree photo tilt
     # (project_spatial_drift_finding.md). Falls through to spatial+text
     # picker when rank-pair declines (no layout / thin OCR).
     rank_pair_items = None
     if vendor in ("Farm Art", "FarmArt"):
         rank_pair_items = _try_rank_pair_farmart(pages)
+    elif vendor == "Sysco":
+        rank_pair_items = _try_rank_pair_sysco(pages)
 
     # Run spatial + text in parallel for the fallback picker. Spatial usually
     # wins for clean OCR (Sysco column-dump, Exceptional, PBM digital), but
