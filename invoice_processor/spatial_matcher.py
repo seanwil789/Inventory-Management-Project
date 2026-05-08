@@ -705,23 +705,36 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
                 and not _PBM_PRICE_RE.fullmatch(t["text"])
                 and not _PBM_UM_RE.fullmatch(t["text"])
             ]
-            my_desc_toks = []
+            # PRIMARY: first-code-below assignment. Works for invoices where
+            # description y < code y (most PBM phone + scanner formats).
+            desc_max = row_spacing - 0.002
+            primary_toks = []
             for t in desc_band_toks:
                 ty = _ymid(t)
-                # First code with y >= ty (small epsilon for OCR jitter)
                 owner = next((c for c in sorted_codes
                               if _ymid(c) >= ty - 0.0005), None)
                 if owner is None:
-                    continue  # token below all codes (footer noise)
-                # Distance gate uses row_spacing not y_win — desc tokens
-                # within a row can spread up to ~0.010 of y, which exceeds
-                # the price-column y_win=0.008. row_spacing-0.002 admits
-                # the full intra-row spread but excludes header text far
-                # from any item.
-                desc_max = row_spacing - 0.002
+                    continue
                 if owner is code_t and abs(_ymid(owner) - ty) <= desc_max:
-                    my_desc_toks.append(t)
-            desc_toks = sorted(my_desc_toks, key=lambda t: t["x_min"])
+                    primary_toks.append(t)
+
+            if primary_toks:
+                desc_toks = sorted(primary_toks, key=lambda t: t["x_min"])
+            else:
+                # FALLBACK: some PBM invoices have description y > code y
+                # (irregular OCR layout, e.g., e4d0bcf4 2026-02-10). When
+                # primary yields nothing for a code, fall back to nearest-
+                # anchor by y-distance — better to have a mashed description
+                # than a [PBM #code] placeholder.
+                fallback_toks = []
+                for t in desc_band_toks:
+                    ty = _ymid(t)
+                    closest_dy = min(abs(_ymid(c) - ty) for c in code_toks)
+                    if closest_dy > desc_max:
+                        continue
+                    if abs(ty - code_y) == closest_dy:
+                        fallback_toks.append(t)
+                desc_toks = sorted(fallback_toks, key=lambda t: t["x_min"])
             description = " ".join(t["text"] for t in desc_toks).strip()
 
             if not description:
