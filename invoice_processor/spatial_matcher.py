@@ -686,11 +686,42 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
                     else _nearest_in_band(code_y, _PBM_UM_X_RANGE, _PBM_UM_RE))
             um = um_t["text"].upper() if um_t else ""
 
-            desc_toks = sorted(
-                _all_in_band(code_y, _PBM_DESC_X_RANGE,
-                              exclude_regexes=(_PBM_PRICE_RE, _PBM_UM_RE)),
-                key=lambda t: t["x_min"],
-            )
+            # B-NEW (2026-05-08): description owner = first code below
+            # token. PBM (both phone and scanner) prints item codes BELOW
+            # their description: scanner has desc y≈0.435, code y≈0.443
+            # (code 0.008 below); phone has desc y≈0.411, code y≈0.404
+            # (code visually at top but bbox y_min ≈ desc y_min — the
+            # next-row's code is the one geometrically below). For each
+            # desc-band token, the owning row's code is the first code
+            # whose y >= desc_y. Closest-anchor fails at boundaries
+            # because midway tokens can be geometrically nearer to the
+            # wrong row — e.g., on INV 2055 'Rolls' (y=0.4222, row 2) is
+            # 0.0046 from row-1 code G105 (0.4176) but 0.0078 from row-2
+            # code L07 (0.4300). First-code-below correctly says L07.
+            sorted_codes = sorted(code_toks, key=_ymid)
+            desc_band_toks = [
+                t for t in tokens
+                if _in_x(t, _PBM_DESC_X_RANGE)
+                and not _PBM_PRICE_RE.fullmatch(t["text"])
+                and not _PBM_UM_RE.fullmatch(t["text"])
+            ]
+            my_desc_toks = []
+            for t in desc_band_toks:
+                ty = _ymid(t)
+                # First code with y >= ty (small epsilon for OCR jitter)
+                owner = next((c for c in sorted_codes
+                              if _ymid(c) >= ty - 0.0005), None)
+                if owner is None:
+                    continue  # token below all codes (footer noise)
+                # Distance gate uses row_spacing not y_win — desc tokens
+                # within a row can spread up to ~0.010 of y, which exceeds
+                # the price-column y_win=0.008. row_spacing-0.002 admits
+                # the full intra-row spread but excludes header text far
+                # from any item.
+                desc_max = row_spacing - 0.002
+                if owner is code_t and abs(_ymid(owner) - ty) <= desc_max:
+                    my_desc_toks.append(t)
+            desc_toks = sorted(my_desc_toks, key=lambda t: t["x_min"])
             description = " ".join(t["text"] for t in desc_toks).strip()
 
             if not description:
