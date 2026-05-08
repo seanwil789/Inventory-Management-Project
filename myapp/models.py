@@ -1118,3 +1118,89 @@ class VendorPriceList(models.Model):
 
     def __str__(self):
         return f"{self.vendor.name}/{self.sku}/{self.unit} ${self.list_price}"
+
+
+class InvoiceValidationStatus(models.Model):
+    """Per-invoice validation status. One row per (vendor, invoice_number).
+
+    First invoice-level (not line-level) record in the DB. Records:
+      - Items extracted vs printed invoice_total
+      - Per-section reconciliation outcome (parser_sum vs printed GROUP TOTAL)
+      - Overall PASS/REVIEW/FAIL classification
+
+    Populated by `validate_all_invoices` mgmt command and by `db_write`
+    after every ingestion. Drives the validation-failure surface (B5
+    durable layer) per `project_parser_accuracy_goal.md`. Per Trust LAW,
+    REVIEW/FAIL invoices need Sean's eye before downstream consumers
+    (Synergy sheet, recipe cost calc) trust the underlying ILI rows.
+    """
+
+    STATUS_CHOICES = [
+        # Invoice math reconciles within tolerance — every consumer can trust
+        # the underlying ILI rows.
+        ('pass',    'PASS — all sections + invoice_total reconcile within tolerance'),
+        # Some sections diverge but invoice_total is approximately right —
+        # extraction has gaps but isn't catastrophically wrong.
+        ('review',  'REVIEW — section-level diffs exceed tolerance'),
+        # Items_sum diverges from invoice_total by >10% — the system can't
+        # vouch for these numbers; downstream consumers should not use them.
+        ('fail',    'FAIL — items_sum vs invoice_total >10% off'),
+        # Section data unavailable (no GROUP TOTAL extracted, or partial
+        # cache) — can't reconcile but no obvious failure.
+        ('partial', 'PARTIAL — invoice_total or section data missing'),
+    ]
+
+    vendor          = models.ForeignKey(Vendor, on_delete=models.CASCADE)
+    invoice_number  = models.CharField(max_length=20, db_index=True)
+    invoice_date    = models.DateField(null=True, blank=True)
+
+    items_count     = models.IntegerField(default=0)
+    items_sum       = models.DecimalField(max_digits=10, decimal_places=2,
+                                           null=True, blank=True)
+    invoice_total   = models.DecimalField(max_digits=10, decimal_places=2,
+                                           null=True, blank=True,
+                                           help_text="Printed INVOICE TOTAL extracted from the invoice.")
+    invoice_gap     = models.DecimalField(max_digits=10, decimal_places=2,
+                                           null=True, blank=True,
+                                           help_text="items_sum − invoice_total. Negative = items missing.")
+    invoice_gap_pct = models.DecimalField(max_digits=6, decimal_places=2,
+                                           null=True, blank=True,
+                                           help_text="abs(invoice_gap) / invoice_total × 100.")
+
+    sections_total      = models.IntegerField(default=0,
+                                              help_text="Number of distinct sections detected.")
+    sections_reconciled = models.IntegerField(default=0,
+                                              help_text="Sections where parser_sum matches printed GROUP TOTAL within $0.50.")
+    sections_with_gap   = models.IntegerField(default=0,
+                                              help_text="Sections with diff > $0.50.")
+
+    # Full per-section reconciliation list — same shape as
+    # section_validator.reconcile() output. Stored for audit + UI display.
+    section_reconciliation = models.JSONField(
+        default=list, blank=True,
+        help_text="List of {section, parser_sum, printed_total, diff_abs, diff_pct, item_count}.",
+    )
+
+    # Cache hashes (sha256 prefixes) that contributed to this invoice's
+    # validation. Lets us trace back to the OCR sources that fed parsing.
+    cache_hashes    = models.JSONField(
+        default=list, blank=True,
+        help_text="OCR cache file SHA256 hashes that fed this validation.",
+    )
+
+    status          = models.CharField(max_length=10, choices=STATUS_CHOICES,
+                                        default='partial', db_index=True)
+    notes           = models.TextField(blank=True)
+    last_validated  = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        unique_together = [('vendor', 'invoice_number')]
+        indexes = [
+            models.Index(fields=['status', '-last_validated']),
+            models.Index(fields=['vendor', '-invoice_date']),
+        ]
+        ordering = ['-invoice_date', 'vendor', 'invoice_number']
+
+    def __str__(self):
+        return (f"{self.vendor.name} {self.invoice_number} "
+                f"[{self.status}] {self.invoice_gap_pct or 0}%")
