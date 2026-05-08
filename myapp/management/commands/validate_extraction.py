@@ -125,36 +125,46 @@ def extract_sysco_fees(pages):
     return fees
 
 
-_SYSCO_INV_NUM_RE = re.compile(
-    # Sysco invoice numbers are 9 digits (e.g. 775263771). DocAI sometimes
-    # interleaves the customer code (6-digit, e.g. 815579) between the
-    # "INVOICE NUMBER" label and the actual invoice number when splitting
-    # multi-column header into stacked text. Non-greedy `[\s\S]{0,200}?`
-    # skips over any intervening junk (whitespace, customer code, page
-    # number, etc.) until the first 9-digit run — that's the invoice
-    # number. The 9-digit constraint ignores 6-digit customer codes,
-    # 4-digit route codes, and 7-digit manifest numbers.
-    r'INVOICE\s*NUMBER[\s\S]{0,200}?(\d{9})',
-    re.IGNORECASE,
-)
+_SYSCO_NINE_DIGIT_RE = re.compile(r'(\d{9})')
+_SYSCO_INV_LABEL_RE = re.compile(r'INVOICE\s*NUMBER', re.IGNORECASE)
 
 
 def extract_invoice_number(raw_text, vendor):
     """Return invoice number for a cache, or None if not found.
 
     Sysco prints `INVOICE NUMBER` followed by the 9-digit number at the top
-    of every page. The OCR sometimes renders this as one inline string
-    (`INVOICE NUMBER | 775263771`) and sometimes splits the label and value
-    across separate lines — both forms are handled. Other vendors are not
-    yet wired (extend per-vendor as needed).
+    of every page. DocAI's flattening of the multi-column page header is
+    unpredictable: the digits sometimes appear inline (`INVOICE NUMBER |
+    775263771`), sometimes 200+ chars after the label (separated by the
+    customer code, address block, etc.), and on some last-page caches the
+    digits are emitted BEFORE the label in OCR text order. To handle all
+    three, find every "INVOICE NUMBER" occurrence and the nearest 9-digit
+    run to ANY of them (within a 600-char window in either direction).
+
+    The 9-digit constraint filters out 6-digit customer codes, 4-digit
+    route codes, 7-digit manifest numbers, phone-number digit runs (max 4
+    between separators), and the spelled-out customer ID (digit chunks
+    1-3 wide separated by spaces, never forming a 9-digit run).
     """
-    if not raw_text:
+    if not raw_text or vendor != 'Sysco':
         return None
-    if vendor == 'Sysco':
-        m = _SYSCO_INV_NUM_RE.search(raw_text)
-        if m:
-            return m.group(1)
-    return None
+
+    label_positions = [m.start() for m in _SYSCO_INV_LABEL_RE.finditer(raw_text)]
+    if not label_positions:
+        return None
+
+    digit_runs = [(m.start(), m.group(1))
+                  for m in _SYSCO_NINE_DIGIT_RE.finditer(raw_text)]
+    if not digit_runs:
+        return None
+
+    # For each digit run, distance to the nearest label.
+    best_run, best_dist = None, float('inf')
+    for pos, digits in digit_runs:
+        dist = min(abs(pos - lp) for lp in label_positions)
+        if dist < best_dist and dist <= 600:
+            best_run, best_dist = digits, dist
+    return best_run
 
 
 def is_last_page(raw_text):

@@ -73,10 +73,15 @@ def detect_layout_farmart(tokens: list[dict]) -> dict | None:
     if len(right) < 2:
         return None
     ext_max = right[-1]
+    # 2026-05-07 fix (Farm Art INV 1631546): the ext column is right-aligned,
+    # so short-dollar tokens like `9.50` and `15.84` have x_mid further LEFT
+    # than long-dollar tokens like `189.87` (which sets ext_max). Widen the
+    # left side of ext_x from 0.04 to 0.06 so short-dollar items aren't
+    # silently dropped from extraction. Right side unchanged.
     return {
         "qty_x":   (max(0.0, qty_ord - 0.025), qty_ord + 0.025),
         "unit_x":  (ext_max - 0.13, ext_max - 0.07),
-        "ext_x":   (ext_max - 0.04, ext_max + 0.04),
+        "ext_x":   (ext_max - 0.06, ext_max + 0.04),
         "desc_x":  (qty_ord + 0.10, ext_max - 0.15),
     }
 
@@ -310,20 +315,79 @@ def extract_sysco_rank(pages: list[dict]) -> list[dict]:
     competitive-y assignment. We extract per-page and concatenate.
     """
     all_rows: list[dict] = []
+    # B2b fix (2026-05-07): track section state across page boundaries.
+    # When page N starts mid-section (its first SUPC is above all section
+    # headers detected on page N), the items at the top inherit the
+    # section from the END of page N-1. Without this, those items get
+    # section="" and break section-level reconciliation.
+    #
+    # B-NEW (2026-05-07): a page is treated as a continuation ONLY when
+    # it has NO section headers of its own. A page with its own headers
+    # starts a fresh section context. This guards against carry_section
+    # bleeding across UNRELATED pages (e.g., when validate_all_invoices
+    # combines pages from multiple separately-photographed caches in
+    # filesystem order — INV 775605601 had carry_section from cache A's
+    # last section drift into cache B's items, producing junk section
+    # labels like 'CANNED & DRY GROUP' / 'HAZARD'). When the next page
+    # has its own canonical sections, those override carry — already
+    # implemented inline. The bug was in cross-cache assumption.
+    carry_section: str = ""
+    last_cache_sha: str | None = None
     for page in pages or []:
         tokens = page.get("tokens") or []
         if not tokens:
             continue
-        all_rows.extend(_extract_sysco_rank_one_page(tokens))
+        # Reset carry_section at cache boundaries. When pages from
+        # multiple separately-photographed caches are concatenated (one
+        # photo per Sysco invoice page), each cache's first page
+        # starts fresh — section context shouldn't bleed across photos.
+        cache_sha = page.get("_cache_sha")
+        if cache_sha is not None and cache_sha != last_cache_sha:
+            carry_section = ""
+        last_cache_sha = cache_sha
+        rows, last_section = _extract_sysco_rank_one_page(
+            tokens, carry_section=carry_section)
+        all_rows.extend(rows)
+        # Carry the LAST section detected on this page (or the carry-in
+        # if this page had no headers at all) forward to the next page.
+        if last_section:
+            carry_section = last_section
     return all_rows
 
 
-def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
+def _extract_sysco_rank_one_page(
+    tokens: list[dict],
+    carry_section: str = "",
+) -> tuple[list[dict], str]:
     """Single-page rank-pair extraction. Caller (extract_sysco_rank) iterates
-    pages and concatenates results."""
+    pages and concatenates results.
+
+    Args:
+        tokens: page tokens with bounding boxes
+        carry_section: section name carried over from previous page's bottom.
+            Used as the section for items above the first detected section
+            header on this page (B2b cross-page continuity fix).
+
+    Returns:
+        (rows, last_section): extracted item rows + the last section header
+        detected on this page (or carry_section if no headers detected).
+    """
     cfg = detect_layout_sysco(tokens)
     if cfg is None:
-        return []
+        return [], carry_section
+
+    # Section detection — reuse spatial_matcher's row-clustering + section
+    # finder so each extracted item carries its **** SECTION **** tag. Without
+    # this, downstream section-level reconciliation (parser items grouped by
+    # section vs printed GROUP TOTAL) has no signal. Failure is non-fatal:
+    # if the import fails or section detection yields nothing, items get
+    # section="" and reconciliation falls back to invoice-level only.
+    sections: list[tuple[float, str]] = []
+    try:
+        from spatial_matcher import _group_rows, _find_sections
+        sections = _find_sections(_group_rows(tokens))
+    except Exception:
+        pass
 
     # Rank SUPCs by y
     supcs = sorted(
@@ -333,7 +397,17 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
         key=_y_mid,
     )
     if not supcs:
-        return []
+        # No SUPCs but sections may still exist on this page — carry forward
+        # the last section if any.
+        last_sec = carry_section
+        if sections:
+            try:
+                from spatial_matcher import canonicalize_sysco_section
+                sorted_secs = sorted(sections, key=lambda s: s[0])
+                last_sec = canonicalize_sysco_section(sorted_secs[-1][1])
+            except Exception:
+                last_sec = sorted(sections, key=lambda s: s[0])[-1][1]
+        return [], last_sec
 
     # Build description band tokens (excluding price/SUPC/qty noise)
     desc_pool = []
@@ -368,23 +442,71 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
         and re.fullmatch(r"\d{1,2}", t.get("text") or "")
     ]
 
+    # B-NEW (2026-05-07): REMOTE-STOCK marker pool. Sysco prints `REMOTE-STOCK`
+    # immediately below items that were on the order but NOT delivered (the
+    # vendor substituted, ran out of stock, etc.). The row's unit_price is
+    # printed but the row's ext IS NOT — Sean confirmed: this is the same
+    # class as Farm Art's `zz` items. Without this filter, the parser uses
+    # the catalog unit_price as ext (because qty=1 default + no ext token in
+    # right column = synthesize ext = unit × 1), inflating items_sum by the
+    # catalog price of every undelivered row.
+    #
+    # Confirmed cases: INV 775619701 CAMBRO LID ($56.53 over), INV 775645370
+    # (2 items), INV 775632629 (3 items), INV 775662001 (2 items).
+    #
+    # Each REMOTE-STOCK marker associates with the SINGLE closest SUPC above
+    # it (the undelivered row's anchor) — not all SUPCs in a wide window.
+    # First implementation used a wide y-band and accidentally skipped
+    # ADJACENT delivered rows too (gloves at y_g + CAMBRO at y_c, marker at
+    # y_rs > y_c, both SUPCs within wide band → both skipped wrongly).
+    remote_stock_tokens = [
+        t for t in tokens
+        if (t.get("text") or "").upper() in ("REMOTE-STOCK", "REMOTE")
+    ]
+    remote_stock_supcs: set[str] = set()
+    for rs in remote_stock_tokens:
+        rs_y = _y_mid(rs)
+        # Find SUPC closest ABOVE this marker, within reasonable distance.
+        above = [s for s in supcs if _y_mid(s) < rs_y]
+        if not above:
+            continue
+        closest = max(above, key=_y_mid)
+        if (rs_y - _y_mid(closest)) < 0.04:
+            remote_stock_supcs.add(closest["text"])
+
     rows: list[dict] = []
     for k, supc in enumerate(supcs):
         y_supc = _y_mid(supc)
 
         # Find the unit_price for this row: closest 2-decimal price to y_supc,
         # right of SUPC, that's also closer to THIS rank than to neighbor ranks.
-        candidates_2dec = [
-            t for t in price_pool
-            if "." in t["text"]
-            and len(t["text"].rstrip("*").lstrip("$").split(".")[1]) == 2
-            and _x_mid(t) > _x_mid(supc)
-        ]
+        # Sort by x_mid (leftmost first) — Sysco prints unit_price LEFT of
+        # tax/ext on the same row. Picking the leftmost equally-close-y
+        # candidate gives the unit_price column rather than tax/ext.
+        # B-NEW (2026-05-07): without this, INV 775726055 SUPC 4458646
+        # picked TAX $3.72 as unit_price, then ext-derived qty $93.10/$3.72
+        # = 25 (internally math-validated but semantically wrong).
+        candidates_2dec = sorted(
+            [t for t in price_pool
+             if "." in t["text"]
+             and len(t["text"].rstrip("*").lstrip("$").split(".")[1]) == 2
+             and _x_mid(t) > _x_mid(supc)],
+            key=lambda t: _x_mid(t),
+        )
         # Choose by smallest |y - y_supc|; require it's strictly closest to
         # THIS supc rank vs any other supc to prevent cross-rank drift.
+        # Tie-break: when multiple candidates land on the same OCR row
+        # (dy within 0.005 of best), prefer LEFTMOST. The Sysco template
+        # prints unit_price LEFT of tax/ext, so leftmost-on-the-row is the
+        # unit_price column; rightward tokens are tax or ext.
+        # B-NEW (2026-05-07): without strict same-row tie-break,
+        # INV 775726055 SUPC 7136165 picked $139.90 (ext column,
+        # dy=0.0000) over $69.95 (unit column, dy=0.0003) and inflated
+        # ext from $139.90 to $279.80.
         unit_t = None
         best_dy = float("inf")
-        for t in candidates_2dec:
+        SAME_ROW_DY = 0.005
+        for t in candidates_2dec:  # already sorted leftmost-first
             dy_self = abs(_y_mid(t) - y_supc)
             # Check competitors — distance from this token to other SUPCs
             min_other = min(
@@ -392,15 +514,28 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
                  for j, other_supc in enumerate(supcs) if j != k),
                 default=float("inf"),
             )
-            if dy_self < min_other and dy_self < best_dy:
+            if dy_self >= min_other:
+                continue
+            if unit_t is None or dy_self + SAME_ROW_DY < best_dy:
+                # Strictly better row OR first acceptable candidate.
                 best_dy = dy_self
                 unit_t = t
+            # else: same row as current best; keep current (leftmost wins
+            # because candidates_2dec is sorted leftmost-first).
 
         if unit_t is None:
             continue
         try:
             unit_f = float(unit_t["text"].lstrip("$").rstrip("*"))
         except ValueError:
+            continue
+
+        # B-NEW: skip REMOTE-STOCK rows. The remote_stock_supcs set was
+        # pre-computed as: for each REMOTE-STOCK marker, the SINGLE SUPC
+        # closest above it within 0.04 y-distance. Skipping the row drops
+        # the catalog unit_price from items_sum — matches the actual
+        # invoice (undelivered rows print unit but ext=0).
+        if supc["text"] in remote_stock_supcs:
             continue
 
         # Per-lb (catch-weight) — 3-decimal token closest to y_supc, right of SUPC
@@ -419,83 +554,118 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
                 except ValueError:
                     pass
 
-        # NEW: Extract qty from the left column. Sysco prints "1 CS" / "2 CS"
-        # at x<0.17. Pick the digit token closest in y to THIS supc (same
-        # rank-pair competitive-y rule). Default 1 when not found.
-        # Surfaced 2026-05-07 by Sean: PURLIFE WATER row had qty=2 on paper
-        # but extraction hardcoded qty=1 (extended_amount $8.99 vs paper $17.98).
-        # Sysco line layout:
-        #   non-catch-weight: [LINE#] [QTY] [CS|EA|DZ|...] [description...]
-        #   catch-weight:     [Ω]    [QTY] [CS]           [WEIGHT] [LB] [desc]
-        # The qty column position shifts based on whether the row is catch-
-        # weight, but the QTY token is always directly left of the unit-code
-        # token (CS/EA/DZ/etc.). Anchor on that unit code and pick the
-        # nearest 1-2 digit token to its left within ~0.04 x-distance.
-        unit_codes = {"CS", "EA", "DZ", "LB", "GA", "PK", "BG", "RL", "PT", "QT"}
+        # B1+B4 fix (2026-05-07): derive qty from the extended-amount column,
+        # not the left-column qty token. Per `project_parser_accuracy_goal.md`
+        # — the Sysco invoice template puts the qty/CS/pack-size tokens
+        # ~0.011-0.015 BELOW the SUPC y; with `_SYSCO_DESC_Y_TOL=0.012` the
+        # filter cuts off real qty tokens for 11 of 13 SUPCs on a typical
+        # invoice. Result: silent qty=1 fallback. INV 775170714 lost $53 on
+        # MANDARIN; INV 775619701 lost $116 across 4 DAIRY rows.
+        #
+        # New approach: ext / unit_price = qty (when both are extracted).
+        # If that ratio rounds to a clean integer 1-50 within rounding
+        # tolerance 0.05, accept it. This:
+        #   - Is layout-independent (no y-tolerance dependency)
+        #   - Math-validates by construction (the qty IS what makes math work)
+        #   - Handles B4 (OCR token-merging like "1 5" → "15") because
+        #     a wrong qty wouldn't divide cleanly into ext.
+        #
+        # Fall back to left-column qty extraction (with widened y-tolerance)
+        # only when no right-column ext token is present — for rows where
+        # ext = unit (qty=1) the result is identical.
         qty_int = 1
-        unit_anchor = next(
-            (t for t in tokens
-             if (t.get("text") or "").upper() in unit_codes
-             and _x_mid(t) < 0.20
-             and abs(_y_mid(t) - y_supc) < _SYSCO_DESC_Y_TOL),
-            None,
-        )
-        if unit_anchor is not None:
-            anchor_x = _x_mid(unit_anchor)
-            qty_candidates = []
-            for t in qty_pool:
-                dy_self = abs(_y_mid(t) - y_supc)
-                min_other = min(
-                    (abs(_y_mid(t) - _y_mid(other_supc))
-                     for j, other_supc in enumerate(supcs) if j != k),
-                    default=float("inf"),
-                )
-                if dy_self >= min_other or dy_self >= _SYSCO_DESC_Y_TOL:
-                    continue
-                t_x = _x_mid(t)
-                # qty must be immediately LEFT of the unit code, within ~0.04
-                # of it; further-left tokens are line numbers, right-side
-                # tokens are catch-weight values.
-                if t_x >= anchor_x or anchor_x - t_x > 0.04:
-                    continue
-                try:
-                    qty_candidates.append((t, int(t["text"])))
-                except ValueError:
-                    pass
-            if qty_candidates:
-                # Closest to anchor wins (rightmost in the eligible band).
-                qty_candidates.sort(key=lambda c: anchor_x - _x_mid(c[0]))
-                qty_int = qty_candidates[0][1]
+        ext_f = unit_f  # default: qty=1, ext=unit_price
 
-        # NEW: Find extended_amount. When qty>1, ext is a separate 2-decimal
-        # token RIGHT of unit_price (Sysco's "EXTENDED" column). Validated
-        # by qty × unit_price ≈ ext within 5% / $2 tolerance.
-        ext_f = unit_f * qty_int  # default fallback (compute from qty × unit)
-        if qty_int > 1:
-            best_ext_dy = float("inf")
-            for t in candidates_2dec:
-                if _x_mid(t) <= _x_mid(unit_t) + 0.04:
-                    continue  # must be RIGHT of unit_price
-                dy_self = abs(_y_mid(t) - y_supc)
-                min_other = min(
-                    (abs(_y_mid(t) - _y_mid(other_supc))
-                     for j, other_supc in enumerate(supcs) if j != k),
-                    default=float("inf"),
-                )
-                if dy_self >= min_other or dy_self >= _SYSCO_DESC_Y_TOL:
-                    continue
-                try:
-                    cand_ext = float(t["text"].lstrip("$").rstrip("*"))
-                except ValueError:
-                    continue
-                # Validate: matches qty × unit_price within tolerance
-                expected = qty_int * unit_f
-                if expected > 0:
-                    diff_pct = abs(cand_ext - expected) / expected
-                    if diff_pct < 0.05 or abs(cand_ext - expected) < 2.0:
-                        if dy_self < best_ext_dy:
-                            best_ext_dy = dy_self
-                            ext_f = cand_ext
+        # Step 1 — find rightmost 2-decimal token to the right of unit_t.
+        # That's the EXTENDED PRICE column (x≈0.78-0.85 on Sysco). Skip
+        # tax tokens at x≈0.71 by requiring a 0.04 x-buffer past unit_t.
+        ext_t = None
+        for t in sorted(candidates_2dec, key=lambda x: -_x_mid(x)):
+            if _x_mid(t) <= _x_mid(unit_t) + 0.04:
+                continue
+            dy_self = abs(_y_mid(t) - y_supc)
+            min_other = min(
+                (abs(_y_mid(t) - _y_mid(other_supc))
+                 for j, other_supc in enumerate(supcs) if j != k),
+                default=float("inf"),
+            )
+            # Slightly wider y-tol for ext (1.5x) — printer baseline can
+            # differ between SUPC token and right-column ext token.
+            if dy_self < min_other and dy_self < _SYSCO_DESC_Y_TOL * 1.5:
+                ext_t = t
+                break
+
+        # Step 2 — derive qty from ext / unit when ext is found.
+        if ext_t is not None and unit_f > 0:
+            try:
+                cand_ext = float(ext_t["text"].lstrip("$").rstrip("*"))
+            except ValueError:
+                cand_ext = None
+            if cand_ext is not None and cand_ext > 0:
+                derived = cand_ext / unit_f
+                rounded = round(derived)
+                # Accept when (a) rounds to a small integer (1-50), AND
+                # (b) the rounding error is small (< 0.05). The latter
+                # rejects coincidental near-divisions, e.g. tax-only rows
+                # where ext = unit + tax wouldn't divide cleanly.
+                if 1 <= rounded <= 50 and abs(derived - rounded) < 0.05:
+                    qty_int = rounded
+                    ext_f = cand_ext
+
+        # Step 3 — fallback: left-column qty extraction. Only useful when
+        # Step 2 didn't produce qty>1 (typical case: row has unit but no
+        # distinct ext token — single-qty row where ext=unit). Wider
+        # y-tolerance (0.018) here since the Sysco template structurally
+        # offsets qty below SUPC.
+        if qty_int == 1:
+            unit_codes = {"CS", "EA", "DZ", "LB", "GA", "PK", "BG", "RL", "PT", "QT"}
+            QTY_Y_TOL = 0.018
+            unit_anchor = next(
+                (t for t in tokens
+                 if (t.get("text") or "").upper() in unit_codes
+                 and _x_mid(t) < 0.20
+                 and abs(_y_mid(t) - y_supc) < QTY_Y_TOL),
+                None,
+            )
+            if unit_anchor is not None:
+                anchor_x = _x_mid(unit_anchor)
+                qty_candidates = []
+                for t in qty_pool:
+                    dy_self = abs(_y_mid(t) - y_supc)
+                    min_other = min(
+                        (abs(_y_mid(t) - _y_mid(other_supc))
+                         for j, other_supc in enumerate(supcs) if j != k),
+                        default=float("inf"),
+                    )
+                    if dy_self >= min_other or dy_self >= QTY_Y_TOL:
+                        continue
+                    t_x = _x_mid(t)
+                    if t_x >= anchor_x or anchor_x - t_x > 0.04:
+                        continue
+                    try:
+                        qty_candidates.append((t, int(t["text"])))
+                    except ValueError:
+                        pass
+                if qty_candidates:
+                    qty_candidates.sort(key=lambda c: anchor_x - _x_mid(c[0]))
+                    candidate_qty = qty_candidates[0][1]
+                    # B4 guard: validate against ext token before accepting
+                    # a qty>1 from left-column extraction. If ext exists and
+                    # candidate_qty × unit doesn't match it within 5%, the
+                    # qty token is likely OCR-merged garbage (the "1 5"→"15"
+                    # case on the Carrot row). Keep qty=1 in that case.
+                    if candidate_qty > 1 and ext_t is not None:
+                        try:
+                            cand_ext = float(ext_t["text"].lstrip("$").rstrip("*"))
+                            expected = candidate_qty * unit_f
+                            if expected > 0 and abs(cand_ext - expected) / expected < 0.05:
+                                qty_int = candidate_qty
+                                ext_f = cand_ext
+                        except ValueError:
+                            pass
+                    else:
+                        qty_int = candidate_qty
+                        ext_f = unit_f * candidate_qty
 
         # Description tokens for this row: left-of-SUPC tokens whose y is
         # closer to THIS supc's y than to any other supc's y.
@@ -523,13 +693,40 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
             if spread > _SYSCO_DESC_Y_TOL * _AMBIGUITY_RATIO:
                 ambiguous = True
 
+        # Section tag — most-recent **** SECTION **** header above this SUPC.
+        # Sort sections by y (find_sections returns them in row-iteration
+        # order, which isn't always y-sorted on multi-column invoices).
+        # B2b: when no section header on this page sits above the SUPC's y,
+        # use carry_section (the section from the previous page's bottom) —
+        # critical for items at top of continuation pages.
+        # B2c: only use sections that canonicalize to a known Sysco section.
+        # Junk labels like "26.14" (price tokens that passed _find_sections
+        # via stray asterisks) get filtered out here so items aren't tagged
+        # with non-section labels.
+        try:
+            from spatial_matcher import (canonicalize_sysco_section,
+                                          _CANONICAL_SYSCO_SECTIONS)
+            _canon_set = _CANONICAL_SYSCO_SECTIONS
+            _canon_fn = canonicalize_sysco_section
+        except Exception:
+            _canon_set = []
+            _canon_fn = lambda x: x
+        sec_name = carry_section  # default to inherited section from prior page
+        for sec_y, sec_label in sorted(sections, key=lambda s: s[0]):
+            if sec_y <= y_supc:
+                canon = _canon_fn(sec_label)
+                if canon in _canon_set:
+                    sec_name = canon
+            else:
+                break
+
         item = {
             "raw_description":  desc or f"[Sysco #{supc['text']}]",
             "sysco_item_code":  supc["text"],
             "unit_price":       unit_f,
             "extended_amount":  ext_f,
             "case_size_raw":    "",
-            "section":          "",      # caller assigns from section headers
+            "section":          sec_name,
             "quantity":         qty_int,
             "unit_of_measure":  "CASE",
             "ambiguous":        ambiguous,
@@ -540,7 +737,22 @@ def _extract_sysco_rank_one_page(tokens: list[dict]) -> list[dict]:
 
         rows.append(item)
 
-    return rows
+    # B2b: compute the LAST canonical section detected on this page so
+    # the caller can carry it forward to the next page. If no canonical
+    # sections detected here, the carry_section we received remains the
+    # carry-out. B2c: only canonical sections are considered (junk labels
+    # like "26.14" that survive _find_sections must not be carried forward).
+    last_section = carry_section
+    try:
+        from spatial_matcher import (canonicalize_sysco_section,
+                                      _CANONICAL_SYSCO_SECTIONS)
+        for sec_y, sec_label in sorted(sections, key=lambda s: s[0]):
+            canon = canonicalize_sysco_section(sec_label)
+            if canon in _CANONICAL_SYSCO_SECTIONS:
+                last_section = canon  # last-write wins → final canonical section
+    except Exception:
+        pass
+    return rows, last_section
 
 
 def diagnostic_summary(rows: list[dict]) -> dict:

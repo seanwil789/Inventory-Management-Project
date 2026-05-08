@@ -2782,19 +2782,23 @@ Total
         result has <3 items. Empty/header-only pages produce 0 anchors
         → 0 spatial items, so the 0-item fallback to text still fires."""
         _, p = self._import()
-        # 2 items in spatial layout — accepted under min_items=1
+        # 2 items in spatial layout, ext $20 + $21 = $41
         tokens = []
         for i, code in enumerate(["5555555", "6666666"]):
             tokens += self._build_row(0.10 + i*0.03, [
                 ("X", 0.20), (code, 0.57), (f"{20+i}.00", 0.64),
             ])
         pages = [{"page_number": 1, "tokens": tokens}]
+        # Set the text-path invoice_total to match spatial's sum ($41).
+        # Under the math-driven picker, the path closest to invoice_total
+        # wins — spatial's $41 here matches exactly. (Text path here only
+        # finds 1 item at $15 with invoice_total $41 — gap $26 vs spatial's $0.)
         raw = """**** DAIRY ****
 MILK
 1111111 15.00
 LAST PAGE
 Total
-15.00
+41.00
 """
         from unittest.mock import patch
         import mapper
@@ -2803,7 +2807,7 @@ Total
             'vendor_desc_map': {}, 'category_map': {},
         }):
             result = p.parse_invoice(raw, vendor='Sysco', pages=pages)
-        # Spatial result wins (2 items ≥ 1 from text) — both codes captured.
+        # Spatial wins (sum $41 matches invoice_total $41) — both codes captured.
         codes = [it['sysco_item_code'] for it in result['items']]
         self.assertIn('5555555', codes)
         self.assertIn('6666666', codes)
@@ -11639,6 +11643,37 @@ class RankPairFarmartTests(TestCase):
                   self._tok("5.50", 0.85, 0.3)]
         self.assertIsNone(detect_layout_farmart(tokens))
 
+    def test_extracts_short_dollar_ext_tokens(self):
+        """B-extension fix (2026-05-07): the ext column is right-aligned, so
+        single-digit and teen-dollar tokens have x_mid further LEFT than
+        large-dollar totals. The legacy ext_x band (±0.04) dropped them
+        silently. Confirmed case: INV 1631546 SWEET POTATO ($9.50, x_mid=0.927)
+        and TOMATOES ($15.84, x_mid=0.926) — ext_max=0.973 (totals), legacy
+        band starts at 0.933 → both items missed. Widened to ext_max-0.06.
+        """
+        from invoice_processor.rank_pair import extract_farmart_rank
+        # Build an invoice where the LARGEST ext token is far right (mimics
+        # totals at x_mid=0.97) while item ext tokens are short-dollar
+        # values further left (x_mid=0.92-0.93).
+        # _build_invoice's wide layout has ext at x=0.95. Synthesize the
+        # offset by adding a totals token at x=0.97.
+        pages = self._build_invoice([
+            (8.0, 1.20,  9.50, "SWEETPOTATO"),
+            (5.0, 3.20, 15.84, "TOMATOES"),
+            (1.0, 40.90, 40.49, "ORANGEJUICE"),
+            (1.0, 22.95, 22.95, "MUSHROOM"),
+        ], layout='wide')
+        # Append a "totals" token that pushes ext_max further right —
+        # mimicking the printed invoice total at x≈0.97.
+        pages[0]['tokens'].append(self._tok("189.87", 0.97, 0.50))
+        rows = extract_farmart_rank(pages)
+        # All 4 items should extract — the short-dollar SWEET POTATO and
+        # TOMATOES previously missed now reconcile.
+        self.assertEqual(len(rows), 4)
+        descs = [r['raw_description'] for r in rows]
+        self.assertIn('SWEETPOTATO', descs)
+        self.assertIn('TOMATOES', descs)
+
     def test_extracts_untilted_invoice_correctly(self):
         from invoice_processor.rank_pair import extract_farmart_rank
         pages = self._build_invoice([
@@ -11757,6 +11792,589 @@ class RankPairFarmartTests(TestCase):
         self.assertEqual(s['ach_pass'], 2)
         self.assertEqual(s['ach_fail'], 1)
         self.assertEqual(s['ach_no_ext'], 0)
+
+
+class SectionValidatorTests(TestCase):
+    """Section-level reconciliation: parser items grouped by section vs
+    printed GROUP TOTALs from the invoice itself. Each Sysco invoice carries
+    its own ground truth — the validator surfaces extraction gaps without
+    needing any external comparison.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('section_validator', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+        import section_validator
+        return section_validator
+
+    def _tok(self, text, x, y, w=0.01, h=0.005):
+        return {'text': text,
+                'x_min': x - w / 2, 'x_max': x + w / 2,
+                'y_min': y - h / 2, 'y_max': y + h / 2}
+
+    def test_extract_section_totals_picks_max_right_col_decimal_per_section(self):
+        sv = self._import()
+        # Two sections, each with 2 line items in the right column. The
+        # GROUP TOTAL value should be the max of each section's range.
+        # PRODUCE: items 5.50 + 6.14 → group total 11.64 (largest)
+        # DAIRY: items 7.80 + 2.20 → group total 10.00 (largest)
+        tokens = [
+            # section header PRODUCE at y=0.20
+            self._tok('****',    0.30, 0.20),
+            self._tok('PRODUCE', 0.40, 0.20),
+            self._tok('****',    0.50, 0.20),
+            # PRODUCE items
+            self._tok('5.50',  0.78, 0.25),
+            self._tok('6.14',  0.78, 0.30),
+            self._tok('11.64', 0.78, 0.35),  # printed group total
+            # section header DAIRY at y=0.50
+            self._tok('****',  0.30, 0.50),
+            self._tok('DAIRY', 0.40, 0.50),
+            self._tok('****',  0.50, 0.50),
+            # DAIRY items
+            self._tok('7.80',  0.78, 0.55),
+            self._tok('2.20',  0.78, 0.60),
+            self._tok('10.00', 0.78, 0.65),  # printed group total
+        ]
+        page = {'tokens': tokens}
+        sections = [(0.20, 'PRODUCE'), (0.50, 'DAIRY')]
+        out = sv.extract_section_totals_by_max(page, sections)
+        self.assertEqual(out, {'PRODUCE': 11.64, 'DAIRY': 10.00})
+
+    def test_pair_filters_out_misclassified_group_total_rows(self):
+        """`_find_sections` matches any **-bearing row, including the
+        printed `GROUP TOTAL ****  N.NN` row. Pairing must filter those
+        out so they don't shadow real section headers."""
+        sv = self._import()
+        sections = [
+            (0.20, 'PRODUCE'),
+            (0.50, 'GROUP TOTAL  100.00'),  # the bug: GT row classified as section
+            (0.55, 'DAIRY'),
+        ]
+        group_totals = [(0.50, 100.00), (0.85, 50.00)]
+        out = sv.pair_sections_to_totals(sections, group_totals)
+        # PRODUCE pairs with the first GT (100.00) since the fake section
+        # at y=0.50 was filtered out.
+        self.assertEqual(out, {'PRODUCE': 100.00, 'DAIRY': 50.00})
+
+    def test_reconcile_surfaces_section_diffs(self):
+        sv = self._import()
+        items = [
+            {'section': 'DAIRY',   'extended_amount': 50.0},
+            {'section': 'DAIRY',   'extended_amount': 60.0},
+            {'section': 'PRODUCE', 'extended_amount': 30.0},
+        ]
+        printed = {'DAIRY': 200.00, 'PRODUCE': 30.00, 'MEATS': 75.00}
+        recon = sv.reconcile(items, printed)
+        # Indexed by section name for assertions
+        by_sec = {r['section']: r for r in recon}
+        self.assertEqual(by_sec['DAIRY']['parser_sum'], 110.0)
+        self.assertEqual(by_sec['DAIRY']['printed_total'], 200.0)
+        self.assertEqual(by_sec['DAIRY']['diff_abs'], -90.0)
+        self.assertEqual(by_sec['PRODUCE']['diff_abs'], 0.0)
+        # MEATS — printed but no parser items: pure miss, parser_sum=0, diff=-printed
+        self.assertEqual(by_sec['MEATS']['parser_sum'], 0.0)
+        self.assertEqual(by_sec['MEATS']['diff_abs'], -75.0)
+        self.assertEqual(by_sec['MEATS']['item_count'], 0)
+
+
+class InvoiceValidationStatusTests(TestCase):
+    """B5 fix (project_parser_accuracy_goal.md): durable per-invoice
+    validation status surface. Sean's concern: 'we don't currently have
+    a surface for invoices that don't validate' — the section-reconciliation
+    output was stdout-only. Now persisted in InvoiceValidationStatus rows.
+    """
+
+    def test_classify_pass_invoice_under_5pct_gap_no_section_diffs(self):
+        from myapp.management.commands.validate_all_invoices import _classify
+        out = _classify(items_sum=100.00, invoice_total=102.00, section_recon=[
+            {'section': 'DAIRY', 'parser_sum': 50.0, 'printed_total': 50.0,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 5},
+            {'section': 'PRODUCE', 'parser_sum': 50.0, 'printed_total': 50.0,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 5},
+        ])
+        self.assertEqual(out, 'pass')
+
+    def test_classify_fail_invoice_over_10pct_gap(self):
+        from myapp.management.commands.validate_all_invoices import _classify
+        out = _classify(items_sum=120.00, invoice_total=100.00, section_recon=[])
+        self.assertEqual(out, 'fail')
+
+    def test_classify_review_when_section_diffs_exist_but_invoice_close(self):
+        from myapp.management.commands.validate_all_invoices import _classify
+        out = _classify(items_sum=100.00, invoice_total=102.00, section_recon=[
+            {'section': 'DAIRY', 'parser_sum': 60.0, 'printed_total': 50.0,
+             'diff_abs': 10.0, 'diff_pct': 20.0, 'item_count': 5},
+            {'section': 'PRODUCE', 'parser_sum': 40.0, 'printed_total': 50.0,
+             'diff_abs': -10.0, 'diff_pct': -20.0, 'item_count': 5},
+        ])
+        self.assertEqual(out, 'review')
+
+    def test_classify_partial_when_no_invoice_total(self):
+        from myapp.management.commands.validate_all_invoices import _classify
+        out = _classify(items_sum=100.00, invoice_total=None, section_recon=[])
+        self.assertEqual(out, 'partial')
+
+    def test_classify_pass_when_sections_reconcile_despite_invoice_gap(self):
+        """Section reconciliation is the stronger signal: when every
+        section matches its printed GROUP TOTAL within tolerance, items
+        are 100% accurate. Any leftover invoice_total gap is non-item
+        charges (TAX, FUEL SURCHARGE, CREDIT CARD SURCHARGE, MISC).
+        Real example: INV 775726055 6/6 sections reconcile, items_sum
+        $1391.70, invoice_total $1478.10 (5.8% gap = tax + surcharges).
+        """
+        from myapp.management.commands.validate_all_invoices import _classify
+        out = _classify(items_sum=1391.70, invoice_total=1478.10, section_recon=[
+            {'section': 'DAIRY', 'parser_sum': 200.0, 'printed_total': 200.0,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 4},
+            {'section': 'CANNED', 'parser_sum': 1191.70, 'printed_total': 1191.70,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 6},
+        ])
+        self.assertEqual(out, 'pass')
+
+    def test_status_model_persists_section_recon_as_json(self):
+        from myapp.models import Vendor, InvoiceValidationStatus
+        vendor = Vendor.objects.create(name='TestVendor')
+        recon = [
+            {'section': 'DAIRY', 'parser_sum': 100.0, 'printed_total': 100.0,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 3},
+        ]
+        ivs = InvoiceValidationStatus.objects.create(
+            vendor=vendor, invoice_number='123456789',
+            section_reconciliation=recon,
+            status='pass',
+        )
+        ivs.refresh_from_db()
+        self.assertEqual(ivs.section_reconciliation, recon)
+        self.assertEqual(ivs.status, 'pass')
+
+
+class SyscoSectionLabelCanonicalizationTests(TestCase):
+    """B2 fix (project_parser_accuracy_goal.md): map raw section labels
+    extracted from `_find_sections` to canonical Sysco section names.
+    Without canonicalization, section labels vary across pages of the
+    same invoice ('PAPER & DISP' vs 'PAPER & DISP GROUP') and the
+    section_validator can't merge them.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('spatial_matcher',):
+            if m in sys.modules:
+                del sys.modules[m]
+        import spatial_matcher
+        return spatial_matcher
+
+    def test_canonicalize_strips_trailing_junk(self):
+        sm = self._import()
+        self.assertEqual(sm.canonicalize_sysco_section('PAPER & DISP GROUP'),
+                         'PAPER & DISP')
+        self.assertEqual(sm.canonicalize_sysco_section('PAPER & DISP CFR'),
+                         'PAPER & DISP')
+        self.assertEqual(sm.canonicalize_sysco_section('FROZEN PUFF PASTRY SLAB'),
+                         'FROZEN')
+        self.assertEqual(sm.canonicalize_sysco_section(
+            'MISC CHARGES CHARGE FOR CREDIT CARD SRCHRG'),
+                         'MISC CHARGES')
+
+    def test_canonicalize_returns_unchanged_when_no_match(self):
+        """Defensive: unknown labels pass through so audits surface them."""
+        sm = self._import()
+        self.assertEqual(sm.canonicalize_sysco_section('UNKNOWN SECTION'),
+                         'UNKNOWN SECTION')
+        self.assertEqual(sm.canonicalize_sysco_section(''), '')
+
+    def test_canonicalize_picks_longest_match(self):
+        """When a label could match multiple canonicals, longer wins."""
+        sm = self._import()
+        # 'CHEMICAL & JANITORIAL' contains 'JANITORIAL' but should pick
+        # the full phrase (it's listed first in the canonical list).
+        self.assertEqual(
+            sm.canonicalize_sysco_section('CHEMICAL & JANITORIAL'),
+            'CHEMICAL & JANITORIAL')
+
+    def test_find_sections_extracts_between_asterisks(self):
+        """`**** SECTION **** [item tokens]` → label = SECTION only."""
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        rows = [[
+            tok('****',    0.30, 0.20),
+            tok('FROZEN',  0.40, 0.20),
+            tok('****',    0.50, 0.20),
+            tok('PUFF',    0.60, 0.20),  # adjacent line-item leak
+            tok('PASTRY',  0.70, 0.20),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][1], 'FROZEN')
+
+    def test_find_sections_rejects_single_run_with_non_canonical(self):
+        """Single asterisk run + junk ≠ section header. Don't include."""
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        rows = [[
+            tok('****',    0.30, 0.20),
+            tok('SOMETHING', 0.40, 0.20),
+            tok('UNKNOWN', 0.50, 0.20),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(out, [])
+
+    def test_find_sections_accepts_single_run_with_canonical_name(self):
+        """Single run + canonical section name = real section (closing
+        asterisks got OCR'd into a different y-row)."""
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        rows = [[
+            tok('****',    0.30, 0.20),
+            tok('PRODUCE', 0.40, 0.20),
+            tok('00074865271691', 0.50, 0.20),
+            tok('2226983', 0.60, 0.20),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][1], 'PRODUCE')
+
+
+class SyscoMultiPhotoDedupTests(TestCase):
+    """B9 fix (project_parser_accuracy_goal.md): when an invoice is photographed
+    multiple times with overlapping pages, parse_invoice receives combined
+    pages and emits one item per (cache that captured the row). Dedup by
+    SUPC, keeping the highest (qty, ext) version — the partial-photo qty=1
+    fallback is discarded in favor of the math-validated qty>1 extraction.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('parser',):
+            if m in sys.modules:
+                del sys.modules[m]
+        import parser
+        return parser
+
+    def test_dedup_drops_identical_supc_ext_duplicates(self):
+        """Two photos of the same row → same SUPC + same ext + same qty."""
+        p = self._import()
+        items = [
+            {'sysco_item_code': '1234567', 'extended_amount': 50.0, 'quantity': 1},
+            {'sysco_item_code': '1234567', 'extended_amount': 50.0, 'quantity': 1},
+        ]
+        out = p._dedup_sysco_items(items)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['extended_amount'], 50.0)
+
+    def test_dedup_prefers_higher_qty_when_supc_matches(self):
+        """Mandarin 4396446 case: cache A had qty=1 ext=$79.85 (silent fallback),
+        cache B had qty=3 ext=$239.55 (math-validated). Keep qty=3."""
+        p = self._import()
+        items = [
+            {'sysco_item_code': '4396446', 'extended_amount': 79.85, 'quantity': 1},
+            {'sysco_item_code': '4396446', 'extended_amount': 239.55, 'quantity': 3},
+        ]
+        out = p._dedup_sysco_items(items)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0]['quantity'], 3)
+        self.assertEqual(out[0]['extended_amount'], 239.55)
+
+    def test_dedup_keeps_distinct_supcs(self):
+        """Different SUPCs are different lines — keep all."""
+        p = self._import()
+        items = [
+            {'sysco_item_code': '1111111', 'extended_amount': 10.0, 'quantity': 1},
+            {'sysco_item_code': '2222222', 'extended_amount': 20.0, 'quantity': 1},
+            {'sysco_item_code': '3333333', 'extended_amount': 30.0, 'quantity': 1},
+        ]
+        out = p._dedup_sysco_items(items)
+        self.assertEqual(len(out), 3)
+
+    def test_dedup_passes_through_supc_less_items(self):
+        """non_product surcharges, fees — pass through untouched even if
+        same description text appears multiple times (different rows)."""
+        p = self._import()
+        items = [
+            {'sysco_item_code': '', 'raw_description': 'FUEL SURCHARGE',
+             'extended_amount': 5.0, 'quantity': 1},
+            {'sysco_item_code': '', 'raw_description': 'CC SURCHARGE',
+             'extended_amount': 10.0, 'quantity': 1},
+        ]
+        out = p._dedup_sysco_items(items)
+        self.assertEqual(len(out), 2)
+
+
+class SyscoInvoiceNumberExtractionTests(TestCase):
+    """B8 fix (project_parser_accuracy_goal.md): smart Sysco invoice number
+    extraction. Replaces "next line after INVOICE NUMBER label" with a
+    600-char window over INVOICE NUMBER + PURCHASE ORDER labels. Catches
+    last-page caches where the invoice number is far from its label or
+    where the INVOICE NUMBER header column was clipped.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('parser',):
+            if m in sys.modules:
+                del sys.modules[m]
+        import parser
+        return parser
+
+    def test_inline_invoice_number(self):
+        p = self._import()
+        text = 'CONFIDENTIAL\nINVOICE NUMBER\n775793805\nPAGE\n1\n'
+        meta = p.extract_sysco_metadata(text)
+        self.assertEqual(meta['invoice_number'], '775793805')
+
+    def test_invoice_number_far_from_label(self):
+        """INV 775675588 case: digits 361 chars from INVOICE NUMBER label,
+        outside legacy 200-char window but inside new 600-char window."""
+        p = self._import()
+        # Construct a text where "INVOICE NUMBER" is at the top, then ~360
+        # chars of header content, then the 9-digit run.
+        filler = 'CUSTOMER\n' + 'X' * 350 + '\n'
+        text = 'INVOICE NUMBER\nPAGE\n' + filler + '775675588\n0\n3\n'
+        meta = p.extract_sysco_metadata(text)
+        self.assertEqual(meta['invoice_number'], '775675588')
+
+    def test_purchase_order_anchor_when_no_invoice_label(self):
+        """INV 775776429 case (cache 3b25a37a61d5): no INVOICE NUMBER label
+        captured, but PURCHASE ORDER appears just above the digits."""
+        p = self._import()
+        text = ('TERMS - PAST DUE\nNet 7\nMANIFEST# 1282480 NORMAL DELIVERY\n'
+                'PURCHASE ORDER\n775776429\n0\n3\n')
+        meta = p.extract_sysco_metadata(text)
+        self.assertEqual(meta['invoice_number'], '775776429')
+
+    def test_no_label_no_extraction(self):
+        """No anchoring label → return None (caller falls back to manifest)."""
+        p = self._import()
+        text = 'random text with 304363444 and 999999999\nMANIFEST# 1234567'
+        meta = p.extract_sysco_metadata(text)
+        self.assertIsNone(meta['invoice_number'])
+        self.assertEqual(meta['manifest'], '1234567')
+
+
+class RankPairSyscoQtyExtractionTests(TestCase):
+    """B1+B4 fix (project_parser_accuracy_goal.md):
+    qty derived from ext / unit_price rounding to clean integer.
+    Replaces the silent qty=1 fallback that lost $53 on INV 775170714
+    Mandarin and $116 across 4 DAIRY rows on INV 775619701.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+        from rank_pair import extract_sysco_rank
+        return extract_sysco_rank
+
+    def _tok(self, text, x, y, w=0.01, h=0.005):
+        return {'text': text,
+                'x_min': x - w / 2, 'x_max': x + w / 2,
+                'y_min': y - h / 2, 'y_max': y + h / 2}
+
+    def _build_supcs_with_ext(self, lines):
+        """Synthesize Sysco-shaped rows with (supc, unit, ext, desc) tuples.
+        Layout-detect requires >=3 SUPCs at 0.40-0.78. Each row gets:
+          - SUPC at x=0.55, y=Y
+          - unit_price (2-dec) at x=0.70, y=Y
+          - ext (2-dec) at x=0.85, y=Y
+          - description tokens at x=0.20-0.45, y=Y
+        """
+        tokens = []
+        for i, (supc, unit, ext, desc) in enumerate(lines):
+            y = 0.20 + i * 0.05
+            tokens.append(self._tok(supc,         0.55, y))
+            tokens.append(self._tok(f'{unit:.2f}', 0.70, y))
+            tokens.append(self._tok(f'{ext:.2f}',  0.85, y))
+            tokens.append(self._tok(desc,         0.20, y))
+        return [{'tokens': tokens}]
+
+    def test_qty_2_extracted_from_ext_token(self):
+        """The Mandarin case: qty=2, unit=$53.55, ext=$107.10 (printed)."""
+        extract = self._import()
+        pages = self._build_supcs_with_ext([
+            ('1192600', 53.55, 107.10, 'MANDARIN'),
+            ('1234567',  9.35,   9.35, 'CARROT'),
+            ('2345678', 22.55,  22.55, 'STRAW'),
+        ])
+        rows = extract(pages)
+        self.assertEqual(len(rows), 3)
+        mandarin = next(r for r in rows if r['sysco_item_code'] == '1192600')
+        self.assertEqual(mandarin['quantity'], 2)
+        self.assertAlmostEqual(mandarin['unit_price'], 53.55)
+        self.assertAlmostEqual(mandarin['extended_amount'], 107.10)
+
+    def test_qty_3_extracted_from_ext_token(self):
+        """INV 775619701 MILK 2% case: qty=3, unit=$30.45, ext=$91.35."""
+        extract = self._import()
+        pages = self._build_supcs_with_ext([
+            ('4676280', 30.45, 91.35, 'MILK'),
+            ('1111111',  5.00,  5.00, 'X'),
+            ('2222222', 10.00, 10.00, 'Y'),
+        ])
+        rows = extract(pages)
+        milk = next(r for r in rows if r['sysco_item_code'] == '4676280')
+        self.assertEqual(milk['quantity'], 3)
+        self.assertAlmostEqual(milk['extended_amount'], 91.35)
+
+    def test_qty_1_when_ext_equals_unit(self):
+        """qty=1 single-case row: ext == unit → derived qty=1.0 → accept."""
+        extract = self._import()
+        pages = self._build_supcs_with_ext([
+            ('1111111', 42.65, 42.65, 'APPLE'),
+            ('2222222', 38.95, 38.95, 'BANANA'),
+            ('3333333', 13.75, 13.75, 'BREAD'),
+        ])
+        rows = extract(pages)
+        for r in rows:
+            self.assertEqual(r['quantity'], 1)
+            self.assertAlmostEqual(r['extended_amount'], r['unit_price'])
+
+    def test_b4_guard_rejects_merged_qty_token(self):
+        """B4: when OCR merges qty digit + pack-size digit into '15',
+        the left-column extraction would extract qty=15 if it ran. The
+        guard rejects qty>1 when ext / unit doesn't validate it. For
+        a qty=1 row (ext=unit), candidate_qty=15 fails math: 15 × $9.35
+        = $140.25 ≠ ext=$9.35. Reject — keep qty=1.
+        """
+        extract = self._import()
+        # Construct a row where:
+        #  - SUPC + unit + ext are at SUPC y
+        #  - A "15" token sits at x<0.20 in the qty column band, BELOW SUPC y
+        #  - A "CS" unit-code token sits next to "15" in the same below-y band
+        # This is the Carrot pattern: real qty=1 but OCR token "15" exists.
+        pages_tokens = [
+            # 3 SUPCs for layout detection
+            self._tok('7064617', 0.55, 0.20),
+            self._tok('85.85',   0.70, 0.20),
+            self._tok('85.85',   0.85, 0.20),
+            self._tok('CUP',     0.30, 0.20),
+
+            self._tok('2461200', 0.55, 0.30),
+            self._tok('67.85',   0.70, 0.30),
+            self._tok('67.85',   0.85, 0.30),
+            self._tok('TISSUE',  0.30, 0.30),
+
+            # Carrot row: SUPC at y=0.40, ext=unit ($9.35).
+            # Merged "15" qty + "CS" unit-code token at y=0.41 (below SUPC,
+            # within widened 0.018 tol). 15 × 9.35 = 140.25 ≠ 9.35 → guard
+            # rejects, qty stays 1.
+            self._tok('3597911', 0.55, 0.40),
+            self._tok('9.35',    0.70, 0.40),
+            self._tok('9.35',    0.85, 0.40),
+            self._tok('CARROT',  0.30, 0.40),
+            self._tok('15',      0.14, 0.415),  # merged qty token
+            self._tok('CS',      0.16, 0.415),  # unit-code anchor
+        ]
+        pages = [{'tokens': pages_tokens}]
+        rows = extract(pages)
+        carrot = next(r for r in rows if r['sysco_item_code'] == '3597911')
+        # Guard must reject qty=15 because 15 × 9.35 ≠ 9.35
+        self.assertEqual(carrot['quantity'], 1)
+        self.assertAlmostEqual(carrot['extended_amount'], 9.35)
+
+
+class RankPairSyscoSectionTaggingTests(TestCase):
+    """Sysco rank-pair output must carry section tags. Without them,
+    section-level reconciliation (parser items vs printed GROUP TOTAL)
+    has no signal — the only available comparison is invoice-level.
+    """
+
+    def _tok(self, text, x, y, w=0.01, h=0.005):
+        return {'text': text,
+                'x_min': x - w / 2, 'x_max': x + w / 2,
+                'y_min': y - h / 2, 'y_max': y + h / 2}
+
+    def _build(self):
+        """Sysco-shaped tokens with two **** SECTION **** headers and SUPC
+        anchors below each. Layout-detect requires >=3 SUPCs at 0.40-0.78.
+        OCR emits `****` as a SINGLE token (contiguous asterisks) — the
+        section-detector regex requires `\\*{2,}` so individual `*` tokens
+        won't match.
+        """
+        tokens = []
+        # Section header 1: **** PRODUCE ****  (asterisks contiguous as OCR'd)
+        tokens.append(self._tok('****',    0.30, 0.20))
+        tokens.append(self._tok('PRODUCE', 0.40, 0.20))
+        tokens.append(self._tok('****',    0.50, 0.20))
+        # 2 PRODUCE SUPC rows
+        tokens.append(self._tok('1234567', 0.55, 0.25))
+        tokens.append(self._tok('5.50',    0.78, 0.25))
+        tokens.append(self._tok('APPLE',   0.20, 0.25))
+        tokens.append(self._tok('2345678', 0.55, 0.30))
+        tokens.append(self._tok('3.10',    0.78, 0.30))
+        tokens.append(self._tok('CARROT',  0.20, 0.30))
+        # Section header 2: **** DAIRY ****
+        tokens.append(self._tok('****',  0.30, 0.50))
+        tokens.append(self._tok('DAIRY', 0.40, 0.50))
+        tokens.append(self._tok('****',  0.50, 0.50))
+        # 2 DAIRY SUPC rows
+        tokens.append(self._tok('3456789', 0.55, 0.55))
+        tokens.append(self._tok('7.80',    0.78, 0.55))
+        tokens.append(self._tok('MILK',    0.20, 0.55))
+        tokens.append(self._tok('4567890', 0.55, 0.60))
+        tokens.append(self._tok('2.20',    0.78, 0.60))
+        tokens.append(self._tok('YOGURT',  0.20, 0.60))
+        return [{'tokens': tokens}]
+
+    def test_extracted_rows_carry_section_label(self):
+        # Same module-reset pattern as RankPairFarmartTests — invoice_processor
+        # uses absolute imports against a sys.path that the test runner sets
+        # up via Django; cached modules from earlier tests can mask edits.
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+        from rank_pair import extract_sysco_rank
+        rows = extract_sysco_rank(self._build())
+        self.assertEqual(len(rows), 4)
+        sections = [r.get('section') for r in rows]
+        # First two rows belong to PRODUCE, last two to DAIRY
+        self.assertEqual(sections[0], 'PRODUCE')
+        self.assertEqual(sections[1], 'PRODUCE')
+        self.assertEqual(sections[2], 'DAIRY')
+        self.assertEqual(sections[3], 'DAIRY')
 
 
 class ParseInvoiceRankPairProductionSwapTests(TestCase):
@@ -12007,21 +12625,24 @@ Invoice Total
             (2.0, 3.10, 6.14, "BANANAS"),
             (3.0, 2.20, 6.53, "CARROTS"),
         ])
+        # Rank-pair items sum to 5.45+6.14+6.53 = 18.12. Set the text-path
+        # invoice_total to match — under the math-driven picker, the path
+        # closest to invoice_total wins. Here rank-pair matches exactly.
         text = """Farm Art Invoice
 4/15/2026
 Description
 ROMAINE, 24CT
 United States
 12.50
-25.00
+18.12
 Invoice Total
-25.00
+18.12
 """
         result = p.parse_invoice(text, vendor='Farm Art', pages=pages)
-        # rank-pair wins for items
+        # rank-pair wins for items (its sum 18.12 matches invoice_total)
         self.assertEqual(len(result['items']), 3)
         # invoice_total still flows through from text parser
-        self.assertEqual(result.get('invoice_total'), 25.00)
+        self.assertEqual(result.get('invoice_total'), 18.12)
 
 
 class CanonicalVendorPriceListFKTests(TestCase):

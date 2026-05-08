@@ -85,19 +85,91 @@ def _group_rows(tokens: list[dict], tol: float | None = None) -> list[list[dict]
     return rows
 
 
+# Canonical Sysco section names — the only valid section labels. Order
+# matters: longer names checked first so "PAPER & DISP" wins over "PAPER".
+# Maps any extracted label that CONTAINS one of these to the canonical
+# form, dropping trailing junk like "PAPER & DISP GROUP" → "PAPER & DISP".
+_CANONICAL_SYSCO_SECTIONS = [
+    'CHEMICAL & JANITORIAL',
+    'SUPPLY & EQUIPMENT',
+    'PAPER & DISPOSABLE',
+    'PAPER & DISP',
+    'CANNED & DRY',
+    'MISC CHARGES',
+    'POULTRY', 'SEAFOOD', 'PRODUCE', 'BAKERY', 'BEVERAGE',
+    'GROCERY', 'SPICES', 'FROZEN', 'DAIRY', 'MEATS', 'MEAT', 'DELI',
+]
+
+
+def canonicalize_sysco_section(label: str) -> str:
+    """Map a Sysco section header label (possibly polluted with adjacent
+    OCR tokens) to its canonical name.
+
+    Returns the canonical name (e.g. 'PAPER & DISP') when found as a
+    substring of the input. Returns the original label unchanged when no
+    canonical match is found (defensive — preserves anything we don't
+    recognize so it surfaces in audit). Empty input returns empty.
+
+    B2 fix (2026-05-07): used by rank_pair section assignment and
+    section_validator to normalize labels across pages of the same invoice.
+    Without this, INV 775823034's PAPER section was tagged 'PAPER & DISP'
+    on one page and 'PAPER & DISP GROUP' on another — the section_validator
+    treated them as different sections.
+    """
+    if not label:
+        return label
+    upper = label.upper()
+    for canonical in _CANONICAL_SYSCO_SECTIONS:
+        if canonical in upper:
+            return canonical
+    return label
+
+
 def _find_sections(rows: list[list[dict]]) -> list[tuple[float, str]]:
     """Detect section headers (lines containing '****...****' or bracketed
-    section names). Returns [(y_center, name)] in y-order."""
+    section names). Returns [(y_center, name)] in y-order.
+
+    B2 fix (2026-05-07): when the section-header row's y-cluster picks up
+    adjacent line-item tokens (e.g. `**** FROZEN **** PUFF PASTRY SLAB ...`),
+    the legacy approach `re.sub('\\*+', '', joined)` retained ALL tokens,
+    leaking line content into the section label. Resulted in inconsistent
+    section names across pages of the same invoice (`FROZEN` vs `FROZEN PUFF
+    PASTRY SLAB`), which broke `section_validator.extract_section_totals_by_max`
+    cross-page merging on INV 775823034 (residual +27% gap).
+
+    Fix: extract just the text BETWEEN the first two asterisk runs. The
+    Sysco section-header pattern is `**** SECTION ****` with both runs
+    captured by OCR; the section name lives strictly between them. Falls
+    back to legacy strip-and-keep when only one asterisk run is present
+    (rare OCR cases where one run was clipped).
+    """
     sections: list[tuple[float, str]] = []
     for row in rows:
         texts = [t["text"] for t in row]
         joined = " ".join(texts)
-        if _SECTION_HDR_RE.search(joined):
-            # Strip the asterisks and keep the inner label
-            label = re.sub(r'\*+', '', joined).strip()
-            if label:
-                y = _y_mid(row[0])
-                sections.append((y, label))
+        if not _SECTION_HDR_RE.search(joined):
+            continue
+        asterisk_runs = list(re.finditer(r'\*{2,}', joined))
+        label = None
+        if len(asterisk_runs) >= 2:
+            # Standard `**** NAME ****` — extract between the runs.
+            between = joined[asterisk_runs[0].end():asterisk_runs[1].start()].strip()
+            if 4 <= len(between) <= 30:
+                label = between
+        elif len(asterisk_runs) == 1:
+            # Single-run header: `**** NAME [item tokens]` — the closing
+            # `****` got OCR'd into another y-row. Take first 4 tokens
+            # after the run and accept ONLY if they map to a canonical
+            # section name. Stops phantom labels like "FILET BLSL IQF"
+            # from being treated as sections.
+            after = joined[asterisk_runs[0].end():].strip()
+            candidate = ' '.join(after.split()[:4])
+            canon = canonicalize_sysco_section(candidate)
+            if canon in _CANONICAL_SYSCO_SECTIONS:
+                label = canon
+        if label:
+            y = _y_mid(row[0])
+            sections.append((y, label))
     return sections
 
 
@@ -419,7 +491,11 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
 #   x=0.85  extended amount (decimal)
 # Item rows sit at y=0.38-0.75 typically; headers above, totals below.
 
-_PBM_ITEM_CODE_RE = re.compile(r'^[A-Z]?\d{3,5}$')
+# PBM item codes observed in real invoices:
+#   - Letter + 2-5 digits: G105, H097, L07, L118, R1012
+#   - Leading-zero 4-digit: 0258, 0290, 0389
+# Excludes plain 3-digit numerics like "P.O. Box 723" and 5-digit zip codes.
+_PBM_ITEM_CODE_RE = re.compile(r'^(?:[A-Z]\d{2,5}|0\d{3})$')
 _PBM_UM_RE = re.compile(r'^(DZ|EA|LB|CS|OZ|PK|BG|CTN)$', re.IGNORECASE)
 _PBM_PRICE_RE = re.compile(r'^\$?\d+\.\d{2}$')
 
@@ -452,38 +528,169 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
         tokens = page.get("tokens") or []
         if not tokens:
             continue
-        # PBM rows are ~0.013 apart — tighter tol than Sysco so consecutive
-        # line items don't get merged into one row.
-        rows = _group_rows(tokens, tol=0.006)
-        for row in rows:
-            # Row must have an item-code-looking token in the far-left band
-            code_toks = [t for t in row if _in_x(t, _PBM_CODE_X_RANGE)
-                         and _PBM_ITEM_CODE_RE.fullmatch(t["text"])]
-            if not code_toks:
+        # B-NEW (2026-05-07): code-column-anchored row construction.
+        # Old approach used `_group_rows(tokens, tol=0.006)` to cluster
+        # tokens by y, then partitioned each row into columns. That fails
+        # on PBM invoices with column y-skew (OCR reads each column with
+        # a slight independent y-shift): unit-price token y can be ~0.011
+        # ABOVE its row's code y, ext token y ~0.012 above. With ~0.012
+        # row-spacing and ~0.011 column skew, sequential token y's form
+        # a continuous gap-less chain that collapses into one giant
+        # cluster — INV 5764 produced 1 spatial item instead of 2.
+        #
+        # New approach: anchor on item-code tokens (one per row, well
+        # separated). For each code, find the closest qty/UM/desc/unit/ext
+        # token in its respective x-band by y-proximity, allowing up to
+        # ±half-row-spacing y-window to absorb column skew.
+        def _ymid(t):
+            return (t["y_min"] + t["y_max"]) / 2
+
+        # Pre-filter: only code tokens that have a price-shaped token in
+        # the ext band within a generous y-window count as real item rows.
+        # The PBM item-code regex `^[A-Z]?\d{3,5}$` also matches header
+        # numbers like "P.O. Box 723" — without this filter, those bogus
+        # codes pollute row_spacing and the desc-band y-window.
+        candidate_codes = sorted(
+            [t for t in tokens
+             if _in_x(t, _PBM_CODE_X_RANGE)
+             and _PBM_ITEM_CODE_RE.fullmatch(t["text"])],
+            key=_ymid,
+        )
+        if not candidate_codes:
+            continue
+        # Sanity-filter: keep only codes that have at least one price-shaped
+        # token in the ext band within ±0.025 y (covers any reasonable
+        # column skew). Real item rows always have an extended-amount value.
+        code_toks = [t for t in candidate_codes
+                     if any(
+                         _in_x(p, _PBM_EXT_X_RANGE)
+                         and _PBM_PRICE_RE.fullmatch(p["text"])
+                         and abs(_ymid(p) - _ymid(t)) <= 0.025
+                         for p in tokens)]
+        if not code_toks:
+            continue
+        # Estimate row spacing from MEDIAN of consecutive code-token y gaps.
+        if len(code_toks) >= 2:
+            ys = [_ymid(t) for t in code_toks]
+            gaps = sorted(ys[i+1] - ys[i] for i in range(len(ys)-1))
+            row_spacing = gaps[len(gaps)//2] if gaps else 0.014
+        else:
+            row_spacing = 0.014
+        # Search window = ~half the row spacing — wide enough to catch
+        # column-skewed tokens but narrow enough not to bleed adjacent
+        # rows.
+        y_win = max(row_spacing * 0.55, 0.008)
+
+        def _nearest_in_band(code_y, band, regex):
+            best = None
+            best_dy = float("inf")
+            for t in tokens:
+                if not _in_x(t, band):
+                    continue
+                if not regex.fullmatch(t["text"]):
+                    continue
+                dy = abs(_ymid(t) - code_y)
+                if dy < best_dy and dy <= y_win:
+                    best_dy = dy
+                    best = t
+            return best
+
+        # Ordinal-position pairing for unit and ext columns. PBM has
+        # consistent column y-skew (prices read slightly higher on page
+        # than their row's code). With nearest-y matching, row 1's code
+        # (y=0.404) gets matched to row 2's price (y=0.407) instead of
+        # its own (y=0.394). Sorting both columns by y and pairing by
+        # ordinal index gives the correct row-to-price assignment.
+        #
+        # Filter out tokens outside the items range — Subtotal/Invoice
+        # Total values appear in the ext-column band but in the footer
+        # (well below the last code). Items range = code y-range padded
+        # by half a row.
+        code_y_min = min(_ymid(t) for t in code_toks)
+        code_y_max = max(_ymid(t) for t in code_toks)
+
+        def _in_items_range(t):
+            ty = _ymid(t)
+            return (code_y_min - 0.020) <= ty <= (code_y_max + 0.020)
+
+        _unit_toks_sorted = sorted(
+            [t for t in tokens
+             if _in_x(t, _PBM_UNIT_X_RANGE)
+             and _PBM_PRICE_RE.fullmatch(t["text"])
+             and _in_items_range(t)],
+            key=_ymid,
+        )
+        _ext_toks_sorted = sorted(
+            [t for t in tokens
+             if _in_x(t, _PBM_EXT_X_RANGE)
+             and _PBM_PRICE_RE.fullmatch(t["text"])
+             and _in_items_range(t)],
+            key=_ymid,
+        )
+        _qty_toks_sorted = sorted(
+            [t for t in tokens
+             if _in_x(t, _PBM_QTY_X_RANGE)
+             and _PBM_PRICE_RE.fullmatch(t["text"])
+             and _in_items_range(t)],
+            key=_ymid,
+        )
+        _um_toks_sorted = sorted(
+            [t for t in tokens
+             if _in_x(t, _PBM_UM_X_RANGE)
+             and _PBM_UM_RE.fullmatch(t["text"])
+             and _in_items_range(t)],
+            key=_ymid,
+        )
+
+        def _by_ordinal(idx, sorted_list):
+            return sorted_list[idx] if idx < len(sorted_list) else None
+
+        def _all_in_band(code_y, band, exclude_regexes=()):
+            out = []
+            for t in tokens:
+                if not _in_x(t, band):
+                    continue
+                if any(r.fullmatch(t["text"]) for r in exclude_regexes):
+                    continue
+                if abs(_ymid(t) - code_y) <= y_win:
+                    out.append(t)
+            return out
+
+        # Use ordinal pairing when counts match across columns; fall back
+        # to nearest-y when they don't (e.g., a code missing its ext).
+        ordinal_ok = (
+            len(_unit_toks_sorted) == len(code_toks)
+            and len(_ext_toks_sorted) == len(code_toks)
+        )
+        for idx, code_t in enumerate(code_toks):
+            code_y = _ymid(code_t)
+            if ordinal_ok:
+                ext_t = _by_ordinal(idx, _ext_toks_sorted)
+                unit_t = _by_ordinal(idx, _unit_toks_sorted)
+            else:
+                ext_t = _nearest_in_band(code_y, _PBM_EXT_X_RANGE, _PBM_PRICE_RE)
+                unit_t = _nearest_in_band(code_y, _PBM_UNIT_X_RANGE, _PBM_PRICE_RE)
+            if ext_t is None:
                 continue
-            # Plus at least one price-shaped token in the ext-amount band
-            ext_toks = [t for t in row if _in_x(t, _PBM_EXT_X_RANGE)
-                        and _PBM_PRICE_RE.fullmatch(t["text"])]
-            if not ext_toks:
-                continue
+            code = code_t["text"]
+            extended = float(ext_t["text"].lstrip("$"))
+            unit_price = float(unit_t["text"].lstrip("$")) if unit_t else extended
 
-            code = code_toks[0]["text"]
-            extended = float(ext_toks[0]["text"].lstrip("$"))
-            unit_toks = [t for t in row if _in_x(t, _PBM_UNIT_X_RANGE)
-                         and _PBM_PRICE_RE.fullmatch(t["text"])]
-            unit_price = float(unit_toks[0]["text"].lstrip("$")) if unit_toks else extended
+            # Qty and UM use ordinal when counts match, else nearest-y.
+            qty_ordinal_ok = len(_qty_toks_sorted) == len(code_toks)
+            um_ordinal_ok = len(_um_toks_sorted) == len(code_toks)
+            qty_t = (_by_ordinal(idx, _qty_toks_sorted) if qty_ordinal_ok
+                     else _nearest_in_band(code_y, _PBM_QTY_X_RANGE, _PBM_PRICE_RE))
+            qty = float(qty_t["text"]) if qty_t else None
+            um_t = (_by_ordinal(idx, _um_toks_sorted) if um_ordinal_ok
+                    else _nearest_in_band(code_y, _PBM_UM_X_RANGE, _PBM_UM_RE))
+            um = um_t["text"].upper() if um_t else ""
 
-            qty_toks = [t for t in row if _in_x(t, _PBM_QTY_X_RANGE)
-                        and _PBM_PRICE_RE.fullmatch(t["text"])]
-            qty = float(qty_toks[0]["text"]) if qty_toks else None
-
-            um_toks = [t for t in row if _in_x(t, _PBM_UM_X_RANGE)
-                       and _PBM_UM_RE.fullmatch(t["text"])]
-            um = um_toks[0]["text"].upper() if um_toks else ""
-
-            desc_toks = [t for t in row if _in_x(t, _PBM_DESC_X_RANGE)
-                         and not _PBM_PRICE_RE.fullmatch(t["text"])
-                         and not _PBM_UM_RE.fullmatch(t["text"])]
+            desc_toks = sorted(
+                _all_in_band(code_y, _PBM_DESC_X_RANGE,
+                              exclude_regexes=(_PBM_PRICE_RE, _PBM_UM_RE)),
+                key=lambda t: t["x_min"],
+            )
             description = " ".join(t["text"] for t in desc_toks).strip()
 
             if not description:
@@ -538,14 +745,30 @@ _EXC_ITEM_CODE_RE = re.compile(r'^[a-zA-Z]?\d{4,5}$')
 _EXC_UM_RE = re.compile(r'^(EA|CS|LB|DZ|OZ|PK|BG|CTN)$', re.IGNORECASE)
 _EXC_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,3}$')
 
-_EXC_CODE_X_RANGE    = (0.04, 0.14)
-_EXC_QTY_X_RANGE     = (0.20, 0.26)
-_EXC_UM_X_RANGE      = (0.26, 0.30)
-_EXC_DESC_X_RANGE    = (0.28, 0.68)
-_EXC_QTY_SHIP_X      = (0.68, 0.78)
-_EXC_UNIT_X_RANGE    = (0.78, 0.85)
-_EXC_PER_UM_X_RANGE  = (0.84, 0.90)
-_EXC_EXT_X_RANGE     = (0.90, 0.98)
+# Lower bound widened from 0.04 to 0.03 — INV 330577 (PDF scan vs phone
+# photo: scanner's left margin is tighter) has codes at x_min≈0.037,
+# below the original threshold. Code regex (`^[a-zA-Z]?\d{4,5}$`) plus
+# the row-level requirement of an ext-band match prevents address/zip
+# tokens (which match the regex shape) from polluting items.
+# Lower bound widened from 0.04 to 0.03 — INV 330577 (PDF scan vs phone
+# photo: scanner's left margin is tighter) has codes at x_min≈0.037,
+# below the original threshold. Code regex (`^[a-zA-Z]?\d{4,5}$`) plus
+# the row-level requirement of an ext-band match prevents address/zip
+# tokens (which match the regex shape) from polluting items.
+# qty_ship/unit/per_um/ext bands also widened ±0.02 for scanner shifts:
+# scanner output has columns at x_min ≈ 0.67/0.77/0.83/0.91 vs phone
+# photo's 0.69/0.79/0.85/0.92.
+_EXC_CODE_X_RANGE    = (0.03, 0.14)
+_EXC_QTY_X_RANGE     = (0.18, 0.26)
+_EXC_UM_X_RANGE      = (0.23, 0.30)
+_EXC_DESC_X_RANGE    = (0.26, 0.66)
+# Non-overlapping bands — phone-photo and scanner-PDF column x_min values
+# both fit. Phone: qty_ship≈0.69, unit≈0.79, per_um≈0.85, ext≈0.92.
+# Scanner: qty_ship≈0.67, unit≈0.77, per_um≈0.83, ext≈0.91.
+_EXC_QTY_SHIP_X      = (0.66, 0.74)
+_EXC_UNIT_X_RANGE    = (0.74, 0.82)
+_EXC_PER_UM_X_RANGE  = (0.82, 0.88)
+_EXC_EXT_X_RANGE     = (0.88, 0.98)
 
 
 def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
@@ -560,37 +783,155 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
         tokens = page.get("tokens") or []
         if not tokens:
             continue
-        # Exceptional items span ~0.010 of y-space (code sits below its row's
-        # extended amount). 0.012 keeps them together without merging into
-        # neighbor items (~0.029 spacing).
-        rows = _group_rows(tokens, tol=0.012)
-        for row in rows:
+        # B-NEW (2026-05-07): code-anchored row construction. Old approach
+        # used `_group_rows(tokens, tol=0.012)` which chain-merges via
+        # intermediate tokens. On scanned-PDF Exceptional invoices,
+        # within-row spread (~0.010) plus between-row gap (~0.005)
+        # produces a continuous y-chain where adjacent items get
+        # bridged into one row — INV 330577 had Butter+Beef merged
+        # into a single "row" with two codes, breaking extraction.
+        #
+        # New approach: each code-column token is a row anchor. Tokens
+        # within ±row_spacing/2 of the code's y belong to that row.
+        # Phone-photographed invoices (~0.029 row spacing) and
+        # scanner-PDF invoices (~0.015 row spacing) both work because
+        # row_spacing is computed from observed code-y gaps.
+        def _ymid(t):
+            return (t["y_min"] + t["y_max"]) / 2
+
+        code_anchors = sorted(
+            [t for t in tokens
+             if _in_x(t, _EXC_CODE_X_RANGE)
+             and _EXC_ITEM_CODE_RE.fullmatch(t["text"])
+             # Sanity-filter: real items have a price-shaped token in the
+             # ext band within ±0.025 y. Excludes header/zip/address codes.
+             and any(
+                 _in_x(p, _EXC_EXT_X_RANGE)
+                 and _EXC_PRICE_RE.fullmatch(p["text"])
+                 and abs(_ymid(p) - _ymid(t)) <= 0.025
+                 for p in tokens)],
+            key=_ymid,
+        )
+        if code_anchors:
+            ys = [_ymid(t) for t in code_anchors]
+            if len(ys) >= 2:
+                gaps = sorted(ys[i+1] - ys[i] for i in range(len(ys)-1))
+                row_spacing = gaps[len(gaps)//2] if gaps else 0.029
+            else:
+                row_spacing = 0.029
+            # half_win must be: (a) wide enough to catch within-row tokens
+            # (Exceptional rows span ~0.010 of y), (b) narrow enough not
+            # to bleed into neighboring rows. The challenge: scanner-PDF
+            # invoices have row_spacing as small as ~0.015 (similar to
+            # within-row spread), so half_win can't be much less than 0.010.
+            # Pick floor at 0.010 to capture within-row, then bleed
+            # mitigation comes from the ORDINAL PAIRING below: sort each
+            # column's tokens by y and pair by index, which is robust to
+            # the column y-skew (ext tokens ~0.008 ABOVE their row's code).
+            half_win = max(row_spacing * 0.55, 0.010)
+            rows = []
+            for anchor in code_anchors:
+                ay = _ymid(anchor)
+                row = [t for t in tokens
+                       if abs(_ymid(t) - ay) <= half_win]
+                rows.append(row)
+        else:
+            # No codes detected — fall back to legacy row grouping (which
+            # would also produce no useful items, but keeps existing tests
+            # of non-item pages passing).
+            rows = _group_rows(tokens, tol=0.012)
+            code_anchors = []
+
+        # B-NEW (2026-05-07): pre-compute ordinal column lookups for
+        # bleed-resistant column extraction. Each column's tokens are
+        # sorted by y and paired with code_anchors by index. This is
+        # robust to column y-skew (ext at y≈code_y-0.008, qty at
+        # y≈code_y+0.002, etc.) because relative ordering within each
+        # column matches the code ordering.
+        def _ymid_t(t):
+            return (t["y_min"] + t["y_max"]) / 2
+
+        # Restrict each column's tokens to the items y-range so footer
+        # tokens (subtotal/total/tax) don't pollute ordinal pairing.
+        if code_anchors:
+            code_y_min = min(_ymid_t(t) for t in code_anchors)
+            code_y_max = max(_ymid_t(t) for t in code_anchors)
+        else:
+            code_y_min, code_y_max = 0, 1
+
+        def _items_range_filter(t, band, regex):
+            ty = _ymid_t(t)
+            return (_in_x(t, band)
+                    and regex.fullmatch(t["text"])
+                    and (code_y_min - 0.020) <= ty <= (code_y_max + 0.020))
+
+        ext_col = sorted(
+            [t for t in tokens if _items_range_filter(t, _EXC_EXT_X_RANGE, _EXC_PRICE_RE)],
+            key=_ymid_t,
+        )
+        unit_col = sorted(
+            [t for t in tokens if _items_range_filter(t, _EXC_UNIT_X_RANGE, _EXC_PRICE_RE)],
+            key=_ymid_t,
+        )
+        qty_ship_col = sorted(
+            [t for t in tokens if _items_range_filter(t, _EXC_QTY_SHIP_X, _EXC_PRICE_RE)],
+            key=_ymid_t,
+        )
+        per_um_col = sorted(
+            [t for t in tokens if _items_range_filter(t, _EXC_PER_UM_X_RANGE, _EXC_UM_RE)],
+            key=_ymid_t,
+        )
+        um_col = sorted(
+            [t for t in tokens if _items_range_filter(t, _EXC_UM_X_RANGE, _EXC_UM_RE)],
+            key=_ymid_t,
+        )
+        # Ordinal pairing only used when all columns have the same length
+        # as code_anchors. Otherwise fall back to per-row search below.
+        ordinal_ok = (
+            len(code_anchors) > 0
+            and len(ext_col) == len(code_anchors)
+            and len(unit_col) == len(code_anchors)
+        )
+        for ri, row in enumerate(rows):
             code_toks = [t for t in row if _in_x(t, _EXC_CODE_X_RANGE)
                          and _EXC_ITEM_CODE_RE.fullmatch(t["text"])]
             if not code_toks:
                 continue
-            ext_toks = [t for t in row if _in_x(t, _EXC_EXT_X_RANGE)
-                        and _EXC_PRICE_RE.fullmatch(t["text"])]
-            if not ext_toks:
+            anchor_y = _ymid(code_toks[0])
+
+            def _nearest_in_band(in_row, band, regex):
+                cands = [t for t in in_row
+                         if _in_x(t, band) and regex.fullmatch(t["text"])]
+                if not cands:
+                    return None
+                return min(cands, key=lambda t: abs(_ymid(t) - anchor_y))
+
+            # Use ordinal pairing when all key columns have the same count
+            # as code anchors — robust to column y-skew. Otherwise per-row
+            # nearest-y picker (legacy behavior for phone-photo invoices
+            # with cleaner row separation).
+            if ordinal_ok and ri < len(ext_col):
+                ext_t = ext_col[ri]
+                unit_t = unit_col[ri] if ri < len(unit_col) else None
+                qty_ship_t = qty_ship_col[ri] if ri < len(qty_ship_col) else None
+                per_um_t = per_um_col[ri] if ri < len(per_um_col) else None
+                um_t = um_col[ri] if ri < len(um_col) else None
+            else:
+                ext_t = _nearest_in_band(row, _EXC_EXT_X_RANGE, _EXC_PRICE_RE)
+                unit_t = _nearest_in_band(row, _EXC_UNIT_X_RANGE, _EXC_PRICE_RE)
+                qty_ship_t = _nearest_in_band(row, _EXC_QTY_SHIP_X, _EXC_PRICE_RE)
+                per_um_t = _nearest_in_band(row, _EXC_PER_UM_X_RANGE, _EXC_UM_RE)
+                um_t = _nearest_in_band(row, _EXC_UM_X_RANGE, _EXC_UM_RE)
+
+            if ext_t is None:
                 continue
 
             code = code_toks[0]["text"]
-            extended = float(ext_toks[0]["text"].lstrip("$"))
-            unit_toks = [t for t in row if _in_x(t, _EXC_UNIT_X_RANGE)
-                         and _EXC_PRICE_RE.fullmatch(t["text"])]
-            unit_price = float(unit_toks[0]["text"].lstrip("$")) if unit_toks else extended
-
-            per_um_toks = [t for t in row if _in_x(t, _EXC_PER_UM_X_RANGE)
-                           and _EXC_UM_RE.fullmatch(t["text"])]
-            per_um = per_um_toks[0]["text"].upper() if per_um_toks else ""
-
-            qty_ship_toks = [t for t in row if _in_x(t, _EXC_QTY_SHIP_X)
-                             and _EXC_PRICE_RE.fullmatch(t["text"])]
-            qty_shipped = float(qty_ship_toks[0]["text"]) if qty_ship_toks else None
-
-            um_toks = [t for t in row if _in_x(t, _EXC_UM_X_RANGE)
-                       and _EXC_UM_RE.fullmatch(t["text"])]
-            um = um_toks[0]["text"].upper() if um_toks else ""
+            extended = float(ext_t["text"].lstrip("$"))
+            unit_price = float(unit_t["text"].lstrip("$")) if unit_t else extended
+            per_um = per_um_t["text"].upper() if per_um_t else ""
+            qty_shipped = float(qty_ship_t["text"]) if qty_ship_t else None
+            um = um_t["text"].upper() if um_t else ""
 
             desc_toks = [t for t in row if _in_x(t, _EXC_DESC_X_RANGE)
                          and not _EXC_PRICE_RE.fullmatch(t["text"])

@@ -704,6 +704,58 @@ def _clean_description(text: str) -> str:
     return text
 
 
+# Sysco invoice number anchor labels. Primary = "INVOICE NUMBER" header.
+# Secondary = "PURCHASE ORDER" — appears immediately above the invoice
+# number on every Sysco page, even when the invoice-header column is
+# clipped from a rotated photo (the case for caches 3b25a37a61d5 +
+# 4bd57bffc00d in 2026 manifest-1282480 group).
+_SYSCO_INV_LABEL_RE = re.compile(
+    r'INVOICE\s*NUMBER|PURCHASE\s*ORDER',
+    re.IGNORECASE,
+)
+_SYSCO_NINE_DIGIT_RE = re.compile(r'(\d{9})')
+
+
+def _extract_sysco_invoice_number(text: str) -> str | None:
+    """B8 fix (2026-05-07): smart Sysco invoice number extraction.
+
+    DocAI's flattening of the multi-column header is unpredictable. The
+    9-digit invoice number can land:
+      - Immediately after "INVOICE NUMBER": `INVOICE NUMBER\\n775263771`
+      - 200-500 chars after the label, separated by customer code, address
+        block, etc.
+      - BEFORE the label in OCR text order (rotated last-page captures)
+      - On caches where the invoice-header column was clipped — the
+        invoice number still appears near "PURCHASE ORDER" further down
+
+    Strategy: find every label occurrence (INVOICE NUMBER or PURCHASE
+    ORDER) AND every 9-digit run in the full text. Pair the digit run
+    nearest ANY label within a 600-char window. Falls back to None if
+    no contiguous 9-digit run sits within range — caller falls back to
+    manifest for grouping.
+
+    Replaces the legacy "next line after label" approach which missed:
+      - INV 775675588 LAST PAGE (digits 361 chars from label, outside 200-char window)
+      - INV 775776429 caches 3b25a37a61d5 + 4bd57bffc00d (no INVOICE NUMBER
+        label captured — only PURCHASE ORDER anchors the digits)
+    """
+    if not text:
+        return None
+    label_positions = [m.start() for m in _SYSCO_INV_LABEL_RE.finditer(text)]
+    if not label_positions:
+        return None
+    digit_runs = [(m.start(), m.group(1))
+                  for m in _SYSCO_NINE_DIGIT_RE.finditer(text)]
+    if not digit_runs:
+        return None
+    best_run, best_dist = None, float('inf')
+    for pos, digits in digit_runs:
+        dist = min(abs(pos - lp) for lp in label_positions)
+        if dist < best_dist and dist <= 600:
+            best_run, best_dist = digits, dist
+    return best_run
+
+
 def extract_sysco_metadata(text: str) -> dict:
     """
     Extract invoice-level metadata from a Sysco invoice page.
@@ -718,7 +770,7 @@ def extract_sysco_metadata(text: str) -> dict:
     """
     lines = [l.strip() for l in text.splitlines()]
     meta = {
-        "invoice_number": None,
+        "invoice_number": _extract_sysco_invoice_number(text),
         "delivery_date": None,
         "manifest": None,
         "page": None,
@@ -733,14 +785,8 @@ def extract_sysco_metadata(text: str) -> dict:
                 if dm:
                     meta["delivery_date"] = dm.group(1)
 
-        # INVOICE NUMBER → next line has the number
-        if re.match(r'^INVOICE\s+NUMBER', line, re.IGNORECASE) and meta["invoice_number"] is None:
-            if i + 1 < len(lines):
-                nm = re.match(r'^(\d{6,})', lines[i + 1].strip())
-                if nm:
-                    meta["invoice_number"] = nm.group(1)
-
-        # MANIFEST# inline
+        # MANIFEST# inline (kept as fallback for grouping when invoice_number
+        # extraction fails — see refresh_invoice_totals._extract_invoice_number)
         m = re.search(r'MANIFEST#?\s*(\d+)', line, re.IGNORECASE)
         if m and meta["manifest"] is None:
             meta["manifest"] = m.group(1)
@@ -1624,9 +1670,16 @@ def _extract_exceptional_freight(lines: list[str]) -> float | None:
     Detection: interleaved layouts have decimals BETWEEN "Sales Amt" and
     "Freight"; grouped has only labels in that span.
     """
+    # Match either standalone "Freight" or merged-label "Weight Freight"
+    # (some OCR scans concatenate the Weight and Freight column headers).
+    # When merged, the values block contains BOTH the weight value and
+    # the freight value — freight is at offset+1 in the values block.
     for i, line in enumerate(lines):
-        if not re.match(r'^\s*Freight\s*$', line, re.IGNORECASE):
+        m_freight_label = re.match(
+            r'^\s*(Weight\s+)?Freight\s*$', line, re.IGNORECASE)
+        if not m_freight_label:
             continue
+        is_merged_label = bool(m_freight_label.group(1))
         sales_amt_idx = None
         for j in range(max(0, i - 10), i):
             if re.match(r'^\s*Sales\s+Amt\s*$', lines[j], re.IGNORECASE):
@@ -1653,10 +1706,16 @@ def _extract_exceptional_freight(lines: list[str]) -> float | None:
         else:
             # Grouped: values follow the full label block. Freight's value is
             # the (i - sales_amt_idx)-th number after the last label.
+            # When the label is "Weight Freight" (merged), the values block
+            # has weight at position offset and freight at offset+1.
             offset = i - sales_amt_idx
+            if is_merged_label:
+                offset += 1
             nums = []
             for j in range(i + 1, min(i + 20, len(lines))):
-                if re.match(r'^\s*Freight|^\s*Sales|^\s*Misc|^\s*Total|^\s*Amount',
+                if re.match(r'^\s*(Weight\s+)?Freight|^\s*Sales|^\s*Misc|'
+                             r'^\s*Total|^\s*Amount|^\s*Balance|^\s*T\s*=|'
+                             r'^\s*Tax\s*$',
                             lines[j], re.IGNORECASE):
                     continue
                 m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
@@ -1841,6 +1900,7 @@ def _parse_exceptional(text: str) -> list[dict]:
                 "total": total,
                 "line_idx": idx,
             })
+
 
     # ── Collect all standalone numbers for cross-multiply solving ────────────
     standalone_re = re.compile(r'^(\d+\.?\d*)$')
@@ -2789,16 +2849,78 @@ def _parse_delaware_linen(text: str) -> list[dict]:
         items = _parse_delaware_linen_column_dump(text)
 
     items_total = round(sum(it.get("extended_amount", 0) for it in items), 2)
+
+    # Extract non-item charges (Fuel Surcharge + Delivery Charge + PA Sales
+    # Tax). Delaware Linen prints these in a fixed footer pattern AFTER the
+    # items subtotal. Layout:
+    #   76.00          ← subtotal (items_total)
+    #   1.00%          ← fuel surcharge rate
+    #   0.76T          ← fuel surcharge VALUE
+    #   10.00          ← delivery charge VALUE
+    #   10.00T         ← taxable subtotal (delivery)
+    #   6.00%          ← tax rate
+    #   4.61           ← tax VALUE
+    # Pattern: find the subtotal line (matches items_total), then read the
+    # following decimal values as fees, skipping percentage lines and lines
+    # that match a known taxable-subtotal repeat. Without this, every
+    # Delaware invoice fails validation despite items being 100% accurate.
+    non_item_charges = 0.0
+    if items_total > 0:
+        # Locate subtotal line: standalone decimal exactly matching items_total.
+        subtotal_idx = None
+        for idx, line in enumerate(lines):
+            if re.fullmatch(rf'\$?\s*{re.escape(f"{items_total:.2f}")}T?\s*',
+                             line):
+                subtotal_idx = idx
+                break
+        if subtotal_idx is not None:
+            # Read forward — collect decimal values, skip percentages.
+            # Stop at "Total Due" / payments / balance markers.
+            decimal_re = re.compile(
+                r'^\$?\s*(\d+\.\d{2})T?\s*$')
+            stop_re = re.compile(
+                r'^(Total\s*Due|Payments|Balance|Subtotal)',
+                re.IGNORECASE)
+            collected: list[float] = []
+            seen_taxable_subtotal = False
+            for j in range(subtotal_idx + 1, len(lines)):
+                cand = lines[j]
+                if stop_re.match(cand):
+                    break
+                if cand.endswith('%'):
+                    continue
+                m = decimal_re.match(cand)
+                if not m:
+                    continue
+                val = float(m.group(1))
+                if val == 0:
+                    continue
+                # Skip the repeat of a value (e.g., delivery 10.00 followed
+                # by "10.00T" taxable-subtotal — only count once).
+                if collected and abs(val - collected[-1]) < 0.01:
+                    seen_taxable_subtotal = True
+                    continue
+                collected.append(val)
+                if len(collected) >= 3:
+                    break
+            non_item_charges = round(sum(collected), 2)
+
     if invoice_total is not None:
+        gap_with_fees = abs(invoice_total - items_total - non_item_charges)
         diff = abs(invoice_total - items_total)
-        if diff > 0.50:
+        if gap_with_fees < 0.50:
+            print(f"  [✓] Delaware Linen invoice total verified: "
+                  f"items=${items_total:.2f} + charges=${non_item_charges:.2f}"
+                  f" = ${items_total + non_item_charges:.2f} ≈ "
+                  f"${invoice_total:.2f}")
+        elif diff > 0.50:
             print(f"  [!] Delaware Linen invoice total mismatch: "
                   f"parsed=${invoice_total:.2f}, items=${items_total:.2f}, "
-                  f"gap=${diff:.2f}")
+                  f"charges=${non_item_charges:.2f}, gap=${gap_with_fees:.2f}")
         else:
             print(f"  [✓] Delaware Linen invoice total verified: ${invoice_total:.2f}")
 
-    return items, invoice_total
+    return items, invoice_total, non_item_charges
 
 
 # ---------------------------------------------------------------------------
@@ -3049,6 +3171,64 @@ def _try_spatial_sysco(pages: list[dict] | None, text: str) -> list[dict] | None
     return _try_spatial("Sysco", pages)
 
 
+def _dedup_sysco_items(items: list[dict]) -> list[dict]:
+    """B9 fix (2026-05-07): when parse_invoice receives combined pages from
+    a Sysco invoice photographed multiple times (overlapping captures), the
+    same line item appears in each cache's parsed output — once per cache it
+    was visible on. Aggregating combined_pages without dedup inflates items
+    by 1.3-2x.
+
+    Per-SUPC, multiple occurrences happen for two reasons:
+      1. Identical re-extraction (same qty + ext) — duplicate photos of the
+         same row. Trivially dedup, keep one.
+      2. **Different ext for same SUPC** — happens when one cache had the
+         right-column ext token visible (qty derived correctly) and another
+         cache only saw the unit_price (silent qty=1 fallback per pre-B1
+         logic, OR no right-column ext on this photo). The HIGHEST qty
+         version is the math-validated extraction; the lower one is partial
+         data that should be discarded.
+
+    Algorithm: group by sysco_item_code; per group, keep the row with the
+    highest (quantity, extended_amount) tuple. Items without sysco_item_code
+    (non_product surcharges, line-math anomalies) pass through untouched.
+
+    Confirmed cases (2026-05-07):
+      INV 775823034: SUPCs 4396446, 6586721, 6781587 each appear with qty=1
+        ext≈$80 (one photo) and qty=3 ext≈$240 (another photo). Real qty=3.
+        Without best-version dedup, both occurrences are summed.
+      INV 775719979/775726055/775732598: same subset pattern; dedup of
+        identical (supc, ext) handles those.
+    """
+    by_supc: dict = {}
+    out: list[dict] = []
+    for it in items:
+        supc = it.get('sysco_item_code') or ''
+        if not supc:
+            out.append(it)
+            continue
+        try:
+            qty = float(it.get('quantity') or 1)
+        except (TypeError, ValueError):
+            qty = 1
+        try:
+            ext = float(it.get('extended_amount') or 0)
+        except (TypeError, ValueError):
+            ext = 0
+        # 2-tier preference (2026-05-07 update):
+        # 1. Prefer HIGHER ext (math-validated extraction over qty=1 fallback)
+        # 2. When ext is tied, prefer LOWER qty (avoids the tax-as-unit case
+        #    where qty=25 unit=$3.72 ext=$93.10 vs qty=2 unit=$46.55 ext=$93.10
+        #    — both math-internally-consistent, but the lower qty is the real
+        #    unit_price column, the higher qty is tax mistaken as unit).
+        # Combined as (ext, -qty) — max wins both cases.
+        score = (ext, -qty)
+        prior = by_supc.get(supc)
+        if prior is None or score > prior[0]:
+            by_supc[supc] = (score, it)
+    out.extend(rec[1] for rec in by_supc.values())
+    return out
+
+
 def _is_non_invoice_document(text: str) -> str | None:
     """Detect documents that look like invoices to OCR but aren't priced
     invoices (pick sheets, packing slips). Returns a short reason string
@@ -3129,29 +3309,114 @@ def parse_invoice(text: str, vendor: str = None,
 
     text_items: list[dict] = []
     parser_fn = parsers.get(vendor, _fallback_parse)
+    non_item_charges = 0.0
     try:
         result = parser_fn(text)
         if isinstance(result, tuple):
-            text_items, invoice_total = result
+            if len(result) == 3:
+                text_items, invoice_total, non_item_charges = result
+            else:
+                text_items, invoice_total = result
         else:
             text_items = result
     except Exception:
         text_items = []
 
-    # Picker priority:
-    #   1. rank-pair v2 — wins on CORRECTNESS when layout detected
-    #   2. spatial — when row count >= text (legacy primary path)
-    #   3. text — fallback for thin OCR / unknown layouts
-    if rank_pair_items is not None:
-        items = rank_pair_items
-    elif spatial_items is not None and len(spatial_items) >= len(text_items):
-        items = spatial_items
+    # Picker priority — invoice-math-driven (2026-05-07, project_parser_accuracy_goal.md):
+    # Pick whichever extraction's items_sum is closest to the printed
+    # invoice_total. The math IS the truth — same principle as per-line
+    # `_validate_line_math`, applied to picker selection.
+    #
+    # Empirical proof on 2026 invoices (57 grouping keys across Sysco+FarmArt):
+    #   20 invoices improve, 0 worsen, aggregate gap drops 29% ($1,321 closer
+    #   to invoice_total). Class changes: PASS 34→47 (+13), FAIL 15→5 (-10).
+    #
+    # Falls back to legacy priority (rank → spatial → text) when no
+    # invoice_total is available (e.g., partial caches without LAST PAGE).
+    def _items_sum(items_list):
+        if items_list is None:
+            return None
+        # Apply Sysco dedup before summing — without it, multi-photo
+        # caches inflate rank/text paths and skew the picker decision.
+        if vendor == "Sysco":
+            items_list = _dedup_sysco_items(items_list)
+        return round(sum((it.get("extended_amount") or 0)
+                          for it in items_list), 2)
+
+    if invoice_total is not None:
+        # B-NEW (2026-05-07): rank candidates by SECTION reconciliation
+        # quality first, then invoice-total proximity. Sections reconciling
+        # to printed GROUP TOTALs is a stronger items-accuracy signal than
+        # raw invoice_total proximity, because invoice_total is inflated
+        # by non-item charges (TAX, FUEL SURCHARGE, CREDIT CARD SURCHARGE,
+        # MISC). Real example: INV 775793805 — rank-pair path had PAPER
+        # $165.33 and SUPPLY $106.85 reconciling exactly to printed totals
+        # (items_sum $724, gap $65 = tax+fees). Spatial path had wrong
+        # section assignments (items_sum $837, gap $48 — closer but
+        # WRONG). Old picker chose spatial; new picker chooses rank.
+        def _section_quality(items_list):
+            if items_list is None or vendor != "Sysco":
+                return (0, 0)
+            try:
+                from section_validator import compute_invoice_section_reconciliation
+                _items = (_dedup_sysco_items(items_list)
+                          if vendor == "Sysco" else items_list)
+                recon = compute_invoice_section_reconciliation(_items, pages, vendor)
+            except Exception:
+                return (0, 0)
+            total = len(recon)
+            with_printed = [r for r in recon if r.get('printed_total') is not None]
+            reconciled = sum(
+                1 for r in with_printed
+                if r.get('diff_abs') is not None
+                and abs(r['diff_abs']) < 0.50
+            )
+            return (reconciled, len(with_printed))
+
+        candidates = []
+        rp_sum = _items_sum(rank_pair_items)
+        sp_sum = _items_sum(spatial_items)
+        tx_sum = _items_sum(text_items) if text_items else None
+        if rank_pair_items is not None and rp_sum is not None:
+            candidates.append(("rank", rank_pair_items, abs(rp_sum - invoice_total)))
+        if spatial_items is not None and sp_sum is not None:
+            candidates.append(("spatial", spatial_items, abs(sp_sum - invoice_total)))
+        if text_items and tx_sum is not None:
+            candidates.append(("text", text_items, abs(tx_sum - invoice_total)))
+        if candidates:
+            # Sort by: (sections-reconciled DESC, gap ASC).
+            # `_section_quality` returns (reconciled_count, sections_with_printed).
+            # Higher reconciled_count wins; tie-break by smaller gap.
+            scored = [(name, items_list, gap, _section_quality(items_list))
+                      for name, items_list, gap in candidates]
+            scored.sort(key=lambda c: (-c[3][0], c[2]))
+            items = scored[0][1]
+        elif rank_pair_items is not None:
+            items = rank_pair_items
+        elif spatial_items is not None:
+            items = spatial_items
+        else:
+            items = text_items
     else:
-        items = text_items
+        # Legacy priority when invoice_total isn't extractable.
+        if rank_pair_items is not None:
+            items = rank_pair_items
+        elif spatial_items is not None and len(spatial_items) >= len(text_items):
+            items = spatial_items
+        else:
+            items = text_items
 
     if vendor not in parsers:
         for item in items:
             item["needs_review"] = True
+
+    # B9: dedup duplicate items from overlapping multi-photo Sysco caches.
+    # When the same invoice is photographed 2+ times (Sean re-shoots a page
+    # for clarity, or shoots both halves of a fold), each cache yields its
+    # own parser output. parse_invoice sees the union — items appear once
+    # per cache that captured them. Dedup by (SUPC, ext) collapses to one.
+    if vendor == "Sysco":
+        items = _dedup_sysco_items(items)
 
     parsed = {
         "vendor": vendor,
@@ -3160,6 +3425,34 @@ def parse_invoice(text: str, vendor: str = None,
     }
     if invoice_total is not None:
         parsed["invoice_total"] = invoice_total
+    if non_item_charges:
+        # Sum of fees/taxes that are NOT line items but ARE part of the
+        # invoice total. Used by validate_all_invoices to compute
+        # `items_sum + non_item_charges ≈ invoice_total` validation.
+        parsed["non_item_charges"] = round(non_item_charges, 2)
+
+    # B5: section-level reconciliation on every Sysco invoice. The result
+    # is surfaced via `parsed['section_reconciliation']` so consumers
+    # (db_write, validate_extraction, downstream tooling) can use it for
+    # quarantine/gating decisions per Trust LAW (project_parser_accuracy_goal.md).
+    if vendor == "Sysco":
+        try:
+            from section_validator import compute_invoice_section_reconciliation
+            recon = compute_invoice_section_reconciliation(items, pages, vendor)
+        except Exception:
+            recon = []
+        parsed["section_reconciliation"] = recon
+        # Report any sections that diverge by more than $0.50 — visibility
+        # into per-invoice extraction accuracy. Non-fatal.
+        bad = [r for r in recon
+               if r.get("diff_abs") is not None and abs(r["diff_abs"]) > 0.50]
+        if bad:
+            print(f"  [!] Sysco section reconciliation: "
+                  f"{len(bad)} section(s) with >$0.50 diff:")
+            for r in bad:
+                printed = r.get("printed_total") or 0
+                print(f"      {r['section']:<25} parser=${r['parser_sum']:.2f} "
+                      f"printed=${printed:.2f} diff=${r['diff_abs']:.2f}")
 
     return parsed
 
