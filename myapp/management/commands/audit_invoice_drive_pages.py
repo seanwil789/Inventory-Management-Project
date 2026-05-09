@@ -154,40 +154,37 @@ class Command(BaseCommand):
                                 'note': f'no vendor folder {vendor_canon}'})
                 continue
 
-            # Walk to week folder
-            wk_key = (year, month, vendor_canon, week_name)
+            # Walk to week folder. Drive convention is inconsistent:
+            #   'Week 4 2.23 - 2.28' (spaces around dash, 1-digit month)
+            #   'Week 1 04.06-04.12' (no spaces, 2-digit month)
+            #   '2.8 - 2.15' (no "Week N" prefix)
+            #   'Week 4' (no dates at all)
+            # Strategy: list all week folders for the (year, month, vendor)
+            # tuple, parse date ranges flexibly, find the one covering d.
+            wk_key = (year, month, vendor_canon, str(d))
             if wk_key not in week_files_cache:
-                week_folders = list_subfolders(drive, vendor_id)
-                week_id = next((f['id'] for f in week_folders
-                                if f['name'] == week_name), None)
-                if week_id:
-                    week_files_cache[wk_key] = list_files(drive, week_id)
-                else:
-                    week_files_cache[wk_key] = None
-
-            files = week_files_cache[wk_key]
-            if files is None:
-                # Try to find the week heuristically — week names sometimes
-                # vary in folder convention
-                week_folders = list_subfolders(drive, vendor_id)
-                fallback_id = None
-                for w in week_folders:
-                    if w['name'].startswith('Week') and (
-                        f'{d.month:02d}.{d.day:02d}' in w['name']
-                        or _date_in_week_range(d, w['name'])
-                    ):
-                        fallback_id = w['id']
-                        week_name = w['name']
+                all_week_folders = list_subfolders(drive, vendor_id)
+                matched_id = None
+                matched_name = None
+                for w in all_week_folders:
+                    if _folder_covers_date(w['name'], d):
+                        matched_id = w['id']
+                        matched_name = w['name']
                         break
-                if fallback_id:
-                    files = list_files(drive, fallback_id)
-                    week_files_cache[wk_key] = files
+                if matched_id:
+                    week_files_cache[wk_key] = (list_files(drive, matched_id),
+                                                 matched_name)
                 else:
-                    results.append({'ivs': ivs, 'drive_files': [],
-                                    'cached_count': len(ivs.cache_hashes or []),
-                                    'missing_count': 0,
-                                    'note': f'no week folder for {d}'})
-                    continue
+                    week_files_cache[wk_key] = (None, None)
+
+            files, matched_name = week_files_cache[wk_key]
+            if files is None:
+                results.append({'ivs': ivs, 'drive_files': [],
+                                'cached_count': len(ivs.cache_hashes or []),
+                                'missing_count': 0,
+                                'note': f'no week folder covering {d}'})
+                continue
+            week_name = matched_name
 
             # Now we have a list of Drive files for this week.
             # We can't easily attribute each file to a specific invoice
@@ -240,15 +237,26 @@ class Command(BaseCommand):
         self.stdout.write(f'  Drive matches OCR cache (gap is fees/parser, not pages):     {len(same_count)}')
 
 
-def _date_in_week_range(d, week_name: str) -> bool:
-    """Check if date d falls within the range encoded in 'Week N MM.DD - MM.DD'."""
+def _folder_covers_date(folder_name: str, d) -> bool:
+    """True when folder_name encodes a date range that includes d.
+
+    Handles all observed Drive variants:
+      'Week 4 2.23 - 2.28'   (spaces, 1-digit month)
+      'Week 1 04.06-04.12'   (no spaces, 2-digit month)
+      '2.8 - 2.15'           (no Week prefix)
+      'Week 4'               (no dates) → False (can't determine)
+    """
     import re
-    m = re.search(r'(\d{2})\.(\d{2})\s*-\s*(\d{2})\.(\d{2})', week_name)
+    # Find any "M.D - M.D" or "M.D-M.D" pattern; allow 1- or 2-digit
+    m = re.search(r'(\d{1,2})\.(\d{1,2})\s*-\s*(\d{1,2})\.(\d{1,2})', folder_name)
     if not m:
         return False
     s_mo, s_da, e_mo, e_da = (int(g) for g in m.groups())
-    s = datetime(d.year, s_mo, s_da).date()
-    e = datetime(d.year, e_mo, e_da).date()
-    if s > e:  # week crosses year boundary
+    try:
+        s = datetime(d.year, s_mo, s_da).date()
+        e = datetime(d.year, e_mo, e_da).date()
+    except ValueError:
+        return False
+    if s > e:  # crosses year
         e = datetime(d.year + 1, e_mo, e_da).date()
     return s <= d <= e
