@@ -17,7 +17,7 @@ Single-operator today (Wentworth kitchen, ~45 residents, 4 meals/day). Architect
 - **WhiteNoise + Gunicorn** for production serving
 - **cron** for pipeline scheduling (hourly batch, daily refresh, weekly sync)
 
-716 tests, ~95s suite runtime. Test discipline notes in `.claude/memory` (shared separately).
+855 tests, ~95s suite runtime. Test discipline notes in `.claude/memory` (shared separately).
 
 Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via Tailscale; the Chromebook is the dev host. The Pi has been the authoritative cron + DB host since the 2026-04-26-28 cutover.
 
@@ -84,17 +84,18 @@ Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via T
 │                                   derivation; MealService save   │
 │                                   → learned-popularity recompute │
 ├──────────────────────────────────────────────────────────────────┤
-│ DATA           15 models · 66 migrations · Django ORM            │
+│ DATA           17 models · 69 migrations · Django ORM            │
 │                SQLite file (Postgres-ready via env var)          │
 ├──────────────────────────────────────────────────────────────────┤
-│ INGESTION      invoice_processor/  — 28 modules                  │
-│                Pipeline:  drive → docai → parser → mapper →      │
-│                           db_write                                │
+│ INGESTION      invoice_processor/  — 27 modules                  │
+│                Pipeline:  drive → docai → parser → rank_pair →   │
+│                           spatial_matcher → mapper → db_write    │
 │                Siblings:  synergy_sync, budget_sync, csv_ingest  │
+│                Validation: section_validator, canonical_match    │
 │                Utilities: discover_unmapped, learn_from_reviews, │
 │                           reprocess_{archive,jpgs}, audit_*      │
 │                                                                   │
-│                myapp/management/commands/ — 44 commands for      │
+│                myapp/management/commands/ — 74 commands for      │
 │                imports, audits, backfills, and derivations       │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -149,15 +150,16 @@ Vendor ──┐
 
 ## Current state
 
-### Volume (Pi production, 2026-05-02)
-- 2,821 InvoiceLineItems across 2025-06 → today, 7 vendors
-- 553 Products, 2,069 ProductMappings (~94% mapping coverage post-quarantine guards)
-- 88 Recipes, 587 RecipeIngredients
+### Volume (Pi production, 2026-05-08)
+- 3,109 InvoiceLineItems across 2025-06 → today, 8 vendors (95.21% mapped)
+- 558 Products, 2,324 ProductMappings
+- 93 Recipes, 624 RecipeIngredients
 - 1,119 YieldReferences, 96 StandardPortionReferences
-- 282 Menus across the active biweekly cycles
-- 37 MenuFreetextComponents, 28 Census rows
-- 754 ProductMappingProposals (609 approved / 75 rejected / 70 pending) — drift_audit unification active
-- 716 tests passing in ~95s (local)
+- 301 Menus across the active biweekly cycles
+- 67 MenuFreetextComponents, 28 Census rows
+- 1,009 ProductMappingProposals (901 approved / 108 rejected / 0 pending — cron-applied)
+- 111 InvoiceValidationStatus rows (98.8% PASS for 2026 invoices)
+- 855 tests passing in ~95s (local)
 
 ### What's in flight
 Active workstream is bottom-up refinement of the data foundations: parser → DB schema → cost calc → consumers, in that order. The cost calculator is the load-bearing metric (it exercises every layer); its coverage drives order-guide accuracy, sheet correctness, and COGs dashboard trust.
@@ -209,13 +211,17 @@ python manage.py audit_orphan_products
 python manage.py mapper_regression_check
 ```
 
-Cron schedule (production; not needed for review):
+Cron schedule (production Pi; not needed for review):
 ```
-0 * * * *   run_invoice_batch.sh          # hourly Drive inbox poll
-0 6 * * *   run_refresh_invoice_totals.sh # daily totals cache rebuild
-0 7 * * *   run_mapping_review_discover.sh
-0 */6 * * * run_mapping_review_apply.sh
-0 8 * * 5   run_budget_sync.sh            # Fri 8am budget push
+0 * * * *      run_invoice_batch.sh           # hourly Drive inbox poll
+@reboot sleep 60 && run_invoice_batch.sh       # post-boot pickup
+0 6 * * *      run_refresh_invoice_totals.sh  # daily totals cache rebuild
+0 7 * * *      run_mapping_review_discover.sh # daily unmapped → PMP queue
+0 */6 * * *    run_mapping_review_apply.sh    # apply Sean-approved PMPs
+0 8 * * 5      run_budget_sync.sh             # Fri 8am budget push
+5 0 1 * *      run_monthly_synergy_tab.sh     # 1st of month new sheet
+0 6 * * 0      run_drift_audit.sh weekly      # Sun 6am safe-only auto-clean
+0 7 1 * *      run_drift_audit.sh monthly     # 1st 7am ambiguous → PMP
 ```
 
 ---
@@ -228,33 +234,34 @@ myproject/                Django project scaffold
   urls.py                 Root routing (admin, auth, myapp)
 
 myapp/                    Main application
-  models.py               15 models end-to-end (~806 lines)
-  cost_utils.py           Cost calculation dispatch + density tables (~817 lines)
-  taxonomy.py             Locked naming + descriptor convention (~907 lines)
-  calendar_utils.py       Biweekly anchor math (~17 lines)
+  models.py               17 models end-to-end (~1,206 lines)
+  cost_utils.py           Cost calculation dispatch + density tables (~856 lines)
+  taxonomy.py             Locked naming + descriptor convention (~913 lines)
+  calendar_utils.py       Biweekly anchor math + weekend slot logic (~31 lines)
   signals.py              3 receivers (menu, m2m, mealservice) — 138 lines
-  views.py                ~60 view functions (~3,836 lines)
-  urls.py                 60 URL routes
+  views.py                ~80 view functions (~3,847 lines)
+  urls.py                 55 URL routes
   forms.py                Custom forms (~208 lines)
   consumption_utils.py    Per-Product date-range consumption engine (~232 lines)
   admin.py                Admin registration for all models (~141 lines)
-  tests.py                716 tests (~10,812 lines)
+  tests.py                855 tests (~13,616 lines)
   yield_parsing/          Per-section parsers for Book of Yields PDF
-  templates/myapp/        44 HTMX + Tailwind templates
-  management/commands/    59 commands (imports, audits, backfills)
-  migrations/             66 migrations (latest: 0066)
+  templates/myapp/        43 HTMX + Tailwind templates
+  management/commands/    74 commands (imports, audits, backfills)
+  migrations/             69 migrations (latest: 0069_invoicevalidationstatus)
 
-invoice_processor/        Pipeline modules (non-Django, 28 files)
-  batch.py                Cron entry — Drive inbox → full pipeline (~530 lines)
-  parser.py               6 vendor dialects (~2,574 lines, the crown-jewel file)
-  mapper.py               7-tier match cascade (~1,002 lines)
-  spatial_matcher.py      2D bbox matching for Sysco + 4 other vendors (~691 lines)
+invoice_processor/        Pipeline modules (non-Django, 27 files)
+  batch.py                Cron entry — Drive inbox → full pipeline (~571 lines)
+  parser.py               6 vendor dialects (~3,466 lines, the crown-jewel file)
+  rank_pair.py            Tilt-resilient rank-pair extractor (Farm Art + Sysco) (~790 lines)
+  spatial_matcher.py      2D bbox matching for 5 vendors (~1,357 lines)
+  section_validator.py    Per-section reconciliation against printed GROUP TOTAL (~401 lines)
+  canonical_match.py      Fuzzy match → VendorPriceList canonical (~113 lines)
+  mapper.py               6-tier match cascade (~970 lines)
   docai.py                Document AI wrapper (~906 lines)
-  db_write.py             Upsert + quarantine layer — pipeline/ORM boundary (~292 lines)
-  synergy_sync.py         Google Sheets push for the operator's monthly tab (~1,506 lines)
+  db_write.py             Upsert + quarantine layer — pipeline/ORM boundary (~607 lines)
+  synergy_sync.py         Google Sheets push for the operator's monthly tab (~1,845 lines)
   budget_sync.py          OneDrive xlsx push (scheduled; blocked on credential drop)
-  discover_unmapped.py    Fuzzy-suggestion generator for the review workflow (~1,054 lines)
-  learn_from_reviews.py   Self-modifying rule learner from operator decisions
   reprocess_archive.py    Full-archive replay for parser-change validation
   abbreviations.py        Vendor shorthand expansion (~187 lines, ~75 entries)
 
