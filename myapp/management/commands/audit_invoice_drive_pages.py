@@ -238,25 +238,41 @@ class Command(BaseCommand):
 
 
 def _folder_covers_date(folder_name: str, d) -> bool:
-    """True when folder_name encodes a date range that includes d.
+    """True when folder_name encodes a date or date range that includes d.
 
     Handles all observed Drive variants:
-      'Week 4 2.23 - 2.28'   (spaces, 1-digit month)
-      'Week 1 04.06-04.12'   (no spaces, 2-digit month)
-      '2.8 - 2.15'           (no Week prefix)
-      'Week 4'               (no dates) → False (can't determine)
+      'Week 4 2.23 - 2.28'   (date range, spaces, 1-digit month)
+      'Week 1 04.06-04.12'   (date range, no spaces, 2-digit month)
+      '2.8 - 2.15'           (date range, no Week prefix)
+      '9.16.25'              (single date M.D.YY — 2025 archive)
+      '9.16'                 (single date M.D)
+      'Week 4'               (no dates) → False
     """
     import re
-    # Find any "M.D - M.D" or "M.D-M.D" pattern; allow 1- or 2-digit
+    # Try a date range first
     m = re.search(r'(\d{1,2})\.(\d{1,2})\s*-\s*(\d{1,2})\.(\d{1,2})', folder_name)
-    if not m:
-        return False
-    s_mo, s_da, e_mo, e_da = (int(g) for g in m.groups())
-    try:
-        s = datetime(d.year, s_mo, s_da).date()
-        e = datetime(d.year, e_mo, e_da).date()
-    except ValueError:
-        return False
-    if s > e:  # crosses year
-        e = datetime(d.year + 1, e_mo, e_da).date()
-    return s <= d <= e
+    if m:
+        s_mo, s_da, e_mo, e_da = (int(g) for g in m.groups())
+        try:
+            s = datetime(d.year, s_mo, s_da).date()
+            e = datetime(d.year, e_mo, e_da).date()
+        except ValueError:
+            return False
+        if s > e:
+            e = datetime(d.year + 1, e_mo, e_da).date()
+        return s <= d <= e
+    # Single-date pattern: 'M.D.YY' or 'M.D' — week containing that date
+    # (treated as the week starting that day; Sysco/Sean's archive
+    # convention groups deliveries by their day-of-week).
+    m = re.fullmatch(r'(\d{1,2})\.(\d{1,2})(?:\.(\d{2,4}))?', folder_name.strip())
+    if m:
+        mo, da, yy = m.group(1), m.group(2), m.group(3)
+        try:
+            anchor = datetime(d.year, int(mo), int(da)).date()
+        except ValueError:
+            return False
+        # Match if invoice_date is within 7 days of the anchor (covers the
+        # weekly bucket regardless of which day of the week is the anchor)
+        diff = (d - anchor).days
+        return -1 <= diff <= 7
+    return False
