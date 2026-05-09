@@ -359,14 +359,12 @@ class InvoiceLineItem(models.Model):
         # row drops from /mapping-review/ unresolved without re-surfacing
         # the same conflated suggestion.
         ('unmatched_repointed', 'Unmatched (Repointed by Cleanup)'),
-        # Fuzzy-quarantine pending tag — db_write quarantines vendor_fuzzy
-        # tier hits with FK detached; ILI gets <tier>_pending while the
-        # PMP awaits human review in /mapping-review/. NOTE: the same
-        # _pending suffix is applied to fuzzy/stripped_fuzzy/subset_match
-        # tiers too (db_write._FUZZY_TIERS) — those variants haven't
-        # accumulated rows yet but WILL when the corresponding tiers fire
-        # into quarantine. Add them to choices when they do.
+        # Fuzzy-quarantine pending tags — db_write quarantines fuzzy-tier
+        # hits with FK detached; ILI gets <tier>_pending while the PMP
+        # awaits human review in /mapping-review/.
         ('vendor_fuzzy_pending', 'Vendor Fuzzy (Quarantined, Pending Review)'),
+        ('subset_match_pending', 'Subset Match (Quarantined, Pending Review)'),
+        ('stripped_fuzzy_pending', 'Stripped Fuzzy (Quarantined, Pending Review)'),
     ]
 
     vendor          = models.ForeignKey(Vendor, null=True, blank=True, on_delete=models.SET_NULL)
@@ -455,7 +453,15 @@ class InvoiceLineItem(models.Model):
     source_file     = models.CharField(max_length=255, blank=True)  # original filename
     match_confidence = models.CharField(max_length=30, blank=True, choices=CONFIDENCE_CHOICES)
     match_score     = models.IntegerField(null=True, blank=True)  # 0-100 fuzzy score
-    price_flagged   = models.BooleanField(default=False)  # True if price anomaly detected
+    price_flagged   = models.BooleanField(default=False)  # True if price anomaly detected (historical drift)
+    # B6 (project_parser_accuracy_goal.md): line-math validation flag.
+    # Set at parse time by `invoice_processor/line_math.py` when
+    # qty × price ≠ extended beyond tolerance (catch-weight aware: uses
+    # price_per_pound when populated, unit_price otherwise).
+    # Downstream consumers (synergy_sync, cost_utils, /price-alerts/,
+    # /category-spend/, /cogs/) filter math_flagged=True from aggregations
+    # so poisoned rows don't distort dashboards. Per Trust LAW.
+    math_flagged    = models.BooleanField(default=False, db_index=True)
     section_hint    = models.CharField(
         max_length=60, blank=True, db_index=True,
         help_text="Section header from the invoice (e.g. 'DAIRY', "
@@ -780,8 +786,12 @@ class RecipeIngredient(models.Model):
         # Walk ILI rows newest-first. Prefer the newest row that has EITHER
         # a parseable case_size OR a populated price_per_pound. If neither
         # is reachable within the top 5, fall back to the absolute newest.
+        # B6: exclude math_flagged rows so anomaly-contaminated unit_price /
+        # price_per_pound values don't poison recipe cost estimates. Per
+        # Trust LAW. The walk continues to the NEXT-newest clean row.
         ili_candidates = list(InvoiceLineItem.objects
                               .filter(product=self.product)
+                              .exclude(math_flagged=True)
                               .order_by('-invoice_date')[:5])
         if not ili_candidates:
             return None, 'no invoice history'

@@ -20,6 +20,8 @@ from __future__ import annotations
 import re
 from statistics import median
 
+from line_math import validate_line_math
+
 
 _QTY_RE = re.compile(r"^\d+\.\d{3}$")
 _PRICE_RE = re.compile(r"^\$?\d+\.\d{2,4}\*?$")
@@ -226,7 +228,7 @@ def _extract_farmart_rank_one_page(tokens: list[dict]) -> list[dict]:
             except ValueError:
                 ext_f = None
 
-        rows.append({
+        row = {
             "qty": qty_f,
             "purchase_uom": None,  # Farm Art doesn't expose a U/M column reliably
             "unit_price": unit_f,
@@ -234,7 +236,12 @@ def _extract_farmart_rank_one_page(tokens: list[dict]) -> list[dict]:
             "raw_description": desc,
             "section_hint": None,  # section detection is downstream of extraction
             "ambiguous": ambiguous,
-        })
+        }
+        # Catch-weight aware math validation. Self-correct enabled because
+        # Farm Art rank-pair occasionally pulls qty=2 when actual qty=1
+        # (ext rounds clean to ext/unit). Sets math_flagged on real anomalies.
+        validate_line_math(row, vendor='Farm Art', try_self_correct=True)
+        rows.append(row)
 
     return rows
 
@@ -735,6 +742,11 @@ def _extract_sysco_rank_one_page(
             item["unit_of_measure"] = "LB"
             item["price_per_unit"] = per_lb_f
 
+        # Catch-weight aware math validation. ppp (via price_per_unit alias)
+        # wins for MEATS/POULTRY/SEAFOOD. No self-correct here — Sysco
+        # rank-pair already derives qty from ext/unit deterministically
+        # (B1 fix); a second self-correct layer could mask real anomalies.
+        validate_line_math(item, vendor='Sysco')
         rows.append(item)
 
     # B2b: compute the LAST canonical section detected on this page so

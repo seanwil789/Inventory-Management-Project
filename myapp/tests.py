@@ -668,6 +668,17 @@ def _import_parser():
     return invoice_parser
 
 
+def _import_line_math():
+    """Import line_math from invoice_processor/ — adds its dir to sys.path."""
+    import sys
+    from django.conf import settings
+    path = str(settings.BASE_DIR / 'invoice_processor')
+    if path not in sys.path:
+        sys.path.insert(0, path)
+    import line_math
+    return line_math
+
+
 class ParserDetectVendorTests(TestCase):
     """`detect_vendor` — keyword-based vendor detection. First-match-wins."""
 
@@ -813,6 +824,486 @@ class ParserCatchWeightTests(TestCase):
         p = _import_parser()
         self.assertIsNone(p._extract_catch_weight("REGULAR PRODUCT DESCRIPTION"))
         self.assertIsNone(p._extract_catch_weight(""))
+
+
+class LineMathValidationTests(TestCase):
+    """`validate_line_math` — qty × price ≈ extended, catch-weight aware.
+
+    Exercises the unified math validator that all 3 extraction paths
+    (text/spatial/rank-pair) call. Catch-weight semantic is THE bug class
+    this module exists to handle — Exceptional + Sysco MEATS rows store
+    line-total in unit_price; the validator must use price_per_pound when
+    populated to avoid 100% false-positive rate on those vendors.
+    See project_parser_accuracy_goal.md (B6).
+    """
+
+    # ── Standard semantic (qty × unit_price) ─────────────────────────────
+
+    def test_standard_math_ok_no_flag(self):
+        lm = _import_line_math()
+        item = {'quantity': 3, 'unit_price': 9.37, 'extended_amount': 28.11,
+                'raw_description': 'Bread B'}
+        lm.validate_line_math(item, vendor='PBM')
+        self.assertNotIn('math_flagged', item)
+
+    def test_standard_math_within_tolerance_no_flag(self):
+        """Small rounding/discount within 5% AND $2 doesn't flag."""
+        lm = _import_line_math()
+        # qty × unit = 100.00; ext = 100.50 → 0.5% diff, $0.50 abs
+        item = {'quantity': 10, 'unit_price': 10.00, 'extended_amount': 100.50,
+                'raw_description': 'Tolerant row'}
+        lm.validate_line_math(item, vendor='Sysco')
+        self.assertNotIn('math_flagged', item)
+
+    def test_standard_math_over_tolerance_flags(self):
+        """Big diff exceeding both bars flags."""
+        lm = _import_line_math()
+        # qty × unit = 100.00; ext = 250.00 → 150% diff, $150 abs → flag
+        item = {'quantity': 10, 'unit_price': 10.00, 'extended_amount': 250.00,
+                'raw_description': 'Anomaly row'}
+        lm.validate_line_math(item, vendor='Sysco')
+        self.assertTrue(item.get('math_flagged'))
+        self.assertEqual(item['math_diff_abs'], 150.00)
+        self.assertEqual(item['math_diff_pct'], 150.00)
+
+    def test_pct_only_below_bar_no_flag(self):
+        """50% diff but $1 absolute — under $2 floor, no flag."""
+        lm = _import_line_math()
+        # qty × unit = 2.00; ext = 3.00 → 50% diff but $1 abs
+        item = {'quantity': 1, 'unit_price': 2.00, 'extended_amount': 3.00,
+                'raw_description': 'Small line'}
+        lm.validate_line_math(item, vendor='Farm Art')
+        self.assertNotIn('math_flagged', item)
+
+    def test_abs_only_below_bar_no_flag(self):
+        """$1.50 abs but 1.5% — under 5% bar, no flag."""
+        lm = _import_line_math()
+        # qty × unit = 100.00; ext = 101.50 → 1.5% diff, $1.50 abs
+        item = {'quantity': 10, 'unit_price': 10.00, 'extended_amount': 101.50,
+                'raw_description': 'Drift'}
+        lm.validate_line_math(item, vendor='Sysco')
+        self.assertNotIn('math_flagged', item)
+
+    # ── Catch-weight semantic (qty × price_per_pound) ────────────────────
+
+    def test_catch_weight_exceptional_clean_no_flag(self):
+        """Real Exceptional row: qty=10 lbs, U/P=$53.90 (line total),
+        ppp=$5.39, ext=$53.90. qty × U/P would falsely flag; qty × ppp
+        reconciles cleanly."""
+        lm = _import_line_math()
+        item = {'quantity': 10.00, 'unit_price': 53.90,
+                'extended_amount': 53.90, 'price_per_pound': 5.39,
+                'raw_description': 'Wafer Steak 4 oz Beef Philly'}
+        lm.validate_line_math(item, vendor='Exceptional Foods')
+        self.assertNotIn('math_flagged', item,
+                         'catch-weight row falsely flagged — would have '
+                         'flagged 52 Exceptional rows in production DB')
+
+    def test_catch_weight_sysco_meats_clean_no_flag(self):
+        """Sysco MEATS catch-weight: qty=22.64 lbs, U/P=$47.32 (line total),
+        ppp=$2.09, ext=$47.32."""
+        lm = _import_line_math()
+        item = {'quantity': 22.64, 'unit_price': 47.32,
+                'extended_amount': 47.32, 'price_per_pound': 2.09,
+                'raw_description': 'Pork Loin Boneless'}
+        lm.validate_line_math(item, vendor='Sysco')
+        self.assertNotIn('math_flagged', item)
+
+    def test_catch_weight_anomaly_flags(self):
+        """Real catch-weight anomaly: ppp present but qty × ppp doesn't
+        reconcile to ext. Should flag (parser bug class — wrong qty
+        extraction)."""
+        lm = _import_line_math()
+        # qty × ppp = 100.00; ext = 250.00 → 150% diff, $150 abs → flag
+        item = {'quantity': 10, 'unit_price': 250.00,
+                'extended_amount': 250.00, 'price_per_pound': 10.00,
+                'raw_description': 'Bad catch-weight'}
+        lm.validate_line_math(item, vendor='Exceptional Foods')
+        self.assertTrue(item.get('math_flagged'))
+
+    def test_ppp_takes_priority_over_unit_price(self):
+        """When both ppp and unit_price are populated, ppp wins (catch-weight
+        semantic). Verify the validator picks ppp explicitly via printed
+        diagnostics."""
+        lm = _import_line_math()
+        # qty=10, ppp=$5; expected = $50. unit_price=$50 (line total) — both
+        # paths happen to agree only because ppp × qty == unit_price (catch-
+        # weight identity). ext=$50 reconciles via ppp.
+        item = {'quantity': 10, 'unit_price': 50.00,
+                'extended_amount': 50.00, 'price_per_pound': 5.00,
+                'raw_description': 'Catch-weight identity'}
+        lm.validate_line_math(item, vendor='Exceptional Foods')
+        self.assertNotIn('math_flagged', item)
+
+    # ── Insufficient-data no-ops ─────────────────────────────────────────
+
+    def test_missing_qty_no_flag(self):
+        lm = _import_line_math()
+        item = {'quantity': None, 'unit_price': 10.00,
+                'extended_amount': 100.00, 'raw_description': 'No qty'}
+        lm.validate_line_math(item, vendor='X')
+        self.assertNotIn('math_flagged', item)
+
+    def test_missing_extended_no_flag(self):
+        lm = _import_line_math()
+        item = {'quantity': 10, 'unit_price': 10.00,
+                'extended_amount': None, 'raw_description': 'No ext'}
+        lm.validate_line_math(item, vendor='X')
+        self.assertNotIn('math_flagged', item)
+
+    def test_zero_qty_no_flag(self):
+        lm = _import_line_math()
+        item = {'quantity': 0, 'unit_price': 10.00, 'extended_amount': 100.00,
+                'raw_description': 'Zero qty'}
+        lm.validate_line_math(item, vendor='X')
+        self.assertNotIn('math_flagged', item)
+
+    def test_zero_price_no_flag(self):
+        """zz/undelivered Farm Art rows: qty>0 but unit=0 + ext=0. No flag —
+        the row will be filtered out elsewhere."""
+        lm = _import_line_math()
+        item = {'quantity': 1, 'unit_price': 0, 'extended_amount': 0,
+                'raw_description': 'zz UNDELIVERED'}
+        lm.validate_line_math(item, vendor='Farm Art')
+        self.assertNotIn('math_flagged', item)
+
+    def test_negative_extended_no_flag(self):
+        """Credit memo row: ext < 0. Don't flag — different problem class."""
+        lm = _import_line_math()
+        item = {'quantity': 1, 'unit_price': 10.00, 'extended_amount': -10.00,
+                'raw_description': 'CREDIT MEMO'}
+        lm.validate_line_math(item, vendor='X')
+        self.assertNotIn('math_flagged', item)
+
+    # ── Self-correction ──────────────────────────────────────────────────
+
+    def test_self_correct_succeeds_clears_flag(self):
+        """qty extraction got line-number 12 instead of real qty 1.
+        ext / unit = 9.37 / 9.37 = 1.0 → derives qty=1, applies, no flag."""
+        lm = _import_line_math()
+        item = {'quantity': 12, 'unit_price': 9.37, 'extended_amount': 9.37,
+                'raw_description': 'Self-correctable'}
+        lm.validate_line_math(item, vendor='Sysco', try_self_correct=True)
+        self.assertEqual(item['quantity'], 1.0)
+        self.assertNotIn('math_flagged', item)
+
+    def test_self_correct_off_by_default(self):
+        """Without try_self_correct, anomaly flags without correction."""
+        lm = _import_line_math()
+        item = {'quantity': 12, 'unit_price': 9.37, 'extended_amount': 9.37,
+                'raw_description': 'Self-correctable but not asked'}
+        lm.validate_line_math(item, vendor='Sysco')
+        self.assertTrue(item.get('math_flagged'))
+        self.assertEqual(item['quantity'], 12)  # qty unchanged
+
+    def test_self_correct_fails_on_non_clean_ratio(self):
+        """ext/unit doesn't round to clean integer → no correction, flag set."""
+        lm = _import_line_math()
+        # 17.50 / 10.00 = 1.75 — not within 0.10 of an integer
+        item = {'quantity': 5, 'unit_price': 10.00, 'extended_amount': 17.50,
+                'raw_description': 'Non-clean ratio'}
+        lm.validate_line_math(item, vendor='X', try_self_correct=True)
+        self.assertTrue(item.get('math_flagged'))
+        self.assertEqual(item['quantity'], 5)
+
+    def test_self_correct_uses_ppp_when_present(self):
+        """Self-correction uses the same price-source priority as validation:
+        ppp wins over unit_price."""
+        lm = _import_line_math()
+        # qty extracted as 99 but real qty=10. ppp=$5.39, ext=$53.90.
+        # ext/ppp = 10.0 → derives 10, snaps qty.
+        item = {'quantity': 99, 'unit_price': 53.90,
+                'extended_amount': 53.90, 'price_per_pound': 5.39,
+                'raw_description': 'Catch-weight self-correct'}
+        lm.validate_line_math(item, vendor='Exceptional Foods',
+                              try_self_correct=True)
+        self.assertEqual(item['quantity'], 10.0)
+        self.assertNotIn('math_flagged', item)
+
+    # ── Tolerance edge cases ─────────────────────────────────────────────
+
+    def test_tolerance_just_under_no_flag(self):
+        """4.99% diff with $2.50 abs — under 5% pct bar → no flag."""
+        lm = _import_line_math()
+        # 4.99% diff: qty × unit = 100, ext = 104.99
+        item = {'quantity': 10, 'unit_price': 10.00, 'extended_amount': 104.99,
+                'raw_description': 'Just under pct'}
+        lm.validate_line_math(item, vendor='X')
+        self.assertNotIn('math_flagged', item)
+
+    def test_tolerance_just_over_flags(self):
+        """6% diff with $6 abs — over both bars → flags."""
+        lm = _import_line_math()
+        # 6% diff: qty × unit = 100, ext = 106 → 6%/$6
+        item = {'quantity': 10, 'unit_price': 10.00, 'extended_amount': 106.00,
+                'raw_description': 'Just over both'}
+        lm.validate_line_math(item, vendor='X')
+        self.assertTrue(item.get('math_flagged'))
+
+    def test_custom_tolerance_overrides(self):
+        """Caller can tighten tolerance per vendor."""
+        lm = _import_line_math()
+        # 3% diff: qty × unit = 100, ext = 103 — passes default but fails
+        # tolerance_pct=2.0
+        item = {'quantity': 10, 'unit_price': 10.00, 'extended_amount': 103.00,
+                'raw_description': 'Custom tol'}
+        lm.validate_line_math(item, vendor='X',
+                              tolerance_pct=2.0, tolerance_abs=2.0)
+        self.assertTrue(item.get('math_flagged'))
+
+    # ── Field-name compatibility (qty vs quantity, ppu vs ppp) ───────────
+
+    def test_qty_alias_for_farmart_rank_pair(self):
+        """rank_pair Farm Art rows use 'qty' key, not 'quantity'.
+        Validator must read either."""
+        lm = _import_line_math()
+        # qty × unit = 100; ext = 250 → flag
+        item = {'qty': 10, 'unit_price': 10.00, 'extended_amount': 250.00,
+                'raw_description': 'Farm Art rank-pair shape'}
+        lm.validate_line_math(item, vendor='Farm Art')
+        self.assertTrue(item.get('math_flagged'))
+
+    def test_qty_self_correct_preserves_field_name(self):
+        """When original item had 'qty' (rank_pair), self-correction must
+        update 'qty' — not insert 'quantity' (would leave both keys, breaking
+        downstream consumers that read one or the other)."""
+        lm = _import_line_math()
+        item = {'qty': 12, 'unit_price': 9.37, 'extended_amount': 9.37,
+                'raw_description': 'Farm Art self-correct'}
+        lm.validate_line_math(item, vendor='Farm Art', try_self_correct=True)
+        self.assertEqual(item['qty'], 1.0)
+        self.assertNotIn('quantity', item, 'should not insert wrong field')
+        self.assertNotIn('math_flagged', item)
+
+    def test_price_per_unit_alias_for_parser_items(self):
+        """Parsed items use 'price_per_unit' (parser convention); DB rows use
+        'price_per_pound'. Validator must read either for catch-weight."""
+        lm = _import_line_math()
+        # qty=10, price_per_unit=$5.39 → expected $53.90; ext=$53.90 → ok.
+        # qty × unit_price = 10 × 53.90 = $539 → would falsely flag if ppu
+        # were ignored.
+        item = {'quantity': 10.00, 'unit_price': 53.90,
+                'extended_amount': 53.90, 'price_per_unit': 5.39,
+                'raw_description': 'Exceptional parsed-item shape'}
+        lm.validate_line_math(item, vendor='Exceptional Foods')
+        self.assertNotIn('math_flagged', item,
+                         'price_per_unit alias not consulted — would have '
+                         'falsely flagged catch-weight rows in production')
+
+    def test_ppp_takes_priority_over_ppu_when_both_present(self):
+        """If both price_per_pound and price_per_unit are set (DB row also
+        carrying parser metadata), ppp wins (DB-shape priority)."""
+        lm = _import_line_math()
+        # Both ppp and ppu set; qty=10, ppp=$5, ppu=$99 (sentinel).
+        # Validator should use ppp → expected $50, ext=$50 → ok.
+        item = {'quantity': 10, 'unit_price': 50.00,
+                'extended_amount': 50.00,
+                'price_per_pound': 5.00, 'price_per_unit': 99.00,
+                'raw_description': 'Both ppp + ppu set'}
+        lm.validate_line_math(item, vendor='X')
+        self.assertNotIn('math_flagged', item)
+
+
+class MathFlaggedDbWriteTests(TestCase):
+    """B6 integration: parsed-item math_flagged threads through to ILI row."""
+
+    def test_db_write_persists_math_flagged_true(self):
+        """When parser produces an item with math_flagged=True, db_write
+        writes it to the ILI row."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from db_write import write_invoice_to_db
+
+        v = Vendor.objects.create(name='TestVendorA')
+        Product.objects.create(canonical_name='TestCanonical')
+        items = [{
+            'canonical': 'TestCanonical',
+            'unit_price': 10.00,
+            'extended_amount': 250.00,  # qty=10 × unit=10 = 100 ≠ 250 → flag
+            'quantity': 10,
+            'raw_description': 'TEST ANOMALY ROW',
+            'math_flagged': True,
+        }]
+        write_invoice_to_db(v.name, '2026-05-08', items, source_file='test.jpg')
+        ili = InvoiceLineItem.objects.filter(
+            vendor=v, raw_description='TEST ANOMALY ROW').first()
+        self.assertIsNotNone(ili)
+        self.assertTrue(ili.math_flagged)
+
+    def test_db_write_persists_math_flagged_false_when_unset(self):
+        """Items with no math_flagged key (clean rows) write False — never None."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from db_write import write_invoice_to_db
+
+        v = Vendor.objects.create(name='TestVendorB')
+        Product.objects.create(canonical_name='TestCleanCanonical')
+        items = [{
+            'canonical': 'TestCleanCanonical',
+            'unit_price': 10.00,
+            'extended_amount': 100.00,
+            'quantity': 10,
+            'raw_description': 'CLEAN ROW',
+            # no math_flagged key
+        }]
+        write_invoice_to_db(v.name, '2026-05-08', items, source_file='test.jpg')
+        ili = InvoiceLineItem.objects.filter(
+            vendor=v, raw_description='CLEAN ROW').first()
+        self.assertIsNotNone(ili)
+        self.assertFalse(ili.math_flagged)
+
+
+class MathAnomalyManagementCommandTests(TestCase):
+    """B6 mgmt cmds: backfill_math_flagged retroactively flags + clears;
+    audit_math_anomalies surfaces flagged rows."""
+
+    def setUp(self):
+        from datetime import date
+        self.v_sysco = Vendor.objects.create(name='SyscoTest')
+        self.v_farmart = Vendor.objects.create(name='FarmArtTest')
+        self.p = Product.objects.create(canonical_name='TestPrd')
+
+        # Clean Sysco row: qty × ppp = ext
+        InvoiceLineItem.objects.create(
+            vendor=self.v_sysco, product=self.p,
+            quantity=Decimal('10'), unit_price=Decimal('100.00'),
+            extended_amount=Decimal('100.00'),
+            price_per_pound=Decimal('10.00'),  # 10 × 10 = 100 ✓
+            invoice_date=date.today(),
+            raw_description='Clean catch-weight',
+        )
+        # Anomaly Sysco row: qty × ppp ≠ ext
+        InvoiceLineItem.objects.create(
+            vendor=self.v_sysco, product=self.p,
+            quantity=Decimal('1'), unit_price=Decimal('10.00'),
+            extended_amount=Decimal('100.00'),
+            price_per_pound=Decimal('10.00'),  # 1 × 10 = 10 ≠ 100
+            invoice_date=date.today(),
+            raw_description='Anomaly catch-weight',
+        )
+        # Stale flag: row currently flagged but math is actually clean
+        InvoiceLineItem.objects.create(
+            vendor=self.v_farmart, product=self.p,
+            quantity=Decimal('5'), unit_price=Decimal('10.00'),
+            extended_amount=Decimal('50.00'),
+            invoice_date=date.today(),
+            raw_description='Stale flag',
+            math_flagged=True,  # incorrectly set
+        )
+
+    def test_backfill_dry_run_does_not_persist(self):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('backfill_math_flagged', stdout=out)
+        # No --apply: nothing should change
+        anomaly = InvoiceLineItem.objects.get(raw_description='Anomaly catch-weight')
+        self.assertFalse(anomaly.math_flagged)
+        stale = InvoiceLineItem.objects.get(raw_description='Stale flag')
+        self.assertTrue(stale.math_flagged)  # still wrongly flagged
+
+    def test_backfill_apply_flags_anomaly_clears_stale(self):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('backfill_math_flagged', '--apply', stdout=out)
+        clean = InvoiceLineItem.objects.get(raw_description='Clean catch-weight')
+        self.assertFalse(clean.math_flagged)
+        anomaly = InvoiceLineItem.objects.get(raw_description='Anomaly catch-weight')
+        self.assertTrue(anomaly.math_flagged)
+        stale = InvoiceLineItem.objects.get(raw_description='Stale flag')
+        self.assertFalse(stale.math_flagged)  # cleared
+
+    def test_audit_math_anomalies_runs_clean(self):
+        """Smoke: audit cmd executes without error and reports correctly."""
+        from django.core.management import call_command
+        from io import StringIO
+        # Flag the anomaly first (setUp also creates a 'Stale flag' row already
+        # math_flagged=True, so we expect 2 flagged total).
+        anomaly = InvoiceLineItem.objects.get(raw_description='Anomaly catch-weight')
+        anomaly.math_flagged = True
+        anomaly.save()
+
+        out = StringIO()
+        call_command('audit_math_anomalies', stdout=out)
+        output = out.getvalue()
+        self.assertIn('Math-flagged ILI rows: 2', output)
+        self.assertIn('SyscoTest', output)
+        self.assertIn('FarmArtTest', output)
+
+    def test_audit_filters_by_vendor(self):
+        """--vendor filter narrows the report."""
+        from django.core.management import call_command
+        from io import StringIO
+        anomaly = InvoiceLineItem.objects.get(raw_description='Anomaly catch-weight')
+        anomaly.math_flagged = True
+        anomaly.save()
+
+        out = StringIO()
+        call_command('audit_math_anomalies', '--vendor', 'SyscoTest', stdout=out)
+        output = out.getvalue()
+        self.assertIn('Math-flagged ILI rows: 1', output)
+        self.assertIn('SyscoTest', output)
+        # FarmArtTest's stale flag row should be excluded
+        self.assertNotIn('FarmArtTest', output)
+
+
+class PriceAnomalyBaselineFilterTests(TestCase):
+    """B6 feedback-loop closure: `_check_price_anomaly` excludes math_flagged
+    rows from the 90-day average baseline. Without this, math-anomaly rows
+    poison the average — flagger can't detect drift against corrupted
+    baseline (false negatives) and clean rows look anomalous against
+    corrupted baseline (false positives)."""
+
+    def test_math_flagged_excluded_from_avg(self):
+        """A poisoned math_flagged row at $1000 + 5 clean rows at $10 each.
+        With filter: avg=$10 → new $11 row not anomalous.
+        Without filter: avg=($1000 + 5×$10)/6 = $175 → $11 looks anomalous-low.
+        We test the filter is in place by checking the avg excludes the
+        poison row."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from db_write import _check_price_anomaly
+        from datetime import date, timedelta
+
+        v = Vendor.objects.create(name='AnomalyTestVendor')
+        p = Product.objects.create(canonical_name='AnomalyTestProduct')
+
+        # 5 clean rows at $10 each, recent
+        for i in range(5):
+            InvoiceLineItem.objects.create(
+                vendor=v, product=p,
+                unit_price=Decimal('10.00'),
+                invoice_date=date.today() - timedelta(days=i*5),
+                raw_description=f'clean {i}',
+            )
+        # 1 math_flagged row at $1000 — should be excluded
+        InvoiceLineItem.objects.create(
+            vendor=v, product=p,
+            unit_price=Decimal('1000.00'),
+            invoice_date=date.today() - timedelta(days=2),
+            raw_description='POISON',
+            math_flagged=True,
+        )
+
+        # New $11 row: should not be flagged as anomalous if poison
+        # excluded (clean avg = $10, $11/$10 = 1.1× — under 2× cap).
+        # If poison NOT excluded, avg ≈ $175 and $11/$175 = 0.06× — under
+        # 0.5× cap → flagged.
+        is_anomaly = _check_price_anomaly(p, v, Decimal('11.00'))
+        self.assertFalse(
+            is_anomaly,
+            'price-anomaly baseline includes math_flagged poison rows '
+            '— feedback-loop filter not working')
 
 
 class ParserCleanDescriptionTests(TestCase):

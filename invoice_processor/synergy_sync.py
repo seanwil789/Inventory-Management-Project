@@ -583,6 +583,11 @@ def load_items_for_month(year: int, month: int) -> list[dict]:
             product__isnull=False,
             unit_price__isnull=False,
         )
+        # B6: exclude math_flagged rows so anomaly-contaminated unit_price /
+        # extended_amount values don't land in the Synergy sheet IUP / J / E
+        # columns. Per Trust LAW. Math-clean rows still surface; flagged
+        # rows route to /mapping-review/ via audit_math_anomalies (separate).
+        .exclude(math_flagged=True)
         .select_related("product", "vendor")
         # Phase 3c (2026-05-02): -extended_amount tiebreaker per the bug
         # register umbrella entry's "Three new variants" #3. Butter row 182
@@ -1072,10 +1077,14 @@ def sync_metadata_to_sheet(sheet_tab: str = None, dry_run: bool = False) -> dict
         product = (Product.objects
                    .filter(canonical_name__iexact=product_name).first())
         if product:
-            # F: latest ILI's case_pack_count
+            # F: latest ILI's case_pack_count.
+            # B6: exclude math_flagged so anomaly rows (where qty/case_pack
+            # extraction may be wrong) don't write incorrect F-column values
+            # to the sheet.
             latest_pack = (InvoiceLineItem.objects
                            .filter(product=product,
                                    case_pack_count__isnull=False)
+                           .exclude(math_flagged=True)
                            .order_by('-invoice_date', '-imported_at')
                            .first())
             f_val = (latest_pack.case_pack_count

@@ -172,6 +172,12 @@ def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:
     """
     Check if a price is anomalous compared to the 90-day historical average
     for this product+vendor. Returns True if price is >2x or <0.5x the average.
+
+    B6 (Sean 2026-05-08): excludes math_flagged rows from the baseline.
+    Without this, math-anomaly rows poison the average — the flagger can't
+    detect drift against a corrupted baseline (false negatives) and clean
+    rows look anomalous against the corrupted baseline (false positives).
+    Closes the feedback loop per Trust LAW.
     """
     from datetime import timedelta
     cutoff = datetime.now().date() - timedelta(days=90)
@@ -185,6 +191,7 @@ def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:
             unit_price__gt=0,
             invoice_date__gte=cutoff,
         )
+        .exclude(math_flagged=True)
         .aggregate(avg_price=Avg('unit_price'))
     )
 
@@ -460,6 +467,11 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             match_confidence=confidence,
             match_score=match_score,
             price_flagged=price_flagged,
+            # B6: line-math validation flag set by parser/spatial/rank-pair via
+            # invoice_processor/line_math.py. Catch-weight aware. Downstream
+            # filters exclude math_flagged=True from price-anomaly baseline,
+            # category-spend, COGs, recipe cost. Per Trust LAW.
+            math_flagged=bool(item.get('math_flagged')),
             section_hint=(item.get('section') or '')[:60],
             # Structured invoice-line schema (Phase 1)
             quantity=quantity_val,

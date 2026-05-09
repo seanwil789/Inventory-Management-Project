@@ -2250,12 +2250,16 @@ def price_alerts(request):
 
     avg_map: dict = {}
     if pv_keys:
-        # Historical average over the 90-day window for these (product, vendor) pairs
+        # Historical average over the 90-day window for these (product, vendor) pairs.
+        # B6: exclude math_flagged rows from baseline (same filter as
+        # `_check_price_anomaly` in db_write — keeps the view consistent
+        # with the flagger). Per Trust LAW.
         avg_rows = (InvoiceLineItem.objects
                     .filter(product_id__in=pids, vendor_id__in=vids,
                             invoice_date__gte=history_start,
                             unit_price__isnull=False,
                             unit_price__gt=0)
+                    .exclude(math_flagged=True)
                     .values('product_id', 'vendor_id')
                     .annotate(avg=Avg('unit_price'),
                               max_date=Max('invoice_date')))
@@ -3362,9 +3366,12 @@ def category_spend(request):
     mo_start = date(year, month, 1)
     mo_end = date(year, month, monthrange(year, month)[1])
 
+    # B6: exclude math_flagged rows so anomaly-contaminated unit_price values
+    # don't distort the category spend distribution. Per Trust LAW.
     current = list(InvoiceLineItem.objects
                    .filter(product__isnull=False,
                            invoice_date__gte=mo_start, invoice_date__lte=mo_end)
+                   .exclude(math_flagged=True)
                    .values('product__category')
                    .annotate(
                        line_count=Count('id'),
@@ -3397,6 +3404,7 @@ def category_spend(request):
         tops = (InvoiceLineItem.objects
                 .filter(product__category=cat,
                         invoice_date__gte=mo_start, invoice_date__lte=mo_end)
+                .exclude(math_flagged=True)
                 .values('product__canonical_name')
                 .annotate(n=Count('id'), spend=Sum('unit_price'))
                 .order_by('-n')[:3])

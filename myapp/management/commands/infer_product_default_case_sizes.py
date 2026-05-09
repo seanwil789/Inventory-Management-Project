@@ -44,9 +44,12 @@ class Command(BaseCommand):
         min_share = opts['min_share']
         overwrite = opts['overwrite']
 
-        # Pull all non-empty case_size rows at once, grouped by product
+        # Pull all non-empty case_size rows at once, grouped by product.
+        # B6: exclude math_flagged rows so anomaly-contaminated case_size
+        # values don't influence the inferred mode. Per Trust LAW.
         rows = (InvoiceLineItem.objects
                 .exclude(case_size='')
+                .exclude(math_flagged=True)
                 .values_list('product_id', 'case_size'))
         by_product: dict[int, Counter] = {}
         for pid, cs in rows:

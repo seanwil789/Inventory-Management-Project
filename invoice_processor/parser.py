@@ -7,6 +7,8 @@ import re
 import json
 from datetime import datetime
 
+from line_math import validate_line_math
+
 
 def detect_vendor(text: str) -> str:
     text_upper = text.upper()
@@ -3321,6 +3323,15 @@ def parse_invoice(text: str, vendor: str = None,
             text_items = result
     except Exception:
         text_items = []
+
+    # B6: validate per-line math on text-path items. Spatial + rank-pair
+    # paths validate at extraction time (via line_math in their respective
+    # modules); text path is the remaining gap. Self-correct off — text
+    # parsers already do their own qty derivation; we want anomalies to
+    # surface for human review, not auto-corrected. Catch-weight aware
+    # via price_per_unit alias when the parser populated it.
+    for _it in text_items:
+        validate_line_math(_it, vendor=vendor)
 
     # Picker priority — invoice-math-driven (2026-05-07, project_parser_accuracy_goal.md):
     # Pick whichever extraction's items_sum is closest to the printed

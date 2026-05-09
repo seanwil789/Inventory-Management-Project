@@ -143,10 +143,14 @@ class Command(BaseCommand):
             raise CommandError(f"No VendorPriceList entries for {vendor.name}.")
 
         cutoff = date.today() - timedelta(days=opts['days'])
+        # B6: exclude math_flagged rows from drift baseline. Anomaly rows
+        # in the baseline produce false positives (real prices look
+        # anomalous against a corrupted average) and false negatives.
         ilis = list(InvoiceLineItem.objects
                     .filter(vendor=vendor, invoice_date__gte=cutoff,
                             unit_price__isnull=False)
                     .exclude(unit_price=0)
+                    .exclude(math_flagged=True)
                     .select_related('canonical_vendor_pricelist')
                     .order_by('-invoice_date'))
 

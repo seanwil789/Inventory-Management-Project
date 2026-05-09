@@ -17,6 +17,8 @@ shape as parser._parse_sysco() output.
 from __future__ import annotations
 import re
 
+from line_math import validate_line_math
+
 # ── Tunable geometry constants (all in DocAI normalized [0,1] space) ────────
 
 # Row grouping tolerance — tokens within this y-center delta are "same row".
@@ -371,72 +373,9 @@ def _extract_row_item(row: list[dict], anchor: dict,
     return item
 
 
-# ── Line-item math validation helper (Sean 2026-05-03) ─────────────────────
-#
-# Per Sean's completeness LAW: validate every parsed line. qty × unit_price
-# should ≈ extended_amount within tolerance. When math fails, surface the
-# anomaly so it can be audited (real billing variance, parser bug, OCR
-# misread). This helper is vendor-agnostic — call from each match_*_spatial
-# function with the extracted (qty, unit_price, extended) triple.
-#
-# Returns dict with diagnostic info (also logs to stdout when anomaly found).
-
-def _validate_line_math(vendor: str, description: str,
-                         qty: float, unit_price: float, extended: float,
-                         tolerance_pct: float = 5.0,
-                         tolerance_abs: float = 2.0,
-                         try_self_correct: bool = False) -> dict:
-    """Check qty × unit_price ≈ extended. Log anomaly when both >tolerance_pct
-    AND >tolerance_abs (avoids noise on rounding/discount under either bar).
-
-    When try_self_correct=True and math fails, attempts to derive a corrected
-    qty from extended / unit_price. If the ratio rounds to a clean small
-    integer (1-50, within 0.10 of integer), returns it as 'corrected_qty'
-    in the result. Caller decides whether to apply.
-
-    Returns dict:
-      ok: bool             — True when math passes within tolerance
-      diff_pct: float      — percent discrepancy
-      diff_abs: float      — absolute discrepancy in dollars
-      expected: float      — qty × unit_price
-      corrected_qty: float — set only when self-correction succeeds
-    """
-    out = {'ok': True, 'diff_pct': 0, 'diff_abs': 0, 'expected': 0}
-    if not (qty and unit_price and extended) or qty <= 0 or unit_price <= 0:
-        return out
-    expected = qty * unit_price
-    if expected <= 0:
-        return out
-    diff_abs = abs(extended - expected)
-    diff_pct = diff_abs / expected * 100
-    ok = not (diff_pct > tolerance_pct and diff_abs > tolerance_abs)
-    out.update({'ok': ok, 'diff_pct': diff_pct, 'diff_abs': diff_abs,
-                'expected': expected})
-    if ok:
-        return out
-
-    # Math failed — try self-correction if requested
-    if try_self_correct:
-        derived_raw = extended / unit_price
-        derived = round(derived_raw)
-        if (1 <= derived <= 50
-                and derived != qty
-                and abs(derived_raw - derived) < 0.10):
-            corrected_expected = derived * unit_price
-            corrected_diff_pct = abs(extended - corrected_expected) / corrected_expected * 100
-            if corrected_diff_pct < tolerance_pct:
-                out['corrected_qty'] = float(derived)
-                print(f"  [✓] {vendor} qty self-corrected: "
-                      f"{description[:40]!r} qty {qty}→{derived} "
-                      f"(ext=${extended:.2f} / U/P=${unit_price:.2f} "
-                      f"= {derived_raw:.2f})")
-                return out
-
-    print(f"  [!] {vendor} line-math anomaly: {description[:40]!r} "
-          f"qty={qty} × unit_price=${unit_price:.2f} = ${expected:.2f} "
-          f"but extended=${extended:.2f} "
-          f"(Δ={diff_pct:.0f}%, ${diff_abs:.2f})")
-    return out
+# Per-line math validation lives in `line_math.py` — catch-weight aware
+# (uses price_per_pound when populated). Imported at top of this module
+# as `validate_line_math`.
 
 
 def match_sysco_spatial(pages: list[dict]) -> list[dict]:
@@ -467,13 +406,10 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
             sec_clean = re.sub(r'[*\s]+', ' ', sec).strip()
             item = _extract_row_item(row, anchor, sec_clean)
             if item:
-                # Validate qty × unit_price ≈ extended (vendor-agnostic check)
-                _validate_line_math(
-                    'Sysco', item.get('raw_description', ''),
-                    item.get('quantity') or 0,
-                    item.get('unit_price') or 0,
-                    item.get('extended_amount') or 0,
-                )
+                # Catch-weight aware math validation (qty × ppp or qty × unit
+                # depending on which is populated). Mutates item with
+                # math_flagged on anomaly.
+                validate_line_math(item, vendor='Sysco')
                 items.append(item)
     return items
 
@@ -758,15 +694,9 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
             # 5 of 6 anomalies in test sample had ext/up rounding cleanly
             # to a small integer (Brioche Buns qty 2→1, White Pita qty 3→1,
             # Plain Bagels qty 2→3, Club White qty 5→3, etc.).
-            check = _validate_line_math(
-                'PBM', item.get('raw_description', ''),
-                item.get('quantity') or 0,
-                item.get('unit_price') or 0,
-                item.get('extended_amount') or 0,
-                try_self_correct=True,
-            )
-            if 'corrected_qty' in check:
-                item['quantity'] = check['corrected_qty']
+            # validate_line_math mutates item['quantity'] in place on
+            # successful self-correction; sets math_flagged on real anomaly.
+            validate_line_math(item, vendor='PBM', try_self_correct=True)
             items.append(item)
     return items
 
@@ -1073,16 +1003,11 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
                     item["count_per_lb_high"] = cpl[1]
             except Exception:
                 pass
-            # Validate qty × unit_price ≈ extended. Note: Exceptional sets
-            # unit_price=extended for catch-weight rows (item totals match
-            # by design); validation will pass trivially in those cases.
-            # For non-catch-weight per-CASE rows it does the real check.
-            _validate_line_math(
-                'Exceptional', item.get('raw_description', ''),
-                item.get('quantity') or 0,
-                item.get('unit_price') or 0,
-                item.get('extended_amount') or 0,
-            )
+            # Catch-weight aware math validation. Exceptional stores line-total
+            # in unit_price for catch-weight rows; validate_line_math uses ppp
+            # when populated so those rows reconcile via qty × ppp ≈ ext rather
+            # than the false-positive qty × unit_price.
+            validate_line_math(item, vendor='Exceptional Foods')
             items.append(item)
     return items
 
@@ -1179,9 +1104,7 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
                 "purchase_uom": "EA",
                 "unit_of_measure": "EA",
             }
-            _validate_line_math(
-                'Delaware', description, qty, unit_price, amount,
-            )
+            validate_line_math(del_item, vendor='Delaware County Linen')
             items.append(del_item)
     return items
 
@@ -1327,16 +1250,10 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
             # $0.99 = $1.98), using `extended` as unit_price overstated
             # per-unit price by qty× and broke calc_iup.
             #
-            # Use the shared validation helper with try_self_correct=True.
-            # When math fails AND ext/unit_price rounds to a clean small
-            # integer, the helper returns corrected_qty — we apply it to
-            # qty_shipped before constructing the item dict.
-            check = _validate_line_math(
-                'Farm Art', description, qty_shipped, unit_price, extended,
-                try_self_correct=True,
-            )
-            if 'corrected_qty' in check:
-                qty_shipped = check['corrected_qty']
+            # Build item dict, then run shared validation with
+            # try_self_correct=True. The helper mutates item['quantity']
+            # on successful self-correction; sets math_flagged on real
+            # anomaly. Catch-weight aware (uses ppp when populated).
             item = {
                 "raw_description": description,
                 "sysco_item_code": "",
@@ -1353,5 +1270,6 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
                 item.update(_extract_farmart_pack(description))
             except Exception:
                 pass
+            validate_line_math(item, vendor='Farm Art', try_self_correct=True)
             items.append(item)
     return items
