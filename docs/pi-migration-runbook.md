@@ -256,7 +256,7 @@ ALLOWED_HOSTS=localhost,127.0.0.1,kitchen-pi,100.x.y.z
 cd ~/my-saas
 source .venv/bin/activate
 python manage.py migrate           # should say "No migrations to apply" — DB came over with state intact
-python manage.py test myapp        # should pass 399 tests in ~60s
+python manage.py test myapp        # should pass 941 tests in ~135s (Chromebook) / ~200s (Pi)
 ```
 
 If `manage.py test` passes, the application code + DB schema + state are all clean on the new host. **This is the gate.** Don't proceed to step 8 until tests pass.
@@ -451,9 +451,9 @@ Captured 2026-04-25 from `penguin`:
 
 **State payload (~30 MB):** `db.sqlite3` (2.5 MB), `.ocr_cache/` (18 MB / 290+ entries), `.invoice_totals/` (20 KB / 4 files), `.historical_stats/` (24 KB), `.kitchen_ops/` (7.2 MB), `invoice_processor/mappings/` (244 KB).
 
-**Codebase scale:** 149 commits, 31,672 LOC across the Python tree, 399 tests passing in ~60s, 27 migrations applied.
+**Codebase scale (Apr 25 baseline; refresh on next migration milestone):** 149 commits, 31,672 LOC, 399 tests, 27 migrations. **Current state (2026-05-09):** 941 tests passing in ~135s, 70 migrations applied (0044 gap), 79 mgmt commands, 28 invoice_processor modules, 45 templates. Pi at HEAD `3f60348`; Chromebook at `fdf7cf0`.
 
-**Cron entries (current Chromebook):** 7 scheduled (hourly batch + on-reboot batch + weekly budget_sync + daily refresh_totals + 6-hourly mapping_apply + daily mapping_discover + monthly synergy_tab).
+**Cron entries (Apr 25 Chromebook baseline):** 7 scheduled. **Current Pi (2026-05-09):** 9 entries — hourly batch + @reboot batch + weekly budget_sync + daily refresh_totals + ~~6-hourly mapping_apply~~ (REMOVED 2026-05-09 — `discover_unmapped.py` deleted in sheet retirement; cron broken silently for 7 days; commits `f98d28b`/`c2e3951`/`fdf7cf0` remove the wrapper) + daily mapping_discover + monthly synergy_tab + weekly Sun drift_audit + monthly day-1 drift_audit.
 
 **Tailscale tailnet:** `penguin` (Linux, current Chromebook host), `alberts-hp` (Windows), `seans-s24-fe` (Android). Pi will join as `kitchen-pi`. Apolosign joins as part of 04-26 install.
 

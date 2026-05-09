@@ -95,7 +95,7 @@ Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via T
 │                Utilities: discover_unmapped, learn_from_reviews, │
 │                           reprocess_{archive,jpgs}, audit_*      │
 │                                                                   │
-│                myapp/management/commands/ — 74 commands for      │
+│                myapp/management/commands/ — 79 commands for      │
 │                imports, audits, backfills, and derivations       │
 └──────────────────────────────────────────────────────────────────┘
 ```
@@ -174,7 +174,7 @@ The next benchmark is the **May 31 perpetual-inventory reconciliation**: Sean au
 3. **No real-time push layer.** Kitchen display polls `/display/` every 60s. Fine for single-kitchen; future multi-tenant product needs SSE or WebSocket.
 4. **Single-tenant schema.** Menu/Census/InvoiceLineItem have no property/tenant FK. Documented scaling posture: SQLite holds until ~20 customers, then Postgres; job queue (Celery+Redis) at ~50; load balancer at ~200.
 5. **Budget sync cron is scheduled but producing no logs** — blocked on OneDrive Graph API credential drop. Admin consent was granted 2026-04-24; awaiting Client/Tenant ID + Secret from IT.
-6. **Sheet retirement complete (2026-05-02):** Mapping Review + Data Sheets + Item Mapping tabs all DELETED. `mapper._load_from_sheet` retired; emits clear-error on empty PM table. Codebase has zero sheet-write paths outside Synergy monthly tabs. Sole remaining sheet surface is the Synergy monthly tab (load-bearing — Sean's audit + month-end inventory + IUP/P# math). 2,069 ProductMappings (up from 1,790).
+6. **Sheet retirement complete (2026-05-02):** Mapping Review + Data Sheets + Item Mapping tabs all DELETED. `mapper._load_from_sheet` retired; emits clear-error on empty PM table. Codebase has zero sheet-write paths outside Synergy monthly tabs. Sole remaining sheet surface is the Synergy monthly tab (load-bearing — Sean's audit + month-end inventory + IUP/P# math). 2,324 ProductMappings on Pi (up from 1,790 at retirement).
 7. **Two memory roots, only one indexed.** User-scope `~/.claude/projects/-home-seanwil789/memory/` (40 files, fully indexed in `MEMORY.md`). Project-scope `~/.claude/projects/-home-seanwil789-my-saas/memory/` (62 files, minimal index). Decision pending.
 
 ---
@@ -246,7 +246,7 @@ myapp/                    Main application
   tests.py                941 tests (~14,849 lines)
   yield_parsing/          Per-section parsers for Book of Yields PDF
   templates/myapp/        45 HTMX + Tailwind templates
-  management/commands/    80 commands (imports, audits, backfills)
+  management/commands/    79 commands (imports, audits, backfills)
   migrations/             71 migrations (latest: 0071_p12_edit_audit)
 
 invoice_processor/        Pipeline modules (non-Django, 28 files)

@@ -10,17 +10,19 @@ The system covers: invoice OCR pipeline (DocAI + 6 vendor parsers + spatial matc
 
 ## Production vs dev
 
-- **Pi (`tailscale ssh sean@server`, hostname `KitchenPi`) = PRODUCTION.** Authoritative DB, 8 cron jobs firing, `django.service` systemd unit. See `~/.claude/projects/-home-seanwil789/memory/project_pi_access.md`.
+- **Pi (`tailscale ssh sean@server`, hostname `KitchenPi`) = PRODUCTION.** Authoritative DB, 9 cron entries firing (8 jobs + reboot pickup), `django.service` systemd unit. See `~/.claude/projects/-home-seanwil789/memory/project_pi_access.md`.
 - **Chromebook (`/home/seanwil789/my-saas/`) = DEV.** Code lives here; sync to Pi via `git push` at session end. Local DB drifts from Pi during the day.
 
 ## Active priorities
 
-Always check `MEMORY.md` first — it's auto-loaded and indexes everything load-bearing. Top items as of 2026-04-29:
+Always check `MEMORY.md` first — it's auto-loaded and indexes everything load-bearing. Top items as of 2026-05-09:
 
-- **`project_thursday_inventory_ready.md`** — current week's punch list, Thursday 2026-04-30 inventory count
-- **`project_six_month_roadmap.md`** — canonical 6-phase plan through 2026-10-28
-- **`feedback_methodologies.md`** — design rules with promotion/shedding mechanics
-- **`feedback_verification_law.md`**, **`feedback_scour_depth.md`**, **`feedback_upstream_downstream_planning.md`** — binding LAWs
+- **`project_parser_accuracy_goal.md`** — ⭐⭐⭐ THE pipeline goal. Parser must extract qty/unit_price/case_size/ext 100% accurately; 4 OPEN bugs blocking (B6/B7 highest-priority).
+- **`project_six_month_roadmap.md`** — canonical 6-phase plan through 2026-10-28; Phase 1 exit deferred to 2026-06-30 baseline.
+- **`session_snapshot.md`** (in this repo's `.claude/`) — point-in-time state, rewritten each scour.
+- **6 LAWs** in user-scope memory: `feedback_verification_law`, `feedback_scour_depth` (LAW 1+2), `feedback_upstream_downstream_planning`, `feedback_trust_as_primary_requirement`, `feedback_completeness`.
+- **Pre-scour reads**: `feedback_architecture_decided_no_menu`, `project_meta_discipline_is_the_product`.
+- **`feedback_methodologies.md`** — probationary design rules with promotion/shedding mechanics.
 
 ## Session start
 
@@ -50,7 +52,7 @@ tailscale ssh sean@server "cd ~/my-saas && .venv/bin/python manage.py pi_state_d
 ## Architecture
 
 - `myproject/` — Django scaffold (settings, root URL conf, WSGI/ASGI)
-- `myapp/` — Main application (18 models, ~80 views, 80 management commands, 71 migrations, 45 templates, 941 tests)
+- `myapp/` — Main application (18 models, ~80 views, 79 management commands, 70 migrations applied + 0044 gap = 71 files, 45 templates, 941 tests)
 - `invoice_processor/` — Non-Django pipeline modules (28 files: parser, mapper, spatial_matcher, docai, db_write, synergy_sync, budget_sync, rank_pair, section_validator, canonical_match, line_math, etc.)
 - `myapp/yield_parsing/` — Per-section parsers for Book of Yields PDF
 - `docs/` — Pi migration runbook, IT access request, deployment notes
