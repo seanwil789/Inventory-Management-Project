@@ -17,7 +17,7 @@ Single-operator today (Wentworth kitchen, ~45 residents, 4 meals/day). Architect
 - **WhiteNoise + Gunicorn** for production serving
 - **cron** for pipeline scheduling (hourly batch, daily refresh, weekly sync)
 
-855 tests, ~95s suite runtime. Test discipline notes in `.claude/memory` (shared separately).
+941 tests, ~135s on Chromebook / ~200s on Pi. Test discipline notes in `.claude/memory` (shared separately).
 
 Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via Tailscale; the Chromebook is the dev host. The Pi has been the authoritative cron + DB host since the 2026-04-26-28 cutover.
 
@@ -71,7 +71,7 @@ Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via T
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ PRESENTATION   views.py (~60 views, 3,836 lines) + 44 templates  │
+│ PRESENTATION   views.py (~80 views, 4,290 lines) + 45 templates  │
 │                LoginRequiredMiddleware on all views except        │
 │                /display/ (kiosk mode for wall-mounted panel)      │
 ├──────────────────────────────────────────────────────────────────┤
@@ -84,10 +84,10 @@ Production runs on a Raspberry Pi 4 (Trixie 64-bit, Python 3.13) reachable via T
 │                                   derivation; MealService save   │
 │                                   → learned-popularity recompute │
 ├──────────────────────────────────────────────────────────────────┤
-│ DATA           17 models · 69 migrations · Django ORM            │
+│ DATA           18 models · 71 migrations · Django ORM            │
 │                SQLite file (Postgres-ready via env var)          │
 ├──────────────────────────────────────────────────────────────────┤
-│ INGESTION      invoice_processor/  — 27 modules                  │
+│ INGESTION      invoice_processor/  — 28 modules                  │
 │                Pipeline:  drive → docai → parser → rank_pair →   │
 │                           spatial_matcher → mapper → db_write    │
 │                Siblings:  synergy_sync, budget_sync, csv_ingest  │
@@ -159,7 +159,7 @@ Vendor ──┐
 - 67 MenuFreetextComponents, 28 Census rows
 - 1,009 ProductMappingProposals (901 approved / 108 rejected / 0 pending — cron-applied)
 - 111 InvoiceValidationStatus rows (98.8% PASS for 2026 invoices)
-- 855 tests passing in ~95s (local)
+- 941 tests passing in ~135s (local)
 
 ### What's in flight
 Active workstream is bottom-up refinement of the data foundations: parser → DB schema → cost calc → consumers, in that order. The cost calculator is the load-bearing metric (it exercises every layer); its coverage drives order-guide accuracy, sheet correctness, and COGs dashboard trust.
@@ -170,7 +170,7 @@ The next benchmark is the **May 31 perpetual-inventory reconciliation**: Sean au
 
 ### Known gaps worth discussing with an architect
 1. **No transaction boundaries in `db_write.py`** — a batch that crashes midway can leave half an invoice written. Idempotent upsert mitigates but doesn't eliminate.
-2. **View tests are smoke-only.** 716 tests concentrate on parser/mapper/cost_utils/integrations. Views get one GET-returns-200 check each.
+2. **View tests are smoke-only.** 941 tests concentrate on parser/mapper/cost_utils/integrations. Views get one GET-returns-200 check each.
 3. **No real-time push layer.** Kitchen display polls `/display/` every 60s. Fine for single-kitchen; future multi-tenant product needs SSE or WebSocket.
 4. **Single-tenant schema.** Menu/Census/InvoiceLineItem have no property/tenant FK. Documented scaling posture: SQLite holds until ~20 customers, then Postgres; job queue (Celery+Redis) at ~50; load balancer at ~200.
 5. **Budget sync cron is scheduled but producing no logs** — blocked on OneDrive Graph API credential drop. Admin consent was granted 2026-04-24; awaiting Client/Tenant ID + Secret from IT.
@@ -238,18 +238,18 @@ myapp/                    Main application
   taxonomy.py             Locked naming + descriptor convention (~913 lines)
   calendar_utils.py       Biweekly anchor math + weekend slot logic (~31 lines)
   signals.py              3 receivers (menu, m2m, mealservice) — 138 lines
-  views.py                ~80 view functions (~3,847 lines)
-  urls.py                 55 URL routes
+  views.py                ~80 view functions (~4,290 lines)
+  urls.py                 62 URL routes
   forms.py                Custom forms (~208 lines)
   consumption_utils.py    Per-Product date-range consumption engine (~232 lines)
   admin.py                Admin registration for all models (~141 lines)
-  tests.py                855 tests (~13,616 lines)
+  tests.py                941 tests (~14,849 lines)
   yield_parsing/          Per-section parsers for Book of Yields PDF
-  templates/myapp/        43 HTMX + Tailwind templates
-  management/commands/    74 commands (imports, audits, backfills)
-  migrations/             69 migrations (latest: 0069_invoicevalidationstatus)
+  templates/myapp/        45 HTMX + Tailwind templates
+  management/commands/    80 commands (imports, audits, backfills)
+  migrations/             71 migrations (latest: 0071_p12_edit_audit)
 
-invoice_processor/        Pipeline modules (non-Django, 27 files)
+invoice_processor/        Pipeline modules (non-Django, 28 files)
   batch.py                Cron entry — Drive inbox → full pipeline (~571 lines)
   parser.py               6 vendor dialects (~3,466 lines, the crown-jewel file)
   rank_pair.py            Tilt-resilient rank-pair extractor (Farm Art + Sysco) (~790 lines)

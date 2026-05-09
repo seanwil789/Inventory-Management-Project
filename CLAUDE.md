@@ -4,13 +4,13 @@ Guidance for Claude Code working in this repository.
 
 ## What this is
 
-`my-saas` is a Django 5.2 application running food operations for a sober-living kitchen (Wentworth, ~45 residents, 4 meals/day). It's a **mature mid-prototype**, not a skeleton — see `README.md` for the architecture diagram and current volumes (3,109 ILI, 558 Products, 93 Recipes, 301 Menus, 855 tests as of 2026-05-08).
+`my-saas` is a Django 5.2 application running food operations for a sober-living kitchen (Wentworth, ~45 residents, 4 meals/day). It's a **mature mid-prototype**, not a skeleton — see `README.md` for the architecture diagram and current volumes (3,109 ILI, 558 Products, 93 Recipes, 301 Menus, 941 tests as of 2026-05-09).
 
 The system covers: invoice OCR pipeline (DocAI + 6 vendor parsers + spatial matcher), product/canonical mapping with human-in-the-loop review, recipe/menu authoring + version history, perpetual inventory + variance reporting, kitchen-display and dashboard surfaces, and Google Sheets/OneDrive integration adapters.
 
 ## Production vs dev
 
-- **Pi (`tailscale ssh sean@server`, hostname `KitchenPi`) = PRODUCTION.** Authoritative DB, 9 cron jobs firing, `django.service` systemd unit. See `~/.claude/projects/-home-seanwil789/memory/project_pi_access.md`.
+- **Pi (`tailscale ssh sean@server`, hostname `KitchenPi`) = PRODUCTION.** Authoritative DB, 8 cron jobs firing, `django.service` systemd unit. See `~/.claude/projects/-home-seanwil789/memory/project_pi_access.md`.
 - **Chromebook (`/home/seanwil789/my-saas/`) = DEV.** Code lives here; sync to Pi via `git push` at session end. Local DB drifts from Pi during the day.
 
 ## Active priorities
@@ -34,7 +34,7 @@ The `SessionStart` hook in `.claude/settings.local.json` injects the project sco
 # Activate virtualenv
 source .venv/bin/activate
 
-# Tests (~95s, expect 855 passing)
+# Tests (~135s on Chromebook, ~200s on Pi; expect 941 passing)
 python manage.py test myapp
 
 # Pipeline operations (dry-run conventions throughout)
@@ -50,8 +50,8 @@ tailscale ssh sean@server "cd ~/my-saas && .venv/bin/python manage.py pi_state_d
 ## Architecture
 
 - `myproject/` — Django scaffold (settings, root URL conf, WSGI/ASGI)
-- `myapp/` — Main application (17 models, ~80 views, 74 management commands, 69 migrations, 43 templates, 855 tests)
-- `invoice_processor/` — Non-Django pipeline modules (27 files: parser, mapper, spatial_matcher, docai, db_write, synergy_sync, budget_sync, rank_pair, section_validator, canonical_match, etc.)
+- `myapp/` — Main application (18 models, ~80 views, 80 management commands, 71 migrations, 45 templates, 941 tests)
+- `invoice_processor/` — Non-Django pipeline modules (28 files: parser, mapper, spatial_matcher, docai, db_write, synergy_sync, budget_sync, rank_pair, section_validator, canonical_match, line_math, etc.)
 - `myapp/yield_parsing/` — Per-section parsers for Book of Yields PDF
 - `docs/` — Pi migration runbook, IT access request, deployment notes
 - `.claude/` — Harness configuration, session_snapshot, time_log
