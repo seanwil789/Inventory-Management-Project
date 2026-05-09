@@ -462,6 +462,11 @@ class InvoiceLineItem(models.Model):
     # /category-spend/, /cogs/) filter math_flagged=True from aggregations
     # so poisoned rows don't distort dashboards. Per Trust LAW.
     math_flagged    = models.BooleanField(default=False, db_index=True)
+    # L1 Phase 1.2 (invoice reconciliation): True once Sean has edited
+    # this row through `/invoices/<id>/lines/<id>/edit/`. Distinguishes
+    # auto-extracted from human-corrected for downstream trust scoring.
+    # Edit history captured in InvoiceLineEdit (FK). Per Trust LAW.
+    user_edited     = models.BooleanField(default=False, db_index=True)
     section_hint    = models.CharField(
         max_length=60, blank=True, db_index=True,
         help_text="Section header from the invoice (e.g. 'DAIRY', "
@@ -1130,6 +1135,78 @@ class VendorPriceList(models.Model):
         return f"{self.vendor.name}/{self.sku}/{self.unit} ${self.list_price}"
 
 
+class InvoiceLineEdit(models.Model):
+    """Audit row capturing every Sean-initiated edit to an InvoiceLineItem.
+
+    Each save through `/invoices/<id>/lines/<id>/edit/` writes one of these
+    so the edit history is replayable + auditable. Per Trust LAW: when
+    Sean overrides parser output, the system records WHAT changed, WHEN,
+    WHO did it, and WHY (reason + note). Downstream consumers know that
+    user-edited rows are higher-trust than auto-extracted rows.
+
+    Pairs with `InvoiceLineItem.user_edited` (boolean — set True on
+    first edit) and `InvoiceValidationStatus.verified_by/verified_at`
+    (set when Sean explicitly approves the whole invoice).
+
+    Phase 1.2 of L1 Invoice Reconciliation. See project_quickbooks_roadmap.md.
+    """
+    REASON_CHOICES = [
+        ('', '— none —'),
+        ('manual_correction', 'Manual correction (parser error / OCR garble)'),
+        ('damaged_transit', 'Damaged in transit (driver credit on paper)'),
+        ('short_ship', 'Short ship (delivered less than billed)'),
+        ('quality_issue', 'Quality issue / return'),
+        ('pricing_correction', 'Pricing correction'),
+        ('handwritten_addition', 'Hand-written invoice / line addition'),
+        ('handwritten_credit', 'Hand-written credit (driver wrote on paper)'),
+        ('portal_credit_match', 'Reconciled to vendor portal credit'),
+        ('other', 'Other (see note)'),
+    ]
+    ili = models.ForeignKey(
+        'InvoiceLineItem', on_delete=models.CASCADE,
+        related_name='edit_history',
+    )
+    edited_by = models.ForeignKey(
+        'auth.User', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+',
+    )
+    edited_at = models.DateTimeField(auto_now_add=True, db_index=True)
+    before = models.JSONField(
+        default=dict,
+        help_text='Snapshot of editable ILI fields BEFORE this edit. '
+                  'Keys: quantity, unit_price, extended_amount, case_size, '
+                  'raw_description.',
+    )
+    after = models.JSONField(
+        default=dict,
+        help_text='Snapshot of editable ILI fields AFTER this edit.',
+    )
+    reason = models.CharField(
+        max_length=30, choices=REASON_CHOICES, blank=True,
+        help_text='Categorical reason. Drives downstream filtering '
+                  '(e.g. credits feed L2 InvoiceCredit reconciliation).',
+    )
+    note = models.TextField(
+        blank=True,
+        help_text='Free-text context for the edit. Why, what was on '
+                  'paper vs what parser captured, etc.',
+    )
+    cleared_math_flag = models.BooleanField(
+        default=False,
+        help_text='True if this edit caused math_flagged to flip from '
+                  'True → False (math now reconciles).',
+    )
+
+    class Meta:
+        ordering = ['-edited_at']
+        indexes = [
+            models.Index(fields=['ili', '-edited_at']),
+        ]
+
+    def __str__(self):
+        return f"Edit on ILI #{self.ili_id} at {self.edited_at} by {self.edited_by}"
+
+
 class InvoiceValidationStatus(models.Model):
     """Per-invoice validation status. One row per (vendor, invoice_number).
 
@@ -1202,6 +1279,18 @@ class InvoiceValidationStatus(models.Model):
                                         default='partial', db_index=True)
     notes           = models.TextField(blank=True)
     last_validated  = models.DateTimeField(auto_now=True)
+
+    # L1 Phase 1.2: Sean-explicit approval gate distinct from auto-validation.
+    # `status='pass'` means "math reconciled automatically"; `verified_by`
+    # means "Sean reviewed it and signed off." Downstream consumers can
+    # opt to require user-verification (eventual L7 QB push criterion).
+    verified_by     = models.ForeignKey(
+        'auth.User', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='+',
+        help_text='User who explicitly verified this invoice. NULL means '
+                  'auto-validation only.',
+    )
+    verified_at     = models.DateTimeField(null=True, blank=True)
 
     class Meta:
         unique_together = [('vendor', 'invoice_number')]

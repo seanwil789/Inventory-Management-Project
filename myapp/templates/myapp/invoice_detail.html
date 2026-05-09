@@ -1,8 +1,23 @@
 {% extends 'myapp/base.html' %}
+{% load static %}
 {% block title %}{{ ivs.vendor.name }} {{ ivs.invoice_number }}{% endblock %}
 
 {% block content %}
 <div class="space-y-5">
+
+  {% if messages %}
+    <div class="space-y-2">
+      {% for msg in messages %}
+        <div class="rounded-md p-3 text-sm
+          {% if msg.tags == 'error' %}bg-red-100 text-red-800 border border-red-200
+          {% elif msg.tags == 'success' %}bg-emerald-100 text-emerald-800 border border-emerald-200
+          {% elif msg.tags == 'warning' %}bg-amber-100 text-amber-800 border border-amber-200
+          {% else %}bg-slate-100 text-slate-800 border border-slate-200{% endif %}">
+          {{ msg }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
 
   <!-- Breadcrumb / back link -->
   <div class="text-sm">
@@ -24,7 +39,7 @@
           {% endif %}
         </p>
       </div>
-      <div>
+      <div class="flex flex-col items-end gap-2">
         {% if ivs.status == 'pass' %}
           <span class="inline-block px-3 py-1 rounded text-sm font-medium bg-emerald-100 text-emerald-800">PASS</span>
         {% elif ivs.status == 'review' %}
@@ -33,6 +48,22 @@
           <span class="inline-block px-3 py-1 rounded text-sm font-medium bg-red-100 text-red-800">FAIL</span>
         {% elif ivs.status == 'partial' %}
           <span class="inline-block px-3 py-1 rounded text-sm font-medium bg-slate-200 text-slate-700">PARTIAL</span>
+        {% endif %}
+        {% if ivs.verified_by %}
+          <div class="flex items-center gap-2">
+            <span class="inline-block px-2 py-0.5 rounded text-xs font-medium bg-indigo-100 text-indigo-800" title="Verified by {{ ivs.verified_by }} at {{ ivs.verified_at|date:'Y-m-d H:i' }}">
+              ✓ Verified
+            </span>
+            <form method="POST" action="{% url 'invoice_verify' ivs.id %}" class="inline">
+              {% csrf_token %}
+              <button type="submit" class="text-xs text-slate-500 hover:text-slate-700 underline">unverify</button>
+            </form>
+          </div>
+        {% else %}
+          <form method="POST" action="{% url 'invoice_verify' ivs.id %}" class="inline">
+            {% csrf_token %}
+            <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white text-xs rounded px-3 py-1">Mark Verified</button>
+          </form>
         {% endif %}
       </div>
     </div>
@@ -153,6 +184,7 @@
               <th class="text-right py-1.5 px-2">Unit $</th>
               <th class="text-right py-1.5 px-2">PPP</th>
               <th class="text-right py-1.5 px-2">Ext $</th>
+              <th class="text-right py-1.5 px-2"></th>
             </tr>
           </thead>
           <tbody>
@@ -174,6 +206,7 @@
                     <span class="font-mono text-slate-700">${{ sec.parser_sum|floatformat:2 }}</span>
                   {% endif %}
                 </td>
+                <td></td>
               </tr>
               {% endif %}
               {% for ili in sec.items %}
@@ -203,6 +236,119 @@
                   {% if ili.price_per_pound %}${{ ili.price_per_pound }}{% else %}—{% endif %}
                 </td>
                 <td class="py-1 px-2 text-right font-mono">${{ ili.extended_amount|default_if_none:"—" }}</td>
+                <td class="py-1 px-2 text-right">
+                  <button type="button"
+                          onclick="document.getElementById('edit-{{ ili.id }}').classList.toggle('hidden')"
+                          class="text-indigo-600 hover:text-indigo-800 text-xs">
+                    {% if ili.user_edited %}✓ edit{% else %}edit{% endif %}
+                  </button>
+                </td>
+              </tr>
+              <tr id="edit-{{ ili.id }}" class="hidden bg-indigo-50 border-t border-indigo-100">
+                <td colspan="8" class="py-3 px-3">
+                  <form method="POST" action="{% url 'invoice_line_edit' ivs.id ili.id %}" class="space-y-2">
+                    {% csrf_token %}
+                    <div class="grid grid-cols-2 sm:grid-cols-5 gap-2">
+                      <label class="text-xs">
+                        <span class="block text-slate-600">Quantity</span>
+                        <input type="text" name="quantity" value="{{ ili.quantity|default_if_none:'' }}"
+                               class="w-full border rounded px-1.5 py-1 text-sm font-mono">
+                      </label>
+                      <label class="text-xs">
+                        <span class="block text-slate-600">Unit price</span>
+                        <input type="text" name="unit_price" value="{{ ili.unit_price|default_if_none:'' }}"
+                               class="w-full border rounded px-1.5 py-1 text-sm font-mono">
+                      </label>
+                      <label class="text-xs">
+                        <span class="block text-slate-600">Extended</span>
+                        <input type="text" name="extended_amount" value="{{ ili.extended_amount|default_if_none:'' }}"
+                               class="w-full border rounded px-1.5 py-1 text-sm font-mono">
+                      </label>
+                      <label class="text-xs col-span-2">
+                        <span class="block text-slate-600">Case size</span>
+                        <input type="text" name="case_size" value="{{ ili.case_size|default:'' }}"
+                               class="w-full border rounded px-1.5 py-1 text-sm font-mono">
+                      </label>
+                    </div>
+                    <label class="text-xs block">
+                      <span class="block text-slate-600">Raw description</span>
+                      <input type="text" name="raw_description" value="{{ ili.raw_description|default:'' }}"
+                             class="w-full border rounded px-1.5 py-1 text-sm">
+                    </label>
+                    <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+                      <label class="text-xs">
+                        <span class="block text-slate-600">Reason</span>
+                        <select name="reason" class="w-full border rounded px-1.5 py-1 text-sm">
+                          <option value="">— none —</option>
+                          <option value="manual_correction">Manual correction (parser error / OCR garble)</option>
+                          <option value="damaged_transit">Damaged in transit (driver credit on paper)</option>
+                          <option value="short_ship">Short ship</option>
+                          <option value="quality_issue">Quality issue / return</option>
+                          <option value="pricing_correction">Pricing correction</option>
+                          <option value="handwritten_addition">Hand-written invoice / line addition</option>
+                          <option value="handwritten_credit">Hand-written credit</option>
+                          <option value="portal_credit_match">Reconciled to vendor portal credit</option>
+                          <option value="other">Other (see note)</option>
+                        </select>
+                      </label>
+                      <label class="text-xs col-span-2">
+                        <span class="block text-slate-600">Note</span>
+                        <textarea name="note" rows="2"
+                                  class="w-full border rounded px-1.5 py-1 text-sm"
+                                  placeholder="What changed and why (visible in audit history)"></textarea>
+                      </label>
+                    </div>
+                    <div class="flex items-center gap-2">
+                      <button type="submit"
+                              class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded px-3 py-1">
+                        Save
+                      </button>
+                      <button type="button"
+                              onclick="document.getElementById('edit-{{ ili.id }}').classList.add('hidden')"
+                              class="bg-slate-200 hover:bg-slate-300 text-slate-700 text-sm rounded px-3 py-1">
+                        Cancel
+                      </button>
+                      {% if ili.edit_history.all|length %}
+                      <span class="text-xs text-slate-500 ml-auto">
+                        {{ ili.edit_history.all|length }} prior edit{{ ili.edit_history.all|length|pluralize }}
+                      </span>
+                      {% endif %}
+                    </div>
+                    {% if ili.edit_history.all %}
+                    <details class="text-xs mt-2">
+                      <summary class="cursor-pointer text-slate-600 hover:text-slate-800">
+                        Edit history ({{ ili.edit_history.all|length }})
+                      </summary>
+                      <table class="w-full mt-1 border-t border-indigo-100">
+                        <thead class="text-slate-500">
+                          <tr>
+                            <th class="text-left py-1 px-2">When</th>
+                            <th class="text-left py-1 px-2">Reason</th>
+                            <th class="text-left py-1 px-2">Note</th>
+                            <th class="text-left py-1 px-2">Changes</th>
+                          </tr>
+                        </thead>
+                        <tbody>
+                          {% for edit in ili.edit_history.all %}
+                          <tr class="border-t border-indigo-100 align-top">
+                            <td class="py-1 px-2 text-slate-600">{{ edit.edited_at|date:"M j H:i" }}</td>
+                            <td class="py-1 px-2">{{ edit.get_reason_display|default:"—" }}</td>
+                            <td class="py-1 px-2 text-slate-700">{{ edit.note|truncatechars:80|default:"—" }}</td>
+                            <td class="py-1 px-2 font-mono text-xs">
+                              {% for k, v in edit.after.items %}
+                                {% if v != edit.before|default:""|stringformat:"s" %}
+                                  {{ k }}: {{ edit.before|default:'—' }}<span class="text-slate-400">→</span>{{ v|default:"—" }}<br>
+                                {% endif %}
+                              {% endfor %}
+                            </td>
+                          </tr>
+                          {% endfor %}
+                        </tbody>
+                      </table>
+                    </details>
+                    {% endif %}
+                  </form>
+                </td>
               </tr>
               {% endfor %}
             {% empty %}
@@ -257,12 +403,19 @@
   </div>
   {% endif %}
 
-  {% if ivs.notes %}
+  <!-- Invoice-level notes (editable) -->
   <div class="rounded-lg bg-yellow-50 border border-yellow-200 p-3">
-    <h2 class="text-xs font-semibold text-yellow-900 uppercase tracking-wide mb-1">Notes</h2>
-    <pre class="text-xs whitespace-pre-wrap text-yellow-900">{{ ivs.notes }}</pre>
+    <form method="POST" action="{% url 'invoice_note' ivs.id %}" class="space-y-2">
+      {% csrf_token %}
+      <h2 class="text-xs font-semibold text-yellow-900 uppercase tracking-wide">Invoice notes</h2>
+      <textarea name="notes" rows="3"
+                class="w-full border border-yellow-300 rounded px-2 py-1 text-sm bg-white"
+                placeholder="Free-text context for the whole invoice (handwritten credit details, missing pages, etc.)">{{ ivs.notes }}</textarea>
+      <button type="submit" class="bg-yellow-600 hover:bg-yellow-700 text-white text-xs rounded px-3 py-1">
+        Save notes
+      </button>
+    </form>
   </div>
-  {% endif %}
 
 </div>
 {% endblock %}

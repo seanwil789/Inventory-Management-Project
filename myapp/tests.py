@@ -1622,6 +1622,198 @@ class InvoiceImageViewTests(AuthedTestCase):
         self.assertEqual(resp['Content-Type'], 'application/pdf')
 
 
+class InvoiceLineEditFlowTests(AuthedTestCase):
+    """L1 Phase 1.2 — edit / verify / note POST flows."""
+
+    def setUp(self):
+        super().setUp()
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        self.v = Vendor.objects.create(name='ILEFlowVendor')
+        self.p = Product.objects.create(canonical_name='ILEFlowProduct')
+        self.ivs = InvoiceValidationStatus.objects.create(
+            vendor=self.v, invoice_number='ILE-1',
+            invoice_date=date(2026, 4, 20),
+            items_count=1, items_sum=Decimal('100'),
+            invoice_total=Decimal('100'),
+            status='review',
+        )
+        # Anomaly: qty × unit ≠ ext (1 × 50 = 50, but ext = 100 — flagged)
+        self.ili = InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.p,
+            quantity=Decimal('1'), unit_price=Decimal('50'),
+            extended_amount=Decimal('100'),
+            invoice_date=date(2026, 4, 20),
+            raw_description='ILE-original-desc',
+            case_size='1/10LB',
+            math_flagged=True,
+        )
+
+    # ── Edit flow ───────────────────────────────────────────────────
+
+    def test_edit_creates_audit_row(self):
+        from myapp.models import InvoiceLineEdit
+        self.assertEqual(InvoiceLineEdit.objects.count(), 0)
+        resp = self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, self.ili.id]),
+            {'quantity': '2', 'unit_price': '50', 'extended_amount': '100',
+             'case_size': '2/10LB', 'raw_description': 'ILE-edited-desc',
+             'reason': 'manual_correction',
+             'note': 'Original parser misread qty=1 as 2'},
+        )
+        self.assertEqual(resp.status_code, 302)  # redirect
+        self.assertEqual(InvoiceLineEdit.objects.count(), 1)
+        edit = InvoiceLineEdit.objects.first()
+        self.assertEqual(edit.ili, self.ili)
+        self.assertEqual(edit.reason, 'manual_correction')
+        self.assertIn('parser misread', edit.note)
+
+    def test_edit_updates_ili_fields(self):
+        self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, self.ili.id]),
+            {'quantity': '2', 'unit_price': '50', 'extended_amount': '100',
+             'case_size': '2/10LB', 'raw_description': 'EDITED'},
+        )
+        self.ili.refresh_from_db()
+        self.assertEqual(self.ili.quantity, Decimal('2'))
+        self.assertEqual(self.ili.case_size, '2/10LB')
+        self.assertEqual(self.ili.raw_description, 'EDITED')
+        self.assertTrue(self.ili.user_edited)
+
+    def test_edit_clears_math_flag_when_math_now_reconciles(self):
+        """Edit qty 1→2 so 2 × 50 = 100 = ext → math reconciles → flag clears."""
+        self.assertTrue(self.ili.math_flagged)
+        self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, self.ili.id]),
+            {'quantity': '2', 'unit_price': '50', 'extended_amount': '100',
+             'case_size': '', 'raw_description': self.ili.raw_description},
+        )
+        self.ili.refresh_from_db()
+        self.assertFalse(self.ili.math_flagged,
+                          'math should reconcile after edit')
+        # Audit row reflects the clear
+        from myapp.models import InvoiceLineEdit
+        edit = InvoiceLineEdit.objects.first()
+        self.assertTrue(edit.cleared_math_flag)
+
+    def test_edit_keeps_math_flag_when_anomaly_persists(self):
+        """Edit but math still doesn't reconcile → flag stays set."""
+        self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, self.ili.id]),
+            {'quantity': '99', 'unit_price': '50', 'extended_amount': '100',
+             'case_size': '', 'raw_description': self.ili.raw_description},
+        )
+        self.ili.refresh_from_db()
+        self.assertTrue(self.ili.math_flagged)
+        from myapp.models import InvoiceLineEdit
+        edit = InvoiceLineEdit.objects.first()
+        self.assertFalse(edit.cleared_math_flag)
+
+    def test_edit_captures_before_after(self):
+        from myapp.models import InvoiceLineEdit
+        self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, self.ili.id]),
+            {'quantity': '2', 'unit_price': '50', 'extended_amount': '100',
+             'case_size': 'NEWCS', 'raw_description': 'NEWDESC'},
+        )
+        edit = InvoiceLineEdit.objects.first()
+        # quantity Decimal field has 3 decimal places → str(Decimal('1')) = '1.000'
+        self.assertEqual(edit.before['quantity'], '1.000')
+        self.assertEqual(edit.before['raw_description'], 'ILE-original-desc')
+        self.assertEqual(edit.after['quantity'], '2')  # form input stays as-typed
+        self.assertEqual(edit.after['raw_description'], 'NEWDESC')
+
+    def test_edit_404_for_wrong_ili(self):
+        """ili_id from a different invoice should 404 (vendor + date guard)."""
+        other_v = Vendor.objects.create(name='OtherVendor')
+        from datetime import date
+        other_ili = InvoiceLineItem.objects.create(
+            vendor=other_v, product=self.p,
+            quantity=Decimal('1'), unit_price=Decimal('1'),
+            extended_amount=Decimal('1'),
+            invoice_date=date(2025, 1, 1),
+            raw_description='wrong-invoice',
+        )
+        resp = self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, other_ili.id]),
+            {'quantity': '99'},
+        )
+        self.assertEqual(resp.status_code, 404)
+
+    def test_edit_GET_redirects(self):
+        """GET to edit endpoint redirects back to detail (no edit performed)."""
+        resp = self.client.get(reverse('invoice_line_edit',
+                                       args=[self.ivs.id, self.ili.id]))
+        self.assertEqual(resp.status_code, 302)
+        # No edit row created
+        from myapp.models import InvoiceLineEdit
+        self.assertEqual(InvoiceLineEdit.objects.count(), 0)
+
+    # ── Verify flow ─────────────────────────────────────────────────
+
+    def test_verify_sets_verified_by_and_at(self):
+        self.assertIsNone(self.ivs.verified_by)
+        self.assertIsNone(self.ivs.verified_at)
+        resp = self.client.post(reverse('invoice_verify', args=[self.ivs.id]))
+        self.assertEqual(resp.status_code, 302)
+        self.ivs.refresh_from_db()
+        self.assertIsNotNone(self.ivs.verified_by)
+        self.assertIsNotNone(self.ivs.verified_at)
+
+    def test_verify_toggles_off(self):
+        # First verify
+        self.client.post(reverse('invoice_verify', args=[self.ivs.id]))
+        self.ivs.refresh_from_db()
+        self.assertIsNotNone(self.ivs.verified_by)
+        # Second call un-verifies
+        self.client.post(reverse('invoice_verify', args=[self.ivs.id]))
+        self.ivs.refresh_from_db()
+        self.assertIsNone(self.ivs.verified_by)
+        self.assertIsNone(self.ivs.verified_at)
+
+    # ── Note flow ────────────────────────────────────────────────────
+
+    def test_note_saves_to_ivs(self):
+        resp = self.client.post(
+            reverse('invoice_note', args=[self.ivs.id]),
+            {'notes': 'Driver wrote $20 credit on bottom; portal sync pending'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.ivs.refresh_from_db()
+        self.assertIn('credit', self.ivs.notes)
+        self.assertIn('portal sync', self.ivs.notes)
+
+    def test_note_overwrites_previous(self):
+        self.ivs.notes = 'first'
+        self.ivs.save()
+        self.client.post(
+            reverse('invoice_note', args=[self.ivs.id]),
+            {'notes': 'second'},
+        )
+        self.ivs.refresh_from_db()
+        self.assertEqual(self.ivs.notes, 'second')
+
+    # ── Edit history surfaced in detail page ────────────────────────
+
+    def test_detail_page_shows_edit_history_after_edit(self):
+        self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, self.ili.id]),
+            {'quantity': '2', 'unit_price': '50', 'extended_amount': '100',
+             'case_size': '', 'raw_description': self.ili.raw_description,
+             'note': 'visible-in-history'},
+        )
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        self.assertIn('visible-in-history', body)
+        self.assertIn('Edit history', body)
+
+    def test_detail_page_shows_verified_badge_when_verified(self):
+        self.client.post(reverse('invoice_verify', args=[self.ivs.id]))
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        self.assertIn('Verified', body)
+
+
 class MathAnomalyManagementCommandTests(TestCase):
     """B6 mgmt cmds: backfill_math_flagged retroactively flags + clears;
     audit_math_anomalies surfaces flagged rows."""

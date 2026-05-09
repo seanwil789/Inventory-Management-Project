@@ -2493,6 +2493,161 @@ def invoices_list(request):
     })
 
 
+def invoice_line_edit(request, ivs_id: int, ili_id: int):
+    """L1 Phase 1.2: POST handler — edit a single InvoiceLineItem.
+
+    Captures before/after JSON, creates InvoiceLineEdit audit row, updates
+    the ILI fields, sets ILI.user_edited=True, re-runs validate_line_math
+    on the new values. If math now reconciles, clears math_flagged.
+
+    Form fields:
+      quantity, unit_price, extended_amount, case_size, raw_description
+      reason (categorical)
+      note (free text)
+    """
+    from django.shortcuts import get_object_or_404, redirect
+    from django.contrib import messages
+    from django.utils import timezone
+    from decimal import Decimal, InvalidOperation
+    from myapp.models import InvoiceValidationStatus, InvoiceLineItem, InvoiceLineEdit
+    import sys
+    from django.conf import settings as _s
+    _ip = str(_s.BASE_DIR / 'invoice_processor')
+    if _ip not in sys.path:
+        sys.path.insert(0, _ip)
+    from line_math import validate_line_math
+
+    ivs = get_object_or_404(InvoiceValidationStatus, pk=ivs_id)
+    ili = get_object_or_404(
+        InvoiceLineItem,
+        pk=ili_id, vendor=ivs.vendor, invoice_date=ivs.invoice_date,
+    )
+
+    if request.method != 'POST':
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    def _to_decimal(raw):
+        s = (raw or '').strip()
+        if not s:
+            return None
+        try:
+            return Decimal(s)
+        except (InvalidOperation, ValueError):
+            return None
+
+    # Snapshot before
+    before = {
+        'quantity': str(ili.quantity) if ili.quantity is not None else None,
+        'unit_price': str(ili.unit_price) if ili.unit_price is not None else None,
+        'extended_amount': str(ili.extended_amount) if ili.extended_amount is not None else None,
+        'case_size': ili.case_size or '',
+        'raw_description': ili.raw_description or '',
+    }
+
+    # Apply form values
+    new_qty = _to_decimal(request.POST.get('quantity'))
+    new_unit = _to_decimal(request.POST.get('unit_price'))
+    new_ext = _to_decimal(request.POST.get('extended_amount'))
+    new_cs = (request.POST.get('case_size') or '').strip()
+    new_raw = (request.POST.get('raw_description') or '').strip()
+
+    ili.quantity = new_qty
+    ili.unit_price = new_unit
+    ili.extended_amount = new_ext
+    ili.case_size = new_cs
+    ili.raw_description = new_raw or ili.raw_description
+
+    # Re-run validate_line_math on the new values. Reset math_flagged first
+    # so the validator can re-evaluate cleanly.
+    was_flagged = ili.math_flagged
+    ili.math_flagged = False
+    item_dict = {
+        'quantity': float(new_qty) if new_qty is not None else None,
+        'unit_price': float(new_unit) if new_unit is not None else None,
+        'extended_amount': float(new_ext) if new_ext is not None else None,
+        'price_per_pound': float(ili.price_per_pound) if ili.price_per_pound is not None else None,
+        'raw_description': new_raw or ili.raw_description,
+    }
+    validate_line_math(item_dict, vendor=(ili.vendor.name if ili.vendor else ''))
+    ili.math_flagged = bool(item_dict.get('math_flagged'))
+
+    cleared = was_flagged and not ili.math_flagged
+    ili.user_edited = True
+    ili.save()
+
+    # Snapshot after
+    after = {
+        'quantity': str(ili.quantity) if ili.quantity is not None else None,
+        'unit_price': str(ili.unit_price) if ili.unit_price is not None else None,
+        'extended_amount': str(ili.extended_amount) if ili.extended_amount is not None else None,
+        'case_size': ili.case_size or '',
+        'raw_description': ili.raw_description or '',
+    }
+
+    InvoiceLineEdit.objects.create(
+        ili=ili,
+        edited_by=request.user if request.user.is_authenticated else None,
+        before=before,
+        after=after,
+        reason=request.POST.get('reason') or '',
+        note=request.POST.get('note') or '',
+        cleared_math_flag=cleared,
+    )
+
+    if cleared:
+        messages.success(request, f'Line edited — math now reconciles, flag cleared.')
+    else:
+        messages.success(request, f'Line edited.')
+
+    return redirect('invoice_detail', ivs_id=ivs_id)
+
+
+def invoice_verify(request, ivs_id: int):
+    """L1 Phase 1.2: POST handler — toggle Sean-explicit verified state on
+    an invoice. Distinct from auto-PASS; means "Sean reviewed + signed off."
+    """
+    from django.shortcuts import get_object_or_404, redirect
+    from django.contrib import messages
+    from django.utils import timezone
+    from myapp.models import InvoiceValidationStatus
+
+    ivs = get_object_or_404(InvoiceValidationStatus, pk=ivs_id)
+    if request.method != 'POST':
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    if ivs.verified_by_id:
+        # Toggle off
+        ivs.verified_by = None
+        ivs.verified_at = None
+        ivs.save(update_fields=['verified_by', 'verified_at'])
+        messages.info(request, 'Verification cleared.')
+    else:
+        ivs.verified_by = request.user if request.user.is_authenticated else None
+        ivs.verified_at = timezone.now()
+        ivs.save(update_fields=['verified_by', 'verified_at'])
+        messages.success(request, 'Invoice marked verified.')
+
+    return redirect('invoice_detail', ivs_id=ivs_id)
+
+
+def invoice_note(request, ivs_id: int):
+    """L1 Phase 1.2: POST handler — save invoice-level note to the
+    existing InvoiceValidationStatus.notes field. Free-text context for
+    the whole invoice (rectification details that don't belong to one line)."""
+    from django.shortcuts import get_object_or_404, redirect
+    from django.contrib import messages
+    from myapp.models import InvoiceValidationStatus
+
+    ivs = get_object_or_404(InvoiceValidationStatus, pk=ivs_id)
+    if request.method != 'POST':
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    ivs.notes = request.POST.get('notes', '').strip()
+    ivs.save(update_fields=['notes'])
+    messages.success(request, 'Notes saved.')
+    return redirect('invoice_detail', ivs_id=ivs_id)
+
+
 def invoice_image(request, ivs_id: int, hash_idx: int = 0):
     """L1 Phase 1.1b: serve the original paper-invoice image for an
     InvoiceValidationStatus row.
