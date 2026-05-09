@@ -42,7 +42,9 @@ def _week_folder_for_date(d: datetime) -> tuple[int, int, str]:
     sunday = monday + timedelta(days=6)
     # Week number = ceil(monday.day / 7)
     week_n = ((monday.day - 1) // 7) + 1
-    name = f'Week {week_n} {monday.month:02d}.{monday.day:02d} - {sunday.month:02d}.{sunday.day:02d}'
+    # Drive convention (verified from actual archive paths in image_cache
+    # index): 'Week 1 04.06-04.12' — no spaces around the dash
+    name = f'Week {week_n} {monday.month:02d}.{monday.day:02d}-{sunday.month:02d}.{sunday.day:02d}'
     return monday.year, monday.month, name
 
 
@@ -125,7 +127,8 @@ class Command(BaseCommand):
                 if not year_id:
                     vendor_folder_cache[vc_key] = None
                     results.append({'ivs': ivs, 'drive_files': [],
-                                    'cached_count': 0, 'missing_count': 0,
+                                    'cached_count': len(ivs.cache_hashes or []),
+                                    'missing_count': 0,
                                     'note': f'no year folder {year}'})
                     continue
                 month_folders = list_subfolders(drive, year_id)
@@ -134,7 +137,8 @@ class Command(BaseCommand):
                 if not month_id:
                     vendor_folder_cache[vc_key] = None
                     results.append({'ivs': ivs, 'drive_files': [],
-                                    'cached_count': 0, 'missing_count': 0,
+                                    'cached_count': len(ivs.cache_hashes or []),
+                                    'missing_count': 0,
                                     'note': f'no month folder {month_str}'})
                     continue
                 vendor_folders = list_subfolders(drive, month_id)
@@ -145,7 +149,8 @@ class Command(BaseCommand):
             vendor_id = vendor_folder_cache[vc_key]
             if not vendor_id:
                 results.append({'ivs': ivs, 'drive_files': [],
-                                'cached_count': 0, 'missing_count': 0,
+                                'cached_count': len(ivs.cache_hashes or []),
+                                'missing_count': 0,
                                 'note': f'no vendor folder {vendor_canon}'})
                 continue
 
@@ -179,7 +184,8 @@ class Command(BaseCommand):
                     week_files_cache[wk_key] = files
                 else:
                     results.append({'ivs': ivs, 'drive_files': [],
-                                    'cached_count': 0, 'missing_count': 0,
+                                    'cached_count': len(ivs.cache_hashes or []),
+                                    'missing_count': 0,
                                     'note': f'no week folder for {d}'})
                     continue
 
