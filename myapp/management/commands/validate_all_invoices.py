@@ -144,7 +144,9 @@ class Command(BaseCommand):
             })
 
         # Group by (vendor, invoice_number). For Sysco, fall back to manifest
-        # when invoice_number can't be extracted.
+        # when invoice_number can't be extracted — BUT skip manifest-only
+        # pages (Sean 2026-05-09 bug: INV 1282480 was a routing slip captured
+        # as a phantom invoice with $2k phantom total).
         groups: dict = defaultdict(list)
         for entry in caches:
             d = entry['cache']
@@ -152,7 +154,24 @@ class Command(BaseCommand):
             inv_num = None
             if vendor == 'Sysco':
                 meta = extract_sysco_metadata(d['raw_text'])
-                inv_num = meta.get('invoice_number') or meta.get('manifest')
+                inv_num = meta.get('invoice_number')
+                # Manifest fallback ONLY when this isn't a manifest-cover page.
+                # Manifest-cover pages start with "MANIFEST <num> NORMAL DELIVERY"
+                # or similar — they're delivery routing slips, not invoices.
+                # Their line items belong to a real invoice in the same
+                # delivery (matched by date), but creating an IVS row for the
+                # manifest itself produces a false invoice with phantom total.
+                if not inv_num and meta.get('manifest'):
+                    raw = d.get('raw_text', '')[:300].upper()
+                    is_manifest_cover = bool(
+                        re.search(r'MANIFEST\s+\d+\s+(NORMAL|SHIP\s*DAY|EXPEDITED)',
+                                  raw)
+                    )
+                    if not is_manifest_cover:
+                        # Real invoice with OCR-degraded invoice_number — fall
+                        # back to manifest for grouping (best-effort recovery).
+                        inv_num = meta.get('manifest')
+                    # else: skip — manifest cover doesn't get its own IVS row
             else:
                 # Other vendors: use a per-vendor regex (matches the logic
                 # in reprocess_ocr_cache._extract_invoice_number).

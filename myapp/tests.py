@@ -13137,6 +13137,29 @@ class InvoiceValidationStatusTests(TestCase):
         ])
         self.assertEqual(out, 'fail')
 
+    def test_manifest_cover_page_pattern_recognized(self):
+        """The manifest-page-detection regex matches Sean's real case.
+
+        Bug context (2026-05-09): INV 1282480 was a Sysco delivery
+        manifest captured as a phantom invoice. Its raw_text starts with
+        'MANIFEST 1282480 NORMAL DELIVERY' (after a noise prefix). The
+        validate_all_invoices grouping skips manifest-cover pages because
+        their items belong to the delivery's actual invoice (separate
+        cache file with the real invoice_number), not to the manifest itself.
+        """
+        import re
+        manifest_text = ("TERMS-21ST DOE ZALANCES ARE RECT TO SERVICE CE\n"
+                         "Net 7\n"
+                         "MANIFEST 1282480 NORMAL DELIVERY\n"
+                         "MA: T4CBZ DAVID CIANFARO\n")
+        regular_text = ("CUSTOMER'S ORIGINAL INVOICE\n"
+                        "INVOICE NUMBER\n"
+                        "775793805\n")
+        # Same regex used in validate_all_invoices.handle()
+        pattern = r'MANIFEST\s+\d+\s+(NORMAL|SHIP\s*DAY|EXPEDITED)'
+        self.assertTrue(re.search(pattern, manifest_text[:300].upper()))
+        self.assertFalse(re.search(pattern, regular_text[:300].upper()))
+
     def test_classify_pass_just_under_10pct_with_section_pass(self):
         """9.9% gap with sections reconciling → still PASS (legitimate
         non-item-charges leftover, e.g. tax + fuel surcharge)."""
