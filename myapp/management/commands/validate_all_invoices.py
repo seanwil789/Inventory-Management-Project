@@ -57,12 +57,21 @@ def _classify(items_sum: float, invoice_total: float | None,
           reconciles to invoice_total within $0.50. For vendors whose
           parsers extract fees/taxes (Delaware Linen).
       (b) Invoice-total math without charges: gap_pct < 5%.
-      (c) Section reconciliation: every section reconciles to its printed
-          GROUP TOTAL within tolerance. Implies items_sum matches the
-          authoritative item totals; any leftover gap is non-item charges
-          (TAX, FUEL SURCHARGE, CREDIT CARD SURCHARGE, MISC CHARGES) that
-          aren't in items_sum by design. Per Sean's goal — items 100%
-          accurate per-line — section reconciliation is the stronger signal.
+      (c) Section reconciliation AND invoice-total gap is reasonable.
+          Every section reconciles to its printed GROUP TOTAL within
+          tolerance, AND items_sum vs invoice_total gap is below the
+          FAIL threshold.
+
+          The gap-guard is critical: when OCR captures only PART of a
+          multi-page invoice (missing pages), the sections we DO see
+          reconcile to their printed GROUP TOTALs, but items_sum is far
+          short of invoice_total. Without the guard, invoices with 78%+
+          missing pages were silently classified as PASS because the
+          surface that was captured looked clean. See INV 1282480
+          (2026-04-06): 1 of N pages OCR'd, $559 items_sum vs $2559
+          invoice_total, sections reconcile, classifier said PASS.
+          That hid $2000 of missing data from downstream consumers.
+          (Bug surfaced by Sean 2026-05-09.)
     """
     if invoice_total is None or invoice_total == 0:
         return 'partial'
@@ -77,8 +86,10 @@ def _classify(items_sum: float, invoice_total: float | None,
     # Path (a): items + extracted fees reconcile.
     if non_item_charges > 0 and gap_with_charges < 0.50:
         return 'pass'
-    # Path (c): every section reconciles → items pass by section evidence.
-    if sections_total > 0 and sections_with_gap == 0:
+    # Path (c): section reconciliation passes ONLY when invoice-total gap is
+    # also reasonable. Catches the missing-pages case described above.
+    if (sections_total > 0 and sections_with_gap == 0
+            and gap_pct < _INVOICE_GAP_FAIL_PCT):
         return 'pass'
     if gap_pct >= _INVOICE_GAP_FAIL_PCT:
         return 'fail'

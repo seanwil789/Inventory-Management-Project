@@ -13109,6 +13109,45 @@ class InvoiceValidationStatusTests(TestCase):
         ])
         self.assertEqual(out, 'pass')
 
+    def test_classify_fail_when_sections_reconcile_but_invoice_gap_huge(self):
+        """Bug surfaced 2026-05-09 (Sean): INV 1282480 had 1 of N pages
+        OCR'd. Sections we DID see reconciled to printed GROUP TOTAL.
+        Classifier (pre-fix) said PASS — hiding 78% missing data ($2000).
+
+        Fix: section-PASS path now requires gap_pct < FAIL threshold.
+        Otherwise falls through to FAIL. Captures the missing-pages case.
+        """
+        from myapp.management.commands.validate_all_invoices import _classify
+        # Real INV 1282480 numbers
+        out = _classify(items_sum=559.18, invoice_total=2559.65, section_recon=[
+            {'section': 'DAIRY', 'parser_sum': 559.18, 'printed_total': 559.18,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 6},
+        ])
+        self.assertEqual(out, 'fail',
+                          'invoice with 78% gap should not pass even if '
+                          'captured sections reconcile')
+
+    def test_classify_fail_at_exact_10pct_gap_with_section_pass(self):
+        """Boundary: 10.0% gap is the FAIL threshold. At-or-above → fail."""
+        from myapp.management.commands.validate_all_invoices import _classify
+        # gap_pct = 10.0%
+        out = _classify(items_sum=90.00, invoice_total=100.00, section_recon=[
+            {'section': 'DAIRY', 'parser_sum': 90.0, 'printed_total': 90.0,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 3},
+        ])
+        self.assertEqual(out, 'fail')
+
+    def test_classify_pass_just_under_10pct_with_section_pass(self):
+        """9.9% gap with sections reconciling → still PASS (legitimate
+        non-item-charges leftover, e.g. tax + fuel surcharge)."""
+        from myapp.management.commands.validate_all_invoices import _classify
+        # gap_pct = 9.91%
+        out = _classify(items_sum=901.00, invoice_total=1000.00, section_recon=[
+            {'section': 'DAIRY', 'parser_sum': 901.0, 'printed_total': 901.0,
+             'diff_abs': 0.0, 'diff_pct': 0.0, 'item_count': 8},
+        ])
+        self.assertEqual(out, 'pass')
+
     def test_status_model_persists_section_recon_as_json(self):
         from myapp.models import Vendor, InvoiceValidationStatus
         vendor = Vendor.objects.create(name='TestVendor')
