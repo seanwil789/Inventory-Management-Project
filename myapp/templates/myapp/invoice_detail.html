@@ -99,40 +99,52 @@
        for now the parsed-lines layout takes the full width. -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
 
-    <!-- LEFT: paper invoice image (B6 / L1.1b) -->
+    <!-- LEFT: paper invoice image (B6 / L1.1b) with multi-page nav (1.1c) -->
     <div class="rounded-lg bg-white border border-slate-200 overflow-hidden flex flex-col">
       <div class="px-4 py-2 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
         <h2 class="text-sm font-semibold text-slate-900">
           Source paper
           {% if ivs.cache_hashes|length > 1 %}
-            <span class="text-xs text-slate-500 font-normal ml-2">
-              {{ ivs.cache_hashes|length }} pages
+            <span class="text-xs text-slate-500 font-normal ml-2" id="page-counter">
+              Page 1 of {{ ivs.cache_hashes|length }}
             </span>
           {% endif %}
         </h2>
         {% if ivs.cache_hashes|length > 1 %}
-        <div class="flex gap-1">
-          {% for h in ivs.cache_hashes %}
-            <a href="{% url 'invoice_image_indexed' ivs.id forloop.counter0 %}"
-               target="_blank"
-               class="text-xs px-2 py-0.5 rounded bg-slate-200 hover:bg-slate-300 text-slate-700">
-              {{ forloop.counter }}
-            </a>
-          {% endfor %}
+        <div class="flex items-center gap-1">
+          <button type="button" id="btn-prev"
+                  onclick="swapPage(-1)" disabled
+                  class="text-sm px-3 py-1 rounded bg-slate-200 hover:bg-slate-300 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed">
+            ◀ Prev
+          </button>
+          <button type="button" id="btn-next"
+                  onclick="swapPage(1)"
+                  class="text-sm px-3 py-1 rounded bg-slate-200 hover:bg-slate-300 text-slate-700 disabled:opacity-40 disabled:cursor-not-allowed">
+            Next ▶
+          </button>
+          <a href="{% url 'invoice_image' ivs.id %}" target="_blank"
+             id="btn-newtab"
+             class="ml-1 text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-600"
+             title="Open current page in new tab">⤴</a>
         </div>
+        {% else %}
+        {% if ivs.cache_hashes %}
+        <a href="{% url 'invoice_image' ivs.id %}" target="_blank"
+           class="text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-600"
+           title="Open in new tab">⤴</a>
+        {% endif %}
         {% endif %}
       </div>
       <div class="flex-1 min-h-[400px] bg-slate-100 flex items-center justify-center">
         {% if ivs.cache_hashes %}
           {% with first_hash=ivs.cache_hashes.0 %}
           <object
+            id="paper-img"
             data="{% url 'invoice_image' ivs.id %}"
             type="application/pdf"
             class="w-full h-full min-h-[600px]">
-            <!-- Fallback for non-PDF (browsers render images via <object> too,
-                 falling through to <img> only when object can't render).
-                 The image endpoint returns the right content-type so this
-                 works for both .jpg and .pdf source files. -->
+            <!-- Fallback for non-PDF — browsers render images via <object>
+                 too, falling through to <img> only when object can't render. -->
             <img src="{% url 'invoice_image' ivs.id %}"
                  alt="Invoice {{ ivs.invoice_number }}"
                  class="max-w-full max-h-full object-contain"
@@ -155,10 +167,61 @@
       </div>
       <div class="px-4 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-500">
         {% if ivs.cache_hashes %}
-          Hashes: {% for h in ivs.cache_hashes %}<code class="font-mono">{{ h }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}
+          <span id="hash-display">Hash: <code class="font-mono">{{ ivs.cache_hashes.0 }}</code></span>
         {% endif %}
       </div>
     </div>
+
+    {% if ivs.cache_hashes|length > 1 %}
+    <script>
+      // Multi-page paper invoice navigation. Vanilla JS (no framework dep).
+      // Swaps the <object data=...> URL on prev/next click; updates counter,
+      // disabled state on buttons at first/last page, and the hash display.
+      (function () {
+        const totalPages = {{ ivs.cache_hashes|length }};
+        const hashes = {{ ivs.cache_hashes|safe }};
+        const baseImageUrl = "{% url 'invoice_image' ivs.id %}";  // ends in /image/
+        let currentPage = 0;
+
+        function urlForPage(idx) {
+          // /invoices/<id>/image/  →  /invoices/<id>/image/<idx>/
+          return baseImageUrl + idx + "/";
+        }
+
+        window.swapPage = function (delta) {
+          const newPage = currentPage + delta;
+          if (newPage < 0 || newPage >= totalPages) return;
+          currentPage = newPage;
+          const obj = document.getElementById('paper-img');
+          // Replace the <object> entirely so browsers reliably re-render
+          // the new content-type (some browsers cache the embedded plugin
+          // and don't re-fetch on data= attribute change alone).
+          const newUrl = urlForPage(currentPage);
+          obj.data = newUrl;
+          // Also update the inner <img> fallback src in case the object
+          // doesn't re-render (img will pick up the change reliably).
+          const innerImg = obj.querySelector('img');
+          if (innerImg) innerImg.src = newUrl;
+
+          document.getElementById('page-counter').textContent =
+            'Page ' + (currentPage + 1) + ' of ' + totalPages;
+          document.getElementById('btn-prev').disabled = (currentPage === 0);
+          document.getElementById('btn-next').disabled = (currentPage === totalPages - 1);
+          document.getElementById('btn-newtab').href = newUrl;
+          document.getElementById('hash-display').innerHTML =
+            'Hash: <code class="font-mono">' + hashes[currentPage] + '</code>';
+        };
+
+        // Keyboard nav: left/right arrows when image pane is focused
+        document.addEventListener('keydown', function (e) {
+          if (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA' ||
+              e.target.tagName === 'SELECT') return;
+          if (e.key === 'ArrowLeft') swapPage(-1);
+          if (e.key === 'ArrowRight') swapPage(1);
+        });
+      })();
+    </script>
+    {% endif %}
 
     <!-- RIGHT: parsed line items, mirroring invoice layout -->
     <div class="rounded-lg bg-white border border-slate-200">

@@ -1406,6 +1406,31 @@ class InvoiceDetailViewTests(AuthedTestCase):
         self.assertEqual(ctx['total_lines'], 2)
         self.assertEqual(ctx['flagged_count'], 1)
 
+    def test_multi_page_nav_renders_when_multiple_hashes(self):
+        """Detail page shows prev/next buttons + page counter for multi-page."""
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        ivs_multi = InvoiceValidationStatus.objects.create(
+            vendor=self.v_sysco, invoice_number='IDV-MULTI',
+            invoice_date=date(2026, 4, 22),
+            cache_hashes=['hash_a' + 'a'*10, 'hash_b' + 'b'*10, 'hash_c' + 'c'*10],
+            status='pass',
+        )
+        resp = self.client.get(reverse('invoice_detail', args=[ivs_multi.id]))
+        body = resp.content.decode()
+        self.assertIn('Page 1 of 3', body)
+        self.assertIn('btn-prev', body)
+        self.assertIn('btn-next', body)
+        self.assertIn('swapPage', body)
+
+    def test_multi_page_nav_hidden_when_single_hash(self):
+        """Single-page invoices don't get nav controls."""
+        # self.ivs already has 1 cache_hashes from setUpTestData → single
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        self.assertNotIn('Page 1 of', body)
+        self.assertNotIn('btn-prev', body)
+
     def test_invoices_list_row_links_to_detail(self):
         """Click-through from list view → detail view."""
         resp = self.client.get(reverse('invoices_list') + '?year=2026')
