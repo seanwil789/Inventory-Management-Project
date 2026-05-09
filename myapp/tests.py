@@ -1307,6 +1307,113 @@ class InvoicesListViewTests(AuthedTestCase):
         self.assertIn('IVT-REVIEW-B', body)
 
 
+class InvoiceDetailViewTests(AuthedTestCase):
+    """L1 Phase 1.1a — `/invoices/<id>/` per-invoice drill-down view."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        cls.v_sysco = Vendor.objects.create(name='SyscoIDV')
+        cls.p1 = Product.objects.create(canonical_name='IDV-Milk')
+        cls.p2 = Product.objects.create(canonical_name='IDV-Cheese')
+
+        cls.ivs = InvoiceValidationStatus.objects.create(
+            vendor=cls.v_sysco, invoice_number='IDV-1234',
+            invoice_date=date(2026, 4, 15),
+            items_count=2, items_sum=Decimal('150.00'),
+            invoice_total=Decimal('150.00'),
+            invoice_gap=Decimal('0'), invoice_gap_pct=Decimal('0'),
+            sections_total=2, sections_reconciled=1, sections_with_gap=1,
+            section_reconciliation=[
+                {'section': 'DAIRY', 'parser_sum': 100.0,
+                 'printed_total': 100.0, 'diff_abs': 0.0,
+                 'diff_pct': 0.0, 'item_count': 1},
+                {'section': 'CHEESE', 'parser_sum': 50.0,
+                 'printed_total': 75.0, 'diff_abs': -25.0,
+                 'diff_pct': -33.3, 'item_count': 1},
+            ],
+            cache_hashes=['idv-cache-hash-1'],
+            status='review',
+        )
+        # 2 ILI rows for this invoice (matched by vendor + date)
+        cls.ili_clean = InvoiceLineItem.objects.create(
+            vendor=cls.v_sysco, product=cls.p1,
+            quantity=Decimal('10'), unit_price=Decimal('10'),
+            extended_amount=Decimal('100'),
+            invoice_date=date(2026, 4, 15),
+            raw_description='IDV-MILK-DESC',
+            section_hint='DAIRY',
+        )
+        cls.ili_flagged = InvoiceLineItem.objects.create(
+            vendor=cls.v_sysco, product=cls.p2,
+            quantity=Decimal('1'), unit_price=Decimal('50'),
+            extended_amount=Decimal('100'),  # 1 × 50 ≠ 100 → flagged
+            invoice_date=date(2026, 4, 15),
+            raw_description='IDV-CHEESE-DESC',
+            section_hint='CHEESE',
+            math_flagged=True,
+        )
+
+    def test_detail_200(self):
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_detail_renders_header_invoice_info(self):
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        self.assertIn('SyscoIDV', body)
+        self.assertIn('IDV-1234', body)
+        self.assertIn('REVIEW', body)
+
+    def test_detail_renders_line_items(self):
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        self.assertIn('IDV-Milk', body)
+        self.assertIn('IDV-Cheese', body)
+        self.assertIn('IDV-MILK-DESC', body)
+        self.assertIn('IDV-CHEESE-DESC', body)
+
+    def test_detail_highlights_math_flagged(self):
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        self.assertIn('math-flagged', body.lower())
+        # The orange-50 background class indicates flagged-row styling
+        self.assertIn('bg-orange-50', body)
+
+    def test_detail_renders_section_reconciliation_table(self):
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        # Header text is "Section reconciliation"
+        self.assertIn('Section reconciliation', body)
+        self.assertIn('DAIRY', body)
+        self.assertIn('CHEESE', body)
+
+    def test_detail_404_for_missing_invoice(self):
+        resp = self.client.get(reverse('invoice_detail', args=[99999]))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_detail_groups_lines_by_section(self):
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        # Both section headers should appear
+        dairy_pos = body.find('DAIRY')
+        cheese_pos = body.find('CHEESE')
+        self.assertGreater(dairy_pos, 0)
+        self.assertGreater(cheese_pos, 0)
+        # Stats: 2 lines, 1 flagged
+        ctx = resp.context
+        self.assertEqual(ctx['total_lines'], 2)
+        self.assertEqual(ctx['flagged_count'], 1)
+
+    def test_invoices_list_row_links_to_detail(self):
+        """Click-through from list view → detail view."""
+        resp = self.client.get(reverse('invoices_list') + '?year=2026')
+        body = resp.content.decode()
+        # Detail URL appears in the row
+        self.assertIn(reverse('invoice_detail', args=[self.ivs.id]), body)
+
+
 class MathAnomalyManagementCommandTests(TestCase):
     """B6 mgmt cmds: backfill_math_flagged retroactively flags + clears;
     audit_math_anomalies surfaces flagged rows."""

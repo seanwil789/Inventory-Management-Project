@@ -9,7 +9,7 @@
     <p class="text-sm text-slate-500 mt-1">
       Validation status across every invoice we have a record for.
       Non-PASS rows surface section diffs + math-flagged line counts inline.
-      Click an invoice to open the dual-view (coming next).
+      Click any invoice to drill into the line-item detail.
     </p>
   </div>
 
@@ -105,9 +105,12 @@
       <tbody>
         {% for row in invoices %}
           {% with ivs=row.ivs %}
-          <tr class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer">
+          <tr class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
+              onclick="window.location='{% url 'invoice_detail' ivs.id %}'">
             <td class="py-2 px-3">{{ ivs.vendor.name }}</td>
-            <td class="py-2 px-3 font-mono">{{ ivs.invoice_number }}</td>
+            <td class="py-2 px-3 font-mono">
+              <a href="{% url 'invoice_detail' ivs.id %}" class="hover:text-indigo-700">{{ ivs.invoice_number }}</a>
+            </td>
             <td class="py-2 px-3">{{ ivs.invoice_date|date:"Y-m-d" }}</td>
             <td class="py-2 px-3">
               {% if ivs.status == 'pass' %}

@@ -2493,6 +2493,75 @@ def invoices_list(request):
     })
 
 
+def invoice_detail(request, ivs_id: int):
+    """Phase 1.1a: per-invoice drill-down (no image yet, no edits yet).
+
+    Shows the invoice with all line items + section reconciliation +
+    math-flagged anomalies highlighted, mirroring the source layout.
+    Image cache layer for the side-by-side paper view lands in 1.1b;
+    edit-in-place + audit trail in 1.2.
+    """
+    from django.shortcuts import get_object_or_404
+    from myapp.models import InvoiceValidationStatus
+
+    ivs = get_object_or_404(
+        InvoiceValidationStatus.objects.select_related('vendor'),
+        pk=ivs_id,
+    )
+
+    # All ILI rows for this (vendor, invoice_date). We don't have a direct
+    # FK from ILI → InvoiceValidationStatus today; the join is by
+    # vendor + date which matches how IVS is keyed (vendor + invoice_number,
+    # but invoice_number isn't stored on ILI). Per-vendor groupings are
+    # tight enough that vendor + date is unique in practice. Future:
+    # add ILI.invoice_validation_status FK for direct join.
+    ili_qs = (InvoiceLineItem.objects
+              .filter(vendor=ivs.vendor, invoice_date=ivs.invoice_date)
+              .select_related('product', 'vendor')
+              .order_by('section_hint', 'id'))
+
+    # Group by section_hint for Sysco-style display; other vendors get
+    # one '' bucket which renders as a single flat table.
+    sections: dict = {}
+    for ili in ili_qs:
+        sec = ili.section_hint or ''
+        sections.setdefault(sec, []).append(ili)
+
+    # Per-section reconciliation lookup from IVS section_reconciliation JSON
+    recon_by_section = {}
+    for r in (ivs.section_reconciliation or []):
+        recon_by_section[r.get('section', '')] = r
+
+    # Build display rows with reconciliation context per section
+    section_rows = []
+    for sec_name, items in sorted(sections.items(), key=lambda kv: kv[0]):
+        recon = recon_by_section.get(sec_name)
+        section_rows.append({
+            'name': sec_name or '(no section)',
+            'items': items,
+            'item_count': len(items),
+            'parser_sum': sum((float(it.extended_amount or 0) for it in items), 0.0),
+            'recon': recon,
+            'has_diff': bool(recon and recon.get('diff_abs') is not None
+                             and abs(float(recon['diff_abs'])) >= 0.50),
+        })
+
+    # Stats
+    total_lines = ili_qs.count()
+    flagged_lines = [it for it in ili_qs if it.math_flagged]
+    flagged_count = len(flagged_lines)
+    total_extended = sum((float(it.extended_amount or 0) for it in ili_qs), 0.0)
+
+    return render(request, 'myapp/invoice_detail.html', {
+        'ivs': ivs,
+        'section_rows': section_rows,
+        'total_lines': total_lines,
+        'flagged_count': flagged_count,
+        'flagged_lines': flagged_lines,
+        'total_extended': round(total_extended, 2),
+    })
+
+
 # ---- Pipeline health dashboard ----
 
 def pipeline_health(request):

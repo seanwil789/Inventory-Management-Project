@@ -44,6 +44,7 @@ urlpatterns = [
     path('alerts/',                         views.price_alerts,        name='price_alerts'),
     path('demo/ready/',                     views.demo_ready,          name='demo_ready'),
     path('invoices/',                       views.invoices_list,       name='invoices_list'),
+    path('invoices/<int:ivs_id>/',          views.invoice_detail,      name='invoice_detail'),
     path('pipeline-health/',                views.pipeline_health,     name='pipeline_health'),
     path('mapping-health/',                 views.mapping_health,      name='mapping_health'),
     path('mapping-review/',                 views.mapping_review,      name='mapping_review'),
