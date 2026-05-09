@@ -293,7 +293,6 @@ Paste the following (paths already adjusted for `/home/sean/`):
 @reboot sleep 60 && /home/sean/my-saas/run_invoice_batch.sh
 0 8 * * 5 /home/sean/my-saas/run_budget_sync.sh
 0 6 * * * /home/sean/my-saas/run_refresh_invoice_totals.sh
-0 */6 * * * /home/sean/my-saas/run_mapping_review_apply.sh
 0 7 * * * /home/sean/my-saas/run_mapping_review_discover.sh
 5 0 1 * * /home/sean/my-saas/run_monthly_synergy_tab.sh
 ```

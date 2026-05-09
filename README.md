@@ -217,7 +217,6 @@ Cron schedule (production Pi; not needed for review):
 @reboot sleep 60 && run_invoice_batch.sh       # post-boot pickup
 0 6 * * *      run_refresh_invoice_totals.sh  # daily totals cache rebuild
 0 7 * * *      run_mapping_review_discover.sh # daily unmapped → PMP queue
-0 */6 * * *    run_mapping_review_apply.sh    # apply Sean-approved PMPs
 0 8 * * 5      run_budget_sync.sh             # Fri 8am budget push
 5 0 1 * *      run_monthly_synergy_tab.sh     # 1st of month new sheet
 0 6 * * 0      run_drift_audit.sh weekly      # Sun 6am safe-only auto-clean
