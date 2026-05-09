@@ -1,0 +1,209 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Invoices{% endblock %}
+
+{% block content %}
+<div class="space-y-5">
+
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Invoices</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Validation status across every invoice we have a record for.
+      Non-PASS rows surface section diffs + math-flagged line counts inline.
+      Click an invoice to open the dual-view (coming next).
+    </p>
+  </div>
+
+  <!-- KPI row: per-status counts for the year -->
+  <div class="grid grid-cols-2 sm:grid-cols-5 gap-3">
+    <div class="rounded-lg border border-slate-200 bg-white p-3">
+      <div class="text-xs text-slate-500 uppercase tracking-wide">Year {{ year_filter }}</div>
+      <div class="text-2xl font-bold text-slate-900">{{ total_n }}</div>
+      <div class="text-xs text-slate-500">invoices total</div>
+    </div>
+    <div class="rounded-lg border
+      {% if pass_pct >= 95 %}border-emerald-200 bg-emerald-50
+      {% elif pass_pct >= 80 %}border-amber-200 bg-amber-50
+      {% else %}border-red-200 bg-red-50{% endif %} p-3">
+      <div class="text-xs uppercase tracking-wide
+        {% if pass_pct >= 95 %}text-emerald-800
+        {% elif pass_pct >= 80 %}text-amber-800
+        {% else %}text-red-800{% endif %}">PASS</div>
+      <div class="text-2xl font-bold">{{ pass_n }}</div>
+      <div class="text-xs">{{ pass_pct }}%</div>
+    </div>
+    <div class="rounded-lg border
+      {% if review_n %}border-amber-200 bg-amber-50{% else %}border-slate-200 bg-white{% endif %} p-3">
+      <div class="text-xs uppercase tracking-wide
+        {% if review_n %}text-amber-800{% else %}text-slate-500{% endif %}">REVIEW</div>
+      <div class="text-2xl font-bold">{{ review_n }}</div>
+    </div>
+    <div class="rounded-lg border
+      {% if fail_n %}border-red-200 bg-red-50{% else %}border-slate-200 bg-white{% endif %} p-3">
+      <div class="text-xs uppercase tracking-wide
+        {% if fail_n %}text-red-800{% else %}text-slate-500{% endif %}">FAIL</div>
+      <div class="text-2xl font-bold">{{ fail_n }}</div>
+    </div>
+    <div class="rounded-lg border
+      {% if partial_n %}border-slate-300 bg-slate-50{% else %}border-slate-200 bg-white{% endif %} p-3">
+      <div class="text-xs text-slate-600 uppercase tracking-wide">PARTIAL</div>
+      <div class="text-2xl font-bold">{{ partial_n }}</div>
+    </div>
+  </div>
+
+  <!-- Filter bar -->
+  <form method="GET" class="flex flex-wrap items-center gap-3 bg-white border border-slate-200 rounded-lg p-3">
+    <label class="text-sm">
+      Year
+      <select name="year" class="ml-1 border rounded px-2 py-1 text-sm">
+        {% for y in years_available %}
+          <option value="{{ y }}" {% if y == year_filter %}selected{% endif %}>{{ y }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <label class="text-sm">
+      Status
+      <select name="status" class="ml-1 border rounded px-2 py-1 text-sm">
+        <option value="" {% if not status_filter %}selected{% endif %}>All</option>
+        <option value="pass" {% if status_filter == 'pass' %}selected{% endif %}>PASS</option>
+        <option value="review" {% if status_filter == 'review' %}selected{% endif %}>REVIEW</option>
+        <option value="fail" {% if status_filter == 'fail' %}selected{% endif %}>FAIL</option>
+        <option value="partial" {% if status_filter == 'partial' %}selected{% endif %}>PARTIAL</option>
+      </select>
+    </label>
+    <label class="text-sm">
+      Vendor
+      <select name="vendor" class="ml-1 border rounded px-2 py-1 text-sm">
+        <option value="" {% if not vendor_filter %}selected{% endif %}>All</option>
+        {% for v in vendors_available %}
+          <option value="{{ v }}" {% if v == vendor_filter %}selected{% endif %}>{{ v }}</option>
+        {% endfor %}
+      </select>
+    </label>
+    <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded px-3 py-1">Filter</button>
+    {% if status_filter or vendor_filter %}
+      <a href="{% url 'invoices_list' %}?year={{ year_filter }}" class="text-sm text-slate-500 hover:underline">clear</a>
+    {% endif %}
+    <span class="ml-auto text-sm text-slate-500">{{ invoices_shown }} shown</span>
+  </form>
+
+  <!-- Invoice table -->
+  <div class="rounded-lg bg-white border border-slate-200 overflow-hidden">
+    <table class="w-full text-sm">
+      <thead class="text-xs uppercase text-slate-500 tracking-wide bg-slate-50">
+        <tr class="border-b border-slate-200">
+          <th class="text-left py-2 px-3">Vendor</th>
+          <th class="text-left py-2 px-3">Invoice #</th>
+          <th class="text-left py-2 px-3">Date</th>
+          <th class="text-left py-2 px-3">Status</th>
+          <th class="text-right py-2 px-3">Items</th>
+          <th class="text-right py-2 px-3">Items $</th>
+          <th class="text-right py-2 px-3">Invoice $</th>
+          <th class="text-right py-2 px-3">Gap %</th>
+          <th class="text-right py-2 px-3 pr-4">Math flags</th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for row in invoices %}
+          {% with ivs=row.ivs %}
+          <tr class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer">
+            <td class="py-2 px-3">{{ ivs.vendor.name }}</td>
+            <td class="py-2 px-3 font-mono">{{ ivs.invoice_number }}</td>
+            <td class="py-2 px-3">{{ ivs.invoice_date|date:"Y-m-d" }}</td>
+            <td class="py-2 px-3">
+              {% if ivs.status == 'pass' %}
+                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium bg-emerald-100 text-emerald-800">PASS</span>
+              {% elif ivs.status == 'review' %}
+                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium bg-amber-100 text-amber-800">REVIEW</span>
+              {% elif ivs.status == 'fail' %}
+                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium bg-red-100 text-red-800">FAIL</span>
+              {% elif ivs.status == 'partial' %}
+                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium bg-slate-200 text-slate-700">PARTIAL</span>
+              {% else %}
+                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium bg-slate-100 text-slate-700">{{ ivs.status|upper }}</span>
+              {% endif %}
+            </td>
+            <td class="py-2 px-3 text-right">{{ ivs.items_count }}</td>
+            <td class="py-2 px-3 text-right">${{ ivs.items_sum|default_if_none:"—" }}</td>
+            <td class="py-2 px-3 text-right">${{ ivs.invoice_total|default_if_none:"—" }}</td>
+            <td class="py-2 px-3 text-right">
+              {% if ivs.invoice_gap_pct is not None %}
+                <span class="
+                  {% if ivs.invoice_gap_pct|floatformat:0|add:0 >= 10 %}text-red-700
+                  {% elif ivs.invoice_gap_pct|floatformat:0|add:0 >= 5 %}text-amber-700
+                  {% else %}text-slate-600{% endif %}">
+                  {{ ivs.invoice_gap_pct }}%
+                </span>
+              {% else %}
+                <span class="text-slate-400">—</span>
+              {% endif %}
+            </td>
+            <td class="py-2 px-3 pr-4 text-right">
+              {% if row.flagged_lines %}
+                <span class="inline-block px-1.5 py-0.5 rounded text-xs font-medium bg-orange-100 text-orange-800" title="Lines with qty × price ≠ extended">
+                  {{ row.flagged_lines }} ⚠
+                </span>
+              {% else %}
+                <span class="text-slate-400">—</span>
+              {% endif %}
+            </td>
+          </tr>
+          {% if row.is_non_pass %}
+          <tr class="bg-slate-50 border-b border-slate-100">
+            <td colspan="9" class="py-2 px-3">
+              <div class="text-xs text-slate-700 space-y-1">
+                {% if ivs.status == 'partial' %}
+                  <div class="text-slate-700">
+                    <span class="font-medium">PARTIAL:</span> no invoice_total extracted. Re-photograph + reprocess to resolve.
+                  </div>
+                {% endif %}
+                {% if ivs.status == 'fail' %}
+                  <div class="text-red-800">
+                    <span class="font-medium">FAIL:</span> items_sum vs invoice_total gap exceeds 10%
+                    {% if ivs.invoice_gap %}(${{ ivs.invoice_gap }}){% endif %}.
+                  </div>
+                {% endif %}
+                {% if row.section_diffs %}
+                  <div>
+                    <span class="font-medium text-slate-700">Section diffs ({{ row.section_diffs|length }}):</span>
+                    <ul class="ml-4 mt-1 space-y-0.5 list-disc list-inside">
+                      {% for s in row.section_diffs %}
+                        <li class="font-mono text-xs">
+                          {{ s.section }} —
+                          parser ${{ s.parser_sum }} /
+                          printed ${{ s.printed_total|default_if_none:"?" }} /
+                          diff ${{ s.diff_abs }}
+                          ({% if s.item_count %}{{ s.item_count }} items{% else %}no items{% endif %})
+                        </li>
+                      {% endfor %}
+                    </ul>
+                  </div>
+                {% endif %}
+                {% if row.flagged_lines %}
+                  <div>
+                    <span class="font-medium text-orange-700">Math-flagged lines:</span>
+                    {{ row.flagged_lines }} on this invoice — see <a href="#" class="text-indigo-600 hover:underline">audit_math_anomalies</a> CLI for detail (per-row UI in next phase).
+                  </div>
+                {% endif %}
+              </div>
+            </td>
+          </tr>
+          {% endif %}
+          {% endwith %}
+        {% empty %}
+          <tr>
+            <td colspan="9" class="py-6 px-3 text-center text-slate-500 text-sm">
+              No invoices match the current filters.
+            </td>
+          </tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+
+  <p class="text-xs text-slate-500">
+    InvoiceValidationStatus is populated by <code class="bg-slate-100 px-1 rounded">manage.py validate_all_invoices --apply</code>.
+    Math flags via <code class="bg-slate-100 px-1 rounded">backfill_math_flagged --apply</code> (one-shot) +
+    parser-time validation (every ingestion).
+  </p>
+</div>
+{% endblock %}

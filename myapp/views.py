@@ -2357,6 +2357,142 @@ def price_alerts(request):
     })
 
 
+# ---- Invoice Reconciliation hub (B6+ / L1) ----
+
+def invoices_list(request):
+    """Invoice Reconciliation hub — `/invoices/`.
+
+    The single page for "all things invoice." Lists every invoice we have
+    a validation record for, with status badges (PASS/REVIEW/FAIL/PARTIAL)
+    and inline expansion of context for non-PASS rows. Filterable by
+    year + vendor + status. Click-through to per-invoice dual-view drill-
+    down lands in the next phase (this view is the index/queue surface
+    only).
+
+    Naming: per Sean 2026-05-09, "invoice reconciliation" matches AP
+    industry terminology; distinct from L8 ledger reconciliation (DB ↔
+    QB GL). See project_quickbooks_roadmap.md.
+    """
+    from django.db.models import Count, Q
+    from myapp.models import InvoiceValidationStatus, Vendor
+
+    today = date.today()
+
+    # ── Filter inputs ─────────────────────────────────────────────
+    try:
+        year_filter = int(request.GET.get('year') or today.year)
+    except (TypeError, ValueError):
+        year_filter = today.year
+
+    status_filter = (request.GET.get('status') or '').strip().lower()
+    if status_filter not in ('pass', 'review', 'fail', 'partial', ''):
+        status_filter = ''
+
+    vendor_filter = (request.GET.get('vendor') or '').strip()
+
+    # ── Base queryset ────────────────────────────────────────────
+    qs = (InvoiceValidationStatus.objects
+          .filter(invoice_date__year=year_filter)
+          .select_related('vendor')
+          .order_by('-invoice_date', 'vendor__name', 'invoice_number'))
+
+    if status_filter:
+        qs = qs.filter(status=status_filter)
+    if vendor_filter:
+        qs = qs.filter(vendor__name=vendor_filter)
+
+    # ── KPI counts (across the year, ignoring vendor/status filters
+    # so the totals row stays stable when you narrow the table) ──
+    year_qs = InvoiceValidationStatus.objects.filter(invoice_date__year=year_filter)
+    by_status_year = {row['status']: row['n']
+                      for row in year_qs.values('status').annotate(n=Count('id'))}
+    pass_n = by_status_year.get('pass', 0)
+    review_n = by_status_year.get('review', 0)
+    fail_n = by_status_year.get('fail', 0)
+    partial_n = by_status_year.get('partial', 0)
+    total_n = pass_n + review_n + fail_n + partial_n
+    pass_pct = round(pass_n / total_n * 100, 1) if total_n else 0
+
+    # ── math_flagged line counts per (vendor, invoice_number) so we can
+    # show a per-row badge ("3 lines flagged") inline ───────────────
+    flag_map: dict = {}
+    flagged_qs = (InvoiceLineItem.objects
+                  .filter(math_flagged=True, invoice_date__year=year_filter)
+                  .select_related('vendor')
+                  .values('vendor__name', 'source_file')
+                  .annotate(n=Count('id')))
+    for row in flagged_qs:
+        # source_file is hash-based; we'll match on vendor+date instead
+        # via a second pass. Keep this for vendor-total only.
+        pass
+    # Per-row math-flagged counts: filter ILI by date+vendor matching the IVS
+    # row we're rendering. Build a lookup via raw counts grouped by
+    # (vendor_id, invoice_date).
+    per_invoice_flagged = {}
+    flagged_by_date_vendor = (InvoiceLineItem.objects
+                              .filter(math_flagged=True,
+                                      invoice_date__year=year_filter)
+                              .values('vendor_id', 'invoice_date')
+                              .annotate(n=Count('id')))
+    for row in flagged_by_date_vendor:
+        per_invoice_flagged[(row['vendor_id'], row['invoice_date'])] = row['n']
+
+    # Decorate invoice rows with derived display values
+    invoices = []
+    for ivs in qs:
+        section_diffs = []
+        for s in (ivs.section_reconciliation or []):
+            diff_abs = s.get('diff_abs')
+            if diff_abs is not None and abs(float(diff_abs)) >= 0.50:
+                section_diffs.append(s)
+
+        flagged_lines = per_invoice_flagged.get(
+            (ivs.vendor_id, ivs.invoice_date), 0
+        )
+
+        invoices.append({
+            'ivs': ivs,
+            'section_diffs': section_diffs,
+            'flagged_lines': flagged_lines,
+            'is_non_pass': ivs.status != 'pass',
+        })
+
+    # ── Filter dropdown options ──────────────────────────────────
+    years_available = sorted(
+        {d.year for d in
+         InvoiceValidationStatus.objects.values_list('invoice_date', flat=True)
+         if d},
+        reverse=True,
+    )
+    if year_filter not in years_available:
+        years_available = [year_filter] + years_available
+
+    vendors_available = sorted(
+        {v for v in
+         InvoiceValidationStatus.objects
+         .values_list('vendor__name', flat=True)
+         if v}
+    )
+
+    return render(request, 'myapp/invoices.html', {
+        'today': today,
+        'year_filter': year_filter,
+        'status_filter': status_filter,
+        'vendor_filter': vendor_filter,
+        'years_available': years_available,
+        'vendors_available': vendors_available,
+        'invoices': invoices,
+        'invoices_shown': len(invoices),
+        # KPIs
+        'total_n': total_n,
+        'pass_n': pass_n,
+        'review_n': review_n,
+        'fail_n': fail_n,
+        'partial_n': partial_n,
+        'pass_pct': pass_pct,
+    })
+
+
 # ---- Pipeline health dashboard ----
 
 def pipeline_health(request):

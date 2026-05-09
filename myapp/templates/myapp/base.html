@@ -67,6 +67,7 @@
         </summary>
         <div class="absolute top-full right-0 mt-1 bg-slate-800 border border-slate-700 rounded shadow-lg py-1 min-w-[180px] z-20">
           <a href="{% url 'demo_ready' %}" class="block px-3 py-1.5 hover:bg-slate-700 text-indigo-300" title="Demo-day readiness checklist">Demo readiness</a>
+          <a href="{% url 'invoices_list' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Invoice reconciliation hub — validation status across every invoice">Invoices</a>
           <a href="{% url 'pipeline_health' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Invoice pipeline + recipe linkage + cache health">Pipeline health</a>
           <a href="{% url 'mapping_health' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Mapper-quality dashboard — drift, suspect mappings, unmapped queue">Mapping health</a>
           <a href="{% url 'mapping_review' %}" class="block px-3 py-1.5 hover:bg-slate-700" title="Approve/reject quarantined fuzzy mapping suggestions">Mapping review</a>

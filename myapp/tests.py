@@ -1159,6 +1159,154 @@ class MathFlaggedDbWriteTests(TestCase):
         self.assertFalse(ili.math_flagged)
 
 
+class InvoicesListViewTests(AuthedTestCase):
+    """L1 Invoice Reconciliation hub `/invoices/` — index/queue surface."""
+
+    @classmethod
+    def setUpTestData(cls):
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        cls.v_sysco = Vendor.objects.create(name='SyscoIVT')
+        cls.v_farmart = Vendor.objects.create(name='FarmArtIVT')
+        cls.p = Product.objects.create(canonical_name='IVTProduct')
+
+        # PASS invoice (Sysco 2026)
+        cls.ivs_pass = InvoiceValidationStatus.objects.create(
+            vendor=cls.v_sysco, invoice_number='IVT-PASS-A',
+            invoice_date=date(2026, 4, 1),
+            items_count=10, items_sum=Decimal('500.00'),
+            invoice_total=Decimal('500.00'),
+            invoice_gap=Decimal('0'), invoice_gap_pct=Decimal('0'),
+            sections_total=2, sections_reconciled=2, sections_with_gap=0,
+            section_reconciliation=[],
+            status='pass',
+        )
+        # REVIEW invoice (Sysco 2026) with section diff
+        cls.ivs_review = InvoiceValidationStatus.objects.create(
+            vendor=cls.v_sysco, invoice_number='IVT-REVIEW-B',
+            invoice_date=date(2026, 4, 5),
+            items_count=10, items_sum=Decimal('500.00'),
+            invoice_total=Decimal('510.00'),
+            invoice_gap=Decimal('-10'), invoice_gap_pct=Decimal('1.96'),
+            sections_total=2, sections_reconciled=1, sections_with_gap=1,
+            section_reconciliation=[
+                {'section': 'DAIRY', 'parser_sum': 200.0,
+                 'printed_total': 200.0, 'diff_abs': 0.0,
+                 'diff_pct': 0.0, 'item_count': 5},
+                {'section': 'PAPER & DISP', 'parser_sum': 300.0,
+                 'printed_total': 250.0, 'diff_abs': 50.0,
+                 'diff_pct': 20.0, 'item_count': 5},
+            ],
+            status='review',
+        )
+        # FAIL invoice (Farm Art 2026)
+        cls.ivs_fail = InvoiceValidationStatus.objects.create(
+            vendor=cls.v_farmart, invoice_number='IVT-FAIL-C',
+            invoice_date=date(2026, 4, 10),
+            items_count=5, items_sum=Decimal('100.00'),
+            invoice_total=Decimal('150.00'),
+            invoice_gap=Decimal('-50'), invoice_gap_pct=Decimal('33.33'),
+            status='fail',
+        )
+        # PARTIAL invoice (Farm Art 2026)
+        cls.ivs_partial = InvoiceValidationStatus.objects.create(
+            vendor=cls.v_farmart, invoice_number='IVT-PARTIAL-D',
+            invoice_date=date(2026, 4, 15),
+            items_count=3, items_sum=Decimal('45.00'),
+            status='partial',
+        )
+        # PASS invoice from 2025 (different year — should be excluded
+        # from default current-year filter)
+        cls.ivs_2025 = InvoiceValidationStatus.objects.create(
+            vendor=cls.v_sysco, invoice_number='IVT-2025-OLD',
+            invoice_date=date(2025, 6, 1),
+            items_count=5, items_sum=Decimal('100.00'),
+            invoice_total=Decimal('100.00'),
+            status='pass',
+        )
+        # Math-flagged ILI on the FAIL invoice (so the row shows the
+        # flagged-lines badge inline)
+        InvoiceLineItem.objects.create(
+            vendor=cls.v_farmart, product=cls.p,
+            quantity=Decimal('5'), unit_price=Decimal('20'),
+            extended_amount=Decimal('100'),
+            invoice_date=date(2026, 4, 10),
+            raw_description='IVT-flagged-line',
+            math_flagged=True,
+        )
+
+    def test_invoices_list_200(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=2026')
+        self.assertEqual(resp.status_code, 200)
+        self.assertContains(resp, 'Invoices')
+
+    def test_pass_review_fail_partial_all_visible_by_default(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=2026')
+        body = resp.content.decode()
+        self.assertIn('IVT-PASS-A', body)  # PASS
+        self.assertIn('IVT-REVIEW-B', body)  # REVIEW
+        self.assertIn('IVT-FAIL-C', body)  # FAIL
+        self.assertIn('IVT-PARTIAL-D', body)  # PARTIAL
+        # 2025 invoice excluded by default year filter
+        self.assertNotIn('IVT-2025-OLD', body)
+
+    def test_status_filter_review_only_shows_review(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=2026&status=review')
+        body = resp.content.decode()
+        self.assertIn('IVT-REVIEW-B', body)  # REVIEW
+        self.assertNotIn('IVT-PASS-A', body)  # PASS excluded
+        self.assertNotIn('IVT-FAIL-C', body)  # FAIL excluded
+
+    def test_vendor_filter(self):
+        resp = self.client.get(reverse('invoices_list')
+                               + '?year=2026&vendor=FarmArtIVT')
+        body = resp.content.decode()
+        self.assertIn('IVT-FAIL-C', body)  # Farm Art FAIL
+        self.assertIn('IVT-PARTIAL-D', body)  # Farm Art PARTIAL
+        self.assertNotIn('IVT-PASS-A', body)  # Sysco PASS excluded
+
+    def test_year_filter_switches_to_2025(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=2025')
+        body = resp.content.decode()
+        self.assertIn('IVT-2025-OLD', body)
+        self.assertNotIn('IVT-PASS-A', body)  # 2026 excluded
+
+    def test_section_diffs_shown_inline_for_review(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=2026')
+        body = resp.content.decode()
+        # Section diff for PAPER & DISP on the REVIEW invoice should appear
+        self.assertIn('PAPER &amp; DISP', body)
+
+    def test_math_flagged_count_shown_on_fail_invoice(self):
+        """The Farm Art FAIL invoice has 1 math-flagged ILI — should show as
+        a per-row badge."""
+        resp = self.client.get(reverse('invoices_list') + '?year=2026')
+        body = resp.content.decode()
+        # The FAIL row should show '1 ⚠' badge
+        self.assertIn('1 ⚠', body)
+
+    def test_kpi_counts_per_status(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=2026')
+        # Context contains the KPI numbers
+        self.assertEqual(resp.context['pass_n'], 1)
+        self.assertEqual(resp.context['review_n'], 1)
+        self.assertEqual(resp.context['fail_n'], 1)
+        self.assertEqual(resp.context['partial_n'], 1)
+        self.assertEqual(resp.context['total_n'], 4)
+
+    def test_invalid_year_falls_back_to_current(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=garbage')
+        self.assertEqual(resp.status_code, 200)
+        # Should default to today.year — no crash
+
+    def test_invalid_status_filter_treated_as_all(self):
+        resp = self.client.get(reverse('invoices_list') + '?year=2026&status=bogus')
+        body = resp.content.decode()
+        # Bogus status → treated as 'all' → all 2026 invoices visible
+        self.assertIn('IVT-PASS-A', body)
+        self.assertIn('IVT-REVIEW-B', body)
+
+
 class MathAnomalyManagementCommandTests(TestCase):
     """B6 mgmt cmds: backfill_math_flagged retroactively flags + clears;
     audit_math_anomalies surfaces flagged rows."""
@@ -9998,7 +10146,7 @@ class DBWriteStructuredFallbackTests(TestCase):
                 'case_pack_unit_size': '8',      # parser supplied
                 'case_pack_unit_uom': 'OZ',      # parser supplied
                 'unit_price': '50', 'extended_amount': '50',
-                'sysco_item_code': '999', 'confidence': 'code', 'score': 100,
+                'sysco_item_code': '5099999', 'confidence': 'code', 'score': 100,
             }],
             source_file='sysco_test')
         from decimal import Decimal
