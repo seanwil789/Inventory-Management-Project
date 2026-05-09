@@ -2493,6 +2493,81 @@ def invoices_list(request):
     })
 
 
+def invoice_image(request, ivs_id: int, hash_idx: int = 0):
+    """L1 Phase 1.1b: serve the original paper-invoice image for an
+    InvoiceValidationStatus row.
+
+    Looks up the cache_hashes JSON on IVS, picks the hash at hash_idx
+    (default 0 — first photo for multi-page invoices), and serves the
+    cached image bytes. On cache miss, attempts to re-fetch from Drive
+    using the SHA→drive_file_id index in image_cache._index.json.
+
+    Falls back to 404 if no hash list, no cached image, no Drive metadata.
+    """
+    from django.http import FileResponse, HttpResponseNotFound
+    from django.shortcuts import get_object_or_404
+    from myapp.models import InvoiceValidationStatus
+    import sys
+    from django.conf import settings as _s
+    _ip = str(_s.BASE_DIR / 'invoice_processor')
+    if _ip not in sys.path:
+        sys.path.insert(0, _ip)
+    from image_cache import (cache_path_for_hash, get_drive_metadata,
+                              cache_image_bytes)
+
+    ivs = get_object_or_404(InvoiceValidationStatus, pk=ivs_id)
+    hashes = ivs.cache_hashes or []
+    if not hashes:
+        return HttpResponseNotFound("No cache hash on InvoiceValidationStatus.")
+    if hash_idx < 0 or hash_idx >= len(hashes):
+        return HttpResponseNotFound(f"hash_idx {hash_idx} out of range "
+                                     f"(invoice has {len(hashes)} hash(es)).")
+
+    sha = hashes[hash_idx]
+    img_path = cache_path_for_hash(sha)
+
+    if img_path is None:
+        # On-demand Drive fetch via the index
+        meta = get_drive_metadata(sha)
+        if meta and meta.get('drive_file_id'):
+            try:
+                from drive import get_drive_client
+                from googleapiclient.http import MediaIoBaseDownload
+                import io
+                drive = get_drive_client()
+                request_obj = drive.files().get_media(fileId=meta['drive_file_id'])
+                buf = io.BytesIO()
+                downloader = MediaIoBaseDownload(buf, request_obj)
+                done = False
+                while not done:
+                    _, done = downloader.next_chunk()
+                ext = meta.get('ext') or '.jpg'
+                # The hash on IVS is a 16-char prefix; need full SHA.
+                # Compute fresh from bytes — should match.
+                from image_cache import compute_sha256
+                full_sha = compute_sha256(buf.getvalue())
+                img_path = cache_image_bytes(full_sha, buf.getvalue(), ext=ext)
+            except Exception as e:
+                return HttpResponseNotFound(f"On-demand fetch failed: {e}")
+
+    if img_path is None or not img_path.exists():
+        return HttpResponseNotFound(
+            "Image not in local cache and no Drive metadata for re-fetch. "
+            "Run: python manage.py backfill_image_cache --apply"
+        )
+
+    # Determine content-type from extension
+    ext = img_path.suffix.lower()
+    content_type = {
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.pdf': 'application/pdf',
+    }.get(ext, 'application/octet-stream')
+
+    return FileResponse(open(img_path, 'rb'), content_type=content_type)
+
+
 def invoice_detail(request, ivs_id: int):
     """Phase 1.1a: per-invoice drill-down (no image yet, no edits yet).
 

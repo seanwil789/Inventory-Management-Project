@@ -1414,6 +1414,214 @@ class InvoiceDetailViewTests(AuthedTestCase):
         self.assertIn(reverse('invoice_detail', args=[self.ivs.id]), body)
 
 
+class ImageCacheModuleTests(TestCase):
+    """L1 Phase 1.1b — invoice_processor/image_cache.py module unit tests."""
+
+    def setUp(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import image_cache
+        # Redirect cache to a temp dir for isolation
+        import tempfile
+        from pathlib import Path
+        self._tmp = tempfile.mkdtemp(prefix='ictest_')
+        self._orig_cache_dir = image_cache._CACHE_DIR
+        self._orig_index_path = image_cache._INDEX_PATH
+        image_cache._CACHE_DIR = Path(self._tmp)
+        image_cache._INDEX_PATH = image_cache._CACHE_DIR / '_index.json'
+        self.image_cache = image_cache
+
+    def tearDown(self):
+        # Restore module-level paths
+        self.image_cache._CACHE_DIR = self._orig_cache_dir
+        self.image_cache._INDEX_PATH = self._orig_index_path
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_compute_sha256_matches_known(self):
+        """SHA256 derivation matches the OCR-cache convention."""
+        import hashlib
+        b = b'hello world'
+        self.assertEqual(self.image_cache.compute_sha256(b),
+                         hashlib.sha256(b).hexdigest())
+
+    def test_cache_image_bytes_writes_file(self):
+        sha = 'a' * 64
+        path = self.image_cache.cache_image_bytes(sha, b'fake image bytes', ext='.jpg')
+        self.assertTrue(path.exists())
+        self.assertEqual(path.read_bytes(), b'fake image bytes')
+
+    def test_cache_path_for_hash_full_match(self):
+        sha = 'b' * 64
+        self.image_cache.cache_image_bytes(sha, b'data', ext='.png')
+        path = self.image_cache.cache_path_for_hash(sha)
+        self.assertIsNotNone(path)
+        self.assertEqual(path.suffix, '.png')
+
+    def test_cache_path_for_hash_prefix_match(self):
+        """The 16-char prefix used in InvoiceValidationStatus.cache_hashes
+        must resolve to the cached file."""
+        sha = 'c' * 64
+        self.image_cache.cache_image_bytes(sha, b'data', ext='.jpg')
+        prefix = sha[:16]
+        path = self.image_cache.cache_path_for_hash(prefix)
+        self.assertIsNotNone(path)
+
+    def test_cache_path_for_hash_miss_returns_none(self):
+        path = self.image_cache.cache_path_for_hash('does_not_exist_hash')
+        self.assertIsNone(path)
+
+    def test_is_cached(self):
+        sha = 'd' * 64
+        self.assertFalse(self.image_cache.is_cached(sha))
+        self.image_cache.cache_image_bytes(sha, b'data', ext='.jpg')
+        self.assertTrue(self.image_cache.is_cached(sha))
+        self.assertTrue(self.image_cache.is_cached(sha[:16]))  # prefix works
+
+    def test_index_roundtrip(self):
+        sha = 'e' * 64
+        meta = {
+            'drive_file_id': 'abc123',
+            'drive_name': 'IMG_001.jpg',
+            'drive_path': '2026/04 April 2026/Sysco/Week 3 04.13-04.19/',
+            'ext': '.jpg',
+        }
+        self.image_cache.cache_image_bytes(sha, b'data', ext='.jpg', drive_metadata=meta)
+        result = self.image_cache.get_drive_metadata(sha)
+        self.assertEqual(result['drive_file_id'], 'abc123')
+        self.assertEqual(result['drive_name'], 'IMG_001.jpg')
+
+    def test_index_prefix_lookup(self):
+        sha = 'f' * 64
+        self.image_cache.cache_image_bytes(sha, b'data', drive_metadata={
+            'drive_file_id': 'xyz789',
+        })
+        # Prefix lookup
+        result = self.image_cache.get_drive_metadata(sha[:16])
+        self.assertIsNotNone(result)
+        self.assertEqual(result['drive_file_id'], 'xyz789')
+
+    def test_short_hash_rejected(self):
+        """Hash strings under 8 chars are rejected — too ambiguous."""
+        self.assertIsNone(self.image_cache.cache_path_for_hash(''))
+        self.assertIsNone(self.image_cache.cache_path_for_hash('abc'))
+
+    def test_cache_stats(self):
+        s = self.image_cache.cache_stats()
+        self.assertEqual(s['files'], 0)
+        # Write 2 MB so size_mb registers (rounds to 2 decimals)
+        self.image_cache.cache_image_bytes('1' * 64, b'x' * (1024 * 1024), ext='.jpg')
+        self.image_cache.cache_image_bytes('2' * 64, b'y' * (1024 * 1024), ext='.jpg',
+                                            drive_metadata={'drive_file_id': 'x'})
+        s = self.image_cache.cache_stats()
+        # _index.json was written by drive_metadata but shouldn't count as a file
+        self.assertEqual(s['files'], 2)
+        self.assertGreater(s['size_mb'], 1.5)
+        self.assertEqual(s['index_entries'], 1)
+
+
+class InvoiceImageViewTests(AuthedTestCase):
+    """L1 Phase 1.1b — `/invoices/<id>/image/` view tests."""
+
+    def setUp(self):
+        super().setUp()
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import image_cache
+        # Redirect cache to a temp dir for isolation
+        import tempfile
+        from pathlib import Path
+        self._tmp = tempfile.mkdtemp(prefix='ivtest_')
+        self._orig = image_cache._CACHE_DIR
+        self._orig_idx = image_cache._INDEX_PATH
+        image_cache._CACHE_DIR = Path(self._tmp)
+        image_cache._INDEX_PATH = image_cache._CACHE_DIR / '_index.json'
+        self.image_cache = image_cache
+
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        self.v = Vendor.objects.create(name='IVImageVendor')
+        # Pre-populate cache with a fake JPG
+        self.fake_sha = 'a' * 64
+        self.fake_bytes = b'\xff\xd8\xff\xe0' + b'fake jpg data'  # JPEG magic header
+        self.image_cache.cache_image_bytes(self.fake_sha, self.fake_bytes, ext='.jpg')
+
+        self.ivs = InvoiceValidationStatus.objects.create(
+            vendor=self.v, invoice_number='IVI-001',
+            invoice_date=date(2026, 4, 15),
+            items_count=1, items_sum=Decimal('50.00'),
+            invoice_total=Decimal('50.00'),
+            cache_hashes=[self.fake_sha[:16]],  # 16-char prefix as IVS stores
+            status='pass',
+        )
+        self.ivs_no_hashes = InvoiceValidationStatus.objects.create(
+            vendor=self.v, invoice_number='IVI-002',
+            invoice_date=date(2026, 4, 16),
+            cache_hashes=[],
+            status='partial',
+        )
+        self.ivs_uncached = InvoiceValidationStatus.objects.create(
+            vendor=self.v, invoice_number='IVI-003',
+            invoice_date=date(2026, 4, 17),
+            cache_hashes=['deadbeef' + 'b' * 8],  # 16-char hash that's not cached
+            status='partial',
+        )
+
+    def tearDown(self):
+        self.image_cache._CACHE_DIR = self._orig
+        self.image_cache._INDEX_PATH = self._orig_idx
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_serves_cached_image_200(self):
+        resp = self.client.get(reverse('invoice_image', args=[self.ivs.id]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp['Content-Type'], 'image/jpeg')
+        self.assertEqual(b''.join(resp.streaming_content), self.fake_bytes)
+
+    def test_404_when_no_cache_hashes(self):
+        resp = self.client.get(reverse('invoice_image', args=[self.ivs_no_hashes.id]))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_404_when_image_not_in_cache(self):
+        resp = self.client.get(reverse('invoice_image', args=[self.ivs_uncached.id]))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_404_for_invalid_ivs(self):
+        resp = self.client.get(reverse('invoice_image', args=[999999]))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_indexed_url_with_hash_idx_0(self):
+        resp = self.client.get(reverse('invoice_image_indexed', args=[self.ivs.id, 0]))
+        self.assertEqual(resp.status_code, 200)
+
+    def test_indexed_url_out_of_range(self):
+        resp = self.client.get(reverse('invoice_image_indexed', args=[self.ivs.id, 5]))
+        self.assertEqual(resp.status_code, 404)
+
+    def test_pdf_content_type(self):
+        """Cached .pdf returns application/pdf content-type."""
+        pdf_sha = '5' * 64
+        self.image_cache.cache_image_bytes(pdf_sha, b'%PDF-1.4 fake', ext='.pdf')
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        ivs_pdf = InvoiceValidationStatus.objects.create(
+            vendor=self.v, invoice_number='IVI-PDF',
+            invoice_date=date(2026, 4, 18),
+            cache_hashes=[pdf_sha[:16]],
+            status='pass',
+        )
+        resp = self.client.get(reverse('invoice_image', args=[ivs_pdf.id]))
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp['Content-Type'], 'application/pdf')
+
+
 class MathAnomalyManagementCommandTests(TestCase):
     """B6 mgmt cmds: backfill_math_flagged retroactively flags + clears;
     audit_math_anomalies surfaces flagged rows."""

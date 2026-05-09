@@ -356,6 +356,29 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
         print("1. Downloading from Drive...")
         tmp_path = download_file(file_id, file_name)
 
+        # 1b. Cache source image bytes locally for the rectification UI
+        # (B6 / L1.1b). Non-blocking — pipeline continues on cache failure.
+        try:
+            from image_cache import (cache_image_bytes, compute_sha256,
+                                      is_cached as _img_is_cached)
+            from datetime import datetime as _dt
+            with open(tmp_path, 'rb') as _fh:
+                _img_bytes = _fh.read()
+            _img_sha = compute_sha256(_img_bytes)
+            if not _img_is_cached(_img_sha):
+                _img_ext = os.path.splitext(file_name)[1].lower() or '.jpg'
+                cache_image_bytes(_img_sha, _img_bytes, ext=_img_ext,
+                    drive_metadata={
+                        'drive_file_id': file_id,
+                        'drive_name': file_name,
+                        'ext': _img_ext,
+                        'size_bytes': len(_img_bytes),
+                        'cached_at': _dt.now().isoformat(),
+                    })
+                print(f"   [image_cache] cached {_img_sha[:16]}... ({len(_img_bytes)/1024:.0f} KB)")
+        except Exception as _ic_err:
+            print(f"   [image_cache] warning: {_ic_err}")
+
         # 2. Parse invoice
         #    Strategy by vendor:
         #    - Sysco: DocAI OCR → Sysco parser (DocAI text + our parser = no merges)

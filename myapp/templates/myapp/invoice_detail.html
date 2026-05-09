@@ -68,17 +68,64 @@
        for now the parsed-lines layout takes the full width. -->
   <div class="grid grid-cols-1 lg:grid-cols-2 gap-5">
 
-    <!-- LEFT: paper image placeholder (1.1b) -->
-    <div class="rounded-lg bg-slate-100 border border-dashed border-slate-300 p-8 flex items-center justify-center text-center min-h-[400px]">
-      <div>
-        <div class="text-slate-400 text-sm font-medium">Paper invoice image</div>
-        <div class="text-xs text-slate-400 mt-2 max-w-sm">
-          Image fetch from Drive archive lands in Phase 1.1b.<br>
-          Cache hashes:
+    <!-- LEFT: paper invoice image (B6 / L1.1b) -->
+    <div class="rounded-lg bg-white border border-slate-200 overflow-hidden flex flex-col">
+      <div class="px-4 py-2 border-b border-slate-200 bg-slate-50 flex items-center justify-between">
+        <h2 class="text-sm font-semibold text-slate-900">
+          Source paper
+          {% if ivs.cache_hashes|length > 1 %}
+            <span class="text-xs text-slate-500 font-normal ml-2">
+              {{ ivs.cache_hashes|length }} pages
+            </span>
+          {% endif %}
+        </h2>
+        {% if ivs.cache_hashes|length > 1 %}
+        <div class="flex gap-1">
           {% for h in ivs.cache_hashes %}
-            <code class="text-xs">{{ h }}</code>{% if not forloop.last %}, {% endif %}
-          {% empty %}—{% endfor %}
+            <a href="{% url 'invoice_image_indexed' ivs.id forloop.counter0 %}"
+               target="_blank"
+               class="text-xs px-2 py-0.5 rounded bg-slate-200 hover:bg-slate-300 text-slate-700">
+              {{ forloop.counter }}
+            </a>
+          {% endfor %}
         </div>
+        {% endif %}
+      </div>
+      <div class="flex-1 min-h-[400px] bg-slate-100 flex items-center justify-center">
+        {% if ivs.cache_hashes %}
+          {% with first_hash=ivs.cache_hashes.0 %}
+          <object
+            data="{% url 'invoice_image' ivs.id %}"
+            type="application/pdf"
+            class="w-full h-full min-h-[600px]">
+            <!-- Fallback for non-PDF (browsers render images via <object> too,
+                 falling through to <img> only when object can't render).
+                 The image endpoint returns the right content-type so this
+                 works for both .jpg and .pdf source files. -->
+            <img src="{% url 'invoice_image' ivs.id %}"
+                 alt="Invoice {{ ivs.invoice_number }}"
+                 class="max-w-full max-h-full object-contain"
+                 onerror="this.style.display='none'; this.nextElementSibling.style.display='block';">
+            <div style="display:none;" class="text-center p-8 text-slate-500 text-sm">
+              <p>Image not available.</p>
+              <p class="mt-2 text-xs">
+                Cache hash: <code class="font-mono">{{ first_hash }}</code><br>
+                If this invoice has source paper available, run:<br>
+                <code class="bg-slate-200 px-1 rounded">python manage.py backfill_image_cache --apply</code>
+              </p>
+            </div>
+          </object>
+          {% endwith %}
+        {% else %}
+          <div class="text-center p-8 text-slate-500 text-sm">
+            No cache hashes recorded for this invoice.
+          </div>
+        {% endif %}
+      </div>
+      <div class="px-4 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-500">
+        {% if ivs.cache_hashes %}
+          Hashes: {% for h in ivs.cache_hashes %}<code class="font-mono">{{ h }}</code>{% if not forloop.last %}, {% endif %}{% endfor %}
+        {% endif %}
       </div>
     </div>
 
