@@ -1561,17 +1561,27 @@ def _parse_sysco(text: str) -> list[dict]:
                 lines[i + 1].strip().upper() == 'TOTAL':
             label_positions.append((i, i + 1))
     if label_positions:
-        _, search_after = label_positions[-1]
-        nums = []
-        for j in range(search_after + 1, min(search_after + 9, len(lines))):
-            m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
-            if m:
-                val = float(m.group(1).replace(",", ""))
-                if val > 1.0:
-                    nums.append(val)
-        if nums:
-            invoice_total = max(nums)
-            print(f"  [✓] Sysco invoice total from INVOICE TOTAL label: ${invoice_total:.2f}")
+        # Iterate LAST-first, then earlier — preserves the original
+        # design of preferring the last label, but falls back to an
+        # earlier label when LAST has an empty lookahead window. Sysco
+        # multi-page OCR can end with a phantom 'INVOICE\nTOTAL\n<EOF>'
+        # on the items-page tail; we must skip it and use the totals-
+        # page label that has actual values after it. (Sean 2026-05-10
+        # bug, Sysco 775687424: phantom-label fallthrough caused
+        # Method 2 to pick a $53.90 surcharge fragment as invoice total
+        # instead of the real $1103.60.)
+        for _, search_after in reversed(label_positions):
+            nums = []
+            for j in range(search_after + 1, min(search_after + 9, len(lines))):
+                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if m:
+                    val = float(m.group(1).replace(",", ""))
+                    if val > 1.0:
+                        nums.append(val)
+            if nums:
+                invoice_total = max(nums)
+                print(f"  [✓] Sysco invoice total from INVOICE TOTAL label: ${invoice_total:.2f}")
+                break
 
     # Method 2: "LAST PAGE" fallback. Numbers may appear before or after
     # the marker; search both directions, take the largest.

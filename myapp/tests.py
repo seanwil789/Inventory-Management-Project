@@ -1104,6 +1104,120 @@ class LineMathValidationTests(TestCase):
         self.assertNotIn('math_flagged', item)
 
 
+class ParserSyscoInvoiceTotalTests(TestCase):
+    """Regression coverage for parse_invoice's Sysco invoice_total extraction.
+
+    Bug B (Sean 2026-05-10): Sysco 775687424 (2026-02-23) bound
+    invoice_total=$53.90 (a fuel-surcharge fragment) instead of the
+    real $1103.60. Two root causes:
+
+      * Method 1 picks the LAST 'INVOICE TOTAL' label position, but
+        Sysco multi-page OCR text ends with a phantom 'INVOICE\\nTOTAL\\n
+        <EOF>' from the items-page tail. The phantom has no value in
+        its lookahead window, so nums was empty and Method 1 silently
+        bailed.
+      * Method 2 (LAST PAGE fallback) then took ±10 lines around the
+        LAST PAGE marker and picked the largest bare-decimal there,
+        which was $53.90 from the surcharge cluster — the real total
+        $1103.60 was 39 lines below the marker, outside the window.
+
+    Fix: Method 1 iterates label_positions in REVERSE and uses the
+    first label whose lookahead window contains a value. Phantom labels
+    are skipped, real label-with-value wins.
+    """
+
+    @staticmethod
+    def _parse(text):
+        import sys, os
+        ip_path = os.path.abspath(
+            os.path.join(os.path.dirname(__file__), '..', 'invoice_processor'))
+        if ip_path not in sys.path:
+            sys.path.insert(0, ip_path)
+        import io
+        from contextlib import redirect_stdout
+        from parser import parse_invoice
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            return parse_invoice(text, vendor='Sysco')
+
+    def test_phantom_invoice_total_label_at_tail_falls_back(self):
+        """Sysco 775687424 layout: totals page (with real INVOICE TOTAL +
+        $1103.60) followed by items page tail with phantom INVOICE/TOTAL/
+        EOF. Method 1 must skip the phantom and use the earlier real
+        label, NOT fall through to Method 2's narrow LAST PAGE window."""
+        text = '\n'.join([
+            # Totals page: surcharge cluster near LAST PAGE marker.
+            'GROUP TOTAL****',
+            '38.95',
+            '53.90',     # surcharge fragment that previously won Method 2
+            '26.14',
+            '6.50',
+            'CHGS FOR FUEL SURCHARGE',
+            'AND 60-714.4 ARE INCORPORATED HEREIN BY REFERENCE',
+            'LAST PAGE',
+            'CASES',
+            'SPLIT TOT. PCS',
+            '14',
+            '2',
+            '16',
+            # Sub/tax/invoice total stack — the real values
+            'TOTAL',
+            '23.84',     # tax total
+            'INVOICE',
+            'TOTAL',
+            '1103.60',   # the actual invoice total
+            '2/23/26',
+            'IMPORTANT PACA PROVISION',
+            # Items page (typical mid-page layout)
+            '110 LB SOMETHING',
+            '1234567 34.99',
+            '34.99',
+            # Items-page tail: phantom INVOICE/TOTAL with no value
+            'PAYABLE ON OR BEFORE',
+            'INVOICE',
+            'TOTAL',
+        ])
+        result = self._parse(text)
+        self.assertEqual(
+            result.get('invoice_total'), 1103.60,
+            'Phantom items-page-tail INVOICE TOTAL should be skipped; '
+            'real $1103.60 should be picked from the totals-page label. '
+            f'Got: {result.get("invoice_total")} '
+            '(if $53.90, Method 2 narrow-window fallback won — Bug B regression)',
+        )
+
+    def test_single_page_invoice_total_label_still_works(self):
+        """Single label, value in window: Method 1 picks it directly."""
+        text = '\n'.join([
+            'GROUP TOTAL****',
+            '500.00',
+            'LAST PAGE',
+            'TOTAL',
+            '23.84',
+            'INVOICE',
+            'TOTAL',
+            '525.00',
+        ])
+        result = self._parse(text)
+        self.assertEqual(result.get('invoice_total'), 525.00)
+
+    def test_stacked_tax_then_invoice_pair_picks_max(self):
+        """Original Method 1 design case: stacked TAX TOTAL + INVOICE TOTAL
+        labels followed by stacked values. The pair containing the largest
+        value is the invoice total. Last label = INVOICE TOTAL; values
+        immediately after are TAX then INVOICE in stacked-decimal layout."""
+        text = '\n'.join([
+            'TAX TOTAL',
+            'INVOICE',
+            'TOTAL',
+            '23.84',
+            '1103.60',
+            'LAST PAGE',
+        ])
+        result = self._parse(text)
+        self.assertEqual(result.get('invoice_total'), 1103.60)
+
+
 class MathFlaggedDbWriteTests(TestCase):
     """B6 integration: parsed-item math_flagged threads through to ILI row."""
 
