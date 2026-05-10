@@ -193,11 +193,17 @@ class Command(BaseCommand):
                 total_unmapped += unmapped_count
 
                 if not opts['dry_run']:
+                    # Phase 4c (Sean 2026-05-10): thread invoice_number for
+                    # the new primary dedup key. Use the group's extracted
+                    # inv_num when present; empty string when group is keyed
+                    # by source_file (vendors w/o reliable extraction).
+                    inv_num_for_db = key[2] if key[0] == 'num' else ''
                     written = write_invoice_to_db(
                         vendor_name=vendor,
                         invoice_date=invoice_date,
                         items=mapped,
                         source_file=source_token,
+                        invoice_number=inv_num_for_db,
                     )
                     total_written += written
 
