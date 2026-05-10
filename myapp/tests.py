@@ -1159,6 +1159,84 @@ class MathFlaggedDbWriteTests(TestCase):
         self.assertFalse(ili.math_flagged)
 
 
+class ValidateAllInvoicesClassifierTests(TestCase):
+    """Regression coverage for `validate_all_invoices._classify`.
+
+    Bug A (Sean 2026-05-10): Sysco 775687424 was stamped status='pass' with
+    a 1668% gap because the pre-`8f6e765` classifier only checked section
+    reconciliation — once every section reconciled to its printed GROUP
+    TOTAL, status was PASS regardless of how far items_sum was from the
+    printed INVOICE TOTAL. The gap-guard added in `8f6e765` requires
+    gap_pct < FAIL threshold even when sections reconcile. These tests
+    lock that behavior in so the bug can't regress.
+    """
+
+    @staticmethod
+    def _classify(*args, **kwargs):
+        from myapp.management.commands.validate_all_invoices import _classify
+        return _classify(*args, **kwargs)
+
+    def test_partial_when_invoice_total_missing(self):
+        self.assertEqual(self._classify(100.0, None, []), 'partial')
+
+    def test_partial_when_invoice_total_zero(self):
+        self.assertEqual(self._classify(100.0, 0, []), 'partial')
+
+    def test_pass_invoice_total_math_no_sections(self):
+        """Path (b): no sections; items reconcile within 5% → PASS."""
+        self.assertEqual(self._classify(100.0, 100.0, []), 'pass')
+        self.assertEqual(self._classify(104.0, 100.0, []), 'pass')
+
+    def test_pass_section_recon_with_small_gap(self):
+        """Path (c): every section reconciles AND gap < 10% → PASS."""
+        recon = [{'diff_abs': 0.0}, {'diff_abs': 0.0}]
+        self.assertEqual(self._classify(108.0, 100.0, recon), 'pass')
+
+    def test_pass_with_extracted_charges(self):
+        """Path (a): items + extracted fees reconcile to total within $0.50."""
+        # items=$76.00 + non_item_charges=$15.37 = $91.37 = invoice_total
+        self.assertEqual(
+            self._classify(76.00, 91.37, [], non_item_charges=15.37),
+            'pass',
+        )
+
+    def test_review_moderate_gap_no_sections(self):
+        """5% < gap < 10% with no section data → REVIEW."""
+        self.assertEqual(self._classify(107.0, 100.0, []), 'review')
+
+    def test_review_when_section_has_gap(self):
+        """A section beyond $0.50 tolerance + invoice gap < 10% → REVIEW."""
+        recon = [{'diff_abs': 0.0}, {'diff_abs': 5.00}]
+        self.assertEqual(self._classify(108.0, 100.0, recon), 'review')
+
+    def test_fail_when_invoice_gap_at_or_above_10pct(self):
+        """gap_pct >= 10% with no sections → FAIL."""
+        self.assertEqual(self._classify(110.0, 100.0, []), 'fail')
+        self.assertEqual(self._classify(150.0, 100.0, []), 'fail')
+
+    def test_fail_high_gap_even_when_sections_reconcile(self):
+        """B-A regression (Sysco 775687424): every section reconciles to
+        its printed GROUP TOTAL, but items_sum is wildly off invoice_total
+        (1668% gap). Pre-fix classifier returned 'pass' here, hiding the
+        extraction failure across the corpus. Post-fix MUST return 'fail'.
+        """
+        recon = [{'diff_abs': 0.0} for _ in range(6)]
+        self.assertEqual(
+            self._classify(953.22, 53.90, recon),
+            'fail',
+            "Sysco 775687424 (1668% gap, 6 sections reconciled) must FAIL "
+            "— the gap-guard in 8f6e765 ensures this can't regress to PASS",
+        )
+
+    def test_fail_delaware_surcharge_pattern(self):
+        """Delaware Linen 16.82% gap pattern (3 invoices show identical
+        $15.37 surcharge gap). Without non_item_charges to absorb it,
+        this MUST classify as FAIL — surcharge handling bug is a
+        downstream concern but the validator must not hide it."""
+        # 76.00 items vs 91.37 total, no charges captured, no sections
+        self.assertEqual(self._classify(76.00, 91.37, []), 'fail')
+
+
 class InvoicesListViewTests(AuthedTestCase):
     """L1 Invoice Reconciliation hub `/invoices/` — index/queue surface."""
 
@@ -1932,6 +2010,169 @@ class MathAnomalyManagementCommandTests(TestCase):
         self.assertIn('SyscoTest', output)
         # FarmArtTest's stale flag row should be excluded
         self.assertNotIn('FarmArtTest', output)
+
+
+class PriceOutlierAuditTests(TestCase):
+    """Bug #1 fix: audit_price_outliers detects parser-fragmentation phantom
+    prices by comparing per-(Product, case_size) median against individual rows.
+
+    Origin: 2026-05-09 audit found Bacon $4.39 (real $70-72), Butter $1.40
+    (real $97), etc. — same canonical, same case_size, but unit_price was a
+    fragment captured by the parser instead of the per-case price.
+    """
+
+    def setUp(self):
+        from datetime import date
+        self.v = Vendor.objects.create(name='OutlierTestVendor')
+        self.bacon = Product.objects.create(canonical_name='OutlierBacon')
+        self.butter = Product.objects.create(canonical_name='OutlierButter')
+        self.tiny = Product.objects.create(canonical_name='OutlierTinyHistory')
+
+        # Bacon: 5 clean rows around $70/case, plus 2 phantom $4.39 rows
+        # Median of all 7 = $70 (phantoms below 0.20 × 70 = $14 → flagged LOW)
+        for price in [70.35, 70.35, 70.35, 71.85, 70.35]:
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.bacon,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='15.0LB', invoice_date=date(2026,3,1),
+                raw_description='Bacon Applewood',
+            )
+        for price in [4.39, 4.69]:
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.bacon,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='15.0LB', invoice_date=date(2026,3,15),
+                raw_description='Bacon Applewood (phantom)',
+            )
+
+        # Butter: 4 clean ~$97 + 1 phantom $1.40
+        for price in [97.39, 98.39, 97.39, 96.50]:
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.butter,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='3/61LB', invoice_date=date(2026,4,1),
+                raw_description='Butter Prints 36/1#',
+            )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.butter,
+            quantity=Decimal('1'), unit_price=Decimal('1.40'),
+            extended_amount=Decimal('1.40'),
+            case_size='3/61LB', invoice_date=date(2026,4,15),
+            raw_description='Butter Prints (phantom)',
+        )
+
+        # Tiny history (2 rows) — should be ignored at default min-group-size=4
+        for price in [10.0, 1000.0]:  # would be detected if min group dropped
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.tiny,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='1EA', invoice_date=date(2026,3,1),
+                raw_description='Tiny history',
+            )
+
+    def test_dry_run_does_not_persist(self):
+        """Default mode is dry-run; math_flagged unchanged."""
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_price_outliers', stdout=out)
+        # No phantom row should be flagged after dry-run
+        flagged = InvoiceLineItem.objects.filter(
+            raw_description__icontains='phantom', math_flagged=True).count()
+        self.assertEqual(flagged, 0,
+                         'No phantom rows should be flagged in dry-run')
+
+    def test_apply_flags_low_outliers(self):
+        """--apply marks the phantom $4.39 / $4.69 / $1.40 rows as math_flagged."""
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_price_outliers', '--apply', stdout=out)
+        # All 3 phantom rows (2 Bacon + 1 Butter) should now be flagged
+        flagged = InvoiceLineItem.objects.filter(
+            raw_description__icontains='phantom', math_flagged=True).count()
+        self.assertEqual(flagged, 3,
+                         f'Expected all 3 phantom rows flagged, got {flagged}')
+        # Clean rows should NOT be flagged
+        clean_flagged = InvoiceLineItem.objects.filter(
+            raw_description='Bacon Applewood', math_flagged=True).count()
+        self.assertEqual(clean_flagged, 0,
+                         'Clean rows should not be flagged')
+
+    def test_min_group_size_filters_small_groups(self):
+        """Default min-group-size=4 means tiny-history group (n=2) is skipped."""
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_price_outliers', '--apply', stdout=out)
+        # Tiny-history rows should NOT be flagged despite extreme variance
+        for ili in InvoiceLineItem.objects.filter(product=self.tiny):
+            self.assertFalse(ili.math_flagged,
+                             'Tiny-history row should not be flagged')
+
+    def test_min_group_size_override_catches_small_groups(self):
+        """Lowering min-group-size to 2 picks up the tiny-history outlier pair."""
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_price_outliers', '--apply',
+                     '--min-group-size', '2', stdout=out)
+        # Now $1000 is high-outlier vs $10/median  (or median(10,1000)=505;
+        # 1000/505=1.98x = under 5x threshold so not flagged HIGH; 10/505=0.02
+        # = below 0.20 threshold = flagged LOW). One of the two flagged.
+        flagged = InvoiceLineItem.objects.filter(
+            product=self.tiny, math_flagged=True).count()
+        self.assertGreaterEqual(flagged, 1)
+
+    def test_vendor_filter_narrows_scope(self):
+        """--vendor filter restricts to the named vendor."""
+        from django.core.management import call_command
+        from io import StringIO
+        # Create a second vendor with its own outlier-pattern rows
+        v2 = Vendor.objects.create(name='OtherVendor')
+        from datetime import date
+        for price in [50.0, 50.0, 50.0, 50.0]:
+            InvoiceLineItem.objects.create(
+                vendor=v2, product=self.bacon,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='OTHER', invoice_date=date(2026,3,1),
+                raw_description='Other vendor clean',
+            )
+        InvoiceLineItem.objects.create(
+            vendor=v2, product=self.bacon,
+            quantity=Decimal('1'), unit_price=Decimal('2.00'),
+            extended_amount=Decimal('2.00'),
+            case_size='OTHER', invoice_date=date(2026,3,15),
+            raw_description='Other vendor phantom',
+        )
+        out = StringIO()
+        call_command('audit_price_outliers', '--apply',
+                     '--vendor', 'OutlierTestVendor', stdout=out)
+        # OtherVendor phantom should NOT be flagged (filter excluded it)
+        other = InvoiceLineItem.objects.get(raw_description='Other vendor phantom')
+        self.assertFalse(other.math_flagged)
+        # OutlierTestVendor phantoms SHOULD be flagged (3 phantom rows)
+        flagged_in_scope = InvoiceLineItem.objects.filter(
+            vendor=self.v, raw_description__icontains='phantom',
+            math_flagged=True).count()
+        self.assertEqual(flagged_in_scope, 3)
+
+    def test_clean_population_emits_clean_message(self):
+        """No outliers in scope → 'Clean — no price outliers' message."""
+        from django.core.management import call_command
+        from io import StringIO
+        # Wipe the outlier rows
+        InvoiceLineItem.objects.filter(
+            raw_description__icontains='phantom').delete()
+        InvoiceLineItem.objects.filter(product=self.tiny).delete()
+        out = StringIO()
+        call_command('audit_price_outliers', stdout=out)
+        self.assertIn('Clean', out.getvalue())
 
 
 class PriceAnomalyBaselineFilterTests(TestCase):
