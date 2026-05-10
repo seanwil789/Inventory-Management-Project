@@ -2455,6 +2455,96 @@ class PriceOutlierAuditTests(TestCase):
         self.assertIn('Clean', out.getvalue())
 
 
+class PriceOutlierVariantClusterSuppressionTests(TestCase):
+    """Phase B (Sean 2026-05-10): suppress 'low outlier' flag when the row
+    has 2+ peers within 1.5x of itself (likely legitimate variant cluster
+    under a broadly-lumped canonical, not a parser-fragmentation phantom).
+
+    Phantom-of-one stays flagged. The Cream Heavy $1.40 lonely case must
+    still fire; the Pringle Original $10 / Cheddar $11 / BBQ $12 cluster
+    must NOT fire (real variant prices, recipe-irrelevant per the
+    canonical-split-vs-lump rule).
+    """
+
+    def setUp(self):
+        from datetime import date
+        self.v = Vendor.objects.create(name='ClusterTestVendor')
+        self.lonely_phantom = Product.objects.create(canonical_name='LonelyPhantomCanonical')
+        self.variant_cluster = Product.objects.create(canonical_name='VariantClusterCanonical')
+
+        # Lonely phantom: 5 clean rows around $50, 1 phantom at $1.40 with
+        # NO nearby peers within 1.5x (peers would need to be ≤$2.10).
+        for price in [50.00, 51.00, 49.50, 50.25, 49.75]:
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.lonely_phantom,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='1EA', invoice_date=date(2026,3,1),
+                raw_description=f'Lonely clean ${price}',
+            )
+        InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.lonely_phantom,
+            quantity=Decimal('1'), unit_price=Decimal('1.40'),
+            extended_amount=Decimal('1.40'),
+            case_size='1EA', invoice_date=date(2026,3,15),
+            raw_description='Lonely phantom $1.40',
+        )
+
+        # Variant cluster: 4 rows around $50, plus 3 rows at $10/$11/$12
+        # (the variant cluster — different SKUs under one canonical).
+        # Each "outlier" has 2 peers within 1.5x → should be SUPPRESSED.
+        for price in [50.00, 51.00, 49.50, 50.25]:
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.variant_cluster,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='1EA', invoice_date=date(2026,3,1),
+                raw_description=f'High clean ${price}',
+            )
+        for price in [10.00, 11.00, 12.00]:
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.variant_cluster,
+                quantity=Decimal('1'), unit_price=Decimal(str(price)),
+                extended_amount=Decimal(str(price)),
+                case_size='1EA', invoice_date=date(2026,3,15),
+                raw_description=f'Variant ${price}',
+            )
+
+    def test_lonely_phantom_still_flagged(self):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_price_outliers', '--apply', stdout=out)
+        # The $1.40 phantom should be flagged
+        phantom = InvoiceLineItem.objects.get(
+            product=self.lonely_phantom, raw_description='Lonely phantom $1.40')
+        self.assertTrue(phantom.math_flagged,
+                        'Lonely phantom (no peers within 1.5x) MUST still flag')
+
+    def test_variant_cluster_suppressed(self):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_price_outliers', '--apply', stdout=out)
+        # The 3 cluster rows ($10/$11/$12) should NOT be flagged — they
+        # have 2+ peers within 1.5x of each other (10/11/12 are within
+        # 1.2x). Suppressed as legitimate variant cluster.
+        for raw in ('Variant $10.0', 'Variant $11.0', 'Variant $12.0'):
+            ili = InvoiceLineItem.objects.get(
+                product=self.variant_cluster, raw_description=raw)
+            self.assertFalse(ili.math_flagged,
+                             f'Variant cluster row {raw} should NOT flag '
+                             f'(has 2+ peers within 1.5x). Got flagged.')
+
+    def test_suppression_count_in_output(self):
+        from django.core.management import call_command
+        from io import StringIO
+        out = StringIO()
+        call_command('audit_price_outliers', stdout=out)
+        # Output should mention how many were suppressed
+        self.assertIn('suppressed', out.getvalue().lower())
+
+
 class PriceAnomalyBaselineFilterTests(TestCase):
     """B6 feedback-loop closure: `_check_price_anomaly` excludes math_flagged
     rows from the 90-day average baseline. Without this, math-anomaly rows
