@@ -204,16 +204,20 @@ def _check_price_anomaly(product, vendor, unit_price: Decimal) -> bool:
 
 
 def write_invoice_to_db(vendor_name: str, invoice_date: str,
-                        items: list[dict], source_file: str = '') -> int:
+                        items: list[dict], source_file: str = '',
+                        invoice_number: str = '') -> int:
     """
     Persist parsed and mapped invoice line items to the database.
 
     Args:
-        vendor_name:  canonical vendor name (e.g. "Sysco")
-        invoice_date: ISO date string "YYYY-MM-DD" or ""
-        items:        list of dicts from map_items() — each has
-                      canonical, raw_description, unit_price, case_size_raw
-        source_file:  original filename for provenance tracking
+        vendor_name:    canonical vendor name (e.g. "Sysco")
+        invoice_date:   ISO date string "YYYY-MM-DD" or ""
+        items:          list of dicts from map_items() — each has
+                        canonical, raw_description, unit_price, case_size_raw
+        source_file:    original filename for provenance tracking
+        invoice_number: vendor-extracted invoice number (Phase 4c primary
+                        dedup key). Empty when vendor lacks reliable
+                        extraction; falls back to source_file-based key.
 
     Returns:
         Number of rows written.
@@ -462,6 +466,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             price_per_pound=price_per_pound,
             case_size=incoming_cs,
             source_file=source_file,
+            invoice_number=invoice_number,
             product=product,
             raw_description=raw_desc,
             match_confidence=confidence,
@@ -499,27 +504,37 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             incoming_fk, _ = find_canonical_match(raw_desc, vpl_candidates)
 
         existing = None
+        duplicates_to_merge: list = []
         if parsed_date:
-            # Primary key: canonical FK + source_file (collapses parser-variant
-            # whitespace + annotation duplicates within the same invoice).
+            # PRIMARY KEY (Phase 4c, Sean 2026-05-10):
+            #   (vendor, canonical_FK, invoice_number, invoice_date)
+            # invoice_number is stable across re-photo + reprocess cycles —
+            # eliminates the duplicate-accumulation bug where source_file
+            # variants (raw filename / cache hash / hash+N) created separate
+            # rows for the same logical invoice line. Used when both the FK
+            # and invoice_number are known (Sysco + Farm Art reliably; PBM/
+            # Exceptional/Delaware partially; Colonial never).
+            if incoming_fk is not None and invoice_number:
+                existing = InvoiceLineItem.objects.filter(
+                    vendor=vendor,
+                    canonical_vendor_pricelist=incoming_fk,
+                    invoice_number=invoice_number,
+                    invoice_date=parsed_date,
+                ).first()
+            # PRIMARY KEY (legacy, Phase 4b — source_file based):
+            # Used when invoice_number can't be extracted (vendors lacking
+            # extraction logic) — preserves pre-4c behavior.
             #
             # Tolerant of multi-photo +N suffix variants. `reprocess_ocr_cache`
-            # uses 'HASH+N' format for merged multi-photo invoices (per
-            # reprocess_ocr_cache.py:174); `reprocess_invoices` uses bare 'HASH'.
-            # Both paths target the same logical invoice, so dedup must find
-            # rows across both formats (otherwise reprocess creates duplicates
-            # — observed 2026-05-07: hash 6bfe607e431e had 41 DB rows for
-            # 16 truth lines because old rows had +1 suffix and new rows
-            # bare hash).
-            if incoming_fk is not None and source_file:
-                # Try exact match first
+            # uses 'HASH+N' format for merged multi-photo invoices;
+            # `reprocess_invoices` uses bare 'HASH'.
+            if existing is None and incoming_fk is not None and source_file:
                 existing = InvoiceLineItem.objects.filter(
                     vendor=vendor,
                     canonical_vendor_pricelist=incoming_fk,
                     source_file=source_file,
                     invoice_date=parsed_date,
                 ).first()
-                # If exact misses, try suffix-tolerant lookup
                 if existing is None:
                     bare_hash = source_file.split('+', 1)[0]
                     existing = InvoiceLineItem.objects.filter(
@@ -534,15 +549,28 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 existing = InvoiceLineItem.objects.filter(
                     vendor=vendor, raw_description=raw_desc, invoice_date=parsed_date
                 ).first()
-            # Fallback 2: product match (when raw differs slightly between
-            # parses but the same canonical resolved).
+            # Fallback 2 (Phase 4c, Sean 2026-05-10): COLLAPSE-ON-MATCH.
+            # Match on (vendor, product, date, unit_price, quantity). When
+            # multiple existing rows match this key (signaling re-photo
+            # duplicates that the primary keys missed), MERGE them: keep
+            # the oldest (lowest id) as the survivor, mark the rest for
+            # deletion. Pre-4c logic used .first() and silently left the
+            # duplicates orphaned — observed 2026-05-10: Farm Art 1654186
+            # accumulated 13 duplicate rows across 3 ingest cycles for the
+            # same 20-item invoice.
+            #
+            # Including quantity in the key distinguishes legitimate multi-
+            # row cases (same product, same price, but qty=2 second case)
+            # from duplicates (same product, same price, qty=1 each ingest).
             if existing is None and product:
-                existing = InvoiceLineItem.objects.filter(
+                candidates = list(InvoiceLineItem.objects.filter(
                     vendor=vendor, product=product, invoice_date=parsed_date,
-                    # Same dollar amount → same line item, not a separate
-                    # invoice for the same product on the same day.
                     unit_price=common_fields.get('unit_price'),
-                ).first()
+                    quantity=common_fields.get('quantity'),
+                ).order_by('id'))
+                if candidates:
+                    existing = candidates[0]
+                    duplicates_to_merge = candidates[1:]
         target_ili = None
         if parsed_date:
             if existing:
@@ -564,6 +592,18 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                     setattr(existing, field, value)
                 existing.save()
                 target_ili = existing
+                # Phase 4c (Sean 2026-05-10): collapse-on-match.
+                # When Fallback 2 found additional rows matching the loose
+                # key, delete them now — they're re-photo-cycle duplicates
+                # that the previous .first()-pick-one logic left orphaned.
+                # Cascades through InvoiceLineEdit FK; preserves nothing
+                # (these duplicates have no audit history worth keeping).
+                if duplicates_to_merge:
+                    dup_ids = [d.id for d in duplicates_to_merge]
+                    InvoiceLineItem.objects.filter(id__in=dup_ids).delete()
+                    print(f"  [✓] Collapsed {len(dup_ids)} duplicate ILI row(s) "
+                          f"for {product.canonical_name if product else '?'} "
+                          f"(kept #{existing.id}, deleted {dup_ids})")
             else:
                 target_ili = InvoiceLineItem.objects.create(
                     vendor=vendor,

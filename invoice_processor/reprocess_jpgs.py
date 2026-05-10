@@ -139,6 +139,7 @@ def main():
                 db_rows = write_invoice_to_db(
                     parsed["vendor"], parsed["invoice_date"], mapped,
                     source_file=file_name,
+                    invoice_number=parsed.get("invoice_number") or '',
                 )
                 # Sync prices (skipped in dry-run)
                 sync_prices_from_items(

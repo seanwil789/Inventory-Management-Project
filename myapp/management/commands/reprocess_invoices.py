@@ -121,6 +121,7 @@ class Command(BaseCommand):
                         invoice_date=invoice_date,
                         items=mapped,
                         source_file=source_token,
+                        invoice_number=parsed.get("invoice_number") or '',
                     )
                     total_written += written
 

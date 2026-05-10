@@ -450,6 +450,14 @@ class InvoiceLineItem(models.Model):
                   "Recipe cost = ($/lb / avg(low,high)) × strips_called_for.",
     )
     invoice_date    = models.DateField(null=True, blank=True)
+    invoice_number  = models.CharField(
+        max_length=20, blank=True, db_index=True,
+        help_text="Vendor-extracted invoice number (e.g. Sysco '775687424', "
+                  "Farm Art '1654186'). Stable across re-photo/reprocess cycles. "
+                  "Phase 4c (Sean 2026-05-10): primary dedup key, replacing "
+                  "source_file-based dedup. Empty when extraction unreliable "
+                  "(Colonial; some PBM/Delaware) — falls back to legacy keys.",
+    )
     source_file     = models.CharField(max_length=255, blank=True)  # original filename
     match_confidence = models.CharField(max_length=30, blank=True, choices=CONFIDENCE_CHOICES)
     match_score     = models.IntegerField(null=True, blank=True)  # 0-100 fuzzy score

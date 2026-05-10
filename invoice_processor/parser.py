@@ -758,6 +758,40 @@ def _extract_sysco_invoice_number(text: str) -> str | None:
     return best_run
 
 
+def extract_invoice_number(text: str, vendor: str) -> str | None:
+    """Vendor-agnostic invoice-number extraction.
+
+    Phase 4c (Sean 2026-05-10): centralized helper so parse_invoice can
+    return invoice_number to feed db_write's invoice_number-based primary
+    dedup key. Same logic that previously lived in
+    `refresh_invoice_totals._extract_invoice_number`.
+
+    Returns the invoice number string when extractable, None when not.
+    Sysco returns invoice_number OR manifest fallback (LAST-PAGE-only photos
+    sometimes lack the INVOICE NUMBER header but always carry a manifest).
+    Other vendors use a per-vendor regex on 'Invoice [No.|Number|#] <digits>'.
+    Colonial has no implementation (always None) — dormant per memory.
+    """
+    if not text:
+        return None
+    if vendor == 'Sysco':
+        meta = extract_sysco_metadata(text)
+        return meta.get('invoice_number') or meta.get('manifest')
+    if vendor in ('Farm Art', 'FarmArt'):
+        m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{5,10})',
+                      text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    if vendor in ('Exceptional Foods', 'Exceptional',
+                  'Philadelphia Bakery Merchants', 'PBM',
+                  'Delaware County Linen'):
+        m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{4,10})',
+                      text, re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return None
+
+
 def extract_sysco_metadata(text: str) -> dict:
     """
     Extract invoice-level metadata from a Sysco invoice page.
@@ -3443,6 +3477,7 @@ def parse_invoice(text: str, vendor: str = None,
         "vendor": vendor,
         "invoice_date": date,
         "items": items,
+        "invoice_number": extract_invoice_number(text, vendor),
     }
     if invoice_total is not None:
         parsed["invoice_total"] = invoice_total

@@ -475,6 +475,7 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
         db_rows = write_invoice_to_db(
             parsed["vendor"], parsed["invoice_date"], mapped_items,
             source_file=file_name,
+            invoice_number=parsed.get("invoice_number") or '',
         )
         print(f"   [✓] {db_rows} rows written to database")
 

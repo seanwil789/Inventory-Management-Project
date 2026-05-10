@@ -1273,6 +1273,172 @@ class MathFlaggedDbWriteTests(TestCase):
         self.assertFalse(ili.math_flagged)
 
 
+class InvoiceNumberDedupTests(TestCase):
+    """Phase 4c (Sean 2026-05-10): primary dedup key = invoice_number.
+
+    Replaces source_file-based primary key with the invoice_number-based
+    one — survives re-photo/reprocess cycles. Falls back to source_file
+    when invoice_number is empty (vendors without reliable extraction).
+    Fallback 2 (product+price+qty) now COLLAPSES duplicates instead of
+    `.first()`-pick-one (the bug that let Farm Art 1654186 accumulate
+    13 duplicate rows over 3 ingest cycles).
+    """
+
+    @staticmethod
+    def _write(vendor_name, date_str, items, source_file='', invoice_number=''):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from db_write import write_invoice_to_db
+        return write_invoice_to_db(vendor_name, date_str, items,
+                                   source_file=source_file,
+                                   invoice_number=invoice_number)
+
+    def setUp(self):
+        self.v = Vendor.objects.create(name='InvNumDedupVendor')
+        self.p = Product.objects.create(canonical_name='InvNumDedupProduct')
+
+    def test_invoice_number_primary_key_collapses_re_photo(self):
+        """Re-photographing the same invoice (different source_file but same
+        invoice_number) must upsert onto the existing row, not duplicate."""
+        item = {
+            'canonical': 'InvNumDedupProduct', 'unit_price': 10.00,
+            'extended_amount': 10.00, 'quantity': 1,
+            'raw_description': 'FIRST PHOTO RAW',
+        }
+        self._write(self.v.name, '2026-05-08', [item],
+                    source_file='photo_v1.jpg', invoice_number='INV-1001')
+        # Second ingest: same invoice number, different source file + raw
+        item2 = {**item, 'raw_description': 'SECOND PHOTO RAW WITH PREFIX'}
+        self._write(self.v.name, '2026-05-08', [item2],
+                    source_file='photo_v2.jpg', invoice_number='INV-1001')
+        rows = InvoiceLineItem.objects.filter(vendor=self.v, product=self.p,
+                                               invoice_date=date(2026,5,8))
+        self.assertEqual(rows.count(), 1,
+                         'Re-photo with same invoice_number must upsert, not duplicate')
+        # Latest write's source_file + raw_description survive
+        self.assertEqual(rows.first().source_file, 'photo_v2.jpg')
+
+    def test_falls_back_to_source_file_when_invoice_number_empty(self):
+        """Vendors without invoice_number extraction (Colonial) fall back to
+        the legacy source_file-based primary key — pre-4c behavior preserved."""
+        item = {
+            'canonical': 'InvNumDedupProduct', 'unit_price': 10.00,
+            'extended_amount': 10.00, 'quantity': 1,
+            'raw_description': 'COLONIAL RAW',
+        }
+        # First ingest: no invoice_number; same file
+        self._write(self.v.name, '2026-05-08', [item],
+                    source_file='colonial_v1.jpg', invoice_number='')
+        self._write(self.v.name, '2026-05-08', [item],
+                    source_file='colonial_v1.jpg', invoice_number='')
+        rows = InvoiceLineItem.objects.filter(vendor=self.v, product=self.p,
+                                               invoice_date=date(2026,5,8))
+        self.assertEqual(rows.count(), 1,
+                         'Same source_file should upsert via legacy primary key')
+
+    def test_fallback2_collapses_orphan_duplicates(self):
+        """When N>1 existing rows match (vendor, product, date, unit_price,
+        quantity), a new write upserts one and DELETES the others. Fixes
+        the Farm Art 1654186 accumulation bug."""
+        # Pre-seed 3 stale duplicate rows (different source_files, same shape)
+        from datetime import date
+        for i, sf in enumerate(['stale_a', 'stale_b', 'stale_c']):
+            InvoiceLineItem.objects.create(
+                vendor=self.v, product=self.p,
+                invoice_date=date(2026,5,8),
+                unit_price=Decimal('10.00'), extended_amount=Decimal('10.00'),
+                quantity=Decimal('1'),
+                raw_description=f'STALE {sf}', source_file=sf,
+                match_confidence='manual_review',
+            )
+        baseline = InvoiceLineItem.objects.filter(
+            vendor=self.v, product=self.p, invoice_date=date(2026,5,8)).count()
+        self.assertEqual(baseline, 3)
+        # New write: same shape, no invoice_number, no matching source_file or raw
+        item = {
+            'canonical': 'InvNumDedupProduct', 'unit_price': 10.00,
+            'extended_amount': 10.00, 'quantity': 1,
+            'raw_description': 'NEW RAW (different from all 3 stales)',
+        }
+        self._write(self.v.name, '2026-05-08', [item], source_file='new_photo.jpg')
+        # Fallback 2 should have found 3 candidates, kept 1, deleted 2
+        rows = InvoiceLineItem.objects.filter(
+            vendor=self.v, product=self.p, invoice_date=date(2026,5,8))
+        self.assertEqual(rows.count(), 1,
+                         f'Collapse-on-match should leave 1 row; got {rows.count()}')
+
+    def test_fallback2_preserves_legitimate_multi_qty_rows(self):
+        """Different qty = legitimate multi-row, NOT a duplicate. Two
+        rows for the same product on the same invoice with same unit_price
+        but qty=1 vs qty=2 must remain as 2 separate rows."""
+        from datetime import date
+        InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.p, invoice_date=date(2026,5,8),
+            unit_price=Decimal('10.00'), extended_amount=Decimal('10.00'),
+            quantity=Decimal('1'),
+            raw_description='QTY 1 line', source_file='inv.jpg',
+        )
+        # New write: same product+price but qty=2
+        item = {
+            'canonical': 'InvNumDedupProduct', 'unit_price': 10.00,
+            'extended_amount': 20.00, 'quantity': 2,
+            'raw_description': 'QTY 2 line',
+        }
+        self._write(self.v.name, '2026-05-08', [item], source_file='inv.jpg')
+        rows = InvoiceLineItem.objects.filter(
+            vendor=self.v, product=self.p, invoice_date=date(2026,5,8))
+        self.assertEqual(rows.count(), 2,
+                         'qty=1 and qty=2 rows must NOT collapse — they are distinct line items')
+
+
+class ParserInvoiceNumberExtractionTests(TestCase):
+    """Phase 4c (Sean 2026-05-10): parse_invoice returns invoice_number for
+    every vendor with extraction support. db_write uses this as the primary
+    dedup key. Empty for Colonial (no extraction); Sysco/Farm Art/PBM/
+    Exceptional/Delaware all return non-empty for canonical formats.
+    """
+
+    @staticmethod
+    def _parse(text, vendor):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from parser import parse_invoice
+        import io
+        from contextlib import redirect_stdout
+        buf = io.StringIO()
+        with redirect_stdout(buf):
+            return parse_invoice(text, vendor=vendor)
+
+    def test_sysco_returns_invoice_number(self):
+        text = '\n'.join(['Sysco', 'INVOICE NUMBER', '775687424', 'IN 8 1 5 5'])
+        result = self._parse(text, 'Sysco')
+        self.assertEqual(result.get('invoice_number'), '775687424')
+
+    def test_farm_art_returns_invoice_number(self):
+        text = 'FarmArt\nDistributors\nInvoice 1654186\nDate: 2026-04-18'
+        result = self._parse(text, 'Farm Art')
+        self.assertEqual(result.get('invoice_number'), '1654186')
+
+    def test_pbm_returns_invoice_number(self):
+        text = 'Philadelphia Bakery Merchants\nInvoice No. 7053\nDate: 2026-05-05'
+        result = self._parse(text, 'Philadelphia Bakery Merchants')
+        self.assertEqual(result.get('invoice_number'), '7053')
+
+    def test_colonial_returns_none(self):
+        """Colonial has no invoice_number extraction. Returns None,
+        which db_write coerces to empty string and falls through to
+        legacy source_file-based primary key."""
+        text = 'Colonial Meat\n100 lb beef chuck'
+        result = self._parse(text, 'Colonial Meat')
+        self.assertIsNone(result.get('invoice_number'))
+
+
 class ValidateAllInvoicesClassifierTests(TestCase):
     """Regression coverage for `validate_all_invoices._classify`.
 
