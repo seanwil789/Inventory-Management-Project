@@ -358,6 +358,23 @@ def _extract_row_item(row: list[dict], anchor: dict,
     if price_per_unit is not None:
         item["unit_of_measure"] = "LB"
         item["price_per_unit"] = price_per_unit
+        # B-Salmon fix (2026-05-10): mirror the rank_pair.py fix — when
+        # catch-weight detected (3-decimal per-lb token), quantity must
+        # be the actual shipped weight (T/WT), not case count. Without
+        # this, validate_line_math fires qty(1) × ppp ≠ ext (line total)
+        # → false-positive math_flag on every Sysco MEATS/POULTRY/SEAFOOD
+        # line. Derive weight from ext/ppp; populate structured catch-
+        # weight fields for downstream cost/inventory consumers.
+        # Sanity guard: skip implausible weights (≤0.1 or ≥1000 lbs).
+        if price_per_unit > 0 and unit_price > 0:
+            derived_weight = round(unit_price / price_per_unit, 3)
+            if 0.1 < derived_weight < 1000:
+                item["quantity"] = derived_weight
+                item["case_total_weight_lb"] = derived_weight
+                item["case_pack_count"] = 1
+                item["case_pack_unit_size"] = str(derived_weight)
+                item["case_pack_unit_uom"] = "LB"
+                item["purchase_uom"] = "LB"
     # Phase 2a (2026-05-02): structured pack-size fields. Reuse the parser
     # helper so spatial + text paths produce identical structured output.
     try:
