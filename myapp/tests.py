@@ -3291,6 +3291,76 @@ class DbWriteSectionHintNormalizationTests(TestCase):
         self.assertEqual(self._normalize('TOTAL'), '')
 
 
+class BackfillSectionHintTests(TestCase):
+    """B-CorruptSection backfill (2026-05-11): cleanup mgmt cmd that
+    normalizes existing ILI.section_hint values stored pre-fix.
+
+    Companion to commits 94d1813 (db_write boundary) + 0dc3d01 (IVS
+    validator) — those prevent NEW pollution; this one cleans HISTORICAL
+    pollution from rows ingested before the fix.
+    """
+
+    def setUp(self):
+        from datetime import date
+        from decimal import Decimal
+        self.v = Vendor.objects.create(name='Sysco')
+        self.date = date(2026, 4, 1)
+
+    def _ili(self, section_hint):
+        from decimal import Decimal
+        return InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date=self.date,
+            raw_description='X', unit_price=Decimal('1'),
+            extended_amount=Decimal('1'),
+            section_hint=section_hint,
+        )
+
+    def test_already_canonical_unchanged(self):
+        from django.core.management import call_command
+        from io import StringIO
+        ili = self._ili('CANNED & DRY')
+        out = StringIO()
+        call_command('backfill_section_hint', '--apply', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.section_hint, 'CANNED & DRY')
+
+    def test_corrupt_with_canonical_substring_normalized(self):
+        from django.core.management import call_command
+        from io import StringIO
+        ili = self._ili('CANNED & DRY GROUP TOTAL 596.81')
+        out = StringIO()
+        call_command('backfill_section_hint', '--apply', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.section_hint, 'CANNED & DRY')
+
+    def test_dispenser_beverage_merges_to_beverage(self):
+        from django.core.management import call_command
+        from io import StringIO
+        ili = self._ili('DISPENSER BEVERAGE')
+        out = StringIO()
+        call_command('backfill_section_hint', '--apply', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.section_hint, 'BEVERAGE')
+
+    def test_pure_junk_cleared_to_empty(self):
+        from django.core.management import call_command
+        from io import StringIO
+        ili = self._ili('HAZARD')
+        out = StringIO()
+        call_command('backfill_section_hint', '--apply', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.section_hint, '')
+
+    def test_dry_run_does_not_write(self):
+        from django.core.management import call_command
+        from io import StringIO
+        ili = self._ili('HAZARD')
+        out = StringIO()
+        call_command('backfill_section_hint', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.section_hint, 'HAZARD')  # unchanged
+
+
 class BackfillCatchWeightQtyTests(TestCase):
     """B-DB-Backfill-CatchWeight (2026-05-10): backfill mgmt cmd that
     cleans up existing catch-weight ILI rows stored with qty=1 + math_flagged
