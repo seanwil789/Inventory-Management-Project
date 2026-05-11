@@ -272,6 +272,58 @@ def delete_from_inbox(file_id: str, file_name: str):
     print(f"   Removed '{file_name}' from New Invoices inbox")
 
 
+# B-CSV-Archive fix (2026-05-10): persistent log of ingested CSV content hashes
+# so subsequent cron runs skip stuck-in-inbox CSVs that couldn't be archived
+# due to service-account permission limits on user-owned Drive files. Without
+# this, the same CSV gets re-processed every hour forever (wasted DocAI-noise
+# cycles + duplicate "(1)" upload patterns in the archive).
+_CSV_INGEST_LOG = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    ".csv_ingest_log.json")
+
+
+def _csv_log_load() -> set[str]:
+    """Load the set of already-ingested CSV content hashes."""
+    if not os.path.exists(_CSV_INGEST_LOG):
+        return set()
+    try:
+        with open(_CSV_INGEST_LOG) as f:
+            data = json.load(f)
+        return {entry["sha"] for entry in data}
+    except (json.JSONDecodeError, KeyError):
+        return set()
+
+
+def _csv_log_record(sha: str, file_name: str, summary: dict):
+    """Append a successful ingest to the log."""
+    from datetime import datetime as _dt
+    entries = []
+    if os.path.exists(_CSV_INGEST_LOG):
+        try:
+            with open(_CSV_INGEST_LOG) as f:
+                entries = json.load(f)
+        except json.JSONDecodeError:
+            entries = []
+    entries.append({
+        "sha": sha,
+        "file_name": file_name,
+        "ingested_at": _dt.now().isoformat(),
+        "summary": summary,
+    })
+    with open(_CSV_INGEST_LOG, "w") as f:
+        json.dump(entries, f, indent=2)
+
+
+def _file_sha(path: str) -> str:
+    """SHA256 of file content."""
+    import hashlib
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(8192), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
 def process_csv(drive_file: dict, dry_run: bool) -> bool:
     """
     Download a Sysco CSV from Drive, run the SUPC code ingestor, then archive.
@@ -289,6 +341,17 @@ def process_csv(drive_file: dict, dry_run: bool) -> bool:
         print("1. Downloading CSV from Drive...")
         tmp_path = download_file(file_id, file_name)
 
+        # B-CSV-Archive: skip if this CSV's content hash was already
+        # ingested. Handles the stuck-in-inbox case where the service
+        # account can't delete a user-owned file from the inbox.
+        sha = _file_sha(tmp_path)
+        if not dry_run and sha in _csv_log_load():
+            print(f"   [skip] CSV content hash {sha[:12]}... already in "
+                  f"ingest log. Skipping re-process. (If the file should "
+                  f"be re-ingested, delete its entry from "
+                  f".csv_ingest_log.json.)")
+            return True
+
         print("2. Ingesting SUPC codes into Item Mapping...")
         summary = ingest_csv(tmp_path, dry_run=dry_run)
         print(f"   Total: {summary['total']}  |  "
@@ -299,6 +362,11 @@ def process_csv(drive_file: dict, dry_run: bool) -> bool:
         if dry_run:
             print("\n[DRY RUN] Skipping Drive archive and inbox deletion.")
             return True
+
+        # Record successful ingest BEFORE attempting archive — archive may
+        # fail on permission-locked CSVs, but the SUPC ingest succeeded
+        # and we don't want to re-ingest on next cron tick.
+        _csv_log_record(sha, file_name, summary)
 
         print("\n3. Archiving CSV to Drive...")
         # Archive under Vendor=Sysco, date derived from filename if possible
@@ -323,7 +391,11 @@ def process_csv(drive_file: dict, dry_run: bool) -> bool:
                 delete_from_inbox(file_id, file_name)
         except Exception as archive_err:
             print(f"   [!] Could not archive/delete CSV from Drive: {archive_err}")
-            print(f"       You can manually delete '{file_name}' from the New Invoices folder.")
+            print(f"       The CSV's content hash has been logged so future "
+                  f"cron runs will skip it. To force re-archive, manually "
+                  f"delete '{file_name}' from the New Invoices folder OR "
+                  f"grant the service account 'Editor' permission on the "
+                  f"inbox folder + remove the log entry.")
 
         return True
 
