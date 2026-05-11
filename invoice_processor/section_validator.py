@@ -365,15 +365,40 @@ def compute_invoice_section_reconciliation(
     # haven't captured the real GROUP TOTAL (OCR likely missed it). Better
     # to leave the section un-reconciled than report a fake diff that
     # masquerades as an extraction bug.
+    # B-CorruptSection IVS-side fix (2026-05-11): normalize parser-emitted
+    # section labels through canonicalize_sysco_section before grouping.
+    # Some extractor paths emit corrupt labels ("CANNED & DRY GROUP",
+    # "DISPENSER BEVERAGE", "HAZARD") that pollute the section graph.
+    # The db_write fix (commit 94d1813) handles this for stored ILI rows,
+    # but validate_all_invoices re-parses from cache + computes section_recon
+    # from parser items directly — bypassing db_write. Apply the same
+    # normalization here so IVS classification reflects the fix.
+    def _norm_sec(s: str) -> str:
+        if not s:
+            return ''
+        try:
+            from spatial_matcher import (canonicalize_sysco_section,
+                                          _CANONICAL_SYSCO_SECTIONS as _CSS)
+        except Exception:
+            return s
+        canon = canonicalize_sysco_section(s)
+        if canon in _CSS:
+            return canon
+        upper = s.upper()
+        if 'GROUP TOTAL' in upper or upper.startswith('TOTAL'):
+            return ''
+        return ''
+
     parser_by_section: dict = {}
     for it in parsed_items:
-        sec = it.get('section') or ''
+        sec = _norm_sec(it.get('section') or '')
         parser_by_section[sec] = parser_by_section.get(sec, 0) + (it.get('extended_amount') or 0)
     plausible_printed = {}
     for sec, val in all_printed.items():
         if _is_plausible_group_total(val, parser_by_section.get(sec, 0)):
             plausible_printed[sec] = val
-    return reconcile(parsed_items, plausible_printed)
+    return reconcile(parsed_items, plausible_printed,
+                      section_normalizer=_norm_sec)
 
 
 def reconcile(
