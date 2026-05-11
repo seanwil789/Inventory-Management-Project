@@ -1685,12 +1685,23 @@ def _parse_sysco(text: str) -> list[dict]:
                   f"(not last page — may be incomplete)")
 
     items_total = round(sum(it.get("extended_amount", 0) or 0 for it in items), 2)
-    if invoice_total is not None:
+    # B-ParserSum-Diagnostic fix (2026-05-10): the prior unconditional warning
+    # was misleading because it compared the TEXT-PATH's items_total vs
+    # invoice_total, but parse_invoice runs 3 extractors in parallel
+    # (text/spatial/rank-pair) and picks the best via section reconciliation.
+    # The text path frequently undercounts on catch-weight rows that the
+    # other extractors handle correctly. Only warn when the gap is LARGE
+    # (>10% of invoice_total) — that signals a real text-path issue worth
+    # surfacing for triage. Smaller gaps are absorbed by picker selection
+    # and/or non_item_charges (MISC + TAX). Phrasing also clarifies this
+    # is the TEXT-PATH sum, not the final picked items_sum.
+    if invoice_total is not None and invoice_total > 0:
         diff = abs(invoice_total - items_total)
-        if diff > 0.50:
-            print(f"  [!] Sysco total vs items gap: "
-                  f"total=${invoice_total:.2f}, items=${items_total:.2f}, "
-                  f"gap=${diff:.2f}")
+        diff_pct = diff / invoice_total * 100
+        if diff_pct > 10.0:
+            print(f"  [!] Sysco text-path items_sum gap (may be picker-corrected): "
+                  f"total=${invoice_total:.2f}, text_items=${items_total:.2f}, "
+                  f"gap=${diff:.2f} ({diff_pct:.1f}%)")
 
     return items, invoice_total
 
