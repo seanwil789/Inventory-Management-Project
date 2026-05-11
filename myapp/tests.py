@@ -1272,24 +1272,29 @@ class ParserSyscoNonItemChargesTests(TestCase):
                                                          'tokens': []}])
 
     def test_derives_non_item_charges_when_sections_clean(self):
-        """Sections all reconcile (diff < $0.50) AND gap exists → derive
-        non_item_charges from gap."""
+        """Sections all reconcile (diff < $0.50) AND gap exists within
+        the 8% legit-charges ceiling → derive non_item_charges from gap.
+
+        Models INV 775856655 shape: items=$1480.02, total=$1573.28,
+        charges=$93.26 = 5.93% < 8% cap → derives cleanly."""
         clean_recon = [
-            {'section': 'DAIRY', 'parser_sum': 100.0,
-             'printed_total': 100.0, 'diff_abs': 0.0,
-             'diff_pct': 0.0, 'item_count': 2},
+            {'section': 'DAIRY', 'parser_sum': 1480.02,
+             'printed_total': 1480.02, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 24},
         ]
         result = self._parse_with_mocked_recon(
             'sysco text',
             recon_result=clean_recon,
-            invoice_total=115.00,  # $100 items + $15 charges
-            items_total=100.0,
+            invoice_total=1573.28,  # $1480.02 items + $93.26 charges (5.93%)
+            items_total=1480.02,
+            items_count=24,
         )
-        self.assertEqual(result.get('invoice_total'), 115.00)
-        self.assertAlmostEqual(result.get('non_item_charges') or 0, 15.00,
-                               places=2,
-                               msg='Should derive non_item_charges=$15.00 '
-                                   'when sections clean')
+        self.assertEqual(result.get('invoice_total'), 1573.28)
+        self.assertAlmostEqual(result.get('non_item_charges') or 0, 93.26,
+                               delta=0.10,
+                               msg='Should derive non_item_charges≈$93.26 '
+                                   'when sections clean AND gap < 8% cap '
+                                   '(small slack for test helper rounding)')
 
     def test_no_derivation_when_section_has_bad_diff(self):
         """Sections have diff > $0.50 → items_sum NOT trustworthy → don't
@@ -1312,24 +1317,32 @@ class ParserSyscoNonItemChargesTests(TestCase):
                          'derivation should be suppressed (items_sum '
                          'untrustworthy)')
 
-    def test_no_derivation_when_gap_exceeds_20pct_cap(self):
-        """Gap exceeds 20% of invoice_total → suspected missing line items,
-        not legit charges. Don't derive."""
+    def test_no_derivation_when_gap_exceeds_8pct_cap(self):
+        """Gap exceeds 8% of invoice_total → suspected missing line items,
+        not legit charges. Don't derive. (Sysco PA: typical MISC + TAX is
+        4-7% of invoice; above 8% suspect missing items.)
+
+        Concrete regression case: INV 775687424 (2026-02-23) had 13.6%
+        gap that snapshot identifies as REAL underextraction. Pre-cap-
+        tightening this PASS'd via path (a) — false positive. Post-fix
+        the 8% cap correctly blocks derivation, leaving the FAIL.
+        """
         clean_recon = [
             {'section': 'DAIRY', 'parser_sum': 100.0,
              'printed_total': 100.0, 'diff_abs': 0.0,
              'diff_pct': 0.0, 'item_count': 2},
         ]
-        # items=$100, invoice_total=$1000 → gap=$900 = 90% of invoice
-        # → suspected missing items, don't derive
+        # items=$100, invoice_total=$120 → gap=$20 = 16.7% of invoice
+        # → suspected missing items (above 8% legit-charges ceiling),
+        # don't derive
         result = self._parse_with_mocked_recon(
             'sysco text',
             recon_result=clean_recon,
-            invoice_total=1000.00,
+            invoice_total=120.00,
             items_total=100.0,
         )
         self.assertNotIn('non_item_charges', result,
-                         'When derived charges exceed 20% of invoice, '
+                         'When derived charges exceed 8% of invoice, '
                          'suspect missing items (not real charges) — '
                          'derivation should be suppressed')
 

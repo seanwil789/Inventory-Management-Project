@@ -3526,9 +3526,19 @@ def parse_invoice(text: str, vendor: str = None,
                 sum((it.get('extended_amount') or 0) for it in items), 2)
             derived = round(invoice_total - sysco_items_sum, 2)
             # Sanity floor + cap: non-item charges should be positive but
-            # < 20% of invoice. Above that → suspected missing line items
-            # masquerading as charges, not legit MISC + TAX. Be conservative.
-            if 0 < derived < invoice_total * 0.20:
+            # < 8% of invoice. Sysco PA charges are typically 6% sales tax
+            # (on taxable items only — food is exempt) + ~$30-60 MISC
+            # fees (CC surcharge, fuel surcharge); combined typically 4-7%
+            # of invoice_total. Above 8% → suspected missing line items
+            # masquerading as charges, not legit MISC + TAX. The tight cap
+            # protects against the missing-pages bug class (originally
+            # caught by classifier path-c gap-guard for INV 1282480 where
+            # 1-of-N pages OCR'd inflated phantom non_item_charges to absorb
+            # $2k of missing items). Pre-tightening this same class hit
+            # 775687424 (2026-02-23) at 13.6% gap → false-PASSed via this
+            # path. Empirically validated 2026-05-10: cap=8% lets
+            # 775856655 (5.93%) through but blocks 775687424 (13.6%).
+            if 0 < derived < invoice_total * 0.08:
                 parsed["non_item_charges"] = derived
 
     return parsed
