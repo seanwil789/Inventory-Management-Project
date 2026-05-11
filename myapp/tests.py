@@ -3231,6 +3231,66 @@ class DBWritePricePerPoundTests(TestCase):
         self.assertEqual(ili.price_per_pound, Decimal('11.2500'))
 
 
+class DbWriteSectionHintNormalizationTests(TestCase):
+    """B-CorruptSection guard (2026-05-11): db_write._normalize_section_hint
+    rejects non-canonical / junk section labels at write boundary.
+
+    Some extractor paths (notably spatial_matcher's _find_sections) are more
+    permissive than canonicalize_sysco_section and emit labels containing
+    "GROUP TOTAL", "HAZARD", "DISPENSER BEVERAGE", etc. Without this guard,
+    those land in ILI.section_hint and produce parallel ghost-section entries
+    in IVS reconciliation (canonical with printed_total + no items, corrupt
+    with items + no printed_total) — both contributing to false REVIEWs.
+    """
+
+    def _normalize(self, label):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('db_write', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+        from db_write import _normalize_section_hint
+        return _normalize_section_hint(label)
+
+    def test_canonical_label_passes_through(self):
+        for canonical in ('PRODUCE', 'DAIRY', 'CANNED & DRY',
+                           'PAPER & DISP', 'CHEMICAL & JANITORIAL'):
+            self.assertEqual(
+                self._normalize(canonical), canonical,
+                f'Canonical {canonical!r} should pass through unchanged')
+
+    def test_canonicalize_substring_match(self):
+        """canonicalize_sysco_section returns canonical name for OCR-polluted
+        variants. _normalize_section_hint should accept those."""
+        # 'CANNED & DRY GROUP TOTAL' contains 'CANNED & DRY' substring →
+        # canonicalize returns 'CANNED & DRY'
+        self.assertEqual(self._normalize('CANNED & DRY GROUP TOTAL 596.81'),
+                         'CANNED & DRY')
+
+    def test_junk_label_rejected(self):
+        """Non-canonical junk labels with no canonical substring rejected."""
+        # 'HAZARD' has no canonical substring → reject
+        self.assertEqual(self._normalize('HAZARD'), '')
+
+    def test_canonical_substring_extracted(self):
+        """When a label contains a canonical substring, that canonical wins.
+        'DISPENSER BEVERAGE' → 'BEVERAGE' (correct merge into BEVERAGE
+        section so items reconcile against the BEVERAGE printed_total)."""
+        self.assertEqual(self._normalize('DISPENSER BEVERAGE'), 'BEVERAGE')
+
+    def test_empty_input_returns_empty(self):
+        self.assertEqual(self._normalize(''), '')
+        self.assertEqual(self._normalize(None), '')
+
+    def test_explicit_total_marker_rejected(self):
+        """A bare 'TOTAL' label rejected even though it might substring-match
+        no canonical. Defensive against future _find_sections changes."""
+        self.assertEqual(self._normalize('TOTAL'), '')
+
+
 class BackfillCatchWeightQtyTests(TestCase):
     """B-DB-Backfill-CatchWeight (2026-05-10): backfill mgmt cmd that
     cleans up existing catch-weight ILI rows stored with qty=1 + math_flagged

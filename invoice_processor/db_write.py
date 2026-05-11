@@ -35,6 +35,37 @@ from django.db.models import Avg
 _FUZZY_TIERS = {'vendor_fuzzy', 'fuzzy', 'stripped_fuzzy', 'subset_match'}
 
 
+# B-CorruptSection guard (2026-05-11): some extractor paths emit
+# section labels containing "GROUP TOTAL", "TOTAL", or non-canonical
+# values like "HAZARD" / "DISPENSER BEVERAGE" because _find_sections
+# (spatial_matcher) is more permissive than canonicalize_sysco_section.
+# When section_hint contains those non-canonical labels, IVS section
+# reconciliation creates parallel ghost-section entries (one canonical
+# with printed_total + no items, one corrupt with items + no printed_total).
+# Fix: at db_write boundary, normalize through canonicalize_sysco_section
+# and store empty when result isn't a known canonical. Empty falls
+# through to orphan handling rather than poisoning the section graph.
+def _normalize_section_hint(label) -> str:
+    if not label:
+        return ''
+    try:
+        # Imported lazily so this module remains importable without the
+        # full invoice_processor path being set up.
+        from spatial_matcher import (canonicalize_sysco_section,
+                                      _CANONICAL_SYSCO_SECTIONS)
+    except Exception:
+        return str(label)[:60]
+    canon = canonicalize_sysco_section(str(label))
+    if canon in _CANONICAL_SYSCO_SECTIONS:
+        return canon[:60]
+    # Defensive: explicit junk markers shouldn't survive even if a
+    # future canonicalize change would let them through.
+    upper = str(label).upper()
+    if 'GROUP TOTAL' in upper or upper.startswith('TOTAL'):
+        return ''
+    return ''
+
+
 # Phase 3d (Sean 2026-05-02): boilerplate-rejection guard.
 #
 # OCR captures invoice headers/addresses/customer-names as text that
@@ -477,7 +508,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             # filters exclude math_flagged=True from price-anomaly baseline,
             # category-spend, COGs, recipe cost. Per Trust LAW.
             math_flagged=bool(item.get('math_flagged')),
-            section_hint=(item.get('section') or '')[:60],
+            section_hint=_normalize_section_hint(item.get('section')),
             # Structured invoice-line schema (Phase 1)
             quantity=quantity_val,
             purchase_uom=purchase_uom_val,
