@@ -14359,6 +14359,95 @@ class RankPairSyscoQtyExtractionTests(TestCase):
         self.assertAlmostEqual(carrot['extended_amount'], 9.35)
 
 
+    def test_catch_weight_quantity_derived_from_ext_over_ppp(self):
+        """B-Salmon fix (2026-05-10): catch-weight Sysco rows (MEATS/POULTRY/
+        SEAFOOD with a 3-decimal per-lb price token) ship by actual weight,
+        not case count. quantity should be derived as ext/per_lb so:
+          (a) qty(lbs) × per_lb($/lb) = ext (validate_line_math passes —
+              no false-positive math_flag)
+          (b) downstream $/lb consumers see correct per-lb shape
+          (c) case_total_weight_lb populated for inventory/cost calcs
+
+        Reference: INV 775856655 Salmon — ext=$105.08, ppp=$9.059, paper
+        truth T/WT=11.600 LB. Pre-fix qty stayed at qty_int (case count=1)
+        and validate_line_math fired qty(1) × ppp($9.06) = $9.06 ≠ $105.08
+        → false-positive flag on EVERY Sysco catch-weight line.
+        """
+        extract = self._import()
+        # Build 3 Sysco rows — first is catch-weight (with 3-decimal per-lb
+        # price), other 2 are non-catch-weight standard pricing.
+        # 3-decimal per-lb token must be RIGHT of SUPC and at same y.
+        tokens = [
+            # SALMON catch-weight row at y=0.20
+            self._tok('SALMON',  0.20, 0.20),
+            self._tok('2184337', 0.55, 0.20),  # SUPC
+            self._tok('9.059',   0.65, 0.20),  # 3-decimal per-lb (right of SUPC)
+            self._tok('105.08',  0.70, 0.20),  # unit_price (1-line $ token)
+            self._tok('105.08',  0.85, 0.20),  # ext
+            # Two standard rows for layout detection (>=3 SUPCs needed)
+            self._tok('1234567', 0.55, 0.30),
+            self._tok('15.00',   0.70, 0.30),
+            self._tok('15.00',   0.85, 0.30),
+            self._tok('STANDARD1', 0.20, 0.30),
+            self._tok('2345678', 0.55, 0.40),
+            self._tok('22.00',   0.70, 0.40),
+            self._tok('22.00',   0.85, 0.40),
+            self._tok('STANDARD2', 0.20, 0.40),
+        ]
+        pages = [{'tokens': tokens}]
+        rows = extract(pages)
+        salmon = next(r for r in rows if r['sysco_item_code'] == '2184337')
+        # qty derived from ext/ppp = 105.08/9.059 = 11.6 LB
+        self.assertAlmostEqual(
+            salmon['quantity'], 11.600, places=2,
+            msg=f'Salmon qty should be 11.6 LB (ext/ppp), got {salmon.get("quantity")}. '
+                'Pre-fix this was 1 (case count) → math_flag false positive.'
+        )
+        self.assertEqual(salmon['unit_of_measure'], 'LB')
+        self.assertAlmostEqual(salmon.get('price_per_unit'), 9.059, places=3)
+        # Downstream structured fields populated
+        self.assertAlmostEqual(salmon.get('case_total_weight_lb'), 11.600, places=2)
+        self.assertEqual(salmon.get('case_pack_count'), 1)
+        self.assertEqual(salmon.get('case_pack_unit_uom'), 'LB')
+        self.assertEqual(salmon.get('purchase_uom'), 'LB')
+        # No false-positive math_flag (validate_line_math: qty × ppp ≈ ext)
+        self.assertFalse(
+            salmon.get('math_flagged'),
+            f'Salmon should NOT be math_flagged after qty derivation. '
+            f'flag={salmon.get("math_flagged")}, '
+            f'diff_pct={salmon.get("math_diff_pct")}'
+        )
+
+    def test_catch_weight_skips_derivation_when_implausible_weight(self):
+        """Sanity guard: when ext/ppp produces an implausible weight (≤0.1
+        or ≥1000 lbs), keep qty alone so downstream math_flag surfaces it
+        for review rather than silently masking with bad weight."""
+        extract = self._import()
+        # Construct a row where ext/ppp gives a tiny weight (0.05 lbs).
+        # ext=$5.00, ppp=$100.00/lb → 0.05 LB → below 0.1 floor → skip
+        tokens = [
+            self._tok('TINY',    0.20, 0.20),
+            self._tok('9999998', 0.55, 0.20),  # SUPC
+            self._tok('100.000', 0.65, 0.20),  # 3-decimal per-lb at $100/lb
+            self._tok('5.00',    0.70, 0.20),
+            self._tok('5.00',    0.85, 0.20),
+            # Layout-detect filler
+            self._tok('1234567', 0.55, 0.30),
+            self._tok('15.00',   0.70, 0.30),
+            self._tok('15.00',   0.85, 0.30),
+            self._tok('2345678', 0.55, 0.40),
+            self._tok('22.00',   0.70, 0.40),
+            self._tok('22.00',   0.85, 0.40),
+        ]
+        pages = [{'tokens': tokens}]
+        rows = extract(pages)
+        tiny = next(r for r in rows if r['sysco_item_code'] == '9999998')
+        # qty stays at qty_int (1) since derived 0.05 < 0.1 floor
+        self.assertEqual(tiny['quantity'], 1,
+                         'Implausibly small derived weight (0.05 LB) → keep '
+                         'qty=1 (case count) so anomaly surfaces')
+
+
 class RankPairSyscoSectionTaggingTests(TestCase):
     """Sysco rank-pair output must carry section tags. Without them,
     section-level reconciliation (parser items vs printed GROUP TOTAL)

@@ -741,6 +741,34 @@ def _extract_sysco_rank_one_page(
         if per_lb_f is not None:
             item["unit_of_measure"] = "LB"
             item["price_per_unit"] = per_lb_f
+            # B-Salmon fix (2026-05-10): catch-weight rows ship by actual
+            # weight (T/WT), not by case count. Without this fix, quantity
+            # stays at qty_int (case count, typically 1) while ppp holds
+            # the per-lb price — `validate_line_math` then computes
+            # qty(1) × ppp($9.06) = $9.06 ≠ ext($105.08) → false-positive
+            # math_flag on EVERY Sysco MEATS/POULTRY/SEAFOOD line.
+            #
+            # Derive shipped weight from ext / per_lb. Mirrors what
+            # spatial_matcher already does for Exceptional catch-weight
+            # (see spatial_matcher.py:951-971). Reference: INV 775856655
+            # Salmon — ext=$105.08, ppp=$9.059, derived qty=11.600 = paper
+            # truth T/WT.
+            #
+            # Also populates case_total_weight_lb + case_pack_* structured
+            # fields for downstream consumers (cost_utils, synergy_sync's
+            # $/lb math, inventory) to read the canonical weight shape.
+            if per_lb_f > 0 and ext_f > 0:
+                derived_weight = round(ext_f / per_lb_f, 3)
+                # Sanity: derived weight must be positive and within a
+                # reasonable range (no million-lb shipments). Skip when
+                # implausible — leave qty alone so math_flag can surface.
+                if 0.1 < derived_weight < 1000:
+                    item["quantity"] = derived_weight
+                    item["case_total_weight_lb"] = derived_weight
+                    item["case_pack_count"] = 1
+                    item["case_pack_unit_size"] = str(derived_weight)
+                    item["case_pack_unit_uom"] = "LB"
+                    item["purchase_uom"] = "LB"
 
         # Catch-weight aware math validation. ppp (via price_per_unit alias)
         # wins for MEATS/POULTRY/SEAFOOD. No self-correct here — Sysco
