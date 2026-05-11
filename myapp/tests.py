@@ -3231,6 +3231,108 @@ class DBWritePricePerPoundTests(TestCase):
         self.assertEqual(ili.price_per_pound, Decimal('11.2500'))
 
 
+class BackfillCatchWeightQtyTests(TestCase):
+    """B-DB-Backfill-CatchWeight (2026-05-10): backfill mgmt cmd that
+    cleans up existing catch-weight ILI rows stored with qty=1 + math_flagged
+    pre-B-Salmon-fix.
+
+    Criteria for backfill: ppp populated, qty=1, ext>0, unit_price≈ext
+    (catch-weight convention), derived weight (ext/ppp) plausible (0.1-1000).
+    Updates: qty=derived_weight, case_total_weight_lb=derived_weight,
+    math_flagged=False (when previously True).
+    """
+
+    def setUp(self):
+        from datetime import date
+        from decimal import Decimal
+        self.v = Vendor.objects.create(name='Sysco')
+        self.date = date(2026, 4, 1)
+
+    def _ili(self, ext, ppp, up=None, qty=1, math_flagged=False):
+        from decimal import Decimal
+        return InvoiceLineItem.objects.create(
+            vendor=self.v, invoice_date=self.date,
+            raw_description='SALMON CATCH-WEIGHT',
+            unit_price=Decimal(str(up if up is not None else ext)),
+            extended_amount=Decimal(str(ext)),
+            price_per_pound=Decimal(str(ppp)),
+            quantity=Decimal(str(qty)),
+            math_flagged=math_flagged,
+        )
+
+    def test_classic_catch_weight_row_gets_backfilled(self):
+        """Salmon ext=$105.08, ppp=$9.059, qty=1, flagged → qty=11.6, unflagged."""
+        from decimal import Decimal
+        from django.core.management import call_command
+        from io import StringIO
+        ili = self._ili(105.08, 9.059, math_flagged=True)
+        out = StringIO()
+        call_command('backfill_catch_weight_qty', '--apply', stdout=out)
+        ili.refresh_from_db()
+        self.assertAlmostEqual(float(ili.quantity), 11.6, places=2)
+        self.assertAlmostEqual(float(ili.case_total_weight_lb), 11.6, places=2)
+        self.assertFalse(ili.math_flagged)
+
+    def test_dry_run_does_not_write(self):
+        """Without --apply, no DB writes."""
+        from django.core.management import call_command
+        from io import StringIO
+        ili = self._ili(105.08, 9.059, math_flagged=True)
+        out = StringIO()
+        call_command('backfill_catch_weight_qty', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.quantity, 1)  # unchanged
+        self.assertTrue(ili.math_flagged)  # unchanged
+
+    def test_skips_when_unit_price_differs_from_ext(self):
+        """Non-classic-catch-weight row (where unit_price ≠ ext) is skipped."""
+        from django.core.management import call_command
+        from io import StringIO
+        # ext=$50, ppp=$5/lb, but unit_price=$5 (per-lb pricing convention,
+        # NOT line total) → not classic catch-weight → skip
+        ili = self._ili(ext=50.0, ppp=5.0, up=5.0, math_flagged=True)
+        out = StringIO()
+        call_command('backfill_catch_weight_qty', '--apply', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.quantity, 1)  # unchanged
+
+    def test_skips_when_derived_weight_implausible(self):
+        """Derived weight outside 0.1-1000 lb range stays flagged for review."""
+        from django.core.management import call_command
+        from io import StringIO
+        # ext=$5, ppp=$100/lb → 0.05 lb → below 0.1 floor
+        ili = self._ili(ext=5.0, ppp=100.0, math_flagged=True)
+        out = StringIO()
+        call_command('backfill_catch_weight_qty', '--apply', stdout=out)
+        ili.refresh_from_db()
+        self.assertEqual(ili.quantity, 1)  # unchanged (skipped)
+
+    def test_vendor_filter(self):
+        """--vendor filter limits to that vendor only."""
+        from django.core.management import call_command
+        from io import StringIO
+        sysco_ili = self._ili(100.0, 10.0, math_flagged=True)
+        # Different vendor
+        v2 = Vendor.objects.create(name='Other')
+        from decimal import Decimal
+        other_ili = InvoiceLineItem.objects.create(
+            vendor=v2, invoice_date=self.date,
+            raw_description='OTHER CATCH-WEIGHT',
+            unit_price=Decimal('100.0'), extended_amount=Decimal('100.0'),
+            price_per_pound=Decimal('10.0'), quantity=Decimal('1'),
+            math_flagged=True,
+        )
+        out = StringIO()
+        call_command('backfill_catch_weight_qty', '--vendor', 'Sysco',
+                     '--apply', stdout=out)
+        sysco_ili.refresh_from_db()
+        other_ili.refresh_from_db()
+        # Sysco was updated
+        self.assertAlmostEqual(float(sysco_ili.quantity), 10.0, places=2)
+        # Other was not
+        self.assertEqual(other_ili.quantity, 1)
+
+
 class BackfillPricePerPoundTests(TestCase):
     """`backfill_price_per_pound` — Track B's one-shot retroactive filler.
 
