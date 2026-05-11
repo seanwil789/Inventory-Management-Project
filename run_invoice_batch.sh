@@ -39,6 +39,16 @@ if [ $EXIT_CODE -eq 0 ]; then
     echo "=== Inserting new canonicals into active Synergy tab ===" | tee -a "$LOG_FILE"
     python3 invoice_processor/synergy_sync.py --insert-new 2>&1 | tee -a "$LOG_FILE" || \
         echo "[!] insert-new failed (non-fatal)" | tee -a "$LOG_FILE"
+
+    # B-NoIVS fix (2026-05-10): refresh InvoiceValidationStatus rows for any
+    # newly-ingested invoices. Without this, new invoices land in DB but have
+    # no IVS row, so /invoices/ list view + L1 reconciliation hub don't show
+    # them until the next manual run. Failure non-fatal — IVS can be rebuilt
+    # any time from OCR caches via the same command.
+    echo "" | tee -a "$LOG_FILE"
+    echo "=== Refreshing InvoiceValidationStatus rows ===" | tee -a "$LOG_FILE"
+    python3 manage.py validate_all_invoices --apply 2>&1 | tee -a "$LOG_FILE" || \
+        echo "[!] validate_all_invoices failed (non-fatal)" | tee -a "$LOG_FILE"
 fi
 
 # Keep only the 30 most recent log files
