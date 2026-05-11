@@ -297,7 +297,19 @@ def compute_invoice_section_reconciliation(
     # priority gives $44.75.
     labeled_across_pages: dict[str, float] = {}
     max_in_range_across_pages: dict[str, float] = {}
-    for page in pages:
+
+    # B-Section-MultiPage fix (2026-05-10): collect ALL sections and ALL
+    # group_totals across pages with page-adjusted y-coordinates, then pair
+    # globally. Without this, a section header on page N and its GROUP TOTAL
+    # on page N+1 never pair (per-page pairing finds neither side alone).
+    # INV 775856655 reference: CANNED & DRY section starts on page 1 with
+    # GROUP TOTAL printed on page 2 → pre-fix `printed_total=None`.
+    # Page-adjusted y = page_idx + y_normalized (each page's y is in [0,1],
+    # so adding the page index shifts ascendingly across the document).
+    all_sections_global: list[tuple[float, str]] = []
+    all_group_totals_global: list[tuple[float, float]] = []
+
+    for page_idx, page in enumerate(pages):
         tokens = page.get('tokens') or []
         if not tokens:
             continue
@@ -320,6 +332,25 @@ def compute_invoice_section_reconciliation(
         for sec, val in max_totals.items():
             max_in_range_across_pages[sec] = max(
                 max_in_range_across_pages.get(sec, 0), val)
+
+        # B-Section-MultiPage: also collect with page-adjusted y for the
+        # global cross-page pairing pass below. This rescues sections whose
+        # GROUP TOTAL prints on a later page than the section header.
+        for y, name in secs:
+            all_sections_global.append((page_idx + y, name))
+        for y, val in group_total_rows:
+            all_group_totals_global.append((page_idx + y, val))
+
+    # B-Section-MultiPage: global cross-page pairing. Only fills sections
+    # NOT already labeled per-page — preserves the existing labeled-priority
+    # over max-in-range, while adding cross-page coverage. Matches the
+    # documented priority: labeled-anywhere > max-in-range.
+    if len(pages) > 1:
+        cross_page_labeled = pair_sections_to_totals(
+            all_sections_global, all_group_totals_global)
+        for sec, val in cross_page_labeled.items():
+            if sec not in labeled_across_pages:
+                labeled_across_pages[sec] = val
 
     all_printed: dict[str, float] = dict(labeled_across_pages)
     for sec, val in max_in_range_across_pages.items():

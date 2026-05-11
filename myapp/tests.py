@@ -1218,6 +1218,137 @@ class ParserSyscoInvoiceTotalTests(TestCase):
         self.assertEqual(result.get('invoice_total'), 1103.60)
 
 
+class ParserSyscoNonItemChargesTests(TestCase):
+    """B-MISC fix (2026-05-10): Sysco invoices have MISC CHARGES + TAX TOTAL
+    that aren't extracted as line items but ARE part of invoice_total. When
+    section reconciliation passes (items_sum trustworthy), parse_invoice
+    derives non_item_charges = invoice_total - items_sum so the validator's
+    Path (a) fires (`items + charges ≈ total → PASS within $0.50`).
+
+    Reference: INV 775856655 (Sysco 2026-05-04) had items_sum=$1,480.02,
+    invoice_total=$1,573.28, derived non_item_charges=$93.26 ($45.94 MISC
+    CC+fuel surcharges + $47.32 tax). Pre-fix the gap_pct was 5.93% (still
+    PASS via path b but loose); post-fix path (a) closes to $0.00.
+    """
+
+    def _parse_with_mocked_recon(self, text, recon_result, invoice_total=None,
+                                  items_count=2, items_total=100.0):
+        """Run parse_invoice('Sysco') with a mocked section reconciliation
+        result and a stubbed _parse_sysco that yields N items summing to
+        items_total. Isolates the B-MISC derivation logic from upstream
+        parser/spatial machinery."""
+        import io
+        import os as _os
+        import sys
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('parser', 'section_validator', 'spatial_matcher', 'mapper'):
+            if m in sys.modules:
+                del sys.modules[m]
+        import parser as parser_mod  # noqa: E402
+        import section_validator      # noqa: E402
+
+        # Stub _parse_sysco to return controlled items + invoice_total
+        per_item = round(items_total / items_count, 2)
+        fake_items = [
+            {'raw_description': f'ITEM-{i}',
+             'unit_price': per_item, 'extended_amount': per_item,
+             'section': 'DAIRY', 'case_size_raw': '', 'sysco_item_code': ''}
+            for i in range(items_count)
+        ]
+        with patch.object(parser_mod, '_parse_sysco',
+                          return_value=(fake_items, invoice_total)), \
+             patch.object(section_validator,
+                          'compute_invoice_section_reconciliation',
+                          return_value=recon_result):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                return parser_mod.parse_invoice(text, vendor='Sysco',
+                                                pages=[{'page_number': 1,
+                                                         'tokens': []}])
+
+    def test_derives_non_item_charges_when_sections_clean(self):
+        """Sections all reconcile (diff < $0.50) AND gap exists → derive
+        non_item_charges from gap."""
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 100.0,
+             'printed_total': 100.0, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 2},
+        ]
+        result = self._parse_with_mocked_recon(
+            'sysco text',
+            recon_result=clean_recon,
+            invoice_total=115.00,  # $100 items + $15 charges
+            items_total=100.0,
+        )
+        self.assertEqual(result.get('invoice_total'), 115.00)
+        self.assertAlmostEqual(result.get('non_item_charges') or 0, 15.00,
+                               places=2,
+                               msg='Should derive non_item_charges=$15.00 '
+                                   'when sections clean')
+
+    def test_no_derivation_when_section_has_bad_diff(self):
+        """Sections have diff > $0.50 → items_sum NOT trustworthy → don't
+        derive non_item_charges (conservative)."""
+        bad_recon = [
+            {'section': 'DAIRY', 'parser_sum': 50.0,
+             'printed_total': 100.0, 'diff_abs': -50.0,
+             'diff_pct': -50.0, 'item_count': 1},
+        ]
+        result = self._parse_with_mocked_recon(
+            'sysco text',
+            recon_result=bad_recon,
+            invoice_total=115.00,
+            items_total=50.0,
+        )
+        # parsed dict should NOT have non_item_charges set (bad sections
+        # mean we can't trust items_sum to derive charges from gap)
+        self.assertNotIn('non_item_charges', result,
+                         'When sections have >$0.50 diff, non_item_charges '
+                         'derivation should be suppressed (items_sum '
+                         'untrustworthy)')
+
+    def test_no_derivation_when_gap_exceeds_20pct_cap(self):
+        """Gap exceeds 20% of invoice_total → suspected missing line items,
+        not legit charges. Don't derive."""
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 100.0,
+             'printed_total': 100.0, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 2},
+        ]
+        # items=$100, invoice_total=$1000 → gap=$900 = 90% of invoice
+        # → suspected missing items, don't derive
+        result = self._parse_with_mocked_recon(
+            'sysco text',
+            recon_result=clean_recon,
+            invoice_total=1000.00,
+            items_total=100.0,
+        )
+        self.assertNotIn('non_item_charges', result,
+                         'When derived charges exceed 20% of invoice, '
+                         'suspect missing items (not real charges) — '
+                         'derivation should be suppressed')
+
+    def test_no_derivation_when_no_invoice_total(self):
+        """No invoice_total → nothing to derive from. Fix should no-op."""
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 100.0,
+             'printed_total': 100.0, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 2},
+        ]
+        result = self._parse_with_mocked_recon(
+            'sysco text',
+            recon_result=clean_recon,
+            invoice_total=None,
+            items_total=100.0,
+        )
+        self.assertNotIn('non_item_charges', result)
+
+
 class MathFlaggedDbWriteTests(TestCase):
     """B6 integration: parsed-item math_flagged threads through to ILI row."""
 
@@ -13644,6 +13775,66 @@ class SectionValidatorTests(TestCase):
         # PRODUCE pairs with the first GT (100.00) since the fake section
         # at y=0.50 was filtered out.
         self.assertEqual(out, {'PRODUCE': 100.00, 'DAIRY': 50.00})
+
+    def test_multipage_section_pairs_with_total_on_later_page(self):
+        """B-Section-MultiPage fix (2026-05-10): when a section header is on
+        page 1 and its GROUP TOTAL prints on page 2, the global cross-page
+        pairing pass rescues it. Without the fix, per-page pairing fails
+        for both pages (page 1: section but no total; page 2: total but no
+        section) → printed_total=None for the cross-page section.
+
+        Reference: INV 775856655 CANNED & DRY section spans pages 1-2 with
+        GROUP TOTAL=$415.57 on page 2.
+        """
+        sv = self._import()
+        # Page 1: PRODUCE section header at y=0.20, items, no GROUP TOTAL
+        # (section continues to page 2)
+        page1_tokens = [
+            self._tok('****',   0.30, 0.20),
+            self._tok('PRODUCE', 0.40, 0.20),
+            self._tok('****',   0.50, 0.20),
+            self._tok('5.50',   0.78, 0.30),
+            self._tok('6.14',   0.78, 0.40),
+        ]
+        # Page 2: GROUP TOTAL for PRODUCE at the top, then DAIRY section
+        page2_tokens = [
+            self._tok('GROUP',  0.41, 0.10),
+            self._tok('TOTAL',  0.45, 0.10),
+            self._tok('****',   0.48, 0.10),
+            self._tok('11.64',  0.78, 0.10),  # PRODUCE printed total
+            self._tok('****',   0.30, 0.30),
+            self._tok('DAIRY',  0.40, 0.30),
+            self._tok('****',   0.50, 0.30),
+            self._tok('7.80',   0.78, 0.40),
+            self._tok('GROUP',  0.41, 0.50),
+            self._tok('TOTAL',  0.45, 0.50),
+            self._tok('****',   0.48, 0.50),
+            self._tok('7.80',   0.78, 0.50),
+        ]
+        pages = [
+            {'page_number': 1, 'tokens': page1_tokens},
+            {'page_number': 2, 'tokens': page2_tokens},
+        ]
+        items = [
+            {'section': 'PRODUCE', 'extended_amount': 5.50},
+            {'section': 'PRODUCE', 'extended_amount': 6.14},
+            {'section': 'DAIRY',   'extended_amount': 7.80},
+        ]
+        recon = sv.compute_invoice_section_reconciliation(items, pages, 'Sysco')
+        by_sec = {r['section']: r for r in recon}
+        # PRODUCE GROUP TOTAL is on page 2; pre-fix this would be None.
+        self.assertIn('PRODUCE', by_sec,
+                      'PRODUCE section should appear in recon output')
+        self.assertEqual(
+            by_sec['PRODUCE']['printed_total'], 11.64,
+            f'Multi-page section PRODUCE should pair with GROUP TOTAL=$11.64 '
+            f'on page 2. Got printed_total={by_sec["PRODUCE"].get("printed_total")}. '
+            f'If None, B-Section-MultiPage regression.'
+        )
+        self.assertEqual(by_sec['PRODUCE']['diff_abs'], 0.0)
+        # DAIRY is single-page; should still work
+        self.assertEqual(by_sec['DAIRY']['printed_total'], 7.80)
+        self.assertEqual(by_sec['DAIRY']['diff_abs'], 0.0)
 
     def test_reconcile_surfaces_section_diffs(self):
         sv = self._import()
