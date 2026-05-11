@@ -737,11 +737,19 @@ def _extract_sysco_rank_one_page(
         # ($299.10) when they belonged to the section starting just below
         # them on the page. Conservative — only fires when sec_name is
         # truly empty (not when carry_section already provided a value).
+        #
+        # Refinement (2026-05-11): require y-distance < 0.10 (half a typical
+        # page section). Items further than that are likely truly orphan
+        # (page-spanning, missing header) and shouldn't be force-tagged
+        # into a far-away section — that creates false section_with_gap
+        # entries when the real section's reconciliation breaks.
         if not sec_name:
+            _ORPHAN_FALLBACK_Y_TOL = 0.10
             below_canonicals = [
                 (sec_y, _canon_fn(sec_label))
                 for sec_y, sec_label in sections
                 if sec_y > y_supc
+                and (sec_y - y_supc) < _ORPHAN_FALLBACK_Y_TOL
                 and _canon_fn(sec_label) in _canon_set
             ]
             if below_canonicals:

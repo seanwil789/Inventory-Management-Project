@@ -14669,6 +14669,10 @@ class RankPairSyscoQtyExtractionTests(TestCase):
         appears at the top of a continuation page before ANY header on that
         page), fall back to the nearest canonical section below.
 
+        Refinement (2026-05-11): require y-distance < 0.10 — items further
+        away are likely truly orphan (page-spanning, missing header) and
+        shouldn't be force-tagged.
+
         Without this, items get section="" and pollute section_reconciliation
         as orphan entries, dragging invoices into REVIEW classification.
 
@@ -14676,30 +14680,30 @@ class RankPairSyscoQtyExtractionTests(TestCase):
         ($299.10) that belonged to the section starting just below them.
         """
         extract_one = self._import_one_page()
-        # Layout: 3 SUPCs at y=0.10, 0.20, 0.50.
-        # PRODUCE section header at y=0.40 (BELOW the first 2 SUPCs).
-        # First 2 SUPCs have no canonical section above; fix should
-        # tag them with PRODUCE (the nearest section below).
+        # Layout: 3 SUPCs at y=0.10, 0.15, 0.30.
+        # PRODUCE section header at y=0.18 (CLOSE to first 2 SUPCs).
+        # First 2 SUPCs (y=0.10, 0.15) have no canonical section above;
+        # they're within 0.10 y-distance of PRODUCE header → fix tags them.
         tokens = [
             # Orphan SUPC at y=0.10 (no section above, none in carry_section)
             self._tok('1234567', 0.55, 0.10),
             self._tok('15.00',   0.70, 0.10),
             self._tok('15.00',   0.85, 0.10),
             self._tok('ORPHAN',  0.20, 0.10),
-            # Second SUPC also above PRODUCE header
-            self._tok('2345678', 0.55, 0.20),
-            self._tok('22.00',   0.70, 0.20),
-            self._tok('22.00',   0.85, 0.20),
-            self._tok('ALSO',    0.20, 0.20),
-            # PRODUCE section header at y=0.40 (with required asterisks)
-            self._tok('****',    0.30, 0.40),
-            self._tok('PRODUCE', 0.40, 0.40),
-            self._tok('****',    0.50, 0.40),
-            # SUPC at y=0.50 (below PRODUCE header — gets PRODUCE normally)
-            self._tok('3456789', 0.55, 0.50),
-            self._tok('30.00',   0.70, 0.50),
-            self._tok('30.00',   0.85, 0.50),
-            self._tok('NORMAL',  0.20, 0.50),
+            # Second SUPC at y=0.15 (also above PRODUCE header at 0.18)
+            self._tok('2345678', 0.55, 0.15),
+            self._tok('22.00',   0.70, 0.15),
+            self._tok('22.00',   0.85, 0.15),
+            self._tok('ALSO',    0.20, 0.15),
+            # PRODUCE section header at y=0.18 (within 0.10 of orphans above)
+            self._tok('****',    0.30, 0.18),
+            self._tok('PRODUCE', 0.40, 0.18),
+            self._tok('****',    0.50, 0.18),
+            # SUPC at y=0.30 (below PRODUCE header — gets PRODUCE normally)
+            self._tok('3456789', 0.55, 0.30),
+            self._tok('30.00',   0.70, 0.30),
+            self._tok('30.00',   0.85, 0.30),
+            self._tok('NORMAL',  0.20, 0.30),
         ]
         rows, _ = extract_one(tokens, carry_section='')
         # All 3 items should be tagged with PRODUCE (the only canonical
@@ -14708,9 +14712,43 @@ class RankPairSyscoQtyExtractionTests(TestCase):
             self.assertEqual(
                 r.get('section'), 'PRODUCE',
                 f'SUPC {r["sysco_item_code"]} should be tagged PRODUCE '
-                f'(only canonical section); got section={r.get("section")!r}. '
-                f'Pre-fix orphan SUPCs (above PRODUCE header) got section="".'
+                f'(only canonical section within 0.10 y-tol); got '
+                f'section={r.get("section")!r}.'
             )
+
+    def test_orphan_section_skips_when_section_too_far(self):
+        """Refinement (2026-05-11): when nearest canonical section below is
+        > 0.10 y-distance away, don't force-tag the orphan. Far-away tags
+        create false section gaps that break reconciliation."""
+        extract_one = self._import_one_page()
+        # Orphan SUPC at y=0.10, PRODUCE header at y=0.50 — distance 0.40 > 0.10
+        tokens = [
+            self._tok('1234567', 0.55, 0.10),
+            self._tok('15.00',   0.70, 0.10),
+            self._tok('15.00',   0.85, 0.10),
+            self._tok('ORPHAN',  0.20, 0.10),
+            # PRODUCE header far below
+            self._tok('****',    0.30, 0.50),
+            self._tok('PRODUCE', 0.40, 0.50),
+            self._tok('****',    0.50, 0.50),
+            self._tok('2345678', 0.55, 0.55),
+            self._tok('22.00',   0.70, 0.55),
+            self._tok('22.00',   0.85, 0.55),
+            self._tok('NORMAL',  0.20, 0.55),
+            self._tok('3456789', 0.55, 0.65),
+            self._tok('30.00',   0.70, 0.65),
+            self._tok('30.00',   0.85, 0.65),
+            self._tok('NORMAL2', 0.20, 0.65),
+        ]
+        rows, _ = extract_one(tokens, carry_section='')
+        orphan = next(r for r in rows if r['sysco_item_code'] == '1234567')
+        # Far-away PRODUCE NOT applied — orphan stays section=''
+        self.assertEqual(
+            orphan.get('section'), '',
+            f'SUPC at y=0.10 with PRODUCE header at y=0.50 (distance 0.40) '
+            f'should stay orphan (section="") — too far to confidently '
+            f'fall back. Got section={orphan.get("section")!r}.'
+        )
 
     def test_orphan_section_carry_section_preserved_when_set(self):
         """Conservative: when carry_section IS set (continuation from prior
