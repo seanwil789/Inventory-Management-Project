@@ -727,6 +727,28 @@ def _extract_sysco_rank_one_page(
             else:
                 break
 
+        # B-OrphanSection fix (2026-05-10): when no canonical section is at-
+        # or-above the SUPC AND carry_section is empty (item appears before
+        # ANY section header), fall back to the NEAREST canonical section
+        # below the SUPC by y-distance. Without this, items get section=""
+        # and surface as an orphan entry in section_reconciliation with
+        # parser_sum > 0 + printed_total=None, polluting REVIEW classification.
+        # Reference: INV 775837983 (2026-04-27) had 5 items orphan-tagged
+        # ($299.10) when they belonged to the section starting just below
+        # them on the page. Conservative — only fires when sec_name is
+        # truly empty (not when carry_section already provided a value).
+        if not sec_name:
+            below_canonicals = [
+                (sec_y, _canon_fn(sec_label))
+                for sec_y, sec_label in sections
+                if sec_y > y_supc
+                and _canon_fn(sec_label) in _canon_set
+            ]
+            if below_canonicals:
+                # Nearest section below by y-distance (smallest sec_y - y_supc)
+                below_canonicals.sort(key=lambda s: s[0] - y_supc)
+                sec_name = below_canonicals[0][1]
+
         item = {
             "raw_description":  desc or f"[Sysco #{supc['text']}]",
             "sysco_item_code":  supc["text"],

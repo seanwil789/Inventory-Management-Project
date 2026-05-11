@@ -14418,6 +14418,97 @@ class RankPairSyscoQtyExtractionTests(TestCase):
             f'diff_pct={salmon.get("math_diff_pct")}'
         )
 
+    def _import_one_page(self):
+        """Import the per-page helper that accepts carry_section directly."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+        from rank_pair import _extract_sysco_rank_one_page
+        return _extract_sysco_rank_one_page
+
+    def test_orphan_section_falls_back_to_nearest_below(self):
+        """B-OrphanSection fix (2026-05-10): when no canonical section is
+        at-or-above an item's SUPC y AND carry_section is empty (e.g. item
+        appears at the top of a continuation page before ANY header on that
+        page), fall back to the nearest canonical section below.
+
+        Without this, items get section="" and pollute section_reconciliation
+        as orphan entries, dragging invoices into REVIEW classification.
+
+        Reference: INV 775837983 (2026-04-27) had 5 items orphan-tagged
+        ($299.10) that belonged to the section starting just below them.
+        """
+        extract_one = self._import_one_page()
+        # Layout: 3 SUPCs at y=0.10, 0.20, 0.50.
+        # PRODUCE section header at y=0.40 (BELOW the first 2 SUPCs).
+        # First 2 SUPCs have no canonical section above; fix should
+        # tag them with PRODUCE (the nearest section below).
+        tokens = [
+            # Orphan SUPC at y=0.10 (no section above, none in carry_section)
+            self._tok('1234567', 0.55, 0.10),
+            self._tok('15.00',   0.70, 0.10),
+            self._tok('15.00',   0.85, 0.10),
+            self._tok('ORPHAN',  0.20, 0.10),
+            # Second SUPC also above PRODUCE header
+            self._tok('2345678', 0.55, 0.20),
+            self._tok('22.00',   0.70, 0.20),
+            self._tok('22.00',   0.85, 0.20),
+            self._tok('ALSO',    0.20, 0.20),
+            # PRODUCE section header at y=0.40 (with required asterisks)
+            self._tok('****',    0.30, 0.40),
+            self._tok('PRODUCE', 0.40, 0.40),
+            self._tok('****',    0.50, 0.40),
+            # SUPC at y=0.50 (below PRODUCE header — gets PRODUCE normally)
+            self._tok('3456789', 0.55, 0.50),
+            self._tok('30.00',   0.70, 0.50),
+            self._tok('30.00',   0.85, 0.50),
+            self._tok('NORMAL',  0.20, 0.50),
+        ]
+        rows, _ = extract_one(tokens, carry_section='')
+        # All 3 items should be tagged with PRODUCE (the only canonical
+        # section on this page — first 2 via fall-back, 3rd via normal logic)
+        for r in rows:
+            self.assertEqual(
+                r.get('section'), 'PRODUCE',
+                f'SUPC {r["sysco_item_code"]} should be tagged PRODUCE '
+                f'(only canonical section); got section={r.get("section")!r}. '
+                f'Pre-fix orphan SUPCs (above PRODUCE header) got section="".'
+            )
+
+    def test_orphan_section_carry_section_preserved_when_set(self):
+        """Conservative: when carry_section IS set (continuation from prior
+        page), use it. The fall-back should only fire when carry_section is
+        truly empty — don't override valid prior-page state."""
+        extract_one = self._import_one_page()
+        tokens = [
+            # SUPC at y=0.10 with no section header on THIS page
+            self._tok('1234567', 0.55, 0.10),
+            self._tok('15.00',   0.70, 0.10),
+            self._tok('15.00',   0.85, 0.10),
+            self._tok('CARRY',   0.20, 0.10),
+            # 2 more SUPCs for layout detection (no section either)
+            self._tok('2345678', 0.55, 0.30),
+            self._tok('22.00',   0.70, 0.30),
+            self._tok('22.00',   0.85, 0.30),
+            self._tok('NEXT1',   0.20, 0.30),
+            self._tok('3456789', 0.55, 0.50),
+            self._tok('30.00',   0.70, 0.50),
+            self._tok('30.00',   0.85, 0.50),
+            self._tok('NEXT2',   0.20, 0.50),
+        ]
+        rows, _ = extract_one(tokens, carry_section='DAIRY')
+        # All 3 items inherit DAIRY from carry_section (no section header
+        # on page; carry takes precedence over fall-back)
+        for r in rows:
+            self.assertEqual(r.get('section'), 'DAIRY',
+                             f'SUPC {r["sysco_item_code"]} should inherit '
+                             f'DAIRY from carry_section; got {r.get("section")!r}')
+
     def test_catch_weight_skips_derivation_when_implausible_weight(self):
         """Sanity guard: when ext/ppp produces an implausible weight (≤0.1
         or ≥1000 lbs), keep qty alone so downstream math_flag surfaces it
