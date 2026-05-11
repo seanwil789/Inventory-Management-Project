@@ -513,6 +513,11 @@ def _normalize_pack_size(pack: str) -> str:
                         return f"{pack_count}/{size}OZ"
 
     # Check for CT packs: "230 CT" = PACK(2) + SIZE(30 CT), "612 CT" = PACK(6) + SIZE(12 CT)
+    # B-CaseSize-Garbage fix (2026-05-11): raised size cap from 100 to 1000.
+    # Paper goods (toilet tissue, sugar packets, gloves) commonly ship as
+    # 80/500CT (Tork Tissue Toilet 2PL), 10/100CT (Gloves Nitrile 100/box),
+    # 20/50CT (Cup Paper). Cap of 100 was excluding these — Tissue
+    # "80500CT" stayed unsplit instead of "80/500CT".
     m = re.match(r'^(\d+)\s*CT$', pack, re.IGNORECASE)
     if m:
         val_str = m.group(1)
@@ -521,8 +526,23 @@ def _normalize_pack_size(pack: str) -> str:
                 pc_str = str(pack_count)
                 if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
                     size = int(val_str[len(pc_str):])
-                    if 1 <= size <= 100:
+                    if 1 <= size <= 1000:
                         return f"{pack_count}/{size}CT"
+
+    # Check for SHT packs: kitchen-roll towels like "12250SHT" = PACK(12) +
+    # SIZE(250 SHT). B-CaseSize-Garbage fix (2026-05-11): SHT was unhandled
+    # — Tissue/Towel rolls stayed unsplit. Common Sysco towel/tissue packs:
+    # 12/250SHT (kitchen roll), 6/350SHT, etc.
+    m = re.match(r'^(\d+)\s*SHT$', pack, re.IGNORECASE)
+    if m:
+        val_str = m.group(1)
+        if len(val_str) >= 3:
+            for pack_count in _COMMON_PACKS:
+                pc_str = str(pack_count)
+                if val_str.startswith(pc_str) and len(val_str) > len(pc_str):
+                    size = int(val_str[len(pc_str):])
+                    if 1 <= size <= 1000:
+                        return f"{pack_count}/{size}SHT"
 
     # Check for GAL packs: "41GAL" = PACK(4) + SIZE(1 GAL)
     m = re.match(r'^(\d+)\s*GAL$', pack, re.IGNORECASE)

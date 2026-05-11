@@ -787,6 +787,31 @@ class ParserCaseSizeExtractTests(TestCase):
         self.assertEqual(p._normalize_pack_size("50LB"), "50LB")  # <=50 → no split
         self.assertEqual(p._normalize_pack_size(""), "")
 
+    def test_normalize_pack_size_high_count_ct_paper_goods(self):
+        """B-CaseSize-Garbage fix (2026-05-11): paper-goods CT packs like
+        '80500CT' (80 cs × 500ct toilet tissue) used to stay unsplit because
+        the per-unit size cap was 100. Raised to 1000.
+
+        INV 775856655 references:
+          '80500CT'  → '80/500CT'   (Tork Tissue Toilet 2PL)
+          '10100CT'  → '10/100CT'   (Gloves Nitrile)
+          '2050CT'   → '20/50CT'    (Cup Paper Hot 8oz)
+        """
+        p = _import_parser()
+        self.assertEqual(p._normalize_pack_size("80500CT"), "80/500CT")
+        self.assertEqual(p._normalize_pack_size("10100CT"), "10/100CT")
+        self.assertEqual(p._normalize_pack_size("2050CT"), "20/50CT")
+
+    def test_normalize_pack_size_sht_kitchen_rolls(self):
+        """B-CaseSize-Garbage fix (2026-05-11): SHT (sheets) unit was
+        unhandled — kitchen-roll towels '12250SHT' stayed unsplit.
+
+        Reference: INV 775856655 Towel Kitchen → '12250SHT' should be
+        '12/250SHT' (12 rolls × 250 sheets per roll).
+        """
+        p = _import_parser()
+        self.assertEqual(p._normalize_pack_size("12250SHT"), "12/250SHT")
+
 
 class ParserCatchWeightTests(TestCase):
     """`_extract_catch_weight` — Sysco protein per-pound weight patterns."""
