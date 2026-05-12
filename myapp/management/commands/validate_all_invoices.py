@@ -190,17 +190,27 @@ class Command(BaseCommand):
             # Combine pages + run parse_invoice (silenced stdout to keep
             # report clean; parse_invoice prints anomaly notices we'll
             # surface in summary instead).
-            # Sort entries by sha for deterministic page order. Without
-            # this, os.listdir filesystem order produces non-deterministic
-            # carry_section flow in extract_sysco_rank (B-NEW 2026-05-07).
-            entries = sorted(entries, key=lambda e: e['sha'])
+            # Sort entries by detected physical page order so rank_pair's
+            # cross-cache section carry flows correctly. sha-sort and
+            # filesystem-order do NOT preserve page sequence — INV
+            # 775292014 / 775451714 / 775238251 all surfaced as cross-cache
+            # section carry failures under sha-sort (Sean 2026-05-11).
+            from section_validator import cache_page_order_key
+            entries = sorted(
+                entries,
+                key=lambda e: (
+                    cache_page_order_key(e['cache'].get('raw_text', '')),
+                    e['sha'],
+                ),
+            )
             combined_text = '\n'.join(e['cache']['raw_text'] for e in entries)
             combined_pages = []
             for e in entries:
-                # Tag each page with its source cache to allow rank-pair
-                # extraction to reset carry_section at cache boundaries
-                # (multi-photo invoices: each cache is a separate photo,
-                # not a continuation of the prior one).
+                # Tag each page with its source cache for diagnostic provenance.
+                # rank_pair no longer resets carry_section at cache boundaries
+                # — upstream page-order sort above ensures correct sequence
+                # within an invoice, and grouping by invoice_number guarantees
+                # no cross-invoice bleed.
                 for page in (e['cache'].get('pages', []) or []):
                     page = {**page, '_cache_sha': e['sha']}
                     combined_pages.append(page)

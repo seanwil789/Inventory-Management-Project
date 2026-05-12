@@ -320,38 +320,28 @@ def extract_sysco_rank(pages: list[dict]) -> list[dict]:
     Multi-page handling: each page has independent y∈[0,1], so flattening
     across pages produces false "two SUPCs at same y" collisions that break
     competitive-y assignment. We extract per-page and concatenate.
+
+    Section carry across pages (B2b fix 2026-05-07): when page N starts
+    mid-section (its first SUPC is above all section headers detected on
+    page N), items at the top inherit the section from the END of page N-1.
+    Without this, those items get section="" and break section-level
+    reconciliation.
+
+    Caller responsibility: pass `pages` ordered by physical page sequence
+    WITHIN a single invoice. Cross-invoice interleaving will produce wrong
+    section carry. validate_all_invoices + reprocess_ocr_cache group caches
+    by (vendor, invoice_number) and order by `section_validator.
+    cache_page_order_key` before passing here (Sean 2026-05-11). An earlier
+    cache_sha reset was added to mitigate filesystem-order interleaving
+    that no longer occurs at this layer — removing it unblocks correct
+    carry on multi-photo invoices (INV 775292014/775451714/775238251).
     """
     all_rows: list[dict] = []
-    # B2b fix (2026-05-07): track section state across page boundaries.
-    # When page N starts mid-section (its first SUPC is above all section
-    # headers detected on page N), the items at the top inherit the
-    # section from the END of page N-1. Without this, those items get
-    # section="" and break section-level reconciliation.
-    #
-    # B-NEW (2026-05-07): a page is treated as a continuation ONLY when
-    # it has NO section headers of its own. A page with its own headers
-    # starts a fresh section context. This guards against carry_section
-    # bleeding across UNRELATED pages (e.g., when validate_all_invoices
-    # combines pages from multiple separately-photographed caches in
-    # filesystem order — INV 775605601 had carry_section from cache A's
-    # last section drift into cache B's items, producing junk section
-    # labels like 'CANNED & DRY GROUP' / 'HAZARD'). When the next page
-    # has its own canonical sections, those override carry — already
-    # implemented inline. The bug was in cross-cache assumption.
     carry_section: str = ""
-    last_cache_sha: str | None = None
     for page in pages or []:
         tokens = page.get("tokens") or []
         if not tokens:
             continue
-        # Reset carry_section at cache boundaries. When pages from
-        # multiple separately-photographed caches are concatenated (one
-        # photo per Sysco invoice page), each cache's first page
-        # starts fresh — section context shouldn't bleed across photos.
-        cache_sha = page.get("_cache_sha")
-        if cache_sha is not None and cache_sha != last_cache_sha:
-            carry_section = ""
-        last_cache_sha = cache_sha
         rows, last_section = _extract_sysco_rank_one_page(
             tokens, carry_section=carry_section)
         all_rows.extend(rows)

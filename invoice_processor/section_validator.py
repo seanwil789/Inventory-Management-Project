@@ -583,3 +583,65 @@ def reconcile(
         })
     out.sort(key=lambda r: -abs(r.get("diff_abs") or 0))
     return out
+
+
+# ─── Multi-cache invoice page ordering ─────────────────────────────────────
+#
+# Sysco multi-page invoices are typically photographed page-by-page, producing
+# one OCR cache per photo. When validate_all_invoices or reprocess_ocr_cache
+# groups caches by invoice_number for combined parsing, the caches must be
+# ordered by their physical page sequence — not by sha or filesystem order —
+# so that rank_pair's section carry flows correctly across cache boundaries.
+#
+# Detection signals (in priority order):
+#   1. "CONT. ON PAGE N" marker → this cache is page (N-1), 1-indexed
+#   2. "LAST PAGE" marker → this cache is the last page (99)
+#   3. No marker, sections present → estimate from average Sysco section
+#      canonical index (early sections → page 1, late sections → page 3+)
+#   4. Nothing → mid-range fallback (50)
+
+_SYSCO_SECTION_ORDER = [
+    'DAIRY', 'MEATS', 'POULTRY', 'SEAFOOD', 'FROZEN', 'PRODUCE',
+    'BAKERY', 'BEVERAGE', 'CANNED & DRY', 'CHEMICAL', 'PAPER & DISP',
+    'SUPPLY', 'DISPENSER', 'MISC',
+]
+
+
+def cache_page_order_key(raw_text: str) -> int:
+    """Compute a page-order sort key from cache raw_text.
+
+    Lower values sort first. Returns:
+      - (N - 1) when "CONT. ON PAGE N" marker present (page is 1-indexed)
+      - 99 when "LAST PAGE" marker present
+      - 1-3 estimated from average Sysco section index when sections present
+      - 50 when no signals available (mid-range fallback)
+
+    Callers should add a deterministic tiebreaker (e.g. sha) when sorting.
+
+    Why: Sysco multi-photo invoices need their caches ordered by physical
+    page sequence so rank_pair's section carry flows correctly across
+    cache boundaries. sha-sort or filesystem-order doesn't preserve this.
+    """
+    upper = raw_text.upper()
+
+    # Strongest: explicit continuation marker tells us our page number.
+    m = re.search(r'CONT\.?\s*ON\s*PAGE\s*(\d+)', upper)
+    if m:
+        return int(m.group(1)) - 1
+
+    # Strong: last-page marker.
+    if 'LAST PAGE' in upper:
+        return 99
+
+    # Weak: estimate from section content.
+    found_idx = [i for i, s in enumerate(_SYSCO_SECTION_ORDER) if s in upper]
+    if found_idx:
+        avg = sum(found_idx) / len(found_idx)
+        if avg < 3:
+            return 1
+        elif avg < 7:
+            return 2
+        else:
+            return 3
+
+    return 50

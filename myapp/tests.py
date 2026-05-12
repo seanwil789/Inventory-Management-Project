@@ -15375,6 +15375,97 @@ class RankPairSyscoSectionTaggingTests(TestCase):
         self.assertFalse(any(r.get('extended_amount') == 9.80 for r in rows),
                           'GROUP TOTAL value leaked into an item ext')
 
+    def test_cross_cache_carry_section_within_invoice(self):
+        """Multi-photo invoices have CANNED & DRY header on cache A's page
+        and items continuing on cache B's page (no header). Items on B
+        must inherit CANNED & DRY from A. Sean 2026-05-11: INV 775292014
+        / 775451714 / 775238251 all surfaced this failure mode under
+        sha-sort + per-cache carry-reset. Regression test fixtures: page
+        1 has CANNED & DRY header + 3 items, page 2 has 3 items no header.
+        """
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+        from rank_pair import extract_sysco_rank
+
+        # Page 1 tokens: **** CANNED & DRY **** header + 3 SUPC items.
+        # Layout-detect requires >=3 SUPCs in 0.40-0.78 x-band per page.
+        page1_tokens = [
+            self._tok('****', 0.30, 0.20),
+            self._tok('CANNED', 0.40, 0.20),
+            self._tok('&', 0.43, 0.20),
+            self._tok('DRY', 0.46, 0.20),
+            self._tok('****', 0.50, 0.20),
+            self._tok('1234567', 0.55, 0.25), self._tok('5.50', 0.78, 0.25),
+            self._tok('SUGAR', 0.20, 0.25),
+            self._tok('2345678', 0.55, 0.30), self._tok('3.10', 0.78, 0.30),
+            self._tok('OREGANO', 0.20, 0.30),
+            self._tok('3456789', 0.55, 0.35), self._tok('4.20', 0.78, 0.35),
+            self._tok('RICE', 0.20, 0.35),
+        ]
+        # Page 2 tokens: NO section header, 3 more SUPC items.
+        # Without cross-page carry these get section='' — the bug.
+        # With carry they inherit CANNED & DRY from page 1.
+        page2_tokens = [
+            self._tok('4567890', 0.55, 0.25), self._tok('1.50', 0.78, 0.25),
+            self._tok('PRINGLES', 0.20, 0.25),
+            self._tok('5678901', 0.55, 0.30), self._tok('2.20', 0.78, 0.30),
+            self._tok('LACROIX', 0.20, 0.30),
+            self._tok('6789012', 0.55, 0.35), self._tok('3.30', 0.78, 0.35),
+            self._tok('TRAILMIX', 0.20, 0.35),
+        ]
+        pages = [{'tokens': page1_tokens}, {'tokens': page2_tokens}]
+        rows = extract_sysco_rank(pages)
+        # All 6 rows should tag CANNED & DRY — 3 from page 1 directly,
+        # 3 from page 2 via carry_section.
+        self.assertEqual(len(rows), 6, f'expected 6 rows; got {len(rows)}')
+        sections = [r.get('section') for r in rows]
+        self.assertTrue(all(s == 'CANNED & DRY' for s in sections),
+                         f'all rows should tag CANNED & DRY; got {sections}')
+
+    def test_cache_page_order_key_signals(self):
+        """`cache_page_order_key` derives page order from CONT./LAST PAGE
+        markers and falls back to Sysco section index heuristic. Sean
+        2026-05-11: validates the sort key used by validate_all_invoices
+        and reprocess_ocr_cache to order multi-photo caches before
+        extract_sysco_rank.
+        """
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('section_validator',):
+            if m in sys.modules:
+                del sys.modules[m]
+        from section_validator import cache_page_order_key
+
+        # CONT. ON PAGE N → N-1
+        self.assertEqual(cache_page_order_key('some text CONT. ON PAGE 2 more'), 1)
+        self.assertEqual(cache_page_order_key('CONT. ON PAGE 3'), 2)
+        self.assertEqual(cache_page_order_key('CONT ON PAGE 4'), 3)
+        # LAST PAGE
+        self.assertEqual(cache_page_order_key('LAST PAGE marker here'), 99)
+        # Sections-only heuristic — early sections → page 1
+        self.assertEqual(cache_page_order_key('DAIRY MEATS POULTRY items'), 1)
+        # Mid sections (BAKERY BEVERAGE → avg=6.5) → page 2
+        self.assertEqual(cache_page_order_key('BAKERY BEVERAGE items'), 2)
+        # Late sections → page 3
+        self.assertEqual(cache_page_order_key('PAPER & DISP CHEMICAL items'), 3)
+        # Nothing → mid-range fallback
+        self.assertEqual(cache_page_order_key('totally random text 12345'), 50)
+        # CONT. wins over sections (priority order)
+        self.assertEqual(
+            cache_page_order_key('DAIRY MEATS items, CONT. ON PAGE 4'), 3)
+        # LAST PAGE wins over sections
+        self.assertEqual(
+            cache_page_order_key('PRODUCE items, LAST PAGE'), 99)
+
 
 class ParseInvoiceRankPairProductionSwapTests(TestCase):
     """Production swap — parse_invoice routes Farm Art through rank-pair v2

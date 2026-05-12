@@ -162,16 +162,27 @@ class Command(BaseCommand):
                 # parser sees clean line breaks between photos. Pages list
                 # extends — each photo contributes its own page dict with
                 # its own tokens, so spatial matchers iterate across all.
+                # Order caches by detected physical page sequence (not
+                # filesystem order) so rank_pair's section carry flows
+                # correctly across cache boundaries (Sean 2026-05-11).
+                from section_validator import cache_page_order_key
+                ordered = sorted(
+                    group,
+                    key=lambda pc: (
+                        cache_page_order_key(pc[1].get('raw_text', '')),
+                        pc[0],  # path as deterministic tiebreaker
+                    ),
+                )
                 merged_raw = '\n\n'.join(
-                    c.get('raw_text', '') for _, c in group
+                    c.get('raw_text', '') for _, c in ordered
                 )
                 merged_pages = []
-                for _, c in group:
+                for _, c in ordered:
                     p_list = c.get('pages', []) or []
                     merged_pages.extend(p_list)
                 # Use first cache's hash; tag with group size for provenance
-                first_hash = os.path.basename(group[0][0]).split('_')[0][:16]
-                source_token = f'{first_hash}+{len(group)-1}'
+                first_hash = os.path.basename(ordered[0][0]).split('_')[0][:16]
+                source_token = f'{first_hash}+{len(ordered)-1}'
 
             try:
                 parsed = parse_invoice(merged_raw, vendor=vendor,
