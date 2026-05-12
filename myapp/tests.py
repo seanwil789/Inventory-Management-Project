@@ -15317,6 +15317,64 @@ class RankPairSyscoSectionTaggingTests(TestCase):
         self.assertEqual(sections[2], 'DAIRY')
         self.assertEqual(sections[3], 'DAIRY')
 
+    def test_group_total_value_not_paired_as_item_ext(self):
+        """Sysco's mid-page section totals print 'GROUP TOTAL **** $<value>'
+        on the right margin in the same x-band as item ext. Without
+        filtering, rank-pair pairs the bottom-most SUPC with the GROUP
+        TOTAL value. Sean 2026-05-11: INV 775292014 page 2 had LACROIX LMN
+        SUPC paired with $749.33 (CANNED & DRY GROUP TOTAL). Regression
+        test: 3 SUPC rows + 1 GROUP TOTAL row at bottom. Expected: 3 items
+        with their correct prices, NOT 4 items with one pulling GROUP
+        TOTAL value.
+        """
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+        from rank_pair import extract_sysco_rank
+
+        tokens = []
+        # **** CANNED & DRY **** header
+        tokens.append(self._tok('****', 0.30, 0.20))
+        tokens.append(self._tok('CANNED', 0.40, 0.20))
+        tokens.append(self._tok('&', 0.43, 0.20))
+        tokens.append(self._tok('DRY', 0.46, 0.20))
+        tokens.append(self._tok('****', 0.50, 0.20))
+        # 3 real SUPC rows in CANNED & DRY (need >=3 for layout-detect)
+        tokens.append(self._tok('1234567', 0.55, 0.30))
+        tokens.append(self._tok('5.50',    0.78, 0.30))
+        tokens.append(self._tok('SUGAR',   0.20, 0.30))
+        tokens.append(self._tok('2345678', 0.55, 0.40))
+        tokens.append(self._tok('3.10',    0.78, 0.40))
+        tokens.append(self._tok('OREGANO', 0.20, 0.40))
+        tokens.append(self._tok('3456789', 0.55, 0.50))
+        tokens.append(self._tok('1.20',    0.78, 0.50))
+        tokens.append(self._tok('PRINGLE', 0.20, 0.50))
+        # GROUP TOTAL **** $9.80 row at bottom (sum of 3 items above).
+        # The "$9.80" value is in the SAME x-band as item exts — only
+        # the GROUP+TOTAL label tokens distinguish it.
+        tokens.append(self._tok('GROUP', 0.35, 0.60))
+        tokens.append(self._tok('TOTAL', 0.40, 0.60))
+        tokens.append(self._tok('****',  0.45, 0.60))
+        tokens.append(self._tok('9.80',  0.78, 0.60))
+
+        pages = [{'tokens': tokens}]
+        rows = extract_sysco_rank(pages)
+        # Expect exactly 3 items (not 4) — GROUP TOTAL row's $9.80 value
+        # must be filtered from the price pool, leaving 3 SUPC anchors
+        # paired with their own ext tokens.
+        self.assertEqual(len(rows), 3, f'expected 3 rows; got {len(rows)}')
+        exts = sorted(r.get('extended_amount') for r in rows)
+        self.assertEqual(exts, [1.20, 3.10, 5.50],
+                          f'expected exts [1.20, 3.10, 5.50]; got {exts}')
+        # No row should have ext=$9.80 (the GROUP TOTAL value)
+        self.assertFalse(any(r.get('extended_amount') == 9.80 for r in rows),
+                          'GROUP TOTAL value leaked into an item ext')
+
 
 class ParseInvoiceRankPairProductionSwapTests(TestCase):
     """Production swap — parse_invoice routes Farm Art through rank-pair v2

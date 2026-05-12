@@ -440,6 +440,37 @@ def _extract_sysco_rank_one_page(
         and _SYSCO_PRICE_RE.fullmatch(t.get("text") or "")
     ]
 
+    # B-GroupTotalLeak fix (Sean 2026-05-11): exclude price tokens on
+    # GROUP TOTAL rows. Sysco's mid-page section totals print as
+    # "GROUP TOTAL****  $<value>" on the right margin in the same x-band
+    # as item exts. Without filtering, rank-pair pairs the bottom-most
+    # SUPC with the GROUP TOTAL value — INV 775292014 page 2 had
+    # LACROIX LMN SUPC 15021239 wrongly paired with $749.33 (CANNED & DRY
+    # GROUP TOTAL), inflating items_sum by $730+ and making rank_pair
+    # lose the picker to spatial. spatial filters footer-only SUB/TAX
+    # TOTAL via `_find_footer_y`; GROUP TOTAL is mid-page, needs its
+    # own filter here.
+    #
+    # Detection: a row is a GROUP TOTAL row if it contains both a
+    # `GROUP` token and a `TOTAL` token at the same y (within tight
+    # tolerance).
+    _GT_Y_TOL = 0.005
+    group_label_ys: list[float] = []
+    for t in tokens:
+        if (t.get("text") or "").upper() == "GROUP":
+            yg = _y_mid(t)
+            for t2 in tokens:
+                if ((t2.get("text") or "").upper() == "TOTAL"
+                        and abs(_y_mid(t2) - yg) < _GT_Y_TOL):
+                    group_label_ys.append(yg)
+                    break
+    if group_label_ys:
+        price_pool = [
+            t for t in price_pool
+            if not any(abs(_y_mid(t) - gy) < _GT_Y_TOL
+                        for gy in group_label_ys)
+        ]
+
     # Pool of digit-only tokens in the qty column (x < 0.17). Used to find
     # qty per row by competitive-y (same rank-pair principle as descriptions).
     # Sysco prints "1 CS" / "2 CS" / "3 EA" — we want the leading integer.
