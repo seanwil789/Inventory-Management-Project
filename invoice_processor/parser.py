@@ -3590,6 +3590,35 @@ def parse_invoice(text: str, vendor: str = None,
         for item in items:
             item["needs_review"] = True
 
+    # B-ExceptionalFreightPostPicker (2026-05-12): Exceptional Foods' label-
+    # anchored freight extraction lives in _parse_exceptional (text path).
+    # When the picker chooses spatial or rank-pair (e.g. INV 332584 where
+    # spatial captures 6 items at $275.95 vs text's 4 items at $221.49),
+    # the synthetic "Freight" ILI isn't present, leaving the residual $5
+    # gap uncaptured. Add it here as a gap-derived synthetic when:
+    #   - no "Freight" row already present in items
+    #   - invoice_total extracted
+    #   - gap is in plausible freight range (0 < gap < $20)
+    # Sanity-bounded to the same range the in-parser gap-derivation uses;
+    # safe across non-target invoices because the existing freight already
+    # closes their math.
+    if vendor in ("Exceptional Foods", "Exceptional") and invoice_total is not None:
+        has_freight = any(
+            (it.get("raw_description") or "").strip().lower() == "freight"
+            for it in items
+        )
+        if not has_freight:
+            items_sum_now = round(
+                sum((it.get("extended_amount") or 0) for it in items), 2)
+            gap = round(invoice_total - items_sum_now, 2)
+            if 0 < gap < 20:
+                items = list(items) + [{
+                    "raw_description": "Freight",
+                    "unit_price": gap,
+                    "extended_amount": gap,
+                    "case_size_raw": "",
+                }]
+
     # B9: dedup duplicate items from overlapping multi-photo Sysco caches.
     # When the same invoice is photographed 2+ times (Sean re-shoots a page
     # for clarity, or shoots both halves of a fold), each cache yields its
