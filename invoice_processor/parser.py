@@ -2673,12 +2673,24 @@ def _parse_pbm(text: str) -> list[dict]:
         ext = ext_amounts[i] if i < len(ext_amounts) else 0
         up = unit_prices[i] if i < len(unit_prices) else ext
         if ext > 0:
-            items.append({
+            it = {
                 "raw_description": desc,
                 "unit_price": up,
                 "extended_amount": ext,
                 "case_size_raw": "",
-            })
+            }
+            # Derive integer quantity from ext/unit when the ratio is an
+            # exact integer (within $0.05). PBM items are sold in whole
+            # units (DZ/EA/CS) so qty=N always cleanly divides ext into
+            # unit. Sets only when math closes — leaves None otherwise so
+            # db_write's preserve-if-none path can fall back to a prior
+            # write's qty. (B-MathPairs-Qty, fixes row-level qty=0 quirk
+            # when text path wins picker but doesn't populate qty.)
+            if up > 0:
+                _q = round(ext / up)
+                if 1 <= _q <= 100 and abs(ext - up * _q) < 0.05:
+                    it["quantity"] = float(_q)
+            items.append(it)
 
     # ── Extract and validate invoice total ────────────────────────────
     invoice_total = None

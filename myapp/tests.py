@@ -15529,6 +15529,40 @@ class PBMMathPairsStrategyTests(TestCase):
         self.assertAlmostEqual(items_sum, 121.72, delta=0.01,
             msg=f"items_sum {items_sum} should reconcile to subtotal $121.72")
 
+    def test_text_path_derives_integer_quantity_from_ext_over_unit(self):
+        """B-MathPairs-Qty (2026-05-12): text-path items now include
+        `quantity` when ext/unit divides to an integer within $0.05.
+        Before this, db_write's preserve-if-none path could leave a
+        stale qty=0 on rows whose qty was set by an earlier write
+        (e.g. spatial path missing a row) — IVS PASSes but row-level
+        data is internally inconsistent. PBM 7465 row 5 (Assorted
+        Donuts $20×2=$40) was the canonical case.
+        """
+        parser = self._import_parser()
+        text = (
+            "Description\n"
+            "Unit Price\n"
+            "Amount\n"
+            "L07\n2.00\nDZ\nHamburger Rolls\n6.22\n12.44\n"
+            "L37\n2.00\nDZ\nHot Dog Rolls\n4.80\n9.60\n"
+            "0150\n2.00\nDZ\nAssorted Danish\n14.92\n29.84\n"
+            "0258\n2.00\nDZ\n"
+            "0290\n2.00\nDZ\n"
+            "Medium Danish/Assorted\n"
+            "Assorted Donuts\n"
+            "14.92\n29.84\n20.00\n40.00\n"
+            "Subtotal($):\n121.72\n"
+            "Invoice Total($):\n121.72\n"
+        )
+        items, _ = parser._parse_pbm(text)
+        self.assertEqual(len(items), 5)
+        # Every row's ext is an integer multiple of unit — qty should be set
+        for it in items:
+            self.assertIn('quantity', it,
+                f"row {it['raw_description']!r} missing quantity")
+            self.assertEqual(it['quantity'], 2.0,
+                f"row {it['raw_description']!r}: expected qty=2, got {it.get('quantity')}")
+
     def test_math_pairs_does_not_disturb_clean_invoices(self):
         """When existing strategies already match subtotal, math_pairs
         must NOT change the picked output. Simple 2-row PBM with clean
