@@ -185,17 +185,31 @@ def _find_sections(rows: list[list[dict]]) -> list[tuple[float, str]]:
             # by this collision pattern.
             if not label:
                 upper_joined = joined.upper()
-                # Longest canonicals first (matches PAPER & DISPOSABLE
-                # before PAPER & DISP, etc. — same ordering as
-                # canonicalize_sysco_section uses). Exclude MISC CHARGES:
-                # it's a totals-block label, not an item section. Including
-                # it would emit phantom 'MISC CHARGES' sections from rows
-                # near the totals area where FUEL/CC values are clustered,
-                # creating false section_with_gap entries.
+                # Longest canonicals first. Emit only when canonical name
+                # is IMMEDIATELY FOLLOWED by ' GROUP ' — that's the
+                # row-cluster-collision signal: the canonical sits at row
+                # start, then the PRIOR section's `GROUP TOTAL **** value`
+                # marker follows on the same row.
+                #
+                # Without this restriction, the substring scan would also
+                # match on normal end-of-section rows like
+                # `MEATS **** GROUP TOTAL **** 181.72 AND` where 'MEATS'
+                # appears as the row label of the section ENDING here.
+                # Emitting it would create a phantom section header AT
+                # the end of items → downstream picker selection / item
+                # attribution regression (Sysco 1249744 went PASS→FAIL).
+                #
+                # The collision pattern always has the new canonical name
+                # followed by GROUP (e.g. 'CANNED & DRY GROUP **** TOTAL⭑
+                # **** 113.98'); the end-of-section pattern has it
+                # followed by '****'. The space gate disambiguates.
+                #
+                # Exclude MISC CHARGES: it's a totals-block label, not an
+                # item section.
                 for canonical in _CANONICAL_SYSCO_SECTIONS:
                     if canonical == 'MISC CHARGES':
                         continue
-                    if canonical in upper_joined:
+                    if f'{canonical} GROUP' in upper_joined:
                         label = canonical
                         break
         elif len(asterisk_runs) == 1:

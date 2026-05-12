@@ -14690,6 +14690,48 @@ class SyscoSectionLabelCanonicalizationTests(TestCase):
         self.assertEqual(out, [],
                          'No canonical in row → no section emitted')
 
+    def test_find_sections_substring_recovery_rejects_end_of_section_marker(self):
+        """B-RowCollision regression (2026-05-11): a printed-group-total
+        row like `MEATS **** GROUP TOTAL **** 181.72 AND` has 'MEATS'
+        followed by '****' (not 'GROUP'). This is the end-of-MEATS marker,
+        NOT the start of a new MEATS section.
+
+        Without the ' GROUP ' suffix gate, the substring scan would emit
+        MEATS at the end of items → downstream picker / item-attribution
+        regression. Reference: Sysco 1249744 went PASS→FAIL (items_sum
+        $602 > invoice_total $513 = over-attribution) when this pattern
+        leaked through an earlier draft of B-RowCollision.
+
+        The disambiguation: collision rows have canonical-name + ' GROUP'
+        (the prior section's GROUP TOTAL marker follows the new section's
+        name). End-of-section rows have canonical-name + ' ****' (the
+        asterisks bracket GROUP TOTAL itself, with the section label at
+        row-start as the row's section identifier).
+        """
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        # End-of-section row: MEATS at left, **** GROUP TOTAL **** value
+        rows = [[
+            tok('MEATS', 0.27, 0.55),
+            tok('****',  0.34, 0.55),
+            tok('GROUP', 0.36, 0.55),
+            tok('TOTAL', 0.40, 0.55),
+            tok('****',  0.44, 0.55),
+            tok('181.72', 0.72, 0.55),
+            tok('AND',   0.78, 0.55),
+        ]]
+        out = sm._find_sections(rows)
+        labels = {name for _, name in out}
+        self.assertNotIn('MEATS', labels,
+                         f'End-of-MEATS marker row must NOT emit MEATS '
+                         f'(would create phantom section header at end '
+                         f'of items, regress section attribution). Got: {labels}')
+
 
 class SyscoMultiPhotoDedupTests(TestCase):
     """B9 fix (project_parser_accuracy_goal.md): when an invoice is photographed
