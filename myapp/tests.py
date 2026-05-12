@@ -15586,6 +15586,116 @@ class PBMMathPairsStrategyTests(TestCase):
         self.assertAlmostEqual(items[1]['extended_amount'], 14.40, delta=0.01)
 
 
+class ExceptionalFreightExtractionTests(TestCase):
+    """B-ExceptionalFreightVBL + B-ExceptionalFreightGap (2026-05-12):
+    _extract_exceptional_freight now handles a third layout where values
+    appear BEFORE the "Weight Freight" / "Freight" label, and
+    _parse_exceptional gap-derives freight when label extraction misses
+    a delayed-value layout (INV 332584).
+
+    Three live-OCR variants confirmed:
+      INV 332338: values-before-label, "Weight Freight" merged label
+      INV 334347: values-before-label, standalone "Freight" label
+      INV 332584: interleaved top + freight value displaced past
+        T=Taxable Items marker → gap-derivation path
+
+    All three have gap = $5.00 (Exceptional's standard freight charge);
+    pre-fix, all PASSed via classifier tolerance but with uncaptured
+    freight (items_sum $5.00 short of invoice_total).
+    """
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'parser' in sys.modules:
+            del sys.modules['parser']
+        import parser as p
+        return p
+
+    def test_values_before_weight_freight_label_332338(self):
+        """INV 332338 layout: Sales Amt label → 5 values → Weight Freight
+        label. Freight at index 2 of the values block = $5.00."""
+        parser = self._import_parser()
+        lines = [
+            "Sales Amt",
+            "250.92",
+            "0.00",
+            "5.00",
+            "0.00",
+            "255.92",
+            "Weight Freight",
+            "91.10 Sales Tax",
+            "Total",
+            "Amount Paid",
+            "Balance Due",
+            "0.00",
+            "255.92",
+        ]
+        freight = parser._extract_exceptional_freight(lines)
+        self.assertEqual(freight, 5.00,
+            f"expected $5.00 freight (idx 2 of values block); got {freight}")
+
+    def test_values_before_freight_label_334347(self):
+        """INV 334347 layout: Sales Amt label → 5 values → standalone
+        Freight label. Freight at index 2 = $5.00."""
+        parser = self._import_parser()
+        lines = [
+            "Misc Amt",
+            "Sales Amt",
+            "349.54",
+            "0.00",
+            "5.00",
+            "0.00",
+            "354.54",
+            "Freight",
+            "Sales Tax",
+            "Total",
+        ]
+        freight = parser._extract_exceptional_freight(lines)
+        self.assertEqual(freight, 5.00)
+
+    def test_extract_exceptional_sales_amt(self):
+        """Helper for gap-derivation: pulls the first plausibly-large
+        decimal after Sales Amt label. Filters Misc Amt ($0.00)."""
+        parser = self._import_parser()
+        lines = ["Sales Amt", "275.95", "Misc Amt", "0.00"]
+        self.assertEqual(parser._extract_exceptional_sales_amt(lines), 275.95)
+        # Misc Amt 0.00 must NOT be picked
+        lines2 = ["Sales Amt", "Misc Amt", "0.00", "275.95"]
+        # First decimal is 0.00 — filter to require >= $50
+        self.assertEqual(parser._extract_exceptional_sales_amt(lines2), 275.95)
+
+    def test_does_not_disturb_clean_extraction_333896(self):
+        """When label extraction works on the normal grouped layout
+        (INV 333896), the new fallbacks must NOT change the result.
+        Grouped: labels block then values block, freight = values[2]
+        after offset adjustment for merged 'Weight Freight'."""
+        parser = self._import_parser()
+        lines = [
+            "Sales Amt",
+            "Misc Amt",
+            "Weight Freight",
+            "71.90",
+            "Sales Tax",
+            "Total",
+            "Amount Paid",
+            "Balance Due",
+            "209.47",
+            "0.00",
+            "40.00",
+            "0.00",
+            "249.47",
+            "0.00",
+            "249.47",
+        ]
+        freight = parser._extract_exceptional_freight(lines)
+        self.assertEqual(freight, 40.00,
+            f"clean grouped layout: expected $40.00 freight; got {freight}")
+
+
 class ParseInvoiceRankPairProductionSwapTests(TestCase):
     """Production swap — parse_invoice routes Farm Art through rank-pair v2
     when DocAI layout data is available, falls back to spatial+text picker

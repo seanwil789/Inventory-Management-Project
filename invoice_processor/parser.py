@@ -1773,13 +1773,31 @@ def _extract_exceptional_freight(lines: list[str]) -> float | None:
                 break
 
         if num_between:
-            # Interleaved: freight value is on the next non-label line
+            # Interleaved: freight value is on the next non-label line.
             for j in range(i + 1, min(i + 3, len(lines))):
                 m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
                 if m:
                     val = float(m.group(1).replace(",", ""))
-                    if 0 <= val < 100:  # freight is typically small
-                        return val if val > 0 else None
+                    if 0 < val < 100:  # plausible freight, strictly positive
+                        return val
+                    # 0.00 here is the Amount Paid value, not freight —
+                    # fall through to values-before-label fallback.
+                    break
+            # Values-before-label fallback (B-ExceptionalFreightVBL,
+            # 2026-05-12): some Exceptional OCR places ALL values between
+            # Sales Amt and the Freight label (label appears AFTER its
+            # values). Column order in the values block is consistent:
+            # [Sales Amt, Misc, Freight, Sales Tax, Total]. INV 332338 +
+            # 334347 confirmed. Sanity-bounded to freight range.
+            values_before = []
+            for j in range(sales_amt_idx + 1, i):
+                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if m:
+                    values_before.append(float(m.group(1).replace(",", "")))
+            if len(values_before) >= 3:
+                val = values_before[2]
+                if 0 < val < 100:
+                    return val
         else:
             # Grouped: values follow the full label block. Freight's value is
             # the (i - sales_amt_idx)-th number after the last label.
@@ -1805,6 +1823,30 @@ def _extract_exceptional_freight(lines: list[str]) -> float | None:
                 # Sanity: freight must be small relative to the total
                 if 0 < val < 100:
                     return val
+    return None
+
+
+def _extract_exceptional_sales_amt(lines: list[str]) -> float | None:
+    """Extract the Sales Amt (sum of items) from Exceptional Foods.
+    Used by _parse_exceptional to gap-derive freight when label extraction
+    fails on layouts where the freight value appears far from its label.
+    Returns the first plausibly-large decimal after a 'Sales Amt' label
+    (filters $0.00 = Misc Amt and three-digit weight values like 100.10
+    lbs that can shoulder into the same vertical span).
+    """
+    for i, line in enumerate(lines):
+        if re.match(r'^\s*Sales\s+Amt\s*$', line, re.IGNORECASE):
+            for j in range(i + 1, min(i + 8, len(lines))):
+                m = re.match(r'^\s*(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if m:
+                    val = float(m.group(1).replace(",", ""))
+                    # Skip Misc Amt (0.00) and Weight (typically 50-200 lbs
+                    # with cents — but real Sales Amt is rarely under $50).
+                    # Real Sales Amt on a delivered invoice is essentially
+                    # always >= the freight charge plus a few items, so
+                    # require >= $50.
+                    if val >= 50:
+                        return val
     return None
 
 
@@ -2106,6 +2148,21 @@ def _parse_exceptional(text: str) -> list[dict]:
     # from item lines. Capture it as a synthetic line so item totals
     # reconcile against invoice_total.
     freight = _extract_exceptional_freight(all_lines)
+    # Gap-derivation fallback (B-ExceptionalFreightGap, 2026-05-12): when
+    # label extraction fails on an unusual layout (INV 332584 has the
+    # freight value displaced after a T=Taxable Items marker, way past
+    # the Freight label), trust the difference between Sales Amt and
+    # invoice total IF the gap is plausibly freight ($0 < gap < $20)
+    # and items_sum aligns with Sales Amt within $0.50.
+    if freight is None and invoice_total is not None:
+        sales_amt = _extract_exceptional_sales_amt(all_lines)
+        items_sum_so_far = round(sum(it.get("extended_amount", 0) or 0
+                                      for it in items), 2)
+        if (sales_amt is not None
+                and abs(items_sum_so_far - sales_amt) < 0.50):
+            gap = round(invoice_total - sales_amt, 2)
+            if 0 < gap < 20:
+                freight = gap
     if freight and freight > 0:
         items.append({
             "raw_description": "Freight",
