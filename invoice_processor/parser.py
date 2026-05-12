@@ -2629,6 +2629,31 @@ def _parse_pbm(text: str) -> list[dict]:
         single_sum = round(sum(single), 2)
         candidates.append(("single", single, single, single_sum))
 
+        # Strategy 5: math-validated adjacent pairs. Greedy walk pairing
+        # (a, b) when b == a*k for integer k in [2, 50]. Handles mixed
+        # layouts where rows 1-N are row-major (qty,unit,ext) but rows
+        # N+1..M have data column-batched (codes/qtys batched, then descs
+        # batched, then prices batched as unit1,ext1,unit2,ext2...). The
+        # other strategies all assume one consistent interleaving for the
+        # full price list and trip at the layout switch. (B-MathPairs,
+        # PBM 7465 + 3743 confirmed 2026-05-12.)
+        mp_pairs = []
+        _i = 0
+        while _i < len(raw_amounts) - 1:
+            _a, _b = raw_amounts[_i], raw_amounts[_i + 1]
+            if _a > 0 and _b > 0:
+                _q = round(_b / _a)
+                if 2 <= _q <= 50 and abs(_b - _a * _q) < 0.05:
+                    mp_pairs.append((_a, _b))
+                    _i += 2
+                    continue
+            _i += 1
+        if len(mp_pairs) >= n_desc:
+            mp_unit = [p[0] for p in mp_pairs[:n_desc]]
+            mp_ext = [p[1] for p in mp_pairs[:n_desc]]
+            mp_sum = round(sum(mp_ext), 2)
+            candidates.append(("math_pairs", mp_unit, mp_ext, mp_sum))
+
         # Pick the strategy that matches subtotal
         best = None
         for name, units, exts, total in candidates:

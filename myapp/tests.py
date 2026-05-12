@@ -15467,6 +15467,91 @@ class RankPairSyscoSectionTaggingTests(TestCase):
             cache_page_order_key('PRODUCE items, LAST PAGE'), 99)
 
 
+class PBMMathPairsStrategyTests(TestCase):
+    """B-MathPairs (2026-05-12): _parse_pbm Format-2 now includes a
+    math-validated adjacent-pair strategy that handles mixed-layout
+    PBM invoices where rows 1..N are row-major and rows N+1..M are
+    column-batched. PBM 7465 + 3743 both confirmed pre-fix.
+
+    The new strategy greedily walks raw_amounts pairing (a,b) when
+    b == a*k for integer k in [2, 50]. Candidate competes with the
+    existing 5 strategies under the same subtotal-anchored picker;
+    wins only when it strictly beats them on subtotal proximity.
+    Hypothesis dry-run 2026-05-12: 0 regressions across 23 Format-2
+    PBM caches; 2 improvements (7465, 3743) — both lock to subtotal.
+    """
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'parser' in sys.modules:
+            del sys.modules['parser']
+        import parser as p
+        return p
+
+    def test_math_pairs_picks_correct_rows_pbm_7465_layout(self):
+        """PBM 7465 (2026-05-07): rows 1-3 row-major, rows 4-5 column-
+        batched. Without math_pairs the triples_que strategy mis-pairs
+        row 4 (picks $2.00 qty as unit, $14.92 unit as ext). With
+        math_pairs all 5 rows close math AND sum equals subtotal."""
+        parser = self._import_parser()
+        text = (
+            "Description\n"
+            "Unit Price\n"
+            "Amount\n"
+            "L07\n2.00\nDZ\nHamburger Rolls\n6.22\n12.44\n"
+            "L37\n2.00\nDZ\nHot Dog Rolls\n4.80\n9.60\n"
+            "0150\n2.00\nDZ\nAssorted Danish\n14.92\n29.84\n"
+            "0258\n2.00\nDZ\n"
+            "0290\n2.00\nDZ\n"
+            "Medium Danish/Assorted\n"
+            "Assorted Donuts\n"
+            "14.92\n29.84\n20.00\n40.00\n"
+            "Subtotal($):\n121.72\n"
+            "Invoice Total($):\n121.72\n"
+        )
+        items, total = parser._parse_pbm(text)
+        self.assertEqual(total, 121.72)
+        self.assertEqual(len(items), 5)
+        # All five rows should have ext == unit * k for integer k
+        for it in items:
+            unit = it['unit_price']
+            ext = it['extended_amount']
+            self.assertGreater(unit, 0)
+            self.assertGreater(ext, 0)
+            ratio = ext / unit
+            self.assertAlmostEqual(ratio, round(ratio), delta=0.01,
+                msg=f"row {it['raw_description']!r}: ext/unit={ratio} not integer")
+        items_sum = round(sum(it['extended_amount'] for it in items), 2)
+        self.assertAlmostEqual(items_sum, 121.72, delta=0.01,
+            msg=f"items_sum {items_sum} should reconcile to subtotal $121.72")
+
+    def test_math_pairs_does_not_disturb_clean_invoices(self):
+        """When existing strategies already match subtotal, math_pairs
+        must NOT change the picked output. Simple 2-row PBM with clean
+        row-major layout — triples_que should still win."""
+        parser = self._import_parser()
+        text = (
+            "Description\n"
+            "Unit Price\n"
+            "Amount\n"
+            "L07\n2.00\nDZ\nHamburger Rolls\n6.22\n12.44\n"
+            "L37\n3.00\nDZ\nHot Dog Rolls\n4.80\n14.40\n"
+            "Subtotal($):\n26.84\n"
+            "Invoice Total($):\n26.84\n"
+        )
+        items, total = parser._parse_pbm(text)
+        self.assertEqual(total, 26.84)
+        self.assertEqual(len(items), 2)
+        self.assertAlmostEqual(items[0]['unit_price'], 6.22, delta=0.01)
+        self.assertAlmostEqual(items[0]['extended_amount'], 12.44, delta=0.01)
+        self.assertAlmostEqual(items[1]['unit_price'], 4.80, delta=0.01)
+        self.assertAlmostEqual(items[1]['extended_amount'], 14.40, delta=0.01)
+
+
 class ParseInvoiceRankPairProductionSwapTests(TestCase):
     """Production swap — parse_invoice routes Farm Art through rank-pair v2
     when DocAI layout data is available, falls back to spatial+text picker
