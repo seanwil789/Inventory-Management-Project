@@ -167,6 +167,37 @@ def _find_sections(rows: list[list[dict]]) -> list[tuple[float, str]]:
                 canon = canonicalize_sysco_section(between)
                 if canon in _CANONICAL_SYSCO_SECTIONS:
                     label = canon
+            # B-RowCollision (2026-05-11): when between-asterisk text doesn't
+            # canonicalize (junk like 'TOTAL⭑'), scan the FULL joined-row
+            # text for a canonical section name. OCR row-cluster collisions
+            # merge two logical rows into one — the canonical section header
+            # tokens may sit OUTSIDE the asterisk runs (e.g. row reads
+            # `CANNED & DRY GROUP **** TOTAL⭑ **** 113.98` where CANNED & DRY
+            # is the actual section header for items below, but the asterisks
+            # bracket the prior section's GROUP TOTAL row).
+            # Without this fallback, the entire row is suppressed → items
+            # below inherit the WRONG prior section, and printed totals at
+            # row-bottom-right (the $113.98) become unreachable for the
+            # prior section's reconciliation.
+            # Reference: REVIEW invoices 775292014 ($676 of CANNED & DRY
+            # items in blank section), 775451714 ($385 of FROZEN in blank),
+            # 775687424 (7 CANNED & DRY items in FROZEN/blank) — all driven
+            # by this collision pattern.
+            if not label:
+                upper_joined = joined.upper()
+                # Longest canonicals first (matches PAPER & DISPOSABLE
+                # before PAPER & DISP, etc. — same ordering as
+                # canonicalize_sysco_section uses). Exclude MISC CHARGES:
+                # it's a totals-block label, not an item section. Including
+                # it would emit phantom 'MISC CHARGES' sections from rows
+                # near the totals area where FUEL/CC values are clustered,
+                # creating false section_with_gap entries.
+                for canonical in _CANONICAL_SYSCO_SECTIONS:
+                    if canonical == 'MISC CHARGES':
+                        continue
+                    if canonical in upper_joined:
+                        label = canonical
+                        break
         elif len(asterisk_runs) == 1:
             # Single-run header: `**** NAME [item tokens]` — the closing
             # `****` got OCR'd into another y-row. Take first 4 tokens

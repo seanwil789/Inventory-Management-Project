@@ -14591,18 +14591,28 @@ class SyscoSectionLabelCanonicalizationTests(TestCase):
         self.assertEqual(out[0][1], 'PRODUCE')
 
     def test_find_sections_rejects_two_run_collision_with_junk_between(self):
-        """B-TotalAsterisk regression (2026-05-11): OCR row-cluster collision
-        merges two logical rows into one. Example pattern from INV 775687424
-        cache: the row at y≈0.60 contains the `CANNED & DRY` section header
-        AND the prior FROZEN section's `GROUP TOTAL ⭑ ****` row tokens at
-        a slightly different y, merged because their y-centers fell within
-        `_ROW_Y_TOL`. The merged row reads, in x-order:
+        """B-TotalAsterisk + B-RowCollision regression (2026-05-11): OCR
+        row-cluster collision merges two logical rows into one. Example
+        pattern from INV 775687424 cache: the row at y≈0.60 contains the
+        `CANNED & DRY` section header AND the prior FROZEN section's
+        `GROUP TOTAL ⭑ ****` row tokens at a slightly different y, merged
+        because their y-centers fell within `_ROW_Y_TOL`. The merged row
+        reads, in x-order:
             CANNED & DRY GROUP **** TOTAL⭑ **** 113.98
-        The `>=2 asterisk runs` branch of `_find_sections` extracts text
-        between the asterisks → `'TOTAL⭑'`. Without canonical filtering,
-        this becomes a phantom section that 7 CANNED & DRY items get
-        mistagged into. Fix: canonicalize + check membership before
-        accepting the label (same as the single-run branch already does).
+
+        B-TotalAsterisk: the `>=2 asterisk runs` branch extracts text
+        between asterisks → 'TOTAL⭑'. Without canonical filtering, this
+        becomes a phantom section that 7 CANNED & DRY items get mistagged
+        into. → reject non-canonical between-labels.
+
+        B-RowCollision (the smarter fix): when between-text rejects but
+        the row CONTAINS a canonical section name elsewhere (here:
+        'CANNED & DRY' appears in the tokens before the asterisks), fall
+        back to that canonical. Without this, the entire row is suppressed
+        → 7 CANNED & DRY items inherit the WRONG section (FROZEN above) and
+        the $113.98 GROUP TOTAL becomes unreachable for FROZEN reconciliation.
+        With this fix: section='CANNED & DRY' is emitted, 7 items below get
+        correctly tagged, and FROZEN's max-in-range still finds $113.98.
         """
         sm = self._import()
 
@@ -14625,15 +14635,60 @@ class SyscoSectionLabelCanonicalizationTests(TestCase):
             tok('113.98',  0.74, 0.591),
         ]]
         out = sm._find_sections(rows)
-        # Result must NOT contain 'TOTAL⭑' as a section name
         labels = {name for _, name in out}
+        # B-TotalAsterisk: TOTAL⭑ phantom must NOT appear
         self.assertNotIn('TOTAL⭑', labels,
-                         f'TOTAL⭑ phantom section leaked through canonical '
-                         f'filter; got {labels}')
-        # Also: 'CANNED & DRY' could legitimately be extracted from the
-        # surviving canonical-substring path. Either it's emitted (good)
-        # or nothing is emitted (acceptable — caller falls back to other
-        # section detection). What's NOT acceptable is a 'TOTAL⭑' entry.
+                         f'TOTAL⭑ phantom section leaked; got {labels}')
+        # B-RowCollision: the canonical CANNED & DRY MUST be emitted
+        # (recovered via substring scan of row text)
+        self.assertIn('CANNED & DRY', labels,
+                      f'B-RowCollision: CANNED & DRY should be recovered '
+                      f'from the collided row; got {labels}')
+
+    def test_find_sections_substring_recovery_only_fires_on_failed_between(self):
+        """B-RowCollision substring scan must NOT spuriously match on
+        normal `**** SECTION ****` rows where between-text already
+        canonicalizes. Otherwise rows like `**** FROZEN **** PUFF PASTRY
+        SLAB` would have the substring scan re-match FROZEN (idempotent,
+        but the cleaner path is the between-extraction)."""
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        # Standard FROZEN header row — between-text 'FROZEN' canonicalizes
+        rows = [[
+            tok('****',   0.30, 0.20),
+            tok('FROZEN', 0.40, 0.20),
+            tok('****',   0.50, 0.20),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(len(out), 1)
+        self.assertEqual(out[0][1], 'FROZEN')
+
+    def test_find_sections_substring_recovery_no_match_when_no_canonical_in_row(self):
+        """When between-text is junk AND no canonical name appears anywhere
+        else in the row, no section emitted. Negative case for B-RowCollision."""
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        # Junk between, junk elsewhere — should emit nothing
+        rows = [[
+            tok('FOOBAR', 0.27, 0.30),
+            tok('****',   0.37, 0.30),
+            tok('GARBAGE', 0.40, 0.30),
+            tok('****',   0.44, 0.30),
+            tok('XYZ',    0.74, 0.30),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(out, [],
+                         'No canonical in row → no section emitted')
 
 
 class SyscoMultiPhotoDedupTests(TestCase):
