@@ -3873,11 +3873,64 @@ def category_spend(request):
     from collections import defaultdict
 
     today = date.today()
-    year, month = today.year, today.month
 
-    # --- Current month breakdown ---
+    # Parse ?month=YYYY-MM (e.g. ?month=2026-04). Empty/invalid falls
+    # back to today's month silently — no 4xx for typos.
+    month_param = request.GET.get('month', '').strip()
+    year, month = today.year, today.month
+    if month_param:
+        try:
+            ys, ms = month_param.split('-')
+            y, m = int(ys), int(ms)
+            if 2020 <= y <= 2100 and 1 <= m <= 12:
+                year, month = y, m
+        except (ValueError, IndexError):
+            pass
+
+    # --- Selected month breakdown ---
     mo_start = date(year, month, 1)
     mo_end = date(year, month, monthrange(year, month)[1])
+
+    # Prev/next month navigation. Only expose links when there's mapped
+    # data on the other side — avoids dead clicks that land on an empty
+    # page. Walks month-by-month indefinitely backward/forward through
+    # InvoiceLineItem.invoice_date space, but caps search at 24 months
+    # in each direction so a sparse DB doesn't spin forever.
+    def _step_month(y, m, direction):
+        nm = m + direction
+        ny = y
+        if nm == 0:
+            nm, ny = 12, y - 1
+        elif nm == 13:
+            nm, ny = 1, y + 1
+        return ny, nm
+
+    def _month_has_data(y, m):
+        s = date(y, m, 1)
+        e = date(y, m, monthrange(y, m)[1])
+        return InvoiceLineItem.objects.filter(
+            product__isnull=False, invoice_date__gte=s, invoice_date__lte=e
+        ).exists()
+
+    prev_url = None
+    py, pm = _step_month(year, month, -1)
+    for _ in range(24):
+        if _month_has_data(py, pm):
+            prev_url = f'?month={py:04d}-{pm:02d}'
+            break
+        py, pm = _step_month(py, pm, -1)
+
+    next_url = None
+    ny, nm = _step_month(year, month, +1)
+    # Don't go past current month even if some test data sits in the future
+    cur_y, cur_m = today.year, today.month
+    for _ in range(24):
+        if (ny, nm) > (cur_y, cur_m):
+            break
+        if _month_has_data(ny, nm):
+            next_url = f'?month={ny:04d}-{nm:02d}'
+            break
+        ny, nm = _step_month(ny, nm, +1)
 
     # B6: exclude math_flagged rows so anomaly-contaminated unit_price values
     # don't distort the category spend distribution. Per Trust LAW.
@@ -3970,7 +4023,11 @@ def category_spend(request):
     donut_slices = _category_spend_donut_slices(current, value_key='est_spend')
 
     return render(request, 'myapp/category_spend.html', {
-        'current_label': today.strftime('%B %Y'),
+        'current_label': mo_start.strftime('%B %Y'),
+        'is_current_month': (year == today.year and month == today.month),
+        'today_url': './',
+        'prev_url': prev_url,
+        'next_url': next_url,
         'current': current,
         'top_products': top_products,
         'trend_months': trend_months,

@@ -9,7 +9,24 @@
   <div class="flex items-baseline justify-between gap-3 flex-wrap">
     <div>
       <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Category Activity</h1>
-      <div class="text-sm text-slate-500">{{ current_label }} — {{ total_lines }} invoice line{{ total_lines|pluralize }} across {{ current|length }} categor{{ current|pluralize:"y,ies" }}</div>
+      <div class="text-sm text-slate-500 flex items-center gap-2 flex-wrap mt-1">
+        {% if prev_url %}
+          <a href="{{ prev_url }}" class="px-2 py-0.5 rounded border border-slate-300 hover:bg-slate-50 text-slate-600" title="Previous month">←</a>
+        {% else %}
+          <span class="px-2 py-0.5 rounded border border-slate-200 text-slate-300 cursor-not-allowed" aria-disabled="true">←</span>
+        {% endif %}
+        <span class="font-medium text-slate-700">{{ current_label }}</span>
+        {% if next_url %}
+          <a href="{{ next_url }}" class="px-2 py-0.5 rounded border border-slate-300 hover:bg-slate-50 text-slate-600" title="Next month">→</a>
+        {% else %}
+          <span class="px-2 py-0.5 rounded border border-slate-200 text-slate-300 cursor-not-allowed" aria-disabled="true">→</span>
+        {% endif %}
+        {% if not is_current_month %}
+          <a href="{{ today_url }}" class="ml-2 text-xs text-indigo-600 hover:text-indigo-800">jump to current</a>
+        {% endif %}
+        <span class="text-slate-400">·</span>
+        <span>{{ total_lines }} line{{ total_lines|pluralize }} across {{ current|length }} categor{{ current|pluralize:"y,ies" }}</span>
+      </div>
     </div>
     <nav class="flex gap-2 text-sm">
       <a href="{% url 'cogs_dashboard' %}" class="px-3 py-1 rounded border border-slate-300 hover:bg-slate-50 text-slate-700">COGs / Budget</a>
