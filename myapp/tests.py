@@ -15586,6 +15586,80 @@ class PBMMathPairsStrategyTests(TestCase):
         self.assertAlmostEqual(items[1]['extended_amount'], 14.40, delta=0.01)
 
 
+class DelawareSurchargeILITests(TestCase):
+    """B-DelawareSurchargeILI (2026-05-12): Delaware County Linen
+    surcharges (1% fuel + flat delivery + 6% sales tax) are now added as
+    synthetic ILI rows instead of returned as a parallel non_item_charges
+    field. Mirrors the Exceptional Foods Freight ILI pattern.
+
+    Before: items_sum=$76.00, non_item_charges=$15.37, invoice_total=$91.37
+            → IVS gap displayed as -$15.37 (raw items-only delta), status
+            PASSed via classifier's gap_with_charges path.
+    After:  items_sum=$91.37 (includes 3 synthetic surcharge rows),
+            invoice_total=$91.37 → IVS gap=$0 cleanly, surcharges visible
+            in ILI for tax/cost reporting.
+    """
+
+    def _import_parser(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'parser' in sys.modules:
+            del sys.modules['parser']
+        import parser as p
+        return p
+
+    def test_three_surcharges_appended_as_ili_rows(self):
+        """Canonical Delaware footer with 1%/flat/6% pattern. After parse,
+        items list includes the 2 line items + 3 synthetic surcharges =
+        5 rows total. items_sum equals invoice_total."""
+        parser = self._import_parser()
+        text = (
+            "Unit Price\n"
+            "Amount\n"
+            "Qty Adjustment\n"
+            "300\n"
+            "25\n"
+            "MOPS\n"
+            "BAPSWTW\n"
+            "Bar Mops\n"
+            "0.22\n"
+            "66.00T\n"
+            "Bib Aprons White\n"
+            "0.40\n"
+            "10.00\n"
+            "76.00\n"
+            "1.00%\n"
+            "0.76T\n"
+            "10.00\n"
+            "10.00T\n"
+            "6.00%\n"
+            "4.61\n"
+            "Total Due\n"
+            "$91.37\n"
+        )
+        result = parser._parse_delaware_linen(text)
+        # Should return 2-tuple now (matching Exceptional/PBM/Farm Art)
+        self.assertEqual(len(result), 2,
+            f"expected 2-tuple return; got {len(result)}-tuple")
+        items, total = result
+        self.assertEqual(total, 91.37)
+        items_sum = round(sum(it.get('extended_amount', 0) or 0 for it in items), 2)
+        self.assertAlmostEqual(items_sum, 91.37, delta=0.01)
+        # 3 synthetic surcharges should be present with the canonical labels
+        descs = [it.get('raw_description', '') for it in items]
+        self.assertIn('Fuel Surcharge', descs)
+        self.assertIn('Delivery Charge', descs)
+        self.assertIn('PA Sales Tax', descs)
+        # Find each by label, check value
+        by_label = {it['raw_description']: it['extended_amount'] for it in items}
+        self.assertAlmostEqual(by_label['Fuel Surcharge'], 0.76, delta=0.01)
+        self.assertAlmostEqual(by_label['Delivery Charge'], 10.00, delta=0.01)
+        self.assertAlmostEqual(by_label['PA Sales Tax'], 4.61, delta=0.01)
+
+
 class ExceptionalFreightExtractionTests(TestCase):
     """B-ExceptionalFreightVBL + B-ExceptionalFreightGap (2026-05-12):
     _extract_exceptional_freight now handles a third layout where values

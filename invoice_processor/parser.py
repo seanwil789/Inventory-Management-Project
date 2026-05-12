@@ -3076,22 +3076,47 @@ def _parse_delaware_linen(text: str) -> list[dict]:
                     break
             non_item_charges = round(sum(collected), 2)
 
+            # B-DelawareSurchargeILI (2026-05-12): add each captured
+            # surcharge as a synthetic ILI row so items_sum naturally
+            # reflects them and the IVS gap displays as $0 instead of
+            # the raw items-only difference. Mirrors how Exceptional
+            # Foods handles its $5 freight via a Freight ILI. Preserves
+            # the standard 3-component label order when all three are
+            # captured (Fuel Surcharge / Delivery Charge / PA Sales Tax
+            # per the docstring layout). Falls back to generic labels
+            # for partial captures so a malformed footer doesn't
+            # mislabel a $4.61 tax as a fuel charge.
+            if len(collected) == 3:
+                _labels = ['Fuel Surcharge', 'Delivery Charge', 'PA Sales Tax']
+            elif len(collected) == 1:
+                _labels = ['Service Charge']
+            else:
+                _labels = [f'Service Charge {i+1}' for i in range(len(collected))]
+            for _label, _val in zip(_labels, collected):
+                items.append({
+                    "raw_description": _label,
+                    "unit_price": _val,
+                    "extended_amount": _val,
+                    "case_size_raw": "",
+                })
+            # Recompute items_total after appending synthetic rows so the
+            # log message + downstream consumers see the right number.
+            items_total = round(sum(it.get("extended_amount", 0) or 0
+                                    for it in items), 2)
+
     if invoice_total is not None:
-        gap_with_fees = abs(invoice_total - items_total - non_item_charges)
         diff = abs(invoice_total - items_total)
-        if gap_with_fees < 0.50:
-            print(f"  [✓] Delaware Linen invoice total verified: "
-                  f"items=${items_total:.2f} + charges=${non_item_charges:.2f}"
-                  f" = ${items_total + non_item_charges:.2f} ≈ "
-                  f"${invoice_total:.2f}")
-        elif diff > 0.50:
+        if diff < 0.50:
+            print(f"  [✓] Delaware Linen invoice total verified: ${invoice_total:.2f}")
+        else:
             print(f"  [!] Delaware Linen invoice total mismatch: "
                   f"parsed=${invoice_total:.2f}, items=${items_total:.2f}, "
-                  f"charges=${non_item_charges:.2f}, gap=${gap_with_fees:.2f}")
-        else:
-            print(f"  [✓] Delaware Linen invoice total verified: ${invoice_total:.2f}")
+                  f"gap=${diff:.2f}")
 
-    return items, invoice_total, non_item_charges
+    # 2-tuple return matches the other vendor parsers (PBM, Exceptional,
+    # Farm Art). Surcharges now flow through as ILI rows so we no longer
+    # need the parallel non_item_charges field for Delaware.
+    return items, invoice_total
 
 
 # ---------------------------------------------------------------------------
