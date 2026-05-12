@@ -154,10 +154,19 @@ def _find_sections(rows: list[list[dict]]) -> list[tuple[float, str]]:
         asterisk_runs = list(re.finditer(r'\*{2,}', joined))
         label = None
         if len(asterisk_runs) >= 2:
-            # Standard `**** NAME ****` — extract between the runs.
+            # Standard `**** NAME ****` — extract between the runs, then
+            # validate it canonicalizes to a real Sysco section. Without
+            # this filter, OCR row-cluster collisions where two logical
+            # rows merge (e.g. `**** CANNED & DRY ****` header colliding
+            # with the prior section's `GROUP TOTAL⭑ **** $113.98` row)
+            # produce junk between-labels like 'TOTAL⭑'. Reference:
+            # INV 775687424 (2026-02-23) had 7 CANNED & DRY items
+            # mistagged section='TOTAL⭑' from this exact pattern.
             between = joined[asterisk_runs[0].end():asterisk_runs[1].start()].strip()
             if 4 <= len(between) <= 30:
-                label = between
+                canon = canonicalize_sysco_section(between)
+                if canon in _CANONICAL_SYSCO_SECTIONS:
+                    label = canon
         elif len(asterisk_runs) == 1:
             # Single-run header: `**** NAME [item tokens]` — the closing
             # `****` got OCR'd into another y-row. Take first 4 tokens

@@ -14365,6 +14365,51 @@ class SyscoSectionLabelCanonicalizationTests(TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0][1], 'PRODUCE')
 
+    def test_find_sections_rejects_two_run_collision_with_junk_between(self):
+        """B-TotalAsterisk regression (2026-05-11): OCR row-cluster collision
+        merges two logical rows into one. Example pattern from INV 775687424
+        cache: the row at y≈0.60 contains the `CANNED & DRY` section header
+        AND the prior FROZEN section's `GROUP TOTAL ⭑ ****` row tokens at
+        a slightly different y, merged because their y-centers fell within
+        `_ROW_Y_TOL`. The merged row reads, in x-order:
+            CANNED & DRY GROUP **** TOTAL⭑ **** 113.98
+        The `>=2 asterisk runs` branch of `_find_sections` extracts text
+        between the asterisks → `'TOTAL⭑'`. Without canonical filtering,
+        this becomes a phantom section that 7 CANNED & DRY items get
+        mistagged into. Fix: canonicalize + check membership before
+        accepting the label (same as the single-run branch already does).
+        """
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        # Synthesize the collided row. Match the actual cache: 'CANNED & DRY'
+        # header tokens at slightly higher y (0.602) and 'GROUP TOTAL⭑ ****'
+        # at y=0.588 — clustered into one row by _group_rows tol.
+        rows = [[
+            tok('CANNED',  0.27, 0.602),
+            tok('&',       0.32, 0.602),
+            tok('DRY',     0.34, 0.602),
+            tok('GROUP',   0.36, 0.588),
+            tok('****',    0.37, 0.601),
+            tok('TOTAL⭑',  0.40, 0.588),
+            tok('****',    0.44, 0.588),
+            tok('113.98',  0.74, 0.591),
+        ]]
+        out = sm._find_sections(rows)
+        # Result must NOT contain 'TOTAL⭑' as a section name
+        labels = {name for _, name in out}
+        self.assertNotIn('TOTAL⭑', labels,
+                         f'TOTAL⭑ phantom section leaked through canonical '
+                         f'filter; got {labels}')
+        # Also: 'CANNED & DRY' could legitimately be extracted from the
+        # surviving canonical-substring path. Either it's emitted (good)
+        # or nothing is emitted (acceptable — caller falls back to other
+        # section detection). What's NOT acceptable is a 'TOTAL⭑' entry.
+
 
 class SyscoMultiPhotoDedupTests(TestCase):
     """B9 fix (project_parser_accuracy_goal.md): when an invoice is photographed
