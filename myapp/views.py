@@ -1004,6 +1004,12 @@ def kitchen_display(request):
     prep_total = PrepTask.objects.filter(date=as_of).count()
     prep_done = PrepTask.objects.filter(date=as_of, completed=True).count()
 
+    # Resident-facing mode: ?audience=residents on the URL. Hides the
+    # back-of-house bits (prep status, staff assignee badges, headcount,
+    # 'Kitchen' framing) so the dining-hall TV shows a clean menu-only
+    # view. Default (no param) = kitchen-team display with all info.
+    is_resident_mode = request.GET.get('audience', '').lower() == 'residents'
+
     return render(request, 'myapp/display.html', {
         'as_of':         as_of,
         'is_today':      as_of == date.today(),
@@ -1015,6 +1021,7 @@ def kitchen_display(request):
         'prep_total':    prep_total,
         'prep_done':     prep_done,
         'clock_time':    now.strftime('%-I:%M %p') if as_of == date.today() else None,
+        'is_resident_mode': is_resident_mode,
     })
 
 

@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <meta http-equiv="refresh" content="60">
-  <title>Kitchen — {{ as_of|date:"l, M j" }}</title>
+  <title>{% if is_resident_mode %}Menu{% else %}Kitchen{% endif %} — {{ as_of|date:"l, M j" }}</title>
   <script src="https://cdn.tailwindcss.com"></script>
   <style>
     html, body { height: 100%; margin: 0; }
@@ -27,7 +27,9 @@
 
   <header class="px-10 py-6 flex items-start justify-between border-b border-slate-700">
     <div>
-      <div class="text-slate-400 uppercase tracking-[0.2em] text-sm">Kitchen · Wentworth</div>
+      <div class="text-slate-400 uppercase tracking-[0.2em] text-sm">
+        {% if is_resident_mode %}Today's Menu · Wentworth{% else %}Kitchen · Wentworth{% endif %}
+      </div>
       <h1 class="text-5xl font-bold mt-1">{{ as_of|date:"l" }}</h1>
       <div class="text-2xl text-slate-300 mt-1">{{ as_of|date:"F j, Y" }}</div>
     </div>
@@ -35,11 +37,11 @@
       {% if clock_time %}
       <div class="text-4xl font-mono text-slate-200 mb-3">{{ clock_time }}</div>
       {% endif %}
-      {% if census %}
+      {% if census and not is_resident_mode %}
       <div class="text-slate-400 uppercase tracking-[0.2em] text-xs">Residents</div>
       <div class="text-5xl font-bold text-emerald-300">{{ census.headcount }}</div>
       {% endif %}
-      {% if prep_total %}
+      {% if prep_total and not is_resident_mode %}
       <div class="mt-3 text-sm text-slate-400">
         Prep: <span class="text-slate-200 font-semibold">{{ prep_done }}/{{ prep_total }}</span> done
       </div>
@@ -78,7 +80,7 @@
             {% endfor %}
           </div>
           {% endif %}
-          {% if row.menu.assignee %}
+          {% if row.menu.assignee and not is_resident_mode %}
           <div class="mt-auto pt-3">
             <span class="text-xs uppercase tracking-wider px-2 py-1 rounded
               {% if row.menu.assignee == 'sean' %}bg-blue-900/60 text-blue-200{% else %}bg-emerald-900/60 text-emerald-200{% endif %}">
