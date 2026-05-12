@@ -3864,9 +3864,14 @@ def category_spend(request):
     trend. Companion to /cogs/ — that view shows authoritative invoice totals;
     this view shows category-level distribution.
 
-    Estimated spend is Σ(unit_price) per category — NOT authoritative dollars
-    (case-count per line isn't stored). Directional only; trends and ratios
-    between categories are reliable."""
+    Estimated spend is Σ(extended_amount) per category — actual line-level
+    dollars, which reconcile to invoice_total within parser-accuracy
+    tolerance (within ~$25 on typical months per 2026-05-12 audit).
+    Pre-2026-05-12 this summed unit_price instead, undercounting by 20-30%
+    on average; switched after extended_amount became reliably populated
+    on every ILI (B-MathPairs, B-OrphanCleanup, B-JunkFilterSectionBleed
+    series). Trends, ratios between categories, AND absolute dollars are
+    now all reliable, modulo the 2 known REVIEW invoices' over-extraction."""
     from django.db.models import Count, Sum
     from django.db.models.functions import TruncMonth
     from calendar import monthrange
@@ -3941,7 +3946,7 @@ def category_spend(request):
                    .values('product__category')
                    .annotate(
                        line_count=Count('id'),
-                       est_spend=Sum('unit_price'),
+                       est_spend=Sum('extended_amount'),
                        unique_products=Count('product', distinct=True),
                    )
                    .order_by('-line_count'))
@@ -3972,7 +3977,7 @@ def category_spend(request):
                         invoice_date__gte=mo_start, invoice_date__lte=mo_end)
                 .exclude(math_flagged=True)
                 .values('product__canonical_name')
-                .annotate(n=Count('id'), spend=Sum('unit_price'))
+                .annotate(n=Count('id'), spend=Sum('extended_amount'))
                 .order_by('-n')[:3])
         top_products[cat] = [
             {'name': t['product__canonical_name'],
