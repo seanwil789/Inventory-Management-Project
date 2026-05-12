@@ -83,8 +83,16 @@ def _classify(items_sum: float, invoice_total: float | None,
         if r.get('diff_abs') is not None
         and abs(r['diff_abs']) >= _SECTION_DIFF_TOLERANCE
     )
-    # Path (a): items + extracted fees reconcile.
-    if non_item_charges > 0 and gap_with_charges < 0.50:
+    # Path (a): invoice-total math reconciles, with OR without extracted
+    # fees. The previous form required `non_item_charges > 0`, which only
+    # PASSed when fees lived in the parallel non_item_charges field. After
+    # B-SyscoFeeILI (2026-05-12) Sysco fees emit as synthetic ILI rows —
+    # items_sum naturally includes them and non_item_charges stays 0. Drop
+    # the non_item_charges > 0 gate so a perfect items_sum == invoice_total
+    # match still PASSes regardless of where the fees lived. Safe vs. the
+    # missing-pages false-PASS class (INV 1282480: items=$559, total=$2559,
+    # gap_with_charges=$2000 — far above $0.50, still fails path (a)).
+    if gap_with_charges < 0.50:
         return 'pass'
     # Path (c): section reconciliation passes ONLY when invoice-total gap is
     # also reasonable. Catches the missing-pages case described above.
