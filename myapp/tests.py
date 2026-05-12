@@ -14590,6 +14590,57 @@ class SyscoSectionLabelCanonicalizationTests(TestCase):
         self.assertEqual(len(out), 1)
         self.assertEqual(out[0][1], 'PRODUCE')
 
+    def test_find_sections_single_run_canonical_BEFORE_asterisks(self):
+        """B-SectionLeftAsterisk (Sean 2026-05-12): when OCR drops leading
+        asterisks, page reads '<NAME> ****' instead of '**** <NAME> ****'.
+        Page 1 of multi-page Sysco invoices typically has DAIRY and MEATS
+        in this shape. Items between these missed sections inherit wrong
+        section tags (or go orphan), breaking section reconciliation.
+        Affected: INV 775292014 (22 orphan items), 775184076 (34 orphan),
+        and others.
+        """
+        sm = self._import()
+
+        def tok(text, x, y, w=0.01, h=0.005):
+            return {'text': text,
+                    'x_min': x - w / 2, 'x_max': x + w / 2,
+                    'y_min': y - h / 2, 'y_max': y + h / 2}
+
+        # 'DAIRY ****' — section name BEFORE the asterisks
+        rows = [[
+            tok('DAIRY', 0.30, 0.20),
+            tok('****',  0.40, 0.20),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(len(out), 1,
+                          f'expected DAIRY section; got {out}')
+        self.assertEqual(out[0][1], 'DAIRY')
+
+        # 'CANNED & DRY ****' — multi-word canonical before asterisks
+        rows = [[
+            tok('CANNED', 0.20, 0.30),
+            tok('&', 0.24, 0.30),
+            tok('DRY', 0.28, 0.30),
+            tok('****', 0.40, 0.30),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(len(out), 1,
+                          f'expected CANNED & DRY section; got {out}')
+        self.assertEqual(out[0][1], 'CANNED & DRY')
+
+        # 'GROUP TOTAL ****' — totals marker, NOT a section header.
+        # canonicalize_sysco_section('GROUP TOTAL') doesn't match any
+        # canonical → label stays None → no section emitted.
+        rows = [[
+            tok('GROUP', 0.30, 0.40),
+            tok('TOTAL', 0.34, 0.40),
+            tok('****',  0.40, 0.40),
+            tok('113.98', 0.78, 0.40),
+        ]]
+        out = sm._find_sections(rows)
+        self.assertEqual(len(out), 0,
+                          f'GROUP TOTAL row must not register as section; got {out}')
+
     def test_find_sections_rejects_two_run_collision_with_junk_between(self):
         """B-TotalAsterisk + B-RowCollision regression (2026-05-11): OCR
         row-cluster collision merges two logical rows into one. Example

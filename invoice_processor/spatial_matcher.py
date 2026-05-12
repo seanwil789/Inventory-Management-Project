@@ -223,6 +223,22 @@ def _find_sections(rows: list[list[dict]]) -> list[tuple[float, str]]:
             canon = canonicalize_sysco_section(candidate)
             if canon in _CANONICAL_SYSCO_SECTIONS:
                 label = canon
+            # B-SectionLeftAsterisk (Sean 2026-05-12): also try text BEFORE
+            # the asterisks. OCR sometimes captures '<NAME> ****' (right
+            # asterisks only, leading asterisks dropped or merged into
+            # the prior y-row). Page 1 of multi-page Sysco invoices
+            # routinely has DAIRY and MEATS in this shape. Without this
+            # branch, those headers go undetected, and items between
+            # them inherit the wrong section (e.g. INV 775292014: 22
+            # CANNED & DRY items orphaned; INV 775184076: 34 orphaned).
+            if not label:
+                before = joined[:asterisk_runs[0].start()].strip()
+                # Match the LAST 4 tokens before the asterisks — the
+                # canonical name sits immediately before the ****.
+                candidate_before = ' '.join(before.split()[-4:])
+                canon_before = canonicalize_sysco_section(candidate_before)
+                if canon_before in _CANONICAL_SYSCO_SECTIONS:
+                    label = canon_before
         if label:
             y = _y_mid(row[0])
             sections.append((y, label))
