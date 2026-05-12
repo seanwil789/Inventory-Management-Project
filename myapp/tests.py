@@ -15599,6 +15599,85 @@ class PBMMathPairsStrategyTests(TestCase):
         self.assertAlmostEqual(items[1]['extended_amount'], 14.40, delta=0.01)
 
 
+class JunkFilterSectionBleedTests(TestCase):
+    """B-JunkFilterSectionBleed (2026-05-12): real Sysco items whose
+    descriptions have a section header bled-in by OCR (e.g.
+    '**** DAIRY **** AMER PARM 1/4 WHL 39919') now bypass the
+    _is_junk_item filter when they carry a valid SUPC + price AND
+    the description has substantive content after stripping section
+    markers. INV 775662001 surfaced this — 2 real items totaling
+    $189 were getting silently dropped between parser and ILI.
+
+    Phantom rows ('** SEAFOOD ****' with no product content) still
+    filter as junk because their stripped description is empty.
+    """
+
+    def _import_mapper(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'mapper' in sys.modules:
+            del sys.modules['mapper']
+        import mapper as m
+        return m
+
+    def test_section_bleed_with_real_product_kept(self):
+        """'**** DAIRY **** AMER PARM 1/4 WHL 39919' has real Parmesan
+        content + SUPC — must NOT be classified as junk."""
+        m = self._import_mapper()
+        item = {
+            'raw_description': '**** DAIRY **** AMER PARM 1/4 WHL 39919',
+            'sysco_item_code': '2149912',
+            'unit_price': 120.06,
+            'extended_amount': 120.06,
+        }
+        self.assertFalse(m._is_junk_item(item),
+            "real item with section bleed + valid SUPC should NOT be junk")
+
+    def test_bare_section_header_still_filtered(self):
+        """'** SEAFOOD ****' has no product content beyond the section
+        header — must still be classified as junk even if a SUPC is
+        attached (parser bug elsewhere)."""
+        m = self._import_mapper()
+        item = {
+            'raw_description': '** SEAFOOD ****',
+            'sysco_item_code': '5106402',
+            'unit_price': 68.99,
+            'extended_amount': 68.99,
+        }
+        self.assertTrue(m._is_junk_item(item),
+            "bare section header (no product content) must still be junk")
+
+    def test_section_bleed_without_supc_still_filtered(self):
+        """Section-bleed exception requires SUPC. Without one, the
+        row could be a header without a real product — still filter."""
+        m = self._import_mapper()
+        item = {
+            'raw_description': '**** DAIRY **** AMER PARM 1/4 WHL 39919',
+            'sysco_item_code': '',  # no code
+            'unit_price': 120.06,
+            'extended_amount': 120.06,
+        }
+        self.assertTrue(m._is_junk_item(item),
+            "section bleed without SUPC stays junk (no anchor of real-ness)")
+
+    def test_fuel_surcharge_still_filtered_even_with_supc(self):
+        """A FUEL SURCHARGE row with a spurious SUPC attached must NOT
+        bypass via Exception 3. The description has no asterisks (no
+        section-bleed signature), so the exception doesn't fire."""
+        m = self._import_mapper()
+        item = {
+            'raw_description': 'CHGS FOR FUEL SURCHARGE',
+            'sysco_item_code': '1234567',
+            'unit_price': 6.50,
+            'extended_amount': 6.50,
+        }
+        self.assertTrue(m._is_junk_item(item),
+            "FUEL SURCHARGE has no section-bleed pattern → still junk")
+
+
 class DelawareSurchargeILITests(TestCase):
     """B-DelawareSurchargeILI (2026-05-12): Delaware County Linen
     surcharges (1% fuel + flat delivery + 6% sales tax) are now added as

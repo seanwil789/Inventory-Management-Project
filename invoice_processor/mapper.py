@@ -893,6 +893,19 @@ _JUNK_RE = re.compile(
 
 _PLACEHOLDER_DESC_RE = re.compile(r'^\[Sysco\s*#\d+\]$')
 
+# Section-header bleed: OCR sometimes prepends a Sysco section header to a
+# real item's description, e.g. '**** DAIRY **** AMER PARM 1/4 WHL 39919'.
+# These match _JUNK_RE's `\*{3,}` pattern but are real items with valid
+# product info. Detection: description contains asterisk markers AND, after
+# stripping section markers + section names, has substantive content.
+_SECTION_HEADER_BLEED_RE = re.compile(r'\*{2,}')
+_SECTION_NAME_STRIP_RE = re.compile(
+    r'\*+|\b(DAIRY|MEATS|POULTRY|SEAFOOD|FROZEN|PRODUCE|BAKERY|BEVERAGE|'
+    r'CANNED\s*&?\s*DRY|CHEMICAL\s*&?\s*JANITORIAL|CHEMICAL|JANITORIAL|'
+    r'PAPER\s*&?\s*DISP|PAPER|DISP|SUPPLY|DISPENSER|MISC)\b',
+    re.IGNORECASE,
+)
+
 
 def _is_junk_item(item: dict) -> bool:
     """Return True if the item is a non-product line (surcharge, header, etc.).
@@ -914,6 +927,16 @@ def _is_junk_item(item: dict) -> bool:
     them confidence='non_product' via the Priority 0 classifier — same
     treatment as legitimate OCR-extracted surcharges on other vendors.
 
+    Exception 3 (2026-05-12): items whose description matches the `\\*{3,}`
+    junk pattern AND, after stripping section header markers, still have
+    substantive content (≥5 chars) AND carry a valid SUPC + non-trivial
+    price. INV 775662001 surfaced this — '**** DAIRY **** AMER PARM 1/4
+    WHL 39919' has supc=2149912 and a real Parmesan; the section header
+    just bled into its description. Without this exception, real $120
+    items get silently dropped by map_items, leaving the IVS items_sum
+    and the ILI table divergent. Phantom rows ('** SEAFOOD ****' with
+    nothing else) strip to empty and still get filtered.
+
     Narrow scope: these exceptions ONLY bypass their specific patterns.
     Other junk (section headers, OCR garbage) still filters normally
     even when a spurious code gets attached.
@@ -933,6 +956,18 @@ def _is_junk_item(item: dict) -> bool:
             and code and len(str(code)) >= 6
             and price > 5):
         return False
+
+    # Exception 3: section-header bleed-in with real product content.
+    # Only fires when the description contains asterisk markers (the
+    # signature of section-header bleed). Strip those + Sysco section
+    # names; if substantive content remains AND row has SUPC + price,
+    # treat as a real item that just has a bad description.
+    if (_SECTION_HEADER_BLEED_RE.search(desc)
+            and code and len(str(code)) >= 6
+            and price > 1):
+        stripped = _SECTION_NAME_STRIP_RE.sub('', desc).strip()
+        if len(stripped) >= 5:
+            return False
 
     return True
 
