@@ -3541,34 +3541,47 @@ def parse_invoice(text: str, vendor: str = None,
                 print(f"      {r['section']:<25} parser=${r['parser_sum']:.2f} "
                       f"printed=${printed:.2f} diff=${r['diff_abs']:.2f}")
 
-        # B-MISC fix (2026-05-10): Sysco invoices have MISC CHARGES (CC
-        # surcharge, fuel surcharge) + TAX TOTAL that are NOT extracted as
-        # line items but ARE part of invoice_total. When sections all
-        # reconcile (items_sum is trustworthy), derive non_item_charges =
-        # invoice_total - items_sum. This unlocks Path (a) of
-        # validate_all_invoices._classify (`items_sum + non_item_charges
-        # ≈ invoice_total → PASS within $0.50`), tightening Sysco
-        # gap-pct accounting from "raw items_sum vs total" to "items +
-        # extracted charges vs total". Captures MISC + TAX without
-        # touching the messy OCR text directly. INV 775856655 reference:
-        # items=$1480.02, derived charges=$93.26, total=$1573.28 → exact.
-        if invoice_total is not None and recon and not bad:
-            sysco_items_sum = round(
-                sum((it.get('extended_amount') or 0) for it in items), 2)
-            derived = round(invoice_total - sysco_items_sum, 2)
-            # Sanity floor + cap: non-item charges should be positive but
-            # < 8% of invoice. Sysco PA charges are typically 6% sales tax
+        # B-FeeLabels fix (2026-05-11): label-anchored extraction of MISC
+        # CHARGES (fuel surcharge, CC processing fee) + TAX TOTAL from the
+        # Sysco totals block. Uses section_validator.extract_sysco_fees,
+        # which finds the LAST PAGE cache, then matches FUEL/CREDIT/TAX
+        # labels to their right-column values by y-proximity. Replaces
+        # the gap-derivation path below when labels are present — more
+        # accurate than gap-math because it works regardless of whether
+        # items_sum has real underextraction.
+        #
+        # Reference: INV 775687424 (2026-02-23) had $56.48 in real fees
+        # ($6.50 fuel + $26.14 CC + $23.84 tax) but gap-derivation was
+        # suppressed because gap_pct (13.6%) exceeded the 8% cap. The
+        # cap is correct (protects against missing-pages masquerading as
+        # charges) but blocked real fee capture. Label extraction has no
+        # such tension: if the label is present, the value belongs.
+        try:
+            from section_validator import extract_sysco_fees
+            extracted_fees = extract_sysco_fees(pages or [])
+        except Exception:
+            extracted_fees = {}
+        fee_sum = round(sum(extracted_fees.values()), 2) if extracted_fees else 0.0
+
+        if fee_sum > 0:
+            parsed["non_item_charges"] = fee_sum
+        elif invoice_total is not None and recon and not bad:
+            # B-MISC fix (2026-05-10) fallback: when label extraction
+            # returns nothing (older Sysco caches where the totals block
+            # didn't OCR cleanly, or non-standard layouts), derive
+            # non_item_charges = invoice_total - items_sum, capped at 8%
+            # of invoice. Sysco PA charges are typically 6% sales tax
             # (on taxable items only — food is exempt) + ~$30-60 MISC
             # fees (CC surcharge, fuel surcharge); combined typically 4-7%
             # of invoice_total. Above 8% → suspected missing line items
-            # masquerading as charges, not legit MISC + TAX. The tight cap
-            # protects against the missing-pages bug class (originally
-            # caught by classifier path-c gap-guard for INV 1282480 where
-            # 1-of-N pages OCR'd inflated phantom non_item_charges to absorb
-            # $2k of missing items). Pre-tightening this same class hit
-            # 775687424 (2026-02-23) at 13.6% gap → false-PASSed via this
-            # path. Empirically validated 2026-05-10: cap=8% lets
-            # 775856655 (5.93%) through but blocks 775687424 (13.6%).
+            # masquerading as charges. The tight cap protects against
+            # the missing-pages bug class: INV 1282480 had 1-of-N pages
+            # OCR'd → phantom non_item_charges would absorb $2k of
+            # missing items; INV 775687424 (13.6% gap) was false-PASSed
+            # pre-cap. Empirically validated 2026-05-10.
+            sysco_items_sum = round(
+                sum((it.get('extended_amount') or 0) for it in items), 2)
+            derived = round(invoice_total - sysco_items_sum, 2)
             if 0 < derived < invoice_total * 0.08:
                 parsed["non_item_charges"] = derived
 

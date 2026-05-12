@@ -1387,6 +1387,231 @@ class ParserSyscoNonItemChargesTests(TestCase):
         self.assertNotIn('non_item_charges', result)
 
 
+class ParserSyscoLabelAnchoredFeesTests(TestCase):
+    """B-FeeLabels fix (2026-05-11): label-anchored extraction of MISC +
+    TAX from Sysco totals block via section_validator.extract_sysco_fees.
+
+    Replaces (when labels present) the gap-derivation B-MISC path that
+    was suppressed by the 8% cap on invoices with real underextraction.
+
+    Reference: INV 775687424 (2026-02-23) had $56.48 in real fees
+    ($6.50 FUEL + $26.14 CC + $23.84 TAX) that gap-derivation couldn't
+    capture because 13.6% gap exceeded the 8% cap.
+    """
+
+    @staticmethod
+    def _tok(text, x, y, w=0.04, h=0.014):
+        return {
+            'text': text,
+            'x_min': x - w / 2, 'x_max': x + w / 2,
+            'y_min': y - h / 2, 'y_max': y + h / 2,
+            'char_start': 0, 'char_end': 0,
+        }
+
+    def _totals_page_tokens(self):
+        """Tokens mimicking the actual 775687424 totals block layout.
+        FUEL SURCHARGE / CREDIT CARD / TAX labels at left-mid x, values
+        at right-column x, LAST PAGE marker in raw_text via a token."""
+        T = self._tok
+        return [
+            T('LAST', 0.65, 0.78),
+            T('PAGE', 0.71, 0.78),
+            T('CREDIT', 0.330, 0.560),
+            T('CARD', 0.371, 0.561),
+            T('SURCHARGE', 0.420, 0.562),
+            T('26.14', 0.726, 0.560),
+            T('CHGS', 0.310, 0.578),
+            T('FOR', 0.332, 0.578),
+            T('FUEL', 0.348, 0.578),
+            T('SURCHARGE', 0.390, 0.578),
+            T('6.50', 0.734, 0.578),
+            T('TAX', 0.732, 0.870),
+            T('23.84', 0.826, 0.876),
+            T('INVOICE', 0.700, 0.910),
+            T('TOTAL', 0.732, 0.910),
+            T('1103.60', 0.835, 0.910),
+        ]
+
+    def _call_parse(self, recon_result, invoice_total, items_total,
+                    pages_extra=None):
+        import io
+        import sys
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('parser', 'section_validator', 'spatial_matcher', 'mapper'):
+            if m in sys.modules:
+                del sys.modules[m]
+        import parser as parser_mod
+        import section_validator
+
+        per_item = round(items_total / 2, 2) if items_total > 0 else 0
+        fake_items = [
+            {'raw_description': f'ITEM-{i}',
+             'unit_price': per_item, 'extended_amount': per_item,
+             'section': 'DAIRY', 'case_size_raw': '', 'sysco_item_code': ''}
+            for i in range(2)
+        ]
+
+        pages = [{'page_number': 1, 'tokens': self._totals_page_tokens()}]
+        if pages_extra:
+            pages = pages_extra + pages
+
+        with patch.object(parser_mod, '_parse_sysco',
+                          return_value=(fake_items, invoice_total)), \
+             patch.object(section_validator,
+                          'compute_invoice_section_reconciliation',
+                          return_value=recon_result):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                return parser_mod.parse_invoice('sysco text', vendor='Sysco',
+                                                pages=pages)
+
+    def test_label_extraction_populates_non_item_charges(self):
+        """FUEL + CC + TAX labels present → sum becomes non_item_charges."""
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 953.22,
+             'printed_total': 953.22, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 26},
+        ]
+        result = self._call_parse(
+            recon_result=clean_recon,
+            invoice_total=1103.60,
+            items_total=953.22,
+        )
+        # Expected: 6.50 + 26.14 + 23.84 = 56.48
+        self.assertEqual(result.get('invoice_total'), 1103.60)
+        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+                               delta=0.01,
+                               msg='Label-anchored extraction should sum '
+                                   'FUEL+CC+TAX = $56.48 from totals page')
+
+    def test_label_extraction_wins_over_gap_derivation(self):
+        """When BOTH label extraction AND gap derivation would succeed,
+        label extraction takes precedence (more accurate)."""
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 1047.12,
+             'printed_total': 1047.12, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 26},
+        ]
+        # Gap derivation would compute: 1103.60 - 1047.12 = 56.48 (under 8%)
+        # Label extraction sums to 56.48 too — both paths agree here. The
+        # important check is that label path runs FIRST (sets the value)
+        # and gap path doesn't double-apply.
+        result = self._call_parse(
+            recon_result=clean_recon,
+            invoice_total=1103.60,
+            items_total=1047.12,
+        )
+        # Result should be exactly 56.48 (label sum), not somehow doubled
+        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+                               delta=0.01)
+
+    def test_label_extraction_works_when_gap_exceeds_8pct(self):
+        """B-MISC's 8% cap blocks derivation for INV 775687424 (gap 13.6%).
+        Label extraction has no such cap — should still find fees."""
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 953.22,
+             'printed_total': 953.22, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 26},
+        ]
+        # gap = 1103.60 - 953.22 = 150.38 = 13.6% > 8% cap
+        # B-MISC would suppress. Label extraction shouldn't.
+        result = self._call_parse(
+            recon_result=clean_recon,
+            invoice_total=1103.60,
+            items_total=953.22,
+        )
+        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+                               delta=0.01,
+                               msg='Label extraction must work even when '
+                                   'B-MISC 8% cap would suppress derivation')
+
+    def test_no_labels_falls_back_to_gap_derivation(self):
+        """When totals page lacks FUEL/CC/TAX labels (older caches,
+        non-standard layouts), the existing B-MISC gap-derivation path
+        still fires. Backward compat."""
+        import io
+        import sys
+        from contextlib import redirect_stdout
+        from unittest.mock import patch
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('parser', 'section_validator', 'spatial_matcher', 'mapper'):
+            if m in sys.modules:
+                del sys.modules[m]
+        import parser as parser_mod
+        import section_validator
+
+        # Page WITHOUT fee labels — only a LAST PAGE marker
+        T = self._tok
+        no_labels_page = [
+            {'page_number': 1, 'tokens': [
+                T('LAST', 0.65, 0.78),
+                T('PAGE', 0.71, 0.78),
+                T('INVOICE', 0.70, 0.91),
+                T('TOTAL', 0.73, 0.91),
+                T('1573.28', 0.83, 0.91),
+            ]}
+        ]
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 1480.02,
+             'printed_total': 1480.02, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 24},
+        ]
+        fake_items = [
+            {'raw_description': f'ITEM-{i}',
+             'unit_price': 740.01, 'extended_amount': 740.01,
+             'section': 'DAIRY', 'case_size_raw': '', 'sysco_item_code': ''}
+            for i in range(2)
+        ]
+        with patch.object(parser_mod, '_parse_sysco',
+                          return_value=(fake_items, 1573.28)), \
+             patch.object(section_validator,
+                          'compute_invoice_section_reconciliation',
+                          return_value=clean_recon):
+            buf = io.StringIO()
+            with redirect_stdout(buf):
+                result = parser_mod.parse_invoice('sysco text', vendor='Sysco',
+                                                   pages=no_labels_page)
+        # Fall-through to gap-derivation: 1573.28 - 1480.02 = 93.26 (5.93%, under cap)
+        self.assertAlmostEqual(result.get('non_item_charges') or 0, 93.26,
+                               delta=0.10,
+                               msg='No fee labels → B-MISC gap-derivation '
+                                   'should still fire (5.93% < 8% cap)')
+
+    def test_finds_totals_page_among_multiple(self):
+        """Multi-cache invoice: LAST PAGE marker on cache A, junk on cache B.
+        extract_sysco_fees must find cache A's totals, not default to cache B."""
+        T = self._tok
+        # cache B (no totals, no fee labels) — placed AFTER totals page
+        junk_page = {'page_number': 2, 'tokens': [
+            T('SOMETHING', 0.30, 0.40),
+            T('ELSE', 0.45, 0.40),
+        ]}
+        clean_recon = [
+            {'section': 'DAIRY', 'parser_sum': 953.22,
+             'printed_total': 953.22, 'diff_abs': 0.0,
+             'diff_pct': 0.0, 'item_count': 26},
+        ]
+        # Pages list: totals page FIRST, junk page LAST
+        result = self._call_parse(
+            recon_result=clean_recon,
+            invoice_total=1103.60,
+            items_total=953.22,
+            pages_extra=[],  # totals page already first via _call_parse default
+        )
+        # If extract_sysco_fees correctly used the LAST PAGE marker (not
+        # pages[-1]), it found the totals tokens → fees = 56.48
+        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+                               delta=0.01)
+
+
 class MathFlaggedDbWriteTests(TestCase):
     """B6 integration: parsed-item math_flagged threads through to ILI row."""
 

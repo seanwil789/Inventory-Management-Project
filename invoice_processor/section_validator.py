@@ -134,6 +134,134 @@ def _find_footer_y(tokens: list[dict]) -> float:
     return footer_y
 
 
+# ── Non-item charges extraction (FUEL / CC / TAX) ───────────────────────────
+# Sysco invoices print MISC CHARGES (fuel surcharge, CC processing fee) and
+# TAX TOTAL as labeled rows in the bottom-right totals block of the LAST
+# PAGE. parse_invoice uses these to populate parsed['non_item_charges'],
+# closing the gap between items_sum and invoice_total without relying on
+# the gap-derivation 8% cap (which suppresses for invoices with > 8%
+# real underextraction, leaving real fees unaccounted).
+
+_FEE_PRICE_RE = re.compile(r'^\d+\.\d{2}$')
+
+
+def _value_for_label(
+    tokens: list[dict],
+    label_tokens: list[dict],
+    max_dy: float = 0.005,
+    min_x: float = 0.5,
+) -> float | None:
+    """Find the dollar amount on the same row as the label, right of it.
+
+    Prices in the totals block stack vertically with ~0.014 row pitch, so
+    max_dy=0.005 keeps each label bound to its own row. Ties broken by
+    closest y, then leftmost x.
+    """
+    if not label_tokens:
+        return None
+    y_target = sum(_y_mid(t) for t in label_tokens) / len(label_tokens)
+    x_max_label = max(_x_mid(t) for t in label_tokens)
+    candidates = [
+        (abs(_y_mid(t) - y_target), _x_mid(t), float(t['text']))
+        for t in tokens
+        if _FEE_PRICE_RE.fullmatch(t.get('text') or '')
+        and abs(_y_mid(t) - y_target) < max_dy
+        and _x_mid(t) > x_max_label
+        and _x_mid(t) > min_x
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: (c[0], c[1]))
+    return candidates[0][2]
+
+
+def _label_row(
+    tokens: list[dict],
+    words: set[str],
+    anchor: str,
+    max_dy: float = 0.005,
+) -> list[dict]:
+    """Return label tokens forming a row whose anchor word is present."""
+    matches = [t for t in tokens
+               if (t.get('text') or '').upper() in words]
+    if not any((t.get('text') or '').upper() == anchor for t in matches):
+        return []
+    anchor_y = next(
+        (_y_mid(t) for t in matches if (t.get('text') or '').upper() == anchor),
+        None,
+    )
+    if anchor_y is None:
+        return []
+    return [t for t in matches if abs(_y_mid(t) - anchor_y) < max_dy]
+
+
+def extract_sysco_fees(pages: list[dict]) -> dict:
+    """Extract fuel surcharge / CC processing / tax from Sysco totals block.
+
+    Returns dict with keys 'fuel_surcharge', 'cc_processing', 'tax' (only
+    those found). Sysco prints these as labeled rows in the totals block at
+    the bottom-right of the LAST PAGE cache.
+
+    For multi-cache invoices (Sysco can have 2-4 photo caches per invoice),
+    finds the page that contains the `LAST PAGE` marker token and uses
+    that page's tokens for label-anchored extraction. Falls back to
+    pages[-1] when no LAST PAGE marker is present (e.g. single-page
+    invoices, or caller has already isolated the totals cache).
+
+    Used by parse_invoice for Sysco to populate parsed['non_item_charges']
+    directly from invoice labels, replacing the gap-derivation heuristic
+    that's blocked by the 8% cap on invoices with real underextraction
+    (e.g. INV 775687424 had $56.48 in real fees but gap-derivation
+    suppressed because 13.6% > 8% cap).
+    """
+    if not pages:
+        return {}
+
+    # Find the cache page that contains the LAST PAGE marker — that's the
+    # totals page. Without this, multi-photo invoices may have non-totals
+    # pages at the end of `pages` by filesystem order; the wrong page would
+    # miss the FUEL/MISC/TAX labels entirely.
+    totals_page = None
+    for p in pages:
+        text = ' '.join((t.get('text') or '') for t in p.get('tokens') or [])
+        if 'LAST PAGE' in text.upper():
+            totals_page = p
+            break
+    if totals_page is None:
+        totals_page = pages[-1]
+
+    tokens = totals_page.get('tokens') or []
+    if not tokens:
+        return {}
+
+    fees: dict = {}
+
+    fuel_row = _label_row(tokens, {'FUEL', 'SURCHARGE'}, 'FUEL')
+    if fuel_row:
+        amt = _value_for_label(tokens, fuel_row)
+        if amt is not None:
+            fees['fuel_surcharge'] = amt
+
+    cc_row = _label_row(tokens, {'CREDIT', 'CARD'}, 'CREDIT')
+    if cc_row:
+        amt = _value_for_label(tokens, cc_row)
+        if amt is not None:
+            fees['cc_processing'] = amt
+
+    # TAX: bottom half only (column-header "TAX" tokens sit in upper-half).
+    tax_tokens = [t for t in tokens
+                  if (t.get('text') or '').upper() == 'TAX'
+                  and _y_mid(t) > 0.5]
+    if tax_tokens:
+        # Lowest-y TAX is closest to INVOICE TOTAL block (the real fee).
+        tax_tokens.sort(key=_y_mid, reverse=True)
+        amt = _value_for_label(tokens, [tax_tokens[0]], max_dy=0.02)
+        if amt is not None:
+            fees['tax'] = amt
+
+    return fees
+
+
 def extract_section_totals_by_max(
     page: dict,
     sections: list[tuple[float, str]],
