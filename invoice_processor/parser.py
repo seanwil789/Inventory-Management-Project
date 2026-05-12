@@ -3098,6 +3098,11 @@ def _parse_delaware_linen(text: str) -> list[dict]:
                     "unit_price": _val,
                     "extended_amount": _val,
                     "case_size_raw": "",
+                    # synthetic_fee flag: parser-generated row, NOT OCR
+                    # noise. Bypasses mapper._is_junk_item which would
+                    # otherwise filter on FUEL SURCHARGE / SALES TAX
+                    # patterns and drop these before db_write.
+                    "synthetic_fee": True,
                 })
             # Recompute items_total after appending synthetic rows so the
             # log message + downstream consumers see the right number.

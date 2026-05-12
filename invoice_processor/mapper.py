@@ -897,7 +897,7 @@ _PLACEHOLDER_DESC_RE = re.compile(r'^\[Sysco\s*#\d+\]$')
 def _is_junk_item(item: dict) -> bool:
     """Return True if the item is a non-product line (surcharge, header, etc.).
 
-    Exception: items whose description is the '[Sysco #NNN]' placeholder —
+    Exception 1: items whose description is the '[Sysco #NNN]' placeholder —
     emitted by the parser when a real anchor has no inline OCR description
     (common on column-dump catch-weight items) — AND that carry a valid
     sysco_item_code + non-trivial price ARE real products, just unmapped.
@@ -905,16 +905,28 @@ def _is_junk_item(item: dict) -> bool:
     CSV import can assign a canonical name. Without this guard, ~$800+
     catch-weight items silently vanish between parser and DB.
 
-    Narrow scope: this exception ONLY bypasses the placeholder pattern.
-    Other junk patterns (FUEL SURCHARGE, section headers, etc.) still
-    filter normally even when a spurious code gets attached to them.
+    Exception 2 (2026-05-12): items flagged synthetic_fee=True are
+    parser-generated rows representing real but non-product charges
+    (Delaware surcharges, Exceptional Freight when added at the picker
+    layer). They look like junk via _JUNK_RE (FUEL SURCHARGE / SALES TAX
+    patterns) but were placed by us deliberately so items_sum reconciles
+    to invoice_total. They flow to db_write where the mapper still tags
+    them confidence='non_product' via the Priority 0 classifier — same
+    treatment as legitimate OCR-extracted surcharges on other vendors.
+
+    Narrow scope: these exceptions ONLY bypass their specific patterns.
+    Other junk (section headers, OCR garbage) still filters normally
+    even when a spurious code gets attached.
     """
+    # Exception 2: synthetic parser-generated fees always pass
+    if item.get("synthetic_fee"):
+        return False
+
     desc = item.get("raw_description", "")
     if not _JUNK_RE.search(desc):
         return False
 
-    # If the junk match is specifically the placeholder AND the item has
-    # a real code + price, override to keep it.
+    # Exception 1: '[Sysco #NNN]' placeholder + real code + non-trivial price
     code = item.get("sysco_item_code", "")
     price = item.get("unit_price") or 0
     if (_PLACEHOLDER_DESC_RE.match(desc)

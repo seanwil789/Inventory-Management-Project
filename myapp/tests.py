@@ -15658,6 +15658,42 @@ class DelawareSurchargeILITests(TestCase):
         self.assertAlmostEqual(by_label['Fuel Surcharge'], 0.76, delta=0.01)
         self.assertAlmostEqual(by_label['Delivery Charge'], 10.00, delta=0.01)
         self.assertAlmostEqual(by_label['PA Sales Tax'], 4.61, delta=0.01)
+        # All 3 surcharges should carry the synthetic_fee flag so mapper's
+        # junk filter doesn't drop them before db_write.
+        for it in items:
+            if it['raw_description'] in ('Fuel Surcharge', 'Delivery Charge', 'PA Sales Tax'):
+                self.assertTrue(it.get('synthetic_fee'),
+                    f"surcharge {it['raw_description']!r} missing synthetic_fee flag")
+
+    def test_synthetic_fee_bypasses_mapper_junk_filter(self):
+        """B-DelawareSurchargeILI flag: items tagged synthetic_fee=True
+        must NOT be classified as junk even when their description
+        matches a _JUNK_RE pattern. Without this, Fuel Surcharge / PA
+        Sales Tax rows get dropped by map_items before reaching db_write."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'mapper' in sys.modules:
+            del sys.modules['mapper']
+        import mapper as m
+
+        # Both descriptions match _JUNK_RE patterns
+        synth_fuel = {'raw_description': 'Fuel Surcharge', 'unit_price': 0.76,
+                       'extended_amount': 0.76, 'synthetic_fee': True}
+        synth_tax = {'raw_description': 'PA Sales Tax', 'unit_price': 4.61,
+                      'extended_amount': 4.61, 'synthetic_fee': True}
+        # Without the flag — would be junk
+        raw_fuel = {'raw_description': 'Fuel Surcharge', 'unit_price': 0.76,
+                     'extended_amount': 0.76}
+
+        self.assertFalse(m._is_junk_item(synth_fuel),
+            "synthetic_fee=True must bypass junk filter (Fuel Surcharge)")
+        self.assertFalse(m._is_junk_item(synth_tax),
+            "synthetic_fee=True must bypass junk filter (PA Sales Tax)")
+        self.assertTrue(m._is_junk_item(raw_fuel),
+            "without flag, Fuel Surcharge is junk (lock no-regression)")
 
 
 class ExceptionalFreightExtractionTests(TestCase):
