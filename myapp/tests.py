@@ -1470,8 +1470,22 @@ class ParserSyscoLabelAnchoredFeesTests(TestCase):
                 return parser_mod.parse_invoice('sysco text', vendor='Sysco',
                                                 pages=pages)
 
+    def _synthetic_fee_sum(self, result):
+        """Sum extended_amount across synthetic_fee=True ILI rows.
+        Post-B-SyscoFeeILI (2026-05-12), label-anchored Sysco fees are
+        emitted as ILI rows instead of stored on parsed['non_item_charges'].
+        """
+        return round(sum(
+            it.get('extended_amount') or 0
+            for it in result.get('items', [])
+            if it.get('synthetic_fee')
+        ), 2)
+
     def test_label_extraction_populates_non_item_charges(self):
-        """FUEL + CC + TAX labels present → sum becomes non_item_charges."""
+        """FUEL + CC + TAX labels present → sum becomes synthetic ILI rows.
+        (Pre-B-SyscoFeeILI: surfaced as parsed['non_item_charges']. Post:
+        emitted as synthetic_fee ILI rows; this test now asserts the sum
+        across those rows.)"""
         clean_recon = [
             {'section': 'DAIRY', 'parser_sum': 953.22,
              'printed_total': 953.22, 'diff_abs': 0.0,
@@ -1484,10 +1498,10 @@ class ParserSyscoLabelAnchoredFeesTests(TestCase):
         )
         # Expected: 6.50 + 26.14 + 23.84 = 56.48
         self.assertEqual(result.get('invoice_total'), 1103.60)
-        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+        self.assertAlmostEqual(self._synthetic_fee_sum(result), 56.48,
                                delta=0.01,
                                msg='Label-anchored extraction should sum '
-                                   'FUEL+CC+TAX = $56.48 from totals page')
+                                   'FUEL+CC+TAX = $56.48 across synthetic ILI rows')
 
     def test_label_extraction_wins_over_gap_derivation(self):
         """When BOTH label extraction AND gap derivation would succeed,
@@ -1497,35 +1511,33 @@ class ParserSyscoLabelAnchoredFeesTests(TestCase):
              'printed_total': 1047.12, 'diff_abs': 0.0,
              'diff_pct': 0.0, 'item_count': 26},
         ]
-        # Gap derivation would compute: 1103.60 - 1047.12 = 56.48 (under 8%)
-        # Label extraction sums to 56.48 too — both paths agree here. The
-        # important check is that label path runs FIRST (sets the value)
-        # and gap path doesn't double-apply.
         result = self._call_parse(
             recon_result=clean_recon,
             invoice_total=1103.60,
             items_total=1047.12,
         )
-        # Result should be exactly 56.48 (label sum), not somehow doubled
-        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+        # Result should be exactly 56.48 (label sum) across synthetic rows,
+        # NOT also set as non_item_charges (would double-count)
+        self.assertAlmostEqual(self._synthetic_fee_sum(result), 56.48,
                                delta=0.01)
+        self.assertNotIn('non_item_charges', result,
+            "non_item_charges must NOT be set when fees become ILI rows")
 
     def test_label_extraction_works_when_gap_exceeds_8pct(self):
-        """B-MISC's 8% cap blocks derivation for INV 775687424 (gap 13.6%).
-        Label extraction has no such cap — should still find fees."""
+        """B-MISC's 8% cap blocks gap-derivation for INV 775687424 (gap
+        13.6%). Label extraction has no such cap — should still find fees
+        AND emit them as synthetic ILI rows."""
         clean_recon = [
             {'section': 'DAIRY', 'parser_sum': 953.22,
              'printed_total': 953.22, 'diff_abs': 0.0,
              'diff_pct': 0.0, 'item_count': 26},
         ]
-        # gap = 1103.60 - 953.22 = 150.38 = 13.6% > 8% cap
-        # B-MISC would suppress. Label extraction shouldn't.
         result = self._call_parse(
             recon_result=clean_recon,
             invoice_total=1103.60,
             items_total=953.22,
         )
-        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+        self.assertAlmostEqual(self._synthetic_fee_sum(result), 56.48,
                                delta=0.01,
                                msg='Label extraction must work even when '
                                    'B-MISC 8% cap would suppress derivation')
@@ -1607,8 +1619,9 @@ class ParserSyscoLabelAnchoredFeesTests(TestCase):
             pages_extra=[],  # totals page already first via _call_parse default
         )
         # If extract_sysco_fees correctly used the LAST PAGE marker (not
-        # pages[-1]), it found the totals tokens → fees = 56.48
-        self.assertAlmostEqual(result.get('non_item_charges') or 0, 56.48,
+        # pages[-1]), it found the totals tokens → fees = 56.48 across
+        # synthetic ILI rows (B-SyscoFeeILI, 2026-05-12).
+        self.assertAlmostEqual(self._synthetic_fee_sum(result), 56.48,
                                delta=0.01)
 
 

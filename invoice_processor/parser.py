@@ -3716,7 +3716,56 @@ def parse_invoice(text: str, vendor: str = None,
             extracted_fees = {}
         fee_sum = round(sum(extracted_fees.values()), 2) if extracted_fees else 0.0
 
-        if fee_sum > 0:
+        # B-SyscoFeeILI (2026-05-12): when label extraction returns plausible
+        # fees, add them as synthetic ILI rows (mirrors Delaware surcharge
+        # pattern). Pre-fix, fees only landed in parsed['non_item_charges']
+        # which the classifier honored for PASS verdicts but the IVS gap
+        # display + ILI table didn't reflect them — items_sum on the IVS
+        # row showed the raw items-only delta of $50-100 even on invoices
+        # whose fees were 100% captured. Same Trust LAW divergence we hit
+        # on Delaware: IVS green-checks while ILI reads $90 short.
+        #
+        # Plausibility cap: fee_sum < 20% of invoice_total. Sysco PA fees
+        # are typically 5-8% combined (6% tax on taxable items + small fuel
+        # + 1-2% CC processing). Above 20% indicates a token-pairing miss
+        # (INV 775675588 surfaced 2026-05-12: extractor read $844.85 as
+        # tax when the real tax was a fraction of that). When the cap
+        # blocks fee capture, leave items unmodified and fall through to
+        # the gap-derivation fallback below for the older smaller-fees
+        # case, OR leave classifier-via-tolerance to handle it.
+        _SYSCO_FEE_LABELS = {
+            'fuel_surcharge': 'Sysco Fuel Surcharge',
+            'cc_processing': 'Sysco CC Processing Fee',
+            'tax': 'Sysco Sales Tax',
+        }
+
+        if fee_sum > 0 and invoice_total is not None:
+            if fee_sum < invoice_total * 0.20:
+                # Plausible — emit each fee as a synthetic ILI row. items
+                # is the same list referenced by parsed["items"]; appending
+                # here propagates to the returned dict.
+                for _key, _val in extracted_fees.items():
+                    if _val and _val > 0:
+                        items.append({
+                            "raw_description": _SYSCO_FEE_LABELS.get(
+                                _key, _key.replace('_', ' ').title()),
+                            "unit_price": _val,
+                            "extended_amount": _val,
+                            "case_size_raw": "",
+                            "synthetic_fee": True,
+                        })
+                # Don't also set non_item_charges — would double-count
+                # against invoice_total in the classifier path.
+            else:
+                # Implausibly high (cap blocked) — log + skip.
+                # Future B-SyscoFeeCap will tighten extract_sysco_fees itself.
+                print(f"  [!] Sysco fee over-extraction guard: "
+                      f"fee_sum=${fee_sum:.2f} exceeds 20% of "
+                      f"invoice_total=${invoice_total:.2f}; "
+                      f"skipping fee ILI capture. Fees: {extracted_fees}")
+        elif fee_sum > 0:
+            # No invoice_total to validate against — preserve original
+            # non_item_charges behavior (classifier may still use it).
             parsed["non_item_charges"] = fee_sum
         elif invoice_total is not None and recon and not bad:
             # B-MISC fix (2026-05-10) fallback: when label extraction
