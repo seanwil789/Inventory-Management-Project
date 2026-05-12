@@ -209,6 +209,33 @@ class Command(BaseCommand):
                     # inv_num when present; empty string when group is keyed
                     # by source_file (vendors w/o reliable extraction).
                     inv_num_for_db = key[2] if key[0] == 'num' else ''
+                    # B-OrphanCleanup (2026-05-12): purge stale ILI for this
+                    # (vendor, invoice_number) BEFORE re-inserting. Multiple
+                    # historical reprocess passes have accumulated orphan rows
+                    # that survived because db_write's upsert only updates
+                    # matching keys — anything from an older parse with a
+                    # different key stays forever. Pi audit 2026-05-12 found
+                    # 88 invoices with $42,707 in ILI excess over IVS items_sum
+                    # (775619701 alone had 143 rows summing to $8672 vs $2964
+                    # in parsed items). Downstream consumers (cost calc,
+                    # synergy sync, dashboards) all read this inflated data.
+                    # Preserve user_edited=True (none today, but B7 will
+                    # introduce them).
+                    if inv_num_for_db:
+                        from myapp.models import InvoiceLineItem, Vendor
+                        vendor_obj = Vendor.objects.filter(name=vendor).first()
+                        if vendor_obj:
+                            stale_qs = InvoiceLineItem.objects.filter(
+                                vendor=vendor_obj,
+                                invoice_number=inv_num_for_db,
+                                user_edited=False,
+                            )
+                            deleted = stale_qs.count()
+                            stale_qs.delete()
+                            if deleted > 0 and opts.get('verbosity', 1) >= 2:
+                                self.stdout.write(
+                                    f'    purged {deleted} stale ILI row(s) '
+                                    f'for {vendor} #{inv_num_for_db}')
                     written = write_invoice_to_db(
                         vendor_name=vendor,
                         invoice_date=invoice_date,
