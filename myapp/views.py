@@ -3781,6 +3781,84 @@ def cost_coverage(request):
 
 # ---- Category spend/activity dashboard ----
 
+def _category_spend_donut_slices(rows, value_key='est_spend',
+                                  cx=140, cy=140, r_outer=120, r_inner=72,
+                                  top_n=7):
+    """Build SVG donut chart slices for category_spend.
+
+    Returns a list of dicts with keys: path, color, category, slug, value,
+    pct. Top `top_n` categories by value_key get their own slice; rest get
+    bundled as 'Other'. Angle starts at 12 o'clock and runs clockwise.
+    """
+    import math
+    from django.utils.text import slugify
+
+    palette = [
+        '#6366f1',  # indigo-500
+        '#10b981',  # emerald-500
+        '#f59e0b',  # amber-500
+        '#f43f5e',  # rose-500
+        '#0ea5e9',  # sky-500
+        '#8b5cf6',  # violet-500
+        '#14b8a6',  # teal-500
+        '#64748b',  # slate-500 (for Other)
+    ]
+
+    # Sort by value DESC; keep top N + bundle the rest as Other
+    enriched = [
+        {'category': (r.get('category') or '(uncategorized)'),
+         'value': float(r.get(value_key, 0) or 0)}
+        for r in rows
+    ]
+    enriched.sort(key=lambda r: r['value'], reverse=True)
+    top = [r for r in enriched[:top_n] if r['value'] > 0]
+    rest = enriched[top_n:]
+    if rest:
+        other_val = sum(r['value'] for r in rest if r['value'] > 0)
+        if other_val > 0:
+            top.append({'category': 'Other', 'value': other_val})
+
+    total = sum(r['value'] for r in top)
+    if total <= 0:
+        return []
+
+    slices = []
+    angle = -math.pi / 2  # start at 12 o'clock
+    for i, row in enumerate(top):
+        val = row['value']
+        slice_angle = (val / total) * 2 * math.pi
+        a1 = angle
+        a2 = angle + slice_angle
+
+        x1, y1 = cx + r_outer * math.cos(a1), cy + r_outer * math.sin(a1)
+        x2, y2 = cx + r_outer * math.cos(a2), cy + r_outer * math.sin(a2)
+        x3, y3 = cx + r_inner * math.cos(a2), cy + r_inner * math.sin(a2)
+        x4, y4 = cx + r_inner * math.cos(a1), cy + r_inner * math.sin(a1)
+
+        large_arc = 1 if slice_angle > math.pi else 0
+
+        # SVG path: outer arc clockwise, line in, inner arc counterclockwise.
+        path = (
+            f"M {x1:.2f} {y1:.2f} "
+            f"A {r_outer} {r_outer} 0 {large_arc} 1 {x2:.2f} {y2:.2f} "
+            f"L {x3:.2f} {y3:.2f} "
+            f"A {r_inner} {r_inner} 0 {large_arc} 0 {x4:.2f} {y4:.2f} "
+            f"Z"
+        )
+
+        slices.append({
+            'path': path,
+            'color': palette[i] if i < len(palette) else palette[-1],
+            'category': row['category'],
+            'slug': slugify(row['category']) if row['category'] != 'Other' else '',
+            'value': val,
+            'pct': round((val / total * 100), 1),
+        })
+        angle = a2
+
+    return slices
+
+
 def category_spend(request):
     """Line-item activity + estimated spend by Product.category, with a 4-month
     trend. Companion to /cogs/ — that view shows authoritative invoice totals;
@@ -3886,6 +3964,11 @@ def category_spend(request):
             max_val = max(max_val, n)
         trend_rows.append({'category': cat, 'cells': cells})
 
+    # Donut chart slices for the current-month est_spend distribution.
+    # Top 7 categories explicit, rest bundled as 'Other'. Empty list when
+    # there's no spend data — template renders a placeholder.
+    donut_slices = _category_spend_donut_slices(current, value_key='est_spend')
+
     return render(request, 'myapp/category_spend.html', {
         'current_label': today.strftime('%B %Y'),
         'current': current,
@@ -3895,6 +3978,7 @@ def category_spend(request):
         'trend_max': max_val or 1,
         'total_lines': total_lines,
         'total_est_spend': total_est_spend.quantize(Decimal('0.01')),
+        'donut_slices': donut_slices,
     })
 
 
