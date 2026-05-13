@@ -26,6 +26,34 @@ from line_math import validate_line_math
 _QTY_RE = re.compile(r"^\d+\.\d{3}$")
 _PRICE_RE = re.compile(r"^\$?\d+\.\d{2,4}\*?$")
 
+# Patterns matching descriptions that aren't real product items but were
+# extracted from rows that happened to align with a SUPC + ext token pair.
+# Filtered at the end of extract_sysco_rank.
+#
+# Pattern C-1 (manifest): Sysco prints a delivery manifest reference line
+# in the totals area. INV 775825138 had "112 SYNERGY CHURCH HOUSES ST
+# MANIFEST #" extracted as a $30.28 BEVERAGE item — same value also
+# captured as Sysco Fuel Surcharge. The "MANIFEST" word is distinctive;
+# real Sysco product descriptions don't contain it.
+#
+# Pattern C-2 (out-of-stock placeholder): "OUT / STOCK" notation rows
+# get an ext value (presumably the price the item would have been) but
+# represent a stock-out, not a billed line. INV 775632629 had this as a
+# $30.45 UNKNOWN item. Match "OUT" followed by space or slash + "STOCK".
+_NON_ITEM_DESC_PATTERNS = [
+    re.compile(r"\bMANIFEST\b", re.IGNORECASE),
+    re.compile(r"^\s*OUT\s*[/\s]\s*STOCK\b", re.IGNORECASE),
+]
+
+
+def _is_non_item_row(item: dict) -> bool:
+    """True if the row's description matches a known non-item pattern
+    (delivery manifest, out-of-stock placeholder, etc.)."""
+    desc = item.get("raw_description") or ""
+    if not desc:
+        return False
+    return any(pat.search(desc) for pat in _NON_ITEM_DESC_PATTERNS)
+
 # Description-y interpolation tolerance. Tightened from 0.014 (initial) to 0.008
 # after observing extraction-stage mash-ups on tightly-spaced rows. Rows whose
 # description tokens span >1.5x this tolerance get an ambiguity flag.
@@ -377,7 +405,7 @@ def extract_sysco_rank(pages: list[dict]) -> list[dict]:
         # if this page had no headers at all) forward to the next page.
         if last_section:
             carry_section = last_section
-    return all_rows
+    return [r for r in all_rows if not _is_non_item_row(r)]
 
 
 def _extract_sysco_rank_one_page(

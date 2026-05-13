@@ -15620,6 +15620,134 @@ class RankPairSyscoSectionTaggingTests(TestCase):
             cache_page_order_key('PRODUCE items, LAST PAGE'), 99)
 
 
+class RankPairSyscoNonItemFilterTests(TestCase):
+    """Sysco rank-pair filters out rows whose extracted description matches
+    known non-item patterns (delivery manifest, out-of-stock placeholder).
+    These show up in the OCR with a SUPC-like token + ext-like token nearby
+    and would otherwise be extracted as items, inflating items_sum.
+
+    Pattern C-1 (manifest): INV 775825138 had "112 SYNERGY CHURCH HOUSES
+    ST MANIFEST #" extracted as a $30.28 BEVERAGE item. Same value also
+    captured as Sysco Fuel Surcharge from the same token. Filter removes
+    the spurious item; the fee capture stays correct.
+
+    Pattern C-2 (out-of-stock): INV 775632629 had "OUT / STOCK" extracted
+    as a $30.45 UNKNOWN item. The notation row had a leftover ext value
+    (likely from OCR misalignment) but isn't a billed line.
+    """
+
+    def _tok(self, text, x, y, w=0.01, h=0.005):
+        return {'text': text,
+                'x_min': x - w / 2, 'x_max': x + w / 2,
+                'y_min': y - h / 2, 'y_max': y + h / 2}
+
+    def _reset_modules(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+
+    def test_manifest_row_filtered(self):
+        """A row whose description contains 'MANIFEST' is dropped from
+        the items list."""
+        self._reset_modules()
+        from rank_pair import extract_sysco_rank
+        T = self._tok
+        tokens = [
+            T('****',    0.30, 0.20),
+            T('PRODUCE', 0.40, 0.20),
+            T('****',    0.50, 0.20),
+            # Real PRODUCE item
+            T('1234567', 0.55, 0.25),
+            T('5.50',    0.78, 0.25),
+            T('APPLE',   0.20, 0.25),
+            # Real PRODUCE item
+            T('2345678', 0.55, 0.30),
+            T('3.10',    0.78, 0.30),
+            T('CARROT',  0.20, 0.30),
+            # MANIFEST row - SUPC-like token + ext, but desc contains MANIFEST
+            T('9999999', 0.55, 0.40),
+            T('30.28',   0.78, 0.40),
+            T('112',           0.10, 0.40),
+            T('SYNERGY',       0.13, 0.40),
+            T('CHURCH',        0.17, 0.40),
+            T('HOUSES',        0.20, 0.40),
+            T('ST',            0.23, 0.40),
+            T('MANIFEST',      0.26, 0.40),
+            T('#',             0.30, 0.40),
+        ]
+        rows = extract_sysco_rank([{'tokens': tokens}])
+        descs = [r.get('raw_description') or '' for r in rows]
+        self.assertEqual(len(rows), 2,
+            f'Expected 2 real items (APPLE, CARROT), got {len(rows)}: {descs}')
+        for d in descs:
+            self.assertNotIn('MANIFEST', d.upper(),
+                f'Row with MANIFEST description should have been filtered: {d!r}')
+
+    def test_out_of_stock_row_filtered(self):
+        """A row whose description matches 'OUT / STOCK' is dropped."""
+        self._reset_modules()
+        from rank_pair import extract_sysco_rank
+        T = self._tok
+        tokens = [
+            T('****',    0.30, 0.20),
+            T('DAIRY',   0.40, 0.20),
+            T('****',    0.50, 0.20),
+            # Real DAIRY item
+            T('1234567', 0.55, 0.25),
+            T('5.50',    0.78, 0.25),
+            T('MILK',    0.20, 0.25),
+            # OUT / STOCK row
+            T('9999999', 0.55, 0.30),
+            T('30.45',   0.78, 0.30),
+            T('OUT',     0.20, 0.30),
+            T('/',       0.23, 0.30),
+            T('STOCK',   0.26, 0.30),
+            # Another real DAIRY item
+            T('3456789', 0.55, 0.35),
+            T('2.20',    0.78, 0.35),
+            T('YOGURT',  0.20, 0.35),
+        ]
+        rows = extract_sysco_rank([{'tokens': tokens}])
+        descs = [r.get('raw_description') or '' for r in rows]
+        self.assertEqual(len(rows), 2,
+            f'Expected 2 real items (MILK, YOGURT), got {len(rows)}: {descs}')
+        for d in descs:
+            self.assertFalse(d.upper().startswith('OUT '),
+                f'OUT/STOCK row should have been filtered: {d!r}')
+
+    def test_real_items_with_OUT_substring_not_filtered(self):
+        """A real product whose description coincidentally starts with
+        'OUT' (e.g., 'OUTDOOR' or 'OUT' as item-prefix) is NOT filtered.
+        The filter only matches 'OUT / STOCK' or 'OUT STOCK' patterns.
+        """
+        self._reset_modules()
+        from rank_pair import extract_sysco_rank
+        T = self._tok
+        tokens = [
+            T('****',    0.30, 0.20),
+            T('PRODUCE', 0.40, 0.20),
+            T('****',    0.50, 0.20),
+            # Real item with 'OUT' as a description token (common Sysco
+            # marker for "out-of-stock substitute" items, but the SUPC
+            # itself is real and should be billed).
+            T('1234567', 0.55, 0.25),
+            T('5.50',    0.78, 0.25),
+            T('OUT',     0.10, 0.25),  # marker
+            T('21',      0.13, 0.25),
+            T('KG',      0.16, 0.25),
+            T('SEAWEED', 0.20, 0.25),
+            T('DRIED',   0.24, 0.25),
+        ]
+        rows = extract_sysco_rank([{'tokens': tokens}])
+        self.assertEqual(len(rows), 1,
+            f'Real item starting with OUT should be kept: {[r.get("raw_description") for r in rows]}')
+
+
 class PBMMathPairsStrategyTests(TestCase):
     """B-MathPairs (2026-05-12): _parse_pbm Format-2 now includes a
     math-validated adjacent-pair strategy that handles mixed-layout
