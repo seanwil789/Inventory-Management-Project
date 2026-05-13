@@ -217,47 +217,62 @@ def extract_sysco_fees(pages: list[dict]) -> dict:
     if not pages:
         return {}
 
-    # Find the cache page that contains the LAST PAGE marker — that's the
-    # totals page. Without this, multi-photo invoices may have non-totals
-    # pages at the end of `pages` by filesystem order; the wrong page would
-    # miss the FUEL/MISC/TAX labels entirely.
-    totals_page = None
-    for p in pages:
-        text = ' '.join((t.get('text') or '') for t in p.get('tokens') or [])
-        if 'LAST PAGE' in text.upper():
-            totals_page = p
-            break
-    if totals_page is None:
-        totals_page = pages[-1]
-
-    tokens = totals_page.get('tokens') or []
-    if not tokens:
-        return {}
-
+    # B-SyscoFeeCap fix (2026-05-12): two changes vs the prior single-page
+    # approach.
+    #
+    # (1) y-tolerance widened from 0.005 to 0.02 for FUEL + CC (matching
+    #     TAX). Real OCR baselines drift 0.008-0.012 between label tokens
+    #     and price tokens in the totals block — pre-fix max_dy=0.005
+    #     silently dropped values that were just outside that band.
+    #     Reference: INV 775619701 FUEL label y=0.224, $6.50 price y=0.216
+    #     (dy=0.0087 > 0.005). Fuel missed → invoice gap inflated by $6.50.
+    #
+    # (2) Multi-cache search: instead of locking onto the LAST PAGE cache
+    #     and ignoring other pages, iterate ALL pages for each fee label.
+    #     Multi-photo Sysco invoices sometimes split the totals block
+    #     across caches (CREDIT label on one cache, LAST PAGE marker on
+    #     another). Pre-fix CC missed entirely on those invoices.
+    #     Reference: INV 775619701 has CREDIT label on cache bc4286dc but
+    #     LAST PAGE marker on cache bdd69b79. CC missed → gap +$66 over.
+    #
+    # Per-fee first-match: the first page that yields a value wins. Order
+    # of `pages` is caller's responsibility; cache_page_order_key already
+    # orders multi-cache invoices by physical page sequence.
     fees: dict = {}
+    for p in pages:
+        tokens = p.get('tokens') or []
+        if not tokens:
+            continue
 
-    fuel_row = _label_row(tokens, {'FUEL', 'SURCHARGE'}, 'FUEL')
-    if fuel_row:
-        amt = _value_for_label(tokens, fuel_row)
-        if amt is not None:
-            fees['fuel_surcharge'] = amt
+        if 'fuel_surcharge' not in fees:
+            fuel_row = _label_row(tokens, {'FUEL', 'SURCHARGE'}, 'FUEL',
+                                  max_dy=0.02)
+            if fuel_row:
+                amt = _value_for_label(tokens, fuel_row, max_dy=0.02)
+                if amt is not None:
+                    fees['fuel_surcharge'] = amt
 
-    cc_row = _label_row(tokens, {'CREDIT', 'CARD'}, 'CREDIT')
-    if cc_row:
-        amt = _value_for_label(tokens, cc_row)
-        if amt is not None:
-            fees['cc_processing'] = amt
+        if 'cc_processing' not in fees:
+            cc_row = _label_row(tokens, {'CREDIT', 'CARD'}, 'CREDIT',
+                                max_dy=0.02)
+            if cc_row:
+                amt = _value_for_label(tokens, cc_row, max_dy=0.02)
+                if amt is not None:
+                    fees['cc_processing'] = amt
 
-    # TAX: bottom half only (column-header "TAX" tokens sit in upper-half).
-    tax_tokens = [t for t in tokens
-                  if (t.get('text') or '').upper() == 'TAX'
-                  and _y_mid(t) > 0.5]
-    if tax_tokens:
-        # Lowest-y TAX is closest to INVOICE TOTAL block (the real fee).
-        tax_tokens.sort(key=_y_mid, reverse=True)
-        amt = _value_for_label(tokens, [tax_tokens[0]], max_dy=0.02)
-        if amt is not None:
-            fees['tax'] = amt
+        if 'tax' not in fees:
+            # TAX: bottom half only (column-header "TAX" tokens sit in
+            # upper-half on the totals page; for non-totals pages, TAX
+            # may not appear at all — the y>0.5 filter is harmless there).
+            tax_tokens = [t for t in tokens
+                          if (t.get('text') or '').upper() == 'TAX'
+                          and _y_mid(t) > 0.5]
+            if tax_tokens:
+                # Lowest-y TAX is closest to INVOICE TOTAL block (the real fee).
+                tax_tokens.sort(key=_y_mid, reverse=True)
+                amt = _value_for_label(tokens, [tax_tokens[0]], max_dy=0.02)
+                if amt is not None:
+                    fees['tax'] = amt
 
     return fees
 

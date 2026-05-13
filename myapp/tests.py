@@ -17047,6 +17047,136 @@ class ExtractSyscoFeesTests(TestCase):
         self.assertEqual(fees, {'tax': 25.00})
 
 
+class ExtractSyscoFeesSyscoFeeCapTests(TestCase):
+    """B-SyscoFeeCap fix (2026-05-12): extract_sysco_fees in section_validator
+    captures FUEL/CC/TAX from Sysco invoice totals blocks. Pre-fix issues
+    surfaced corpus-wide on 22 PASS-with-gap Sysco invoices:
+
+    1. **y-tolerance too tight** — FUEL and CC used max_dy=0.005, but real
+       OCR baselines drift 0.008-0.012 between label tokens and price
+       tokens in the totals block. Result: labels found but values
+       silently missed. Reference: INV 775619701 LAST PAGE cache —
+       FUEL label at y=0.224, $6.50 price at y=0.216 (dy=0.0087 > 0.005).
+       Fuel value missed, gap=-$73 instead of -$67.
+
+    2. **Single-page search** — when CREDIT label and value are on a
+       different OCR cache than the LAST PAGE cache, only LAST PAGE was
+       searched, missing CC entirely. Reference: INV 775619701 has CREDIT
+       label on cache bc4286dc but LAST PAGE on cache bdd69b79. Pre-fix:
+       CC missed, gap inflated.
+
+    Fix: widen FUEL/CC max_dy to 0.02 (matching TAX) AND search ALL
+    pages for each fee label (collect candidates across pages, pair
+    label-to-price within the same page).
+    """
+
+    @staticmethod
+    def _tok(text, x, y, w=0.05, h=0.014):
+        return {
+            'text': text,
+            'x_min': x - w / 2, 'x_max': x + w / 2,
+            'y_min': y - h / 2, 'y_max': y + h / 2,
+            'char_start': 0, 'char_end': 0,
+        }
+
+    def test_widened_y_tol_catches_fuel_when_baseline_drifts(self):
+        """Mirrors INV 775619701 LAST PAGE cache: FUEL label and 6.50
+        price at slightly offset y (0.0087 apart). Pre-fix max_dy=0.005
+        rejected this. Post-fix max_dy=0.02 (matching TAX) catches it.
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        # FUEL label at y=0.224, price at y=0.2155 (dy=0.0085 > 0.005)
+        tokens = [
+            T('FUEL',      0.314, 0.2242),
+            T('SURCHARGE', 0.366, 0.2242),
+            T('6.50',      0.746, 0.2155),  # 0.0087 above label
+            # LAST PAGE marker
+            T('LAST',      0.765, 0.934),
+            T('PAGE',      0.802, 0.934),
+            # TAX block (control — already worked at max_dy=0.02)
+            T('TAX',       0.737, 0.861),
+            T('38.00',     0.840, 0.873),
+        ]
+        pages = [{'tokens': tokens}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees.get('fuel_surcharge'), 6.50,
+            'FUEL with dy=0.0087 between label and price should now '
+            'capture (post-widening). Got fees={0}.'.format(fees))
+        # TAX still captured (no regression)
+        self.assertEqual(fees.get('tax'), 38.00)
+
+    def test_multi_page_finds_cc_label_outside_last_page_cache(self):
+        """Mirrors INV 775619701: CREDIT CARD label is on cache bc4286dc
+        (NOT the LAST PAGE cache). Pre-fix: extract_sysco_fees searched
+        only the LAST PAGE cache, missing CC entirely.
+
+        Post-fix: search all pages for each fee label, pair within page.
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        # Page 1 (LAST PAGE cache): FUEL + TAX, but no CREDIT
+        last_page_tokens = [
+            T('FUEL',      0.314, 0.2242),
+            T('SURCHARGE', 0.366, 0.2242),
+            T('6.50',      0.746, 0.2155),
+            T('LAST',      0.765, 0.934),
+            T('PAGE',      0.802, 0.934),
+            T('TAX',       0.737, 0.861),
+            T('38.00',     0.840, 0.873),
+        ]
+        # Page 2 (CREDIT cache): CHARGE FOR CREDIT CARD SRCHRG label + value
+        credit_page_tokens = [
+            T('MISC',      0.135, 0.7537),
+            T('CHARGES',   0.184, 0.7532),
+            T('CHARGE',    0.270, 0.7513),
+            T('FOR',       0.312, 0.7498),
+            T('CREDIT',    0.353, 0.7483),
+            T('CARD',      0.397, 0.7468),
+            T('SRCHRG',    0.442, 0.7455),
+            T('66.60',     0.787, 0.7470),  # CC value (real value, not subtotal)
+        ]
+        pages = [
+            {'tokens': last_page_tokens},
+            {'tokens': credit_page_tokens},
+        ]
+        fees = extract_sysco_fees(pages)
+        # All 3 fees captured, even though they're on different pages
+        self.assertEqual(fees.get('fuel_surcharge'), 6.50,
+            'FUEL from LAST PAGE cache. Got fees={0}.'.format(fees))
+        self.assertEqual(fees.get('cc_processing'), 66.60,
+            'CC from non-LAST-PAGE cache (multi-cache search). Got fees={0}.'
+            .format(fees))
+        self.assertEqual(fees.get('tax'), 38.00)
+
+    def test_no_regression_on_tight_paired_layout(self):
+        """When FUEL+CC labels and prices are tightly aligned (dy < 0.005),
+        existing extraction still works. Locks against tolerance widening
+        accidentally pulling wrong tokens.
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        tokens = [
+            T('CREDIT',    0.331, 0.335),
+            T('CARD',      0.373, 0.336),
+            T('18.09',     0.74,  0.337),  # tight pairing
+            T('FUEL',      0.310, 0.348),
+            T('SURCHARGE', 0.363, 0.349),
+            T('8.95',      0.74,  0.350),
+            T('TAX',       0.734, 0.871),
+            T('37.63',     0.827, 0.877),
+            T('LAST',      0.745, 0.934),
+            T('PAGE',      0.788, 0.934),
+        ]
+        pages = [{'tokens': tokens}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees, {
+            'fuel_surcharge': 8.95,
+            'cc_processing': 18.09,
+            'tax': 37.63,
+        })
+
+
 class ValidateExtractionGroupingTests(TestCase):
     """Multi-photo aggregation: caches are grouped by invoice number so a
     multi-page Sysco invoice gets one combined report instead of N
