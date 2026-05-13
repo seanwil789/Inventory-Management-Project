@@ -693,7 +693,18 @@ def _extract_sysco_rank_one_page(
                             pass
                     else:
                         qty_int = candidate_qty
-                        ext_f = unit_f * candidate_qty
+                        # B-CatchWeightDoubling fix (2026-05-12): for catch-
+                        # weight rows (per_lb_f set), unit_f IS the printed
+                        # line ext (T/WT × ppp), already totaling all cases.
+                        # Multiplying by candidate_qty would double the ext.
+                        # Reference: INV 775404605 BEEF STEAK STRIP — 2 CS,
+                        # T/WT=24 lbs, ppp=$12.75, paper ext=$306. Pre-fix
+                        # stored ext=$612, then B-Salmon derived qty=48.
+                        # 3 corpus rows affected (~$600 total inflation).
+                        if per_lb_f is None:
+                            ext_f = unit_f * candidate_qty
+                        # else: catch-weight — leave ext_f at default unit_f
+                        # so B-Salmon below derives correct T/WT = ext/ppp.
 
         # Description tokens for this row: left-of-SUPC tokens whose y is
         # closer to THIS supc's y than to any other supc's y.

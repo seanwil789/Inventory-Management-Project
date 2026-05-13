@@ -15106,6 +15106,76 @@ class RankPairSyscoQtyExtractionTests(TestCase):
             f'diff_pct={salmon.get("math_diff_pct")}'
         )
 
+    def test_catch_weight_multi_case_does_not_double_ext(self):
+        """B-CatchWeightDoubling fix (2026-05-12): multi-case catch-weight
+        rows (qty>1 cases of T/WT meat) must NOT have ext doubled.
+
+        Pre-fix bug: rank_pair Step 3 fallback (line ~696) computes
+        `ext_f = unit_f * candidate_qty` when no separate ext_t is found
+        in Step 2. For catch-weight rows, `unit_f` IS the printed line
+        ext (T/WT × ppp), already totaling all cases. Multiplying by
+        `candidate_qty` (cases ordered) doubles the ext.
+
+        Reference: INV 775404605 BEEF STEAK STRIP — 2 CS, T/WT=24 lbs,
+        ppp=$12.75/lb, paper ext=$306. Pre-fix: stored qty=48 ext=$612
+        (= unit_f $306 × candidate_qty 2). B-Salmon then derived
+        qty = $612 / $12.75 = 48. Inflated items_sum by $306 across
+        3 invoices in the corpus.
+
+        Post-fix: gate the multiplication on `per_lb_f is None` so
+        catch-weight rows keep ext_f = unit_f. B-Salmon derives correct
+        qty = unit_f / per_lb_f = 24 lbs.
+        """
+        extract = self._import()
+        # BEEF STEAK STRIP catch-weight, 2 cases, mirrors INV 775404605
+        # cache A actual token positions (verified via OCR cache inspection).
+        # Critical: only ONE 2-dec token in price column ($306) — no
+        # separate ext_t further right, so Step 2 can't validate qty
+        # via ext/unit ratio. Step 3 falls through to left-column qty
+        # extraction, which finds candidate_qty=2 from "2 CS" anchor.
+        tokens = [
+            # Left column: qty "2" + unit code "CS" near BEEF SUPC y
+            self._tok('2',       0.156, 0.660),
+            self._tok('CS',      0.166, 0.660),
+            self._tok('STEAK',   0.30,  0.668),  # description token
+            # SUPC row: SUPC + per-lb (3-dec) + ext (2-dec, only one)
+            self._tok('3610955', 0.587, 0.668),
+            self._tok('12.750',  0.639, 0.669),  # per_lb (3-decimal)
+            self._tok('306.00',  0.752, 0.672),  # line ext (only 2-dec at this y)
+            # Two standard rows for layout detection (>=3 SUPCs needed)
+            self._tok('1234567', 0.55, 0.30),
+            self._tok('15.00',   0.70, 0.30),
+            self._tok('15.00',   0.85, 0.30),
+            self._tok('STANDARD1', 0.20, 0.30),
+            self._tok('2345678', 0.55, 0.40),
+            self._tok('22.00',   0.70, 0.40),
+            self._tok('22.00',   0.85, 0.40),
+            self._tok('STANDARD2', 0.20, 0.40),
+        ]
+        pages = [{'tokens': tokens}]
+        rows = extract(pages)
+        beef = next(r for r in rows if r['sysco_item_code'] == '3610955')
+        # Post-fix: ext stays at $306 (paper truth), NOT doubled to $612
+        self.assertAlmostEqual(
+            beef['extended_amount'], 306.00, places=2,
+            msg=('BEEF ext should be $306 (paper truth), NOT $612 (doubled). '
+                 'Got ext={0}. If $612, the Step 3 else-branch is still '
+                 'multiplying unit_f by candidate_qty for catch-weight rows.'
+                 .format(beef.get('extended_amount'))))
+        # qty derived from ext/ppp = 306/12.75 = 24 lbs (T/WT)
+        self.assertAlmostEqual(
+            beef['quantity'], 24.0, places=1,
+            msg=('BEEF qty should be 24 lbs (T/WT = ext/ppp), got {0}. '
+                 'If 48, the doubled ext propagated through B-Salmon derivation.'
+                 .format(beef.get('quantity'))))
+        self.assertAlmostEqual(beef['price_per_unit'], 12.75, places=3)
+        self.assertAlmostEqual(beef['case_total_weight_lb'], 24.0, places=1)
+        self.assertEqual(beef['unit_of_measure'], 'LB')
+        # No false-positive math_flag (validate_line_math: 24 × $12.75 = $306 ✓)
+        self.assertFalse(
+            beef.get('math_flagged'),
+            'BEEF should NOT be math_flagged after fix (qty × ppp = ext).')
+
     def _import_one_page(self):
         """Import the per-page helper that accepts carry_section directly."""
         import sys
