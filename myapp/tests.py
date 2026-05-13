@@ -1709,16 +1709,27 @@ class InvoiceNumberDedupTests(TestCase):
 
     def test_invoice_number_primary_key_collapses_re_photo(self):
         """Re-photographing the same invoice (different source_file but same
-        invoice_number) must upsert onto the existing row, not duplicate."""
+        invoice_number) must upsert onto the existing row, not duplicate.
+
+        Phase 4d (2026-05-12): re-photo collapse requires the normalized
+        raw_description to match. Realistic OCR variation between re-photos
+        of the SAME line is whitespace + capitalization noise (collapsed
+        by normalization). Substantially different raw_desc indicates a
+        different LINE on the same invoice (e.g., 3 distinct Gatorade
+        flavors all SUPC-mapping to generic Gatorade) — not the same
+        re-photographed line. See Gatorade case in
+        test_phase4d_distinct_skus_sharing_fk_not_collapsed.
+        """
         item = {
             'canonical': 'InvNumDedupProduct', 'unit_price': 10.00,
             'extended_amount': 10.00, 'quantity': 1,
-            'raw_description': 'FIRST PHOTO RAW',
+            'raw_description': 'WIDGET BRAND PRO 12CT',
         }
         self._write(self.v.name, '2026-05-08', [item],
                     source_file='photo_v1.jpg', invoice_number='INV-1001')
-        # Second ingest: same invoice number, different source file + raw
-        item2 = {**item, 'raw_description': 'SECOND PHOTO RAW WITH PREFIX'}
+        # Second ingest: realistic OCR re-photo variation (whitespace +
+        # casing). Normalization collapses to identical form.
+        item2 = {**item, 'raw_description': 'widget  brand   pro 12ct'}
         self._write(self.v.name, '2026-05-08', [item2],
                     source_file='photo_v2.jpg', invoice_number='INV-1001')
         rows = InvoiceLineItem.objects.filter(vendor=self.v, product=self.p,

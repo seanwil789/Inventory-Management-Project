@@ -629,7 +629,16 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             # Including quantity in the key distinguishes legitimate multi-
             # row cases (same product, same price, but qty=2 second case)
             # from duplicates (same product, same price, qty=1 each ingest).
-            if existing is None and product:
+            #
+            # Phase 4d gate (2026-05-12): skip ONLY when Phase 4d had
+            # authoritative information (invoice_number AND incoming_fk
+            # both present) and returned existing=None — i.e., distinct
+            # SKUs case. When either is missing, Phase 4d couldn't decide
+            # and Fallback 2 remains the safety net for re-photo collapse.
+            phase_4d_was_authoritative = (
+                incoming_fk is not None and bool(invoice_number)
+            )
+            if existing is None and product and not phase_4d_was_authoritative:
                 candidates = list(InvoiceLineItem.objects.filter(
                     vendor=vendor, product=product, invoice_date=parsed_date,
                     unit_price=common_fields.get('unit_price'),
