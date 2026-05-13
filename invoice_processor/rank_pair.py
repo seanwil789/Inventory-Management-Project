@@ -300,9 +300,18 @@ def detect_layout_sysco(tokens: list[dict]) -> dict | None:
         if _SUPC_RE.fullmatch(t.get("text") or "")
         and 0.40 <= _x_mid(t) <= 0.78
     )
-    if len(supc_xs) < 3:
+    # B-SingleSupcLayout fix (2026-05-12): lowered from >=3 to >=1.
+    # Sysco LAST PAGE / totals pages naturally carry 1-2 SUPCs (trailing
+    # items in BEVERAGE/MISC sections + closing matter). The pre-fix
+    # threshold dropped these pages wholesale, silently losing items.
+    # Reference: INV 775404605 cache D had 1 SUPC (Coffee Beans
+    # 7545589 $141.95) — entire page returned []. Per-SUPC validation
+    # downstream (unit_t finder requires nearby 2-decimal, ext_t needs
+    # another further right) is the safety net against header SUPCs.
+    if not supc_xs:
         return None
-    # Robust median of SUPC x positions (resists outlier header tokens)
+    # Robust median of SUPC x positions (resists outlier header tokens).
+    # With a single SUPC, median is that SUPC's x — band centers there.
     supc_x = median(supc_xs)
     return {
         "supc_x":  (supc_x - 0.04, supc_x + 0.04),

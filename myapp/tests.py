@@ -15106,6 +15106,68 @@ class RankPairSyscoQtyExtractionTests(TestCase):
             f'diff_pct={salmon.get("math_diff_pct")}'
         )
 
+    def test_layout_detect_accepts_single_supc_totals_page(self):
+        """B-SinglesupcLayout fix (2026-05-12): Sysco LAST PAGE / totals
+        pages naturally have 1-2 SUPCs (trailing items in BEVERAGE/MISC
+        sections + closing matter). Pre-fix detect_layout_sysco required
+        >=3 SUPCs and returned None for these pages → entire page's items
+        silently dropped.
+
+        Reference: INV 775404605 cache D (LAST PAGE) had 1 product SUPC
+        (7545589 Coffee Beans, $141.95, in DISPENSER BEVERAGE section).
+        Pre-fix: extract_sysco_rank returned [] for cache D, items_sum
+        missing $141.95, BEVERAGE parser_sum=$0 vs printed=$141.95.
+
+        Post-fix: layout-detect accepts >=1 SUPC. Per-SUPC validation
+        (unit_t needs nearby 2-dec, ext_t needs another further right)
+        filters phantom rows from header SUPCs. Coffee Beans extracts
+        cleanly: qty=1, unit_price=$141.95, ext=$141.95.
+        """
+        extract = self._import()
+        # Mirrors INV 775404605 cache D: 1 SUPC + per-row price tokens.
+        # SUPC at typical Sysco x=0.57. unit_t and ext_t both at $141.95
+        # (the OCR captures the value twice — once next to SUPC, once at
+        # the right-margin ext column). qty=1 (single case), no per-lb
+        # token (not catch-weight).
+        tokens = [
+            # **** DISPENSER BEVERAGE **** section header
+            self._tok('****',      0.252, 0.228),
+            self._tok('DISPENSER', 0.302, 0.228),
+            self._tok('BEVERAGE',  0.366, 0.228),
+            self._tok('****',      0.412, 0.229),
+            # Left column: 1 CS qty marker
+            self._tok('1',         0.150, 0.257),
+            self._tok('CS',        0.166, 0.257),
+            self._tok('62LB',      0.207, 0.256),
+            # Description
+            self._tok('CITVCLS',   0.262, 0.254),
+            self._tok('COFFEE',    0.311, 0.254),
+            self._tok('BEAN',      0.352, 0.254),
+            # SUPC + 2 price tokens (one inline, one at ext column)
+            self._tok('7545589',   0.567, 0.250),
+            self._tok('141.95',    0.617, 0.251),
+            self._tok('141.95',    0.722, 0.251),  # ext column
+            # LAST PAGE marker (totals page)
+            self._tok('LAST',      0.742, 0.883),
+            self._tok('PAGE',      0.776, 0.883),
+        ]
+        pages = [{'tokens': tokens}]
+        rows = extract(pages)
+        # Pre-fix: rows == [] (detect_layout_sysco returned None for <3 SUPCs)
+        # Post-fix: 1 row extracted for Coffee Beans
+        self.assertGreaterEqual(len(rows), 1,
+            'Single-SUPC LAST PAGE should still extract its 1 product. '
+            'Got 0 rows — detect_layout_sysco threshold may still be >=3.')
+        coffee = next((r for r in rows if r['sysco_item_code'] == '7545589'), None)
+        self.assertIsNotNone(coffee, 'Coffee Beans (SUPC 7545589) must extract')
+        self.assertAlmostEqual(coffee['unit_price'], 141.95, places=2)
+        self.assertAlmostEqual(coffee['extended_amount'], 141.95, places=2)
+        self.assertEqual(coffee['quantity'], 1)
+        # BEVERAGE section tag (canonicalized from DISPENSER BEVERAGE)
+        self.assertEqual(coffee.get('section'), 'BEVERAGE',
+            'Coffee Beans should tag BEVERAGE section. Got section={0}.'
+            .format(coffee.get('section')))
+
     def test_catch_weight_multi_case_does_not_double_ext(self):
         """B-CatchWeightDoubling fix (2026-05-12): multi-case catch-weight
         rows (qty>1 cases of T/WT meat) must NOT have ext doubled.
