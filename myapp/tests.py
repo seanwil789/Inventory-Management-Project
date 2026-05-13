@@ -17214,6 +17214,70 @@ class ExtractSyscoFeesSyscoFeeCapTests(TestCase):
             'tax': 37.63,
         })
 
+    def test_tax_prefers_rightmost_x_over_subtotal(self):
+        """Pattern A fix (2026-05-12): TAX label has two candidates within
+        max_dy=0.020 — the SUB TOTAL value (slightly left) and the real
+        PA TAX TOTAL value (slightly right). Pre-fix: leftmost-x picked
+        SUB TOTAL → caller's plausibility cap dropped it as too large →
+        no tax captured at all. Post-fix: rightmost-x picks the real tax.
+
+        Reference: INV 775675588 TAX label region. Candidates within
+        max_dy=0.02 of TAX label:
+          - subtotal $844.85 (slightly left x)
+          - real tax $17.37 (slightly right x)
+        Same pattern across all 10 observed Sysco invoices with tax.
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        tokens = [
+            T('SUB',     0.729, 0.840),
+            T('TOTAL',   0.734, 0.852),
+            T('PA',      0.670, 0.870),
+            T('TAX',     0.722, 0.880),  # anchor at y=0.880
+            T('TOTAL',   0.730, 0.892),
+            T('844.85',  0.822, 0.894),  # subtotal value (dy=0.014)
+            T('17.37',   0.826, 0.894),  # real tax value (right of subtotal)
+            T('INVOICE', 0.741, 0.910),
+            T('TOTAL',   0.736, 0.920),
+            T('862.22',  0.835, 0.917),
+            T('LAST',    0.745, 0.93),
+            T('PAGE',    0.788, 0.93),
+        ]
+        pages = [{'tokens': tokens}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees.get('tax'), 17.37,
+            'Rightmost-x should pick real tax $17.37, not subtotal $844.85. '
+            'Got tax={0}.'.format(fees.get('tax')))
+
+    def test_cc_escalates_max_dy_when_no_tight_match(self):
+        """Pattern B fix (2026-05-12): CREDIT label found but no $-value
+        within tight max_dy=0.020. Fall back to max_dy=0.030 to recover
+        invoices with wider OCR baseline drift.
+
+        Reference: INV 775605601 cache 9bc38973 — CREDIT label at y=0.791,
+        CARD at y=0.788. Real CC value $60.03 at y=0.767. dy from label
+        midpoint (0.7895) = 0.0225, just outside 0.020. Pre-fix: missed.
+        Post-fix: escalated band catches it. Plausibility cap (cc < 7%)
+        protects against the wider band picking a wrong value.
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        tokens = [
+            T('CHARGE',  0.294, 0.796),
+            T('FOR',     0.334, 0.794),
+            T('CREDIT',  0.373, 0.791),
+            T('CARD',    0.415, 0.788),
+            T('SRCHRG',  0.457, 0.785),
+            T('60.03',   0.770, 0.767),  # dy=0.0225 from CREDIT/CARD midpoint
+            T('LAST',    0.745, 0.93),
+            T('PAGE',    0.788, 0.93),
+        ]
+        pages = [{'tokens': tokens}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees.get('cc_processing'), 60.03,
+            'Escalated max_dy should catch $60.03 at dy=0.0225. '
+            'Got cc={0}.'.format(fees.get('cc_processing')))
+
 
 class ValidateExtractionGroupingTests(TestCase):
     """Multi-photo aggregation: caches are grouped by invoice number so a

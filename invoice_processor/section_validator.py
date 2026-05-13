@@ -150,15 +150,24 @@ def _value_for_label(
     label_tokens: list[dict],
     max_dy: float = 0.005,
     min_x: float = 0.5,
+    prefer_x: str = 'left',
 ) -> float | None:
     """Find the dollar amount on the same row as the label, right of it.
 
-    Closest-y wins, ties broken by leftmost x. Plausibility filtering of
-    captured fees against invoice_total happens at the caller.
+    Closest-y wins, ties broken by `prefer_x` ('left' default, or 'right').
 
     Boundary epsilon: dy comparison uses `max_dy + 1e-6` so a candidate at
     exactly `max_dy` isn't excluded by float-precision noise (e.g.
     0.020000000000000018 > 0.020 in IEEE 754).
+
+    `prefer_x='right'` is used for the Sysco PA TAX TOTAL label, whose
+    right-column value layout consistently has the SUB TOTAL value to the
+    left of the real PA TAX TOTAL value (both within 0.020 of the TAX
+    label y). Leftmost-x always picks the SUBTOTAL — wrong, then dropped
+    by per-fee plausibility cap, losing the real tax entirely.
+    Reference: INV 775675588/775703753/775776429/775808085/775825138
+    (2026 corpus). Verified rightmost-x is universal across the 10
+    Sysco invoices observed with TAX label.
     """
     if not label_tokens:
         return None
@@ -174,7 +183,10 @@ def _value_for_label(
     ]
     if not candidates:
         return None
-    candidates.sort(key=lambda c: (c[0], c[1]))
+    if prefer_x == 'right':
+        candidates.sort(key=lambda c: (c[0], -c[1]))
+    else:
+        candidates.sort(key=lambda c: (c[0], c[1]))
     return candidates[0][2]
 
 
@@ -259,7 +271,17 @@ def extract_sysco_fees(pages: list[dict]) -> dict:
             cc_row = _label_row(tokens, {'CREDIT', 'CARD'}, 'CREDIT',
                                 max_dy=0.02)
             if cc_row:
+                # Escalating dy: try tight (0.02) first, fall back to 0.03
+                # for invoices with wider OCR baseline drift between the
+                # label row and the value row. Reference: INV 775605601
+                # cache 9bc38973 — CREDIT CARD label at y=0.791,
+                # value $60.03 at y=0.767 (dy=0.024 > 0.020). Tight match
+                # missed the real CC; widening recovers it. Plausibility
+                # cap at the caller (cc < 7% of invoice_total) catches any
+                # wrong values introduced by the wider band.
                 amt = _value_for_label(tokens, cc_row, max_dy=0.02)
+                if amt is None:
+                    amt = _value_for_label(tokens, cc_row, max_dy=0.03)
                 if amt is not None:
                     fees['cc_processing'] = amt
 
@@ -273,7 +295,12 @@ def extract_sysco_fees(pages: list[dict]) -> dict:
             if tax_tokens:
                 # Lowest-y TAX is closest to INVOICE TOTAL block (the real fee).
                 tax_tokens.sort(key=_y_mid, reverse=True)
-                amt = _value_for_label(tokens, [tax_tokens[0]], max_dy=0.02)
+                # prefer_x='right' picks the real PA TAX TOTAL value
+                # over the SUB TOTAL value (both within 0.02 of TAX label
+                # in Sysco's right-column totals layout). See
+                # _value_for_label docstring for full rationale.
+                amt = _value_for_label(tokens, [tax_tokens[0]], max_dy=0.02,
+                                       prefer_x='right')
                 if amt is not None:
                     fees['tax'] = amt
 
