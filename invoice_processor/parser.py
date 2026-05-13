@@ -3656,6 +3656,15 @@ def parse_invoice(text: str, vendor: str = None,
     # per cache that captured them. Dedup by (SUPC, ext) collapses to one.
     if vendor == "Sysco":
         items = _dedup_sysco_items(items)
+        # Pattern C-1/C-2 filter (2026-05-12): drop rows whose description
+        # matches known non-item patterns (delivery manifest, OUT/STOCK
+        # placeholder). Applied here at the picker output so all extraction
+        # paths (rank-pair, spatial, text) get filtered, not just rank-pair.
+        try:
+            from rank_pair import _is_non_item_row
+            items = [it for it in items if not _is_non_item_row(it)]
+        except Exception:
+            pass
 
     parsed = {
         "vendor": vendor,
