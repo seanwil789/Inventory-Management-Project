@@ -3741,6 +3741,32 @@ def parse_invoice(text: str, vendor: str = None,
 
         if fee_sum > 0 and invoice_total is not None:
             if fee_sum < invoice_total * 0.20:
+                # B-SyscoFeeCap subtotal-detection (2026-05-12): for some
+                # multi-cache invoices, extract_sysco_fees pairs the CC
+                # label with a MISC CHARGES SUBTOTAL value (fuel + CC sum)
+                # rather than the individual CC value. Pre-fix this
+                # double-counted fuel: once as `fuel_surcharge`, once
+                # inside the CC value. Reference: INV 775619701 — captured
+                # fuel=$6.50 + CC=$73.10 + tax=$38 → items+fees over
+                # invoice_total by exactly $6.50 (= fuel value).
+                # When the overage matches fuel exactly, subtract fuel from
+                # CC to recover the individual CC value.
+                items_sum_no_fees = round(
+                    sum(it.get('extended_amount', 0) or 0 for it in items), 2)
+                projected = round(items_sum_no_fees + fee_sum, 2)
+                overage = round(projected - invoice_total, 2)
+                if (overage > 0.50
+                        and 'fuel_surcharge' in extracted_fees
+                        and 'cc_processing' in extracted_fees):
+                    fuel_v = extracted_fees['fuel_surcharge']
+                    if abs(overage - fuel_v) < 0.50:
+                        extracted_fees['cc_processing'] = round(
+                            extracted_fees['cc_processing'] - fuel_v, 2)
+                        fee_sum = round(sum(extracted_fees.values()), 2)
+                        print(f"  [!] Sysco CC value reduced by fuel "
+                              f"(subtotal detected): CC now "
+                              f"${extracted_fees['cc_processing']:.2f}")
+
                 # Plausible — emit each fee as a synthetic ILI row. items
                 # is the same list referenced by parsed["items"]; appending
                 # here propagates to the returned dict.
