@@ -630,11 +630,15 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             # row cases (same product, same price, but qty=2 second case)
             # from duplicates (same product, same price, qty=1 each ingest).
             #
-            # Phase 4d gate (2026-05-12): skip ONLY when Phase 4d had
-            # authoritative information (invoice_number AND incoming_fk
-            # both present) and returned existing=None — i.e., distinct
-            # SKUs case. When either is missing, Phase 4d couldn't decide
-            # and Fallback 2 remains the safety net for re-photo collapse.
+            # Phase 4d gate (2026-05-12): when Phase 4d was authoritative
+            # (invoice_number + incoming_fk both present), it already
+            # decided. Otherwise Fallback 2 runs as safety net — but with
+            # normalized raw_description filtering so distinct SKUs that
+            # mapper-collide on the same generic product (Gatorade case,
+            # where incoming_fk is None because the generic Product has no
+            # VPL) aren't collapsed by the (product, price, qty) shape
+            # alone. Re-photo OCR whitespace/case variations still collapse
+            # via normalization match.
             phase_4d_was_authoritative = (
                 incoming_fk is not None and bool(invoice_number)
             )
@@ -644,6 +648,11 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                     unit_price=common_fields.get('unit_price'),
                     quantity=common_fields.get('quantity'),
                 ).order_by('id'))
+                norm_incoming = _normalize_desc(raw_desc)
+                candidates = [
+                    c for c in candidates
+                    if _normalize_desc(c.raw_description) == norm_incoming
+                ]
                 if candidates:
                     existing = candidates[0]
                     duplicates_to_merge = candidates[1:]

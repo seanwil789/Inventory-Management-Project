@@ -1759,9 +1759,18 @@ class InvoiceNumberDedupTests(TestCase):
 
     def test_fallback2_collapses_orphan_duplicates(self):
         """When N>1 existing rows match (vendor, product, date, unit_price,
-        quantity), a new write upserts one and DELETES the others. Fixes
-        the Farm Art 1654186 accumulation bug."""
-        # Pre-seed 3 stale duplicate rows (different source_files, same shape)
+        quantity) AND share normalized raw_description (re-photo of same
+        line), a new write upserts one and DELETES the others. Fixes the
+        Farm Art 1654186 accumulation bug.
+
+        Phase 4d (2026-05-12): Fallback 2 now requires normalized
+        raw_description match too. Re-photo collapse still works because
+        OCR variation is whitespace/case noise (collapses to same form);
+        distinct SKUs that mapper-collide on the same generic Product
+        (e.g., Gatorade flavors) are no longer mis-collapsed.
+        """
+        # Pre-seed 3 stale duplicate rows (different source_files, but
+        # same normalized raw_description — realistic re-photo OCR variation)
         from datetime import date
         for i, sf in enumerate(['stale_a', 'stale_b', 'stale_c']):
             InvoiceLineItem.objects.create(
@@ -1769,20 +1778,23 @@ class InvoiceNumberDedupTests(TestCase):
                 invoice_date=date(2026,5,8),
                 unit_price=Decimal('10.00'), extended_amount=Decimal('10.00'),
                 quantity=Decimal('1'),
-                raw_description=f'STALE {sf}', source_file=sf,
+                # Same item, slight OCR whitespace variation per cycle
+                raw_description='WIDGET BRAND PRO 12CT'.replace(' ', '  ' if i == 1 else ' '),
+                source_file=sf,
                 match_confidence='manual_review',
             )
         baseline = InvoiceLineItem.objects.filter(
             vendor=self.v, product=self.p, invoice_date=date(2026,5,8)).count()
         self.assertEqual(baseline, 3)
-        # New write: same shape, no invoice_number, no matching source_file or raw
+        # New write: same shape + same normalized desc, no invoice_number
         item = {
             'canonical': 'InvNumDedupProduct', 'unit_price': 10.00,
             'extended_amount': 10.00, 'quantity': 1,
-            'raw_description': 'NEW RAW (different from all 3 stales)',
+            'raw_description': 'widget brand pro 12ct',  # case variation
         }
         self._write(self.v.name, '2026-05-08', [item], source_file='new_photo.jpg')
-        # Fallback 2 should have found 3 candidates, kept 1, deleted 2
+        # Fallback 2 should have found 3 candidates (matching normalized
+        # desc), kept 1, deleted 2
         rows = InvoiceLineItem.objects.filter(
             vendor=self.v, product=self.p, invoice_date=date(2026,5,8))
         self.assertEqual(rows.count(), 1,
