@@ -17566,6 +17566,40 @@ class ExtractSyscoFeesSyscoFeeCapTests(TestCase):
             'Rightmost-x must win even when subtotal is dy-closer. '
             'Got tax={0}.'.format(fees.get('tax')))
 
+    def test_cc_excludes_value_already_assigned_to_fuel(self):
+        """Token deduplication (2026-05-13): when FUEL and CREDIT CARD
+        labels are vertically close, both labels can find the same value
+        as closest-y. Pre-fix: same value attributed to both fees,
+        inflating fee_sum. Post-fix: CC excludes any value already
+        assigned to fuel and picks the next-closest candidate.
+
+        Reference: INV 775808085 — fuel label y=0.361 found $21.09
+        at vx=0.754 (closest-y). CC label y=0.347 also found $21.09
+        as closest-y. Pre-fix captured fuel=$21.09 + CC=$21.09
+        (same token, double-counted). Post-fix: CC excludes $21.09,
+        picks $8.95 (next-closest reasonable candidate).
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        tokens = [
+            T('CREDIT',    0.328, 0.347),
+            T('CARD',      0.370, 0.347),
+            T('FUEL',      0.306, 0.361),
+            T('SURCHARGE', 0.361, 0.361),
+            # Both labels see $21.09 (closer in y) and $8.95
+            T('21.09',     0.754, 0.355),  # dy=0.008 from CC, dy=0.006 from FUEL
+            T('8.95',      0.758, 0.370),  # dy=0.023 from CC, dy=0.009 from FUEL
+            T('LAST',      0.745, 0.93),
+            T('PAGE',      0.788, 0.93),
+        ]
+        pages = [{'tokens': tokens}]
+        fees = extract_sysco_fees(pages)
+        # FUEL claims its closest first ($21.09); CC then excludes it.
+        self.assertEqual(fees.get('fuel_surcharge'), 21.09,
+            f'FUEL should pick $21.09. Got: {fees}')
+        self.assertNotEqual(fees.get('cc_processing'), 21.09,
+            f'CC should NOT pick same value as fuel. Got: {fees}')
+
     def test_cc_escalates_max_dy_when_no_tight_match(self):
         """Pattern B fix (2026-05-12): CREDIT label found but no $-value
         within tight max_dy=0.020. Fall back to max_dy=0.030 to recover

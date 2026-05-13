@@ -151,6 +151,7 @@ def _value_for_label(
     max_dy: float = 0.005,
     min_x: float = 0.5,
     prefer_x: str = 'left',
+    exclude_vals: set | None = None,
 ) -> float | None:
     """Find the dollar amount on the same row as the label, right of it.
 
@@ -184,6 +185,7 @@ def _value_for_label(
     # values that differ by ~3e-8 — enough for tuple-sort to ignore the
     # second key entirely. Reference: INV 775675588 TAX candidates
     # $844.85 (dy=0.014240503...) and $17.37 (dy=0.014240533...).
+    excluded = exclude_vals or set()
     candidates = [
         (round(abs(_y_mid(t) - y_target), 4), _x_mid(t), float(t['text']))
         for t in tokens
@@ -191,6 +193,7 @@ def _value_for_label(
         and abs(_y_mid(t) - y_target) <= max_dy + 1e-6
         and _x_mid(t) > x_max_label
         and _x_mid(t) > min_x
+        and round(float(t['text']), 2) not in excluded
     ]
     if not candidates:
         return None
@@ -292,9 +295,22 @@ def extract_sysco_fees(pages: list[dict]) -> dict:
                 # missed the real CC; widening recovers it. Plausibility
                 # cap at the caller (cc < 7% of invoice_total) catches any
                 # wrong values introduced by the wider band.
-                amt = _value_for_label(tokens, cc_row, max_dy=0.02)
+                #
+                # Token deduplication (2026-05-12): exclude any value
+                # already assigned to fuel_surcharge. When FUEL and CC
+                # labels are vertically close (~0.014 apart), both
+                # closest-y to the same value (e.g., INV 775808085
+                # captured fuel=$21.09 and CC=$21.09 — same token
+                # attributed twice). Excluding lets CC find a different
+                # candidate.
+                exclude_vals = set()
+                if 'fuel_surcharge' in fees:
+                    exclude_vals.add(round(fees['fuel_surcharge'], 2))
+                amt = _value_for_label(tokens, cc_row, max_dy=0.02,
+                                       exclude_vals=exclude_vals)
                 if amt is None:
-                    amt = _value_for_label(tokens, cc_row, max_dy=0.03)
+                    amt = _value_for_label(tokens, cc_row, max_dy=0.03,
+                                           exclude_vals=exclude_vals)
                 if amt is not None:
                     fees['cc_processing'] = amt
 
