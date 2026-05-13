@@ -555,8 +555,16 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             # of real items. Normalized desc (uppercase + collapsed
             # whitespace) preserves distinct SKUs while still collapsing
             # re-photo cycles (where OCR produces matching descriptions).
+            def _normalize_desc(s):
+                # Strip ALL whitespace + uppercase. Aggressive enough to
+                # collapse OCR variations like 'DAIRY MILK 2%, 4/1-GAL'
+                # vs 'DAIRY MILK 2 % , 4 / 1 - GAL' (Phase 4b behavior),
+                # but still preserves distinct SKUs that have different
+                # tokens or different SUPC codes embedded.
+                return ''.join((s or '').upper().split())
+
             if incoming_fk is not None and invoice_number:
-                norm_incoming = ' '.join((raw_desc or '').upper().split())
+                norm_incoming = _normalize_desc(raw_desc)
                 candidates = list(InvoiceLineItem.objects.filter(
                     vendor=vendor,
                     canonical_vendor_pricelist=incoming_fk,
@@ -565,8 +573,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 ))
                 existing = next(
                     (c for c in candidates
-                     if ' '.join((c.raw_description or '').upper().split())
-                        == norm_incoming),
+                     if _normalize_desc(c.raw_description) == norm_incoming),
                     None,
                 )
             # PRIMARY KEY (legacy, Phase 4b — source_file based):
@@ -576,7 +583,19 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             # Tolerant of multi-photo +N suffix variants. `reprocess_ocr_cache`
             # uses 'HASH+N' format for merged multi-photo invoices;
             # `reprocess_invoices` uses bare 'HASH'.
-            if existing is None and incoming_fk is not None and source_file:
+            #
+            # Phase 4d (2026-05-12) gate: SKIP Phase 4b when invoice_number
+            # is present, because Phase 4d above already handled that case
+            # authoritatively — including the case where it intentionally
+            # returned existing=None (different normalized raw_desc =
+            # distinct SKU sharing the same FK). Falling through to Phase
+            # 4b would re-collapse those distinct SKUs by the looser
+            # (FK + source_file) key, defeating Phase 4d. Reference: INV
+            # 775872298 Gatorade case.
+            if (existing is None
+                    and incoming_fk is not None
+                    and source_file
+                    and not invoice_number):
                 existing = InvoiceLineItem.objects.filter(
                     vendor=vendor,
                     canonical_vendor_pricelist=incoming_fk,
