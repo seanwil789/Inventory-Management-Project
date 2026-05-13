@@ -17149,6 +17149,44 @@ class ExtractSyscoFeesSyscoFeeCapTests(TestCase):
             .format(fees))
         self.assertEqual(fees.get('tax'), 38.00)
 
+    def test_smaller_value_preferred_when_multiple_within_tolerance(self):
+        """B-SyscoFeeCap smaller-prefer (2026-05-12): when multiple price
+        candidates are within max_dy of a fee label, prefer the SMALLER
+        value. Subtotal/invoice_total tokens are larger; individual fee
+        values are smaller. This prevents TAX label from pairing with
+        subtotal value.
+
+        Reference: INV 775776429 TAX label at y=0.836. Candidates within
+        max_dy=0.02: $2506.05 (subtotal, dy=0.013) AND $53.60 (real tax,
+        dy=0.020). Pre-fix: closest-y picked $2506.05. Caller's 20%
+        plausibility cap then blocked ALL fees because total fee_sum
+        exceeded 20% of invoice_total. Result: 0 fees captured for an
+        invoice that has fuel + CC + tax all visible.
+
+        Post-fix: smaller-prefer picks $53.60 → reasonable, total
+        fee_sum stays under 20% cap → all 3 fees captured.
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        # Mirrors INV 775776429 LAST PAGE cache TAX area
+        tokens = [
+            T('TOTAL',   0.858, 0.813),  # subtotal label
+            T('2506.05', 0.957, 0.823),  # subtotal value (dy=0.013 from TAX)
+            T('TAX',     0.853, 0.836),
+            T('TOTAL',   0.859, 0.851),  # tax total label
+            T('53.60',   0.966, 0.856),  # real tax value (dy=0.020 from TAX)
+            T('INVOICE', 0.865, 0.870),
+            T('TOTAL',   0.859, 0.881),
+            T('2559.65', 0.967, 0.888),  # invoice total
+            T('LAST',    0.745, 0.93),
+            T('PAGE',    0.788, 0.93),
+        ]
+        pages = [{'tokens': tokens}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees.get('tax'), 53.60,
+            'TAX should pick smaller value $53.60, NOT subtotal $2506.05. '
+            'Got tax={0}.'.format(fees.get('tax')))
+
     def test_no_regression_on_tight_paired_layout(self):
         """When FUEL+CC labels and prices are tightly aligned (dy < 0.005),
         existing extraction still works. Locks against tolerance widening

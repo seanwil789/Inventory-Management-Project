@@ -153,24 +153,55 @@ def _value_for_label(
 ) -> float | None:
     """Find the dollar amount on the same row as the label, right of it.
 
-    Prices in the totals block stack vertically with ~0.014 row pitch, so
-    max_dy=0.005 keeps each label bound to its own row. Ties broken by
-    closest y, then leftmost x.
+    Default sort: closer y wins, ties broken by leftmost x.
+
+    B-SyscoFeeCap subtotal-detection (2026-05-12): when multiple candidates
+    are within `max_dy` AND the smallest candidate is < 10% of the largest,
+    the largest is likely a subtotal/invoice_total token (orders-of-
+    magnitude bigger than the individual fee). Prefer the smallest value
+    in that case.
+
+    Reference: INV 775776429 TAX label had two candidates: $2506.05
+    (subtotal, dy=0.013) and $53.60 (real tax, dy=0.020). Pre-fix picked
+    $2506.05 by closest-y. Post-fix detects the ratio (0.021 << 0.1) and
+    picks $53.60.
+
+    Counter-example (no regression): CC label with $18.09 (real CC,
+    dy=0.001) and $8.95 (FUEL value bleeding in, dy=0.014). Ratio
+    8.95/18.09 = 0.49 > 0.1 → no subtotal detected → closest-y sort
+    picks $18.09 correctly.
+
+    Boundary fix: condition is `<=` not `<` so a candidate at exactly
+    `max_dy` is included.
     """
     if not label_tokens:
         return None
     y_target = sum(_y_mid(t) for t in label_tokens) / len(label_tokens)
     x_max_label = max(_x_mid(t) for t in label_tokens)
+    # Float-precision epsilon: 0.020 - 0.836 - (-0.856) = 0.020000000000000018
+    # is technically > 0.020. Add 1e-6 buffer so candidates AT the boundary
+    # aren't excluded by float noise.
     candidates = [
         (abs(_y_mid(t) - y_target), _x_mid(t), float(t['text']))
         for t in tokens
         if _FEE_PRICE_RE.fullmatch(t.get('text') or '')
-        and abs(_y_mid(t) - y_target) < max_dy
+        and abs(_y_mid(t) - y_target) <= max_dy + 1e-6
         and _x_mid(t) > x_max_label
         and _x_mid(t) > min_x
     ]
     if not candidates:
         return None
+    # Subtotal-detection heuristic: when 2+ candidates and smallest is <10%
+    # of largest, the largest is almost certainly a subtotal/invoice_total
+    # bleeding into tolerance. Prefer the smaller (individual fee).
+    if len(candidates) >= 2:
+        values = [c[2] for c in candidates]
+        smallest = min(values)
+        largest = max(values)
+        if largest > 0 and smallest / largest < 0.10:
+            candidates.sort(key=lambda c: (c[2], c[0], c[1]))
+            return candidates[0][2]
+    # Default: closer y wins, ties broken by leftmost x.
     candidates.sort(key=lambda c: (c[0], c[1]))
     return candidates[0][2]
 
