@@ -3714,6 +3714,36 @@ def parse_invoice(text: str, vendor: str = None,
             extracted_fees = extract_sysco_fees(pages or [])
         except Exception:
             extracted_fees = {}
+
+        # B-SyscoFeeCap per-fee plausibility (2026-05-12): drop captured fees
+        # that exceed sane fractions of invoice_total. Real Sysco fee bounds
+        # observed across 100+ invoice corpus:
+        #   - fuel_surcharge: typically $6-$30, always < 5% of total
+        #   - cc_processing: typically $5-$80, always < 7% of total
+        #   - tax (PA sales tax on taxable items only): max ~10% of total
+        # Values above these caps almost always indicate the value-finder
+        # paired the label with a subtotal/group_total/invoice_total token
+        # (extract_sysco_fees uses closest-y, which can pick up section
+        # GROUP TOTALs or the INVOICE TOTAL bleeding into label tolerance).
+        # Reference: INV 775776429 TAX captured $2506.05 (= invoice subtotal)
+        # vs real $53.60. Cap drops the bad capture; gap-derivation fallback
+        # below will pick up real fees if labels are missing entirely.
+        if invoice_total is not None and extracted_fees:
+            _FEE_PLAUSIBILITY = {
+                'fuel_surcharge': 0.05,
+                'cc_processing': 0.07,
+                'tax': 0.10,
+            }
+            for _key, _max_frac in _FEE_PLAUSIBILITY.items():
+                if _key in extracted_fees:
+                    _val = extracted_fees[_key]
+                    if _val > invoice_total * _max_frac:
+                        print(f"  [!] Sysco {_key} ${_val:.2f} exceeds "
+                              f"{_max_frac:.0%} of invoice_total "
+                              f"${invoice_total:.2f}; dropping (likely "
+                              f"subtotal mispairing)")
+                        del extracted_fees[_key]
+
         fee_sum = round(sum(extracted_fees.values()), 2) if extracted_fees else 0.0
 
         # B-SyscoFeeILI (2026-05-12): when label extraction returns plausible

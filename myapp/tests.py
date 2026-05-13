@@ -17149,43 +17149,43 @@ class ExtractSyscoFeesSyscoFeeCapTests(TestCase):
             .format(fees))
         self.assertEqual(fees.get('tax'), 38.00)
 
-    def test_smaller_value_preferred_when_multiple_within_tolerance(self):
-        """B-SyscoFeeCap smaller-prefer (2026-05-12): when multiple price
-        candidates are within max_dy of a fee label, prefer the SMALLER
-        value. Subtotal/invoice_total tokens are larger; individual fee
-        values are smaller. This prevents TAX label from pairing with
-        subtotal value.
+    def test_closest_y_wins_when_group_total_in_tolerance(self):
+        """B-SyscoFeeCap closest-y discipline (2026-05-12): when multiple
+        price candidates fall within max_dy of a fee label, the closest-y
+        candidate wins. Per-fee plausibility caps at the caller (parser.py)
+        catch the rare case where closest-y picks an implausible value
+        (e.g. invoice subtotal); _value_for_label itself stays simple.
 
-        Reference: INV 775776429 TAX label at y=0.836. Candidates within
-        max_dy=0.02: $2506.05 (subtotal, dy=0.013) AND $53.60 (real tax,
-        dy=0.020). Pre-fix: closest-y picked $2506.05. Caller's 20%
-        plausibility cap then blocked ALL fees because total fee_sum
-        exceeded 20% of invoice_total. Result: 0 fees captured for an
-        invoice that has fuel + CC + tax all visible.
-
-        Post-fix: smaller-prefer picks $53.60 → reasonable, total
-        fee_sum stays under 20% cap → all 3 fees captured.
+        Reference: INV 775225457 CC label CREDIT at y=0.404. Candidates
+        within max_dy=0.020:
+          - GROUP TOTAL $100.25 (y=0.391, dy=0.013) - section group total
+          - real CC $43.18 (y=0.405, dy=0.001) - REAL value
+          - fuel $6.50 (y=0.419, dy=0.015) - bleeding from row below
+        Closest-y picks $43.18 (correct). An earlier ratio-based
+        smaller-prefer heuristic would have wrongly picked $6.50; this
+        test locks against re-introducing it.
         """
         from invoice_processor.section_validator import extract_sysco_fees
         T = self._tok
-        # Mirrors INV 775776429 LAST PAGE cache TAX area
         tokens = [
-            T('TOTAL',   0.858, 0.813),  # subtotal label
-            T('2506.05', 0.957, 0.823),  # subtotal value (dy=0.013 from TAX)
-            T('TAX',     0.853, 0.836),
-            T('TOTAL',   0.859, 0.851),  # tax total label
-            T('53.60',   0.966, 0.856),  # real tax value (dy=0.020 from TAX)
-            T('INVOICE', 0.865, 0.870),
-            T('TOTAL',   0.859, 0.881),
-            T('2559.65', 0.967, 0.888),  # invoice total
+            T('GROUP',   0.351, 0.391),
+            T('TOTAL',   0.397, 0.391),
+            T('100.25',  0.744, 0.391),  # group total - dy=0.013 from CREDIT
+            T('CREDIT',  0.310, 0.404),
+            T('CARD',    0.355, 0.405),
+            T('43.18',   0.747, 0.405),  # REAL CC - closest-y winner
+            T('FUEL',    0.288, 0.418),
+            T('SURCHARGE',0.344,0.419),
+            T('6.50',    0.752, 0.419),  # fuel value - dy=0.015 from CREDIT
             T('LAST',    0.745, 0.93),
             T('PAGE',    0.788, 0.93),
         ]
         pages = [{'tokens': tokens}]
         fees = extract_sysco_fees(pages)
-        self.assertEqual(fees.get('tax'), 53.60,
-            'TAX should pick smaller value $53.60, NOT subtotal $2506.05. '
-            'Got tax={0}.'.format(fees.get('tax')))
+        self.assertEqual(fees.get('cc_processing'), 43.18,
+            'CC should pick closest-y value $43.18, not group_total $100.25 '
+            'or fuel $6.50. Got cc={0}.'.format(fees.get('cc_processing')))
+        self.assertEqual(fees.get('fuel_surcharge'), 6.50)
 
     def test_no_regression_on_tight_paired_layout(self):
         """When FUEL+CC labels and prices are tightly aligned (dy < 0.005),
