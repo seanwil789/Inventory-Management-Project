@@ -300,19 +300,38 @@ def detect_layout_sysco(tokens: list[dict]) -> dict | None:
         if _SUPC_RE.fullmatch(t.get("text") or "")
         and 0.40 <= _x_mid(t) <= 0.78
     )
-    # B-SingleSupcLayout fix (2026-05-12): lowered from >=3 to >=1.
-    # Sysco LAST PAGE / totals pages naturally carry 1-2 SUPCs (trailing
-    # items in BEVERAGE/MISC sections + closing matter). The pre-fix
-    # threshold dropped these pages wholesale, silently losing items.
-    # Reference: INV 775404605 cache D had 1 SUPC (Coffee Beans
-    # 7545589 $141.95) — entire page returned []. Per-SUPC validation
-    # downstream (unit_t finder requires nearby 2-decimal, ext_t needs
-    # another further right) is the safety net against header SUPCs.
+    # B-SingleSupcLayout fix (2026-05-12): accept >=1 SUPC + cluster by
+    # x-proximity to handle pages with mixed product+header SUPCs.
+    #
+    # Sysco LAST PAGE / totals pages naturally carry 1-2 product SUPCs
+    # (trailing items in BEVERAGE/MISC sections) + 1-2 header SUPCs
+    # (doc numbers at y≈0.15 that happen to fall in the x-band).
+    # Pre-fix #1 (threshold >=3): pages dropped wholesale.
+    # Pre-fix #2 (naive median of all SUPCs): with 2 SUPCs at distant x
+    # positions, median lands BETWEEN them, excluding both from the
+    # ±0.04 band.
+    #
+    # Fix: cluster SUPCs by x-proximity (0.04 = typical column width),
+    # pick densest cluster as the product band. Ties broken leftmost
+    # (header noise drifts right of product columns at x≈0.57-0.69).
+    # Reference: INV 775404605 cache D — clusters=[[0.567],[0.699]] tied,
+    # leftmost wins → supc_x=0.567 → band captures Coffee Beans.
     if not supc_xs:
         return None
-    # Robust median of SUPC x positions (resists outlier header tokens).
-    # With a single SUPC, median is that SUPC's x — band centers there.
-    supc_x = median(supc_xs)
+    clusters: list[list[float]] = []
+    for x in supc_xs:
+        placed = False
+        for cluster in clusters:
+            # Within 0.04 of any member → same cluster
+            if any(abs(x - cx) < 0.04 for cx in cluster):
+                cluster.append(x)
+                placed = True
+                break
+        if not placed:
+            clusters.append([x])
+    # Densest cluster wins; tie → leftmost cluster
+    clusters.sort(key=lambda c: (-len(c), c[0]))
+    supc_x = median(clusters[0])
     return {
         "supc_x":  (supc_x - 0.04, supc_x + 0.04),
         "price_x": (supc_x + 0.02, 1.0),  # right of SUPC

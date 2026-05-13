@@ -15107,29 +15107,37 @@ class RankPairSyscoQtyExtractionTests(TestCase):
         )
 
     def test_layout_detect_accepts_single_supc_totals_page(self):
-        """B-SinglesupcLayout fix (2026-05-12): Sysco LAST PAGE / totals
+        """B-SingleSupcLayout fix (2026-05-12): Sysco LAST PAGE / totals
         pages naturally have 1-2 SUPCs (trailing items in BEVERAGE/MISC
         sections + closing matter). Pre-fix detect_layout_sysco required
         >=3 SUPCs and returned None for these pages → entire page's items
         silently dropped.
 
-        Reference: INV 775404605 cache D (LAST PAGE) had 1 product SUPC
-        (7545589 Coffee Beans, $141.95, in DISPENSER BEVERAGE section).
-        Pre-fix: extract_sysco_rank returned [] for cache D, items_sum
-        missing $141.95, BEVERAGE parser_sum=$0 vs printed=$141.95.
+        Reference: INV 775404605 cache D (LAST PAGE) had:
+          - 1 product SUPC: 7545589 (Coffee Beans, $141.95, BEVERAGE)
+            at x=0.567 (typical Sysco SUPC column)
+          - 1 header-noise SUPC: 1255964 at x=0.699 (doc number, y=0.15)
 
-        Post-fix: layout-detect accepts >=1 SUPC. Per-SUPC validation
-        (unit_t needs nearby 2-dec, ext_t needs another further right)
-        filters phantom rows from header SUPCs. Coffee Beans extracts
-        cleanly: qty=1, unit_price=$141.95, ext=$141.95.
+        Pre-fix #1 (threshold >=3): page rejected outright, Coffee Beans
+        missed → BEVERAGE parser_sum=$0 vs printed=$141.95.
+
+        Pre-fix #2 (threshold lowered to 1, naive median): with 2 SUPCs
+        at x=[0.567, 0.699], median=0.633. ±0.04 band (0.593, 0.673)
+        excludes BOTH SUPCs. Still 0 items extracted.
+
+        Post-fix: cluster SUPCs by x-proximity (0.04 typical column width),
+        pick densest cluster (ties broken leftmost — header noise drifts
+        right of product columns). For cache D: clusters=[[0.567],[0.699]]
+        tied size, leftmost wins → supc_x=0.567 → band captures Coffee
+        Beans correctly.
         """
         extract = self._import()
-        # Mirrors INV 775404605 cache D: 1 SUPC + per-row price tokens.
-        # SUPC at typical Sysco x=0.57. unit_t and ext_t both at $141.95
-        # (the OCR captures the value twice — once next to SUPC, once at
-        # the right-margin ext column). qty=1 (single case), no per-lb
-        # token (not catch-weight).
+        # Mirrors INV 775404605 cache D: 1 product SUPC + 1 header noise.
+        # SUPC at typical Sysco x=0.567. Header SUPC at x=0.699, y=0.15
+        # (out of items y-range but within x-band [0.40, 0.78]).
         tokens = [
+            # Header noise SUPC (doc number) — at top of page, no prices nearby
+            self._tok('1255964',   0.699, 0.150),
             # **** DISPENSER BEVERAGE **** section header
             self._tok('****',      0.252, 0.228),
             self._tok('DISPENSER', 0.302, 0.228),
@@ -15143,11 +15151,11 @@ class RankPairSyscoQtyExtractionTests(TestCase):
             self._tok('CITVCLS',   0.262, 0.254),
             self._tok('COFFEE',    0.311, 0.254),
             self._tok('BEAN',      0.352, 0.254),
-            # SUPC + 2 price tokens (one inline, one at ext column)
+            # Product SUPC + 2 price tokens
             self._tok('7545589',   0.567, 0.250),
             self._tok('141.95',    0.617, 0.251),
             self._tok('141.95',    0.722, 0.251),  # ext column
-            # LAST PAGE marker (totals page)
+            # LAST PAGE marker
             self._tok('LAST',      0.742, 0.883),
             self._tok('PAGE',      0.776, 0.883),
         ]
