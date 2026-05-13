@@ -173,8 +173,14 @@ def _value_for_label(
         return None
     y_target = sum(_y_mid(t) for t in label_tokens) / len(label_tokens)
     x_max_label = max(_x_mid(t) for t in label_tokens)
+    # dy is rounded to 4 decimals (~0.01% of page height, well below OCR
+    # accuracy) so float-precision noise doesn't pre-empt the prefer_x
+    # tie-break. Without this, two candidates at "the same y" can have dy
+    # values that differ by ~3e-8 — enough for tuple-sort to ignore the
+    # second key entirely. Reference: INV 775675588 TAX candidates
+    # $844.85 (dy=0.014240503...) and $17.37 (dy=0.014240533...).
     candidates = [
-        (abs(_y_mid(t) - y_target), _x_mid(t), float(t['text']))
+        (round(abs(_y_mid(t) - y_target), 4), _x_mid(t), float(t['text']))
         for t in tokens
         if _FEE_PRICE_RE.fullmatch(t.get('text') or '')
         and abs(_y_mid(t) - y_target) <= max_dy + 1e-6
