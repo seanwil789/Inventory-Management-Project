@@ -154,20 +154,25 @@ def _value_for_label(
 ) -> float | None:
     """Find the dollar amount on the same row as the label, right of it.
 
-    Closest-y wins, ties broken by `prefer_x` ('left' default, or 'right').
+    Sort strategy depends on `prefer_x`:
+      - 'left' (default): closest-y wins, ties broken by leftmost x.
+        Used for FUEL/CC where the value sits horizontally next to the
+        label and closest-y reliably identifies the right value.
+      - 'right': RIGHTMOST x wins (primary), dy is the tiebreak.
+        Used for the Sysco PA TAX TOTAL label, whose layout puts the
+        TAX label BETWEEN the SUB TOTAL value (above) and the real
+        PA TAX TOTAL value (below). dy from TAX to either is similar
+        and varies invoice-to-invoice — closest-y is non-deterministic.
+        But the real tax value is universally RIGHT of the subtotal
+        value (rightmost column), making x the deterministic key.
+        Verified across all 10 observed Sysco TAX layouts (2026 corpus:
+        775605601/775632629/775645370/775662001/775675588/775703753/
+        775776429/775808085/775825138/775872298). Per-fee plausibility
+        cap at the caller catches any wrong picks introduced by this.
 
     Boundary epsilon: dy comparison uses `max_dy + 1e-6` so a candidate at
     exactly `max_dy` isn't excluded by float-precision noise (e.g.
     0.020000000000000018 > 0.020 in IEEE 754).
-
-    `prefer_x='right'` is used for the Sysco PA TAX TOTAL label, whose
-    right-column value layout consistently has the SUB TOTAL value to the
-    left of the real PA TAX TOTAL value (both within 0.020 of the TAX
-    label y). Leftmost-x always picks the SUBTOTAL — wrong, then dropped
-    by per-fee plausibility cap, losing the real tax entirely.
-    Reference: INV 775675588/775703753/775776429/775808085/775825138
-    (2026 corpus). Verified rightmost-x is universal across the 10
-    Sysco invoices observed with TAX label.
     """
     if not label_tokens:
         return None
@@ -190,7 +195,9 @@ def _value_for_label(
     if not candidates:
         return None
     if prefer_x == 'right':
-        candidates.sort(key=lambda c: (c[0], -c[1]))
+        # Rightmost-x is primary (see docstring: TAX layout makes x
+        # deterministic where dy is not). dy is the tiebreak.
+        candidates.sort(key=lambda c: (-c[1], c[0]))
     else:
         candidates.sort(key=lambda c: (c[0], c[1]))
     return candidates[0][2]

@@ -17249,6 +17249,39 @@ class ExtractSyscoFeesSyscoFeeCapTests(TestCase):
             'Rightmost-x should pick real tax $17.37, not subtotal $844.85. '
             'Got tax={0}.'.format(fees.get('tax')))
 
+    def test_tax_rightmost_wins_even_when_subtotal_is_closer_in_y(self):
+        """TAX layout puts the label BETWEEN subtotal value (above) and
+        real tax value (below). dy from TAX to either is similar but
+        non-deterministic — sometimes subtotal is dy-closer. Rightmost-x
+        must win as PRIMARY key, not just a tiebreak.
+
+        Reference: INV 775703753 cache 81b7ed73 — TAX label y=0.830.
+        Subtotal $898.77 at vx=0.791 dy=0.013 (dy-closer).
+        Real tax $13.42 at vx=0.795 dy=0.014.
+        Closest-y picks subtotal; rightmost-x correctly picks $13.42.
+        """
+        from invoice_processor.section_validator import extract_sysco_fees
+        T = self._tok
+        tokens = [
+            T('SUB',     0.682, 0.826),
+            T('TOTAL',   0.688, 0.840),
+            T('PA',      0.625, 0.822),
+            T('TAX',     0.696, 0.830),  # anchor
+            T('TOTAL',   0.690, 0.850),
+            T('898.77',  0.791, 0.817),  # subtotal (dy=0.013, ABOVE TAX)
+            T('13.42',   0.795, 0.844),  # real tax  (dy=0.014, BELOW TAX, RIGHT)
+            T('INVOICE', 0.755, 0.896),
+            T('TOTAL',   0.750, 0.908),
+            T('912.19',  0.825, 0.910),
+            T('LAST',    0.745, 0.93),
+            T('PAGE',    0.788, 0.93),
+        ]
+        pages = [{'tokens': tokens}]
+        fees = extract_sysco_fees(pages)
+        self.assertEqual(fees.get('tax'), 13.42,
+            'Rightmost-x must win even when subtotal is dy-closer. '
+            'Got tax={0}.'.format(fees.get('tax')))
+
     def test_cc_escalates_max_dy_when_no_tight_match(self):
         """Pattern B fix (2026-05-12): CREDIT label found but no $-value
         within tight max_dy=0.020. Fall back to max_dy=0.030 to recover
