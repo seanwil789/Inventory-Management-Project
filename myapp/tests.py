@@ -15720,6 +15720,70 @@ class RankPairSyscoNonItemFilterTests(TestCase):
             self.assertFalse(d.upper().startswith('OUT '),
                 f'OUT/STOCK row should have been filtered: {d!r}')
 
+    def test_remote_stock_row_filtered(self):
+        """Pattern C-5: 'REMOTE-STOCK' / 'REMOTE STOCK' placeholder rows
+        marking back-ordered items get an ext value but aren't billed."""
+        self._reset_modules()
+        from rank_pair import extract_sysco_rank
+        T = self._tok
+        tokens = [
+            T('****',    0.30, 0.20),
+            T('CANNED',  0.40, 0.20),
+            T('****',    0.50, 0.20),
+            # Real CANNED item
+            T('1234567', 0.55, 0.25),
+            T('5.50',    0.78, 0.25),
+            T('PEAS',    0.20, 0.25),
+            # REMOTE-STOCK placeholder
+            T('9999999', 0.55, 0.30),
+            T('22.95',   0.78, 0.30),
+            T('REMOTE-STOCK', 0.20, 0.30),
+            # REMOTE STOCK (with space) variant
+            T('8888888', 0.55, 0.35),
+            T('33.49',   0.78, 0.35),
+            T('REMOTE',  0.18, 0.35),
+            T('STOCK',   0.22, 0.35),
+        ]
+        rows = extract_sysco_rank([{'tokens': tokens}])
+        descs = [r.get('raw_description') or '' for r in rows]
+        self.assertEqual(len(rows), 1,
+            f'Expected 1 real item (PEAS), got {len(rows)}: {descs}')
+        for d in descs:
+            self.assertNotIn('REMOTE', d.upper(),
+                f'REMOTE-STOCK row should be filtered: {d!r}')
+
+    def test_section_header_extracted_as_item_filtered(self):
+        """Pattern C-6: a section header like '** SEAFOOD ****' got OCR'd
+        adjacent to a SUPC + ext token from a different row, producing a
+        phantom item. Filter rows whose entire description matches the
+        section-header shape (asterisks + uppercase word(s) + asterisks).
+        """
+        self._reset_modules()
+        from rank_pair import extract_sysco_rank
+        T = self._tok
+        tokens = [
+            T('****',    0.30, 0.20),
+            T('CANNED',  0.40, 0.20),
+            T('****',    0.50, 0.20),
+            # Real CANNED item
+            T('1234567', 0.55, 0.25),
+            T('5.50',    0.78, 0.25),
+            T('PEAS',    0.20, 0.25),
+            # Phantom item: SUPC + ext aligned with section header tokens
+            T('9999999', 0.55, 0.30),
+            T('68.99',   0.78, 0.30),
+            T('**',      0.18, 0.30),
+            T('SEAFOOD', 0.22, 0.30),
+            T('****',    0.27, 0.30),
+        ]
+        rows = extract_sysco_rank([{'tokens': tokens}])
+        descs = [r.get('raw_description') or '' for r in rows]
+        self.assertEqual(len(rows), 1,
+            f'Expected 1 real item (PEAS), got {len(rows)}: {descs}')
+        for d in descs:
+            self.assertNotIn('SEAFOOD', d.upper(),
+                f'Section-header row should be filtered: {d!r}')
+
     def test_real_items_with_OUT_substring_not_filtered(self):
         """A real product whose description coincidentally starts with
         'OUT' (e.g., 'OUTDOOR' or 'OUT' as item-prefix) is NOT filtered.
@@ -16979,6 +17043,75 @@ class DbWriteCanonicalDedupTests(TestCase):
         self.assertEqual(len(ilis), 1)
         self.assertEqual(ilis[0].unit_price, self._Dec('5.50'))
         self.assertIsNone(ilis[0].canonical_vendor_pricelist)
+
+    def test_phase4d_distinct_skus_sharing_fk_not_collapsed(self):
+        """Phase 4d (2026-05-12): when 3 distinct SUPCs map to the same
+        canonical FK + invoice_number + date but have different
+        raw_descriptions, all 3 are written as separate ILIs.
+
+        Reference: INV 775872298 had RASP COOL BLUE, LMN/LM, ORANGE
+        Gatorade SKUs all SUPC-mapping to generic Product 'Gatorade'.
+        Pre-fix: primary key collapsed to 1 row (last-write-wins) —
+        $79.98 of real items lost in DB. Post-fix: normalized
+        raw_description tiebreaker preserves all 3.
+        """
+        from myapp.models import InvoiceLineItem
+        from invoice_processor.db_write import write_invoice_to_db
+
+        # All 3 share the same canonical (mapped via SUPC code tier)
+        # AND the same invoice_number — pre-4d would collapse them.
+        for desc in [
+            'GATRADE DRINK RASP COOL BLUE 10052000324812',
+            'GATRADE DRINK LMN/LM WIDEMOUT 10052000328681',
+            'GATRADE DRINK ORANGE WIDEMOUT 10052000328674',
+        ]:
+            write_invoice_to_db('Farm Art', '2026-05-06', [{
+                'raw_description': desc,
+                'unit_price': self._Dec('39.99'),
+                'extended_amount': self._Dec('39.99'),
+                # Force the same canonical so all 3 inherit the same FK
+                'canonical': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            }], source_file='hash_777.pdf', invoice_number='775872298')
+
+        # All 3 distinct SUPCs/descriptions should survive as separate ILIs
+        ilis = list(InvoiceLineItem.objects.filter(
+            vendor=self.vendor, invoice_number='775872298'
+        ))
+        self.assertEqual(len(ilis), 3,
+            f'Expected 3 distinct ILIs, got {len(ilis)}: '
+            f'{[i.raw_description for i in ilis]}')
+
+    def test_phase4d_re_photo_cycle_with_normalized_match_collapses(self):
+        """Phase 4d preserves re-photo collapse: same logical item with
+        OCR whitespace variation across re-photo cycles still collapses
+        to 1 ILI (normalized raw_desc matches).
+        """
+        from myapp.models import InvoiceLineItem
+        from invoice_processor.db_write import write_invoice_to_db
+
+        # First photo cycle
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+            'unit_price': self._Dec('9.90'),
+            'extended_amount': self._Dec('9.80'),
+            'canonical': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+        }], source_file='hash_111.pdf', invoice_number='INV-A')
+
+        # Second photo cycle — extra whitespace from OCR variation
+        write_invoice_to_db('Farm Art', '2026-05-06', [{
+            'raw_description': 'DAIRY  MILK  2%, 4/1-GAL  *LOCAL',
+            'unit_price': self._Dec('9.95'),
+            'extended_amount': self._Dec('9.85'),
+            'canonical': 'DAIRY MILK 2%, 4/1-GAL *LOCAL',
+        }], source_file='hash_222.pdf', invoice_number='INV-A')
+
+        # Should collapse to 1 ILI (normalized desc matches) with
+        # second-write values (upsert wins)
+        ilis = list(InvoiceLineItem.objects.filter(
+            vendor=self.vendor, invoice_number='INV-A'
+        ))
+        self.assertEqual(len(ilis), 1)
+        self.assertEqual(ilis[0].unit_price, self._Dec('9.95'))
 
     def test_dedup_tolerates_multi_photo_suffix_variants(self):
         """`reprocess_ocr_cache` writes 'HASH+N' source_file for merged

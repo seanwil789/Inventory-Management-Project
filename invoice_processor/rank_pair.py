@@ -28,7 +28,7 @@ _PRICE_RE = re.compile(r"^\$?\d+\.\d{2,4}\*?$")
 
 # Patterns matching descriptions that aren't real product items but were
 # extracted from rows that happened to align with a SUPC + ext token pair.
-# Filtered at the end of extract_sysco_rank.
+# Filtered at the end of extract_sysco_rank AND at parser.py picker output.
 #
 # Pattern C-1 (manifest): Sysco prints a delivery manifest reference line
 # in the totals area. INV 775825138 had "112 SYNERGY CHURCH HOUSES ST
@@ -40,9 +40,21 @@ _PRICE_RE = re.compile(r"^\$?\d+\.\d{2,4}\*?$")
 # get an ext value (presumably the price the item would have been) but
 # represent a stock-out, not a billed line. INV 775632629 had this as a
 # $30.45 UNKNOWN item. Match "OUT" followed by space or slash + "STOCK".
+#
+# Pattern C-5 (remote stock placeholder): "REMOTE STOCK" / "REMOTE-STOCK"
+# is a similar notation marking back-ordered items. INV 775645370 had
+# 2 phantom REMOTE-STOCK items at $22.95 + $33.49 = $56.44 (revealed by
+# parser-vs-DB count discrepancy in IVS bookkeeping investigation).
+#
+# Pattern C-6 (section header extracted as item): "** SEAFOOD ****" got
+# paired with a SUPC + ext token from an adjacent row. INV 775662001
+# had this as a $68.99 phantom item. Match: bare token of asterisks +
+# section-name + asterisks (no real product description).
 _NON_ITEM_DESC_PATTERNS = [
     re.compile(r"\bMANIFEST\b", re.IGNORECASE),
     re.compile(r"^\s*OUT\s*[/\s]\s*STOCK\b", re.IGNORECASE),
+    re.compile(r"^\s*REMOTE[-\s]?STOCK\b", re.IGNORECASE),
+    re.compile(r"^\s*\*+\s*[A-Z][A-Z &]*\s*\*+\s*$", re.IGNORECASE),
 ]
 
 

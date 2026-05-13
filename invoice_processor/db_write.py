@@ -537,21 +537,38 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         existing = None
         duplicates_to_merge: list = []
         if parsed_date:
-            # PRIMARY KEY (Phase 4c, Sean 2026-05-10):
-            #   (vendor, canonical_FK, invoice_number, invoice_date)
+            # PRIMARY KEY (Phase 4c, Sean 2026-05-10; Phase 4d 2026-05-12):
+            #   (vendor, canonical_FK, invoice_number, invoice_date,
+            #    normalized_raw_description)
             # invoice_number is stable across re-photo + reprocess cycles —
             # eliminates the duplicate-accumulation bug where source_file
             # variants (raw filename / cache hash / hash+N) created separate
-            # rows for the same logical invoice line. Used when both the FK
-            # and invoice_number are known (Sysco + Farm Art reliably; PBM/
-            # Exceptional/Delaware partially; Colonial never).
+            # rows for the same logical invoice line.
+            #
+            # Phase 4d (2026-05-12) adds normalized raw_description as a
+            # tiebreaker. Without it, multiple distinct SKUs that mapper-
+            # collapsed onto the same generic Product/VPL share a primary
+            # key and overwrite each other (last-write-wins). Reference:
+            # INV 775872298 had 3 Gatorade SUPCs (RASP COOL BLUE, LMN/LM,
+            # ORANGE) all at $39.99 mapping to Product 143 "Gatorade" via
+            # SUPC code tier — pre-4d collapsed to 1 DB row, losing $79.98
+            # of real items. Normalized desc (uppercase + collapsed
+            # whitespace) preserves distinct SKUs while still collapsing
+            # re-photo cycles (where OCR produces matching descriptions).
             if incoming_fk is not None and invoice_number:
-                existing = InvoiceLineItem.objects.filter(
+                norm_incoming = ' '.join((raw_desc or '').upper().split())
+                candidates = list(InvoiceLineItem.objects.filter(
                     vendor=vendor,
                     canonical_vendor_pricelist=incoming_fk,
                     invoice_number=invoice_number,
                     invoice_date=parsed_date,
-                ).first()
+                ))
+                existing = next(
+                    (c for c in candidates
+                     if ' '.join((c.raw_description or '').upper().split())
+                        == norm_incoming),
+                    None,
+                )
             # PRIMARY KEY (legacy, Phase 4b — source_file based):
             # Used when invoice_number can't be extracted (vendors lacking
             # extraction logic) — preserves pre-4c behavior.
