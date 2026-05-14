@@ -1860,6 +1860,35 @@ class ParserInvoiceNumberExtractionTests(TestCase):
         result = self._parse(text, 'Philadelphia Bakery Merchants')
         self.assertEqual(result.get('invoice_number'), '7053')
 
+    def test_exceptional_2x2_grid_layout(self):
+        """2026-05-14: Exceptional invoices have a 2-column header where
+        OCR reads labels first then values, producing the 2x2 stack:
+            Invoice No.
+            Invoice Date
+            333677
+            05/01/26
+        Pass 1 regex fails (can't span intervening label lines); Pass 2
+        line-walk picks up the digit on a subsequent line.
+        """
+        text = ('Exceptional Foods\nINVOICE\nPage 1 of 1\n'
+                'Invoice No.\nInvoice Date\n333677\n05/01/26\n')
+        result = self._parse(text, 'Exceptional Foods')
+        self.assertEqual(result.get('invoice_number'), '333677')
+
+    def test_pbm_2x2_grid_layout(self):
+        """2026-05-14: PBM column-header pattern, label is 'Invoice:' (no
+        'No.' suffix) and values stack three deep:
+            Invoice:
+            Invoice Date:
+            6597
+            05/01/26
+            04/30/26
+        """
+        text = ('Philadelphia Bakery Merchants\nINVOICE **\n'
+                'Invoice:\nInvoice Date:\n6597\n05/01/26\n04/30/26\n')
+        result = self._parse(text, 'Philadelphia Bakery Merchants')
+        self.assertEqual(result.get('invoice_number'), '6597')
+
     def test_colonial_returns_none(self):
         """Colonial has no invoice_number extraction. Returns None,
         which db_write coerces to empty string and falls through to

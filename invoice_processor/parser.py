@@ -805,10 +805,29 @@ def extract_invoice_number(text: str, vendor: str) -> str | None:
     if vendor in ('Exceptional Foods', 'Exceptional',
                   'Philadelphia Bakery Merchants', 'PBM',
                   'Delaware County Linen'):
+        # Pass 1: inline pattern "Invoice No. 12345" or "Invoice: 12345"
         m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{4,10})',
                       text, re.IGNORECASE)
         if m:
             return m.group(1)
+        # Pass 2 (2026-05-14): 2x2/2x3 grid OCR layout — labels stacked
+        # above values in a column header. Pass 1's regex can't span
+        # intervening label lines. Surfaced when /categories/ <-> /cogs/
+        # audit found 4 May invoices without invoice_number in IVS.
+        # Patterns:
+        #   Exceptional: "Invoice No.\nInvoice Date\n333677\n05/01/26"
+        #   PBM:         "Invoice:\nInvoice Date:\n6597\n05/01/26"
+        # Strategy: find a line that is ONLY the invoice label (possibly
+        # with trailing colon), then walk next <=5 lines for a digit-only
+        # candidate.
+        lines = text.splitlines()
+        for i, line in enumerate(lines):
+            if re.match(r'^\s*Invoice\s*(?:No\.?|Number|#)?:?\s*$',
+                        line, re.IGNORECASE):
+                for j in range(i + 1, min(i + 6, len(lines))):
+                    cand = re.match(r'^\s*(\d{4,10})\s*$', lines[j])
+                    if cand:
+                        return cand.group(1)
     return None
 
 
