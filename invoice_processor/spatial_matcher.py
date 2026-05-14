@@ -1193,7 +1193,36 @@ def match_delaware_spatial(pages: list[dict]) -> list[dict]:
             }
             validate_line_math(del_item, vendor='Delaware County Linen')
             items.append(del_item)
-    return items
+
+    # Pattern C (2026-05-14): when multiple photos of the same invoice
+    # produce the same numeric line with different OCR'd descriptions
+    # (e.g., page 1 reads the row as "Bar Mops" but page 2 OCR'd the
+    # same row's description column as ".P. O. Number"), dedup by
+    # (qty, extended_amount) keeping the cleanest description.
+    # Tiebreak heuristic: count tokens with ≥2 alphabetic chars (real
+    # words). "Bar Mops" → 2 real words; ".P. O. Number" → 1. Simple
+    # letter-count loses because garble can produce more total letters
+    # via noise tokens like ".P." and "O.". Single-photo invoices are
+    # unaffected since their (qty, ext) tuples are naturally unique.
+    # Surfaced during Delaware 224885 audit.
+    if not items:
+        return items
+
+    def _real_word_count(desc: str) -> int:
+        return sum(1 for tok in (desc or "").split()
+                   if sum(1 for c in tok if c.isalpha()) >= 2)
+
+    by_key: dict = {}
+    for it in items:
+        key = (it["quantity"], it["extended_amount"])
+        prev = by_key.get(key)
+        if prev is None:
+            by_key[key] = it
+            continue
+        if _real_word_count(it.get("raw_description") or "") > \
+                _real_word_count(prev.get("raw_description") or ""):
+            by_key[key] = it
+    return list(by_key.values())
 
 
 # ═══════════════════════════════════════════════════════════════════════════

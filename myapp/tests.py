@@ -5437,6 +5437,55 @@ class SpatialMatcherOtherVendorsTests(TestCase):
         self.assertEqual(items[0]["extended_amount"], 66.00)
         self.assertIn("Bar Mops", items[0]["raw_description"])
 
+    def test_delaware_dedups_two_photo_same_invoice(self):
+        """Pattern C (2026-05-14): when 2 photos of the same Delaware
+        invoice produce the same numeric row with different OCR'd
+        descriptions, dedup by (qty, ext) keeping the cleanest desc.
+        Without dedup, items_sum doubles and IVS fails reconciliation.
+        Real case: Delaware 224885 yielded items 'Bar Mops' + garbled
+        '.P. O. Number' with identical qty=300/ext=$66."""
+        sm = self._import()
+        page1 = self._row(0.39, [
+            ("300", 0.11), ("MOPS", 0.16),
+            ("Bar", 0.24), ("Mops", 0.26),
+            ("0.22", 0.66), ("66.00", 0.76),
+        ])
+        page2 = self._row(0.39, [
+            ("300", 0.11), ("MOPS", 0.16),
+            (".P.", 0.24), ("O.", 0.26), ("Number", 0.30),  # garbled OCR
+            ("0.22", 0.66), ("66.00", 0.76),
+        ])
+        items = sm.match_delaware_spatial([
+            {"page_number": 1, "tokens": page1},
+            {"page_number": 2, "tokens": page2},
+        ])
+        self.assertEqual(len(items), 1, f"expected 1 deduped item, got {len(items)}")
+        self.assertEqual(items[0]["extended_amount"], 66.00)
+        # Cleaner desc ('Bar Mops' has more letters than '.P. O. Number') wins.
+        self.assertIn("Bar Mops", items[0]["raw_description"])
+        self.assertNotIn(".P.", items[0]["raw_description"])
+
+    def test_delaware_dedup_preserves_distinct_lines(self):
+        """Sanity: dedup must NOT collapse two legitimately different lines.
+        Different (qty, ext) tuples => kept independently."""
+        sm = self._import()
+        bar_mops = self._row(0.39, [
+            ("300", 0.11), ("MOPS", 0.16),
+            ("Bar", 0.24), ("Mops", 0.26),
+            ("0.22", 0.66), ("66.00", 0.76),
+        ])
+        bib_aprons = self._row(0.41, [
+            ("25", 0.11), ("BAPSWT", 0.16),
+            ("Bib", 0.24), ("Aprons", 0.27), ("White", 0.32),
+            ("0.40", 0.66), ("10.00", 0.76),
+        ])
+        items = sm.match_delaware_spatial([
+            {"page_number": 1, "tokens": bar_mops + bib_aprons},
+        ])
+        self.assertEqual(len(items), 2)
+        totals = sorted(it["extended_amount"] for it in items)
+        self.assertEqual(totals, [10.00, 66.00])
+
     # ── Dispatcher ────────────────────────────────────────────────────
     def test_parse_invoice_dispatches_pbm_to_spatial(self):
         """parse_invoice should route PBM through its spatial matcher
