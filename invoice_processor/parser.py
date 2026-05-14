@@ -3038,6 +3038,29 @@ def _parse_delaware_linen(text: str) -> list[dict]:
     if not items:
         items = _parse_delaware_linen_column_dump(text)
 
+    # Pattern C (2026-05-14): when 2 photos of the same invoice are merged,
+    # combined_text contains BOTH caches' OCR. The walker finds each item
+    # description twice — once clean, once garbled (e.g., page 2's OCR
+    # mangled "Bar Mops" into ".P. O. Number"). Both produce items with
+    # identical (unit_price, extended_amount). Dedup keeping the cleanest
+    # description by real-word count (tokens with ≥2 alphabetic chars).
+    # Surfaced during Delaware 224885 audit.
+    if items:
+        def _real_word_count(desc: str) -> int:
+            return sum(1 for tok in (desc or "").split()
+                       if sum(1 for c in tok if c.isalpha()) >= 2)
+        by_key: dict = {}
+        for it in items:
+            key = (it.get("unit_price"), it.get("extended_amount"))
+            prev = by_key.get(key)
+            if prev is None:
+                by_key[key] = it
+                continue
+            if _real_word_count(it.get("raw_description") or "") > \
+                    _real_word_count(prev.get("raw_description") or ""):
+                by_key[key] = it
+        items = list(by_key.values())
+
     items_total = round(sum(it.get("extended_amount", 0) for it in items), 2)
 
     # Extract non-item charges (Fuel Surcharge + Delivery Charge + PA Sales

@@ -4303,6 +4303,48 @@ Total Due
         self.assertIn('Bar Mops', descs)
         self.assertIn('Bib Aprons White', descs)
 
+    def test_two_photo_merge_dedups_garbled_description(self):
+        """Pattern C (2026-05-14): when 2 photos of the same invoice are
+        merged for parsing, combined_text contains BOTH caches' OCR. The
+        walker finds each item twice — once clean, once garbled by photo-2
+        OCR. Dedup by (unit_price, extended_amount) keeps the cleanest
+        description. Real case: Delaware 224885 produced 4 items totaling
+        $152 (twice the printed $91.37); after fix, 2 items / $76 + fees.
+
+        Test asserts on COUNT and DOLLAR-TOTAL only (not specific
+        descriptions) because the heuristic-picked winner depends on
+        tiebreak shape; the architectural property is "dedup occurs."
+        """
+        parser_mod = self._import_parser()
+        # Two Amount blocks back-to-back simulating combined OCR. Each
+        # has same (unit_price, ext) pairs. Photo 1 has clean descs;
+        # photo 2 has garbled descs for the same numeric rows.
+        raw = """Amount
+Bar Mops
+0.22
+66.00
+Bib Aprons White
+0.40
+10.00
+Amount
+zz garbled
+0.22
+66.00
+yy garbled
+0.40
+10.00
+Total Due
+91.37
+"""
+        result = parser_mod.parse_invoice(raw, vendor='Delaware County Linen')
+        items = result['items']
+        # Without dedup: 4 items / $152. With dedup: 2 items / $76.
+        self.assertEqual(len(items), 2,
+                         f"expected 2 deduped items, got {len(items)}: "
+                         f"{[i['raw_description'] for i in items]}")
+        total = sum(it.get('extended_amount', 0) for it in items)
+        self.assertEqual(round(total, 2), 76.00)
+
     def test_total_due_extraction(self):
         """'Total Due' marker → next standalone decimal is invoice_total."""
         parser_mod = self._import_parser()
