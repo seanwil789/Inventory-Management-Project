@@ -464,6 +464,15 @@ _NON_PRODUCT_PATTERNS = (
     "ENVIRONMENTAL FEE",
     "SURCHARGE",
     "FREIGHT",
+    # 2026-05-14: parser-emitted Sysco fee descriptions (B-SyscoFeeILI from
+    # 2026-05-12 marathon). Without these patterns, synthetic_fee rows
+    # land at confidence='unmatched' instead of 'non_product' as the
+    # mapper docstring intends — surfaced when /categories/ ↔ /cogs/
+    # audit traced 84 corpus-wide mis-tagged rows ($2,807).
+    "SALES TAX",
+    "CC PROCESSING FEE",
+    "PROCESSING FEE",
+    "CREDIT CARD",
 )
 
 

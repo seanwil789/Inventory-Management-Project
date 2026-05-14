@@ -5060,6 +5060,25 @@ class MapperNonProductClassifierTests(TestCase):
             self._empty_mappings(), vendor="Sysco")
         self.assertEqual(r["confidence"], "non_product")
 
+    def test_sysco_sales_tax_tagged_non_product(self):
+        """Parser-emitted synthetic_fee row 'Sysco Sales Tax' must classify
+        as non_product. Pre-fix (2026-05-14) these landed at 'unmatched'."""
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "Sysco Sales Tax", "sysco_item_code": ""},
+            self._empty_mappings(), vendor="Sysco")
+        self.assertEqual(r["confidence"], "non_product")
+        self.assertIsNone(r["canonical"])
+
+    def test_sysco_cc_processing_fee_tagged_non_product(self):
+        """Parser-emitted synthetic_fee row 'Sysco CC Processing Fee'."""
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "Sysco CC Processing Fee", "sysco_item_code": ""},
+            self._empty_mappings(), vendor="Sysco")
+        self.assertEqual(r["confidence"], "non_product")
+        self.assertIsNone(r["canonical"])
+
     def test_real_product_not_tagged_non_product(self):
         """Ordinary product descriptions must not accidentally trip the
         non-product filter (would cost mapping rate)."""
