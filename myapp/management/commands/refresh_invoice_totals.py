@@ -30,7 +30,7 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 
 sys.path.insert(0, str(settings.BASE_DIR / 'invoice_processor'))
-from parser import parse_invoice, extract_sysco_metadata  # noqa: E402
+from parser import parse_invoice, extract_sysco_metadata, extract_invoice_number  # noqa: E402
 
 
 class Command(BaseCommand):
@@ -214,28 +214,8 @@ class Command(BaseCommand):
         self.stdout.write(self.style.SUCCESS(f'  Wrote {out_path}'))
 
     def _extract_invoice_number(self, raw_text: str, vendor: str) -> str | None:
-        """Best-effort invoice-number extraction per vendor."""
-        if not raw_text:
-            return None
-        if vendor == 'Sysco':
-            meta = extract_sysco_metadata(raw_text)
-            # Prefer invoice_number; fall back to manifest when INVOICE NUMBER
-            # header isn't on the captured page (common on LAST-PAGE-only photos)
-            return meta.get('invoice_number') or meta.get('manifest')
-        if vendor == 'Farm Art':
-            # Farm Art: "Invoice\n<number>" or "Invoice: <number>"
-            m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{5,10})',
-                          raw_text, re.IGNORECASE)
-            if m:
-                return m.group(1)
-        if vendor == 'Exceptional Foods':
-            m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{4,10})',
-                          raw_text, re.IGNORECASE)
-            if m:
-                return m.group(1)
-        if vendor == 'Philadelphia Bakery Merchants':
-            m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{4,10})',
-                          raw_text, re.IGNORECASE)
-            if m:
-                return m.group(1)
-        return None
+        """Best-effort invoice-number extraction per vendor.
+        Delegates to parser.extract_invoice_number for centralized logic
+        (2026-05-14 — includes 2x2 grid Pass 2 fallback for Exceptional /
+        PBM / Delaware). Method preserved for backward compat with callers."""
+        return extract_invoice_number(raw_text, vendor)

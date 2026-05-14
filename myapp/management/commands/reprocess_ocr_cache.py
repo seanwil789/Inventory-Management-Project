@@ -41,27 +41,17 @@ from django.conf import settings
 from django.core.management.base import BaseCommand
 
 sys.path.insert(0, str(settings.BASE_DIR / 'invoice_processor'))
-from parser import parse_invoice, extract_sysco_metadata  # noqa: E402
+from parser import parse_invoice, extract_sysco_metadata, extract_invoice_number  # noqa: E402
 from mapper import load_mappings, map_items  # noqa: E402
 from db_write import write_invoice_to_db  # noqa: E402
 
 
 def _extract_invoice_number(raw_text: str, vendor: str) -> str | None:
-    """Best-effort invoice-number extraction per vendor. Mirrors the
-    helper in refresh_invoice_totals so multi-photo grouping uses the
-    same key the totals cache groups on."""
-    if not raw_text:
-        return None
-    if vendor == 'Sysco':
-        meta = extract_sysco_metadata(raw_text)
-        return meta.get('invoice_number') or meta.get('manifest')
-    if vendor in ('Farm Art', 'Exceptional Foods',
-                  'Philadelphia Bakery Merchants'):
-        m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{4,10})',
-                      raw_text, re.IGNORECASE)
-        if m:
-            return m.group(1)
-    return None
+    """Best-effort invoice-number extraction per vendor.
+    Delegates to parser.extract_invoice_number for centralized logic
+    (2026-05-14 — includes 2x2 grid Pass 2 fallback for Exceptional /
+    PBM / Delaware). Function preserved for backward compat with callers."""
+    return extract_invoice_number(raw_text, vendor)
 
 
 class Command(BaseCommand):

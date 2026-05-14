@@ -125,7 +125,7 @@ class Command(BaseCommand):
                             help='OCR cache directory (default: .ocr_cache)')
 
     def handle(self, *args, **opts):
-        from parser import parse_invoice, extract_sysco_metadata  # noqa: E402
+        from parser import parse_invoice, extract_sysco_metadata, extract_invoice_number  # noqa: E402
 
         cache_dir = opts['cache_dir']
         vendor_filter = opts.get('vendor')
@@ -181,11 +181,10 @@ class Command(BaseCommand):
                         inv_num = meta.get('manifest')
                     # else: skip — manifest cover doesn't get its own IVS row
             else:
-                # Other vendors: use a per-vendor regex (matches the logic
-                # in reprocess_ocr_cache._extract_invoice_number).
-                m = re.search(r'Invoice\s*(?:No\.?|Number|#)?\s*[:\n]?\s*(\d{4,10})',
-                              d['raw_text'], re.IGNORECASE)
-                inv_num = m.group(1) if m else None
+                # Other vendors: delegate to centralized parser.extract_invoice_number
+                # (2026-05-14 — was inline regex duplicate; now includes 2x2
+                # grid Pass 2 fallback for Exceptional / PBM / Delaware).
+                inv_num = extract_invoice_number(d['raw_text'], vendor)
             if not inv_num:
                 continue
             groups[(vendor, inv_num)].append(entry)
