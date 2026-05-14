@@ -785,7 +785,33 @@ def match_pbm_spatial(pages: list[dict]) -> list[dict]:
             # successful self-correction; sets math_flagged on real anomaly.
             validate_line_math(item, vendor='PBM', try_self_correct=True)
             items.append(item)
-    return items
+
+    # Pattern C (2026-05-14): when 2 photos of the same invoice are merged,
+    # each item appears in both pages → spatial emits duplicates. Picker
+    # then compares spatial's doubled sum against invoice_total and picks
+    # the text-path (which may have its own bugs). Dedup spatial first
+    # so picker can compare like-for-like. Key (quantity, extended_amount),
+    # tiebreak on real-word count (tokens with ≥2 alphabetic chars).
+    # Surfaced during PBM 2055 audit; single-photo invoices unaffected
+    # since (qty, ext) tuples are naturally unique within one photo.
+    if not items:
+        return items
+
+    def _real_word_count(desc: str) -> int:
+        return sum(1 for tok in (desc or "").split()
+                   if sum(1 for c in tok if c.isalpha()) >= 2)
+
+    by_key: dict = {}
+    for it in items:
+        key = (it.get("quantity"), it.get("extended_amount"))
+        prev = by_key.get(key)
+        if prev is None:
+            by_key[key] = it
+            continue
+        if _real_word_count(it.get("raw_description") or "") > \
+                _real_word_count(prev.get("raw_description") or ""):
+            by_key[key] = it
+    return list(by_key.values())
 
 
 # ═══════════════════════════════════════════════════════════════════════════

@@ -5391,6 +5391,45 @@ class SpatialMatcherOtherVendorsTests(TestCase):
         self.assertEqual(by_desc["Wheat Pita"]["purchase_uom"], "DZ")
         self.assertEqual(by_desc["Wheat Pita"]["unit_of_measure"], "DZ")
 
+    def test_pbm_dedups_two_photo_same_invoice(self):
+        """Pattern C (2026-05-14): when 2 photos of the same PBM invoice
+        are merged, spatial emits identical items from each page. Without
+        dedup, items_sum doubles, and the picker rejects spatial in favor
+        of a buggy text path. Surfaced during PBM 2055 audit."""
+        sm = self._import()
+        row_template = [("L7408", 0.08), ("3.00", 0.24),
+                        ("DZ", 0.41), ("Brioche", 0.46),
+                        ("Buns", 0.51), ("9.37", 0.78),
+                        ("28.11", 0.85)]
+        page1 = self._row(0.40, row_template)
+        page2 = self._row(0.40, row_template)
+        items = sm.match_pbm_spatial([
+            {"page_number": 1, "tokens": page1},
+            {"page_number": 2, "tokens": page2},
+        ])
+        self.assertEqual(len(items), 1,
+                         f"expected 1 deduped item, got {len(items)}")
+        self.assertEqual(items[0]["extended_amount"], 28.11)
+        self.assertEqual(items[0]["quantity"], 3.0)
+
+    def test_pbm_dedup_preserves_distinct_items(self):
+        """Sanity: dedup must NOT collapse two legitimately different lines."""
+        sm = self._import()
+        wheat = self._row(0.38, [("H106", 0.08), ("2.00", 0.24),
+                                  ("DZ", 0.41), ("Wheat", 0.46),
+                                  ("Pita", 0.50), ("5.25", 0.78),
+                                  ("10.50", 0.85)])
+        brioche = self._row(0.40, [("L7408", 0.08), ("3.00", 0.24),
+                                    ("DZ", 0.41), ("Brioche", 0.46),
+                                    ("Buns", 0.51), ("9.37", 0.78),
+                                    ("28.11", 0.85)])
+        items = sm.match_pbm_spatial([
+            {"page_number": 1, "tokens": wheat + brioche},
+        ])
+        self.assertEqual(len(items), 2)
+        totals = sorted(it["extended_amount"] for it in items)
+        self.assertEqual(totals, [10.50, 28.11])
+
     def test_pbm_rejects_rows_without_code_or_price(self):
         """Header rows, address rows, footer total rows should not
         accidentally surface as line items."""
