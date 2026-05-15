@@ -14,8 +14,14 @@
        class="px-2 sm:px-3 py-1.5 bg-white border rounded hover:bg-slate-50">Today</a>
     <a href="{% url 'calendar_biweekly' next_biweekly.isoformat %}"
        class="px-2 sm:px-3 py-1.5 bg-white border rounded hover:bg-slate-50">&rarr;</a>
+    <button type="button" id="edit-mode-toggle"
+            class="hidden md:inline-block px-2 sm:px-3 py-1.5 bg-white border rounded hover:bg-slate-50"
+            title="Drag-swap meals between cells (same meal slot only)">
+      Edit menus
+    </button>
   </div>
 </div>
+<form style="display:none">{% csrf_token %}</form>
 
 {% for week in weeks %}
 <section class="mb-6 sm:mb-8">
@@ -50,7 +56,8 @@
         <tr class="hover:bg-slate-50">
           <th class="p-2 text-xs font-semibold text-slate-600 text-left border-b border-r bg-slate-50">{{ row.slot_label }}</th>
           {% for cell in row.cells %}
-          <td class="p-2 border-b align-top {% if cell.date == today %}bg-amber-50/50{% endif %} {% if cell.is_no_service %}bg-slate-100 text-slate-400{% endif %}">
+          <td class="p-2 border-b align-top {% if cell.date == today %}bg-amber-50/50{% endif %} {% if cell.is_no_service %}bg-slate-100 text-slate-400{% endif %} {% if cell.menu %}menu-cell{% endif %}"
+              {% if cell.menu %}data-menu-id="{{ cell.menu.id }}" data-slot="{{ cell.slot }}"{% endif %}>
             {% if cell.is_no_service %}
               <div class="text-center text-xs text-slate-400">— no service —</div>
             {% else %}
@@ -103,4 +110,74 @@
   </div>
 </section>
 {% endfor %}
+
+<style>
+  body.menus-edit-mode .menu-cell { cursor: grab; outline: 1px dashed rgb(99 102 241 / 0.5); outline-offset: -2px; }
+  body.menus-edit-mode .menu-cell:active { cursor: grabbing; }
+  body.menus-edit-mode .menu-cell.drag-over { outline: 2px solid rgb(99 102 241); background: rgb(238 242 255); }
+  body.menus-edit-mode .menu-cell.drag-source { opacity: 0.4; }
+  body.menus-edit-mode .menu-cell a { pointer-events: none; }
+  #edit-mode-toggle.is-on { background-color: rgb(5 150 105); color: white; border-color: rgb(5 150 105); }
+</style>
+
+<script>
+(function() {
+  const toggle = document.getElementById('edit-mode-toggle');
+  if (!toggle) return;
+  const cells = document.querySelectorAll('td.menu-cell[data-menu-id]');
+  const csrf = document.querySelector('[name=csrfmiddlewaretoken]');
+  const swapUrl = '{% url "menu_swap" %}';
+  let editMode = false;
+  let dragged = null;
+
+  function setEditMode(on) {
+    editMode = on;
+    document.body.classList.toggle('menus-edit-mode', on);
+    toggle.classList.toggle('is-on', on);
+    toggle.textContent = on ? 'Exit edit mode' : 'Edit menus';
+    cells.forEach(c => c.setAttribute('draggable', on ? 'true' : 'false'));
+  }
+
+  toggle.addEventListener('click', () => setEditMode(!editMode));
+
+  cells.forEach(cell => {
+    cell.addEventListener('dragstart', (e) => {
+      if (!editMode) { e.preventDefault(); return; }
+      dragged = cell;
+      cell.classList.add('drag-source');
+      e.dataTransfer.effectAllowed = 'move';
+      e.dataTransfer.setData('text/plain', cell.dataset.menuId);
+    });
+    cell.addEventListener('dragend', () => {
+      cell.classList.remove('drag-source');
+      cells.forEach(c => c.classList.remove('drag-over'));
+      dragged = null;
+    });
+    cell.addEventListener('dragover', (e) => {
+      if (!editMode || !dragged || dragged === cell) return;
+      if (dragged.dataset.slot !== cell.dataset.slot) return;
+      e.preventDefault();
+      e.dataTransfer.dropEffect = 'move';
+      cell.classList.add('drag-over');
+    });
+    cell.addEventListener('dragleave', () => cell.classList.remove('drag-over'));
+    cell.addEventListener('drop', (e) => {
+      if (!editMode || !dragged || dragged === cell) return;
+      if (dragged.dataset.slot !== cell.dataset.slot) return;
+      e.preventDefault();
+      const fd = new FormData();
+      fd.append('from_menu_id', dragged.dataset.menuId);
+      fd.append('to_menu_id', cell.dataset.menuId);
+      fd.append('csrfmiddlewaretoken', csrf.value);
+      fetch(swapUrl, { method: 'POST', body: fd, credentials: 'same-origin' })
+        .then(r => r.json())
+        .then(d => {
+          if (d.ok) { window.location.reload(); }
+          else { alert('Swap failed: ' + (d.error || 'unknown')); }
+        })
+        .catch(err => alert('Swap failed: ' + err));
+    });
+  });
+})();
+</script>
 {% endblock %}

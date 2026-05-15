@@ -8,6 +8,7 @@ urlpatterns = [
     path('menu/new/',                       views.menu_new,            name='menu_new'),
     path('menu/component-row/',             views.menu_component_row,    name='menu_component_row'),
     path('menu/autofill-components/',       views.menu_autofill_components, name='menu_autofill_components'),
+    path('menu/swap/',                      views.menu_swap,           name='menu_swap'),
     path('menu/<int:menu_id>/',             views.menu_detail,         name='menu_detail'),
     path('menu/<int:menu_id>/edit/',        views.menu_edit,           name='menu_edit'),
     path('menu/<int:menu_id>/delete/',      views.menu_delete,         name='menu_delete'),

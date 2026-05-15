@@ -206,6 +206,67 @@ def menu_detail(request, menu_id: int):
 
 
 @require_POST
+def menu_swap(request):
+    """Swap content between two menus in the same meal slot.
+
+    Surfaces a "quick swap" from the calendar edit-mode UI. Swaps
+    `recipe`, `dish_freetext`, `ingredients_raw`, `assignee`, and
+    `additional_recipes` m2m between the two menus. Date and meal_slot
+    stay anchored. Restricts to same meal_slot to keep the swap
+    predictable.
+    """
+    from django.db import transaction
+    from django.http import JsonResponse
+
+    try:
+        from_id = int(request.POST.get('from_menu_id', ''))
+        to_id = int(request.POST.get('to_menu_id', ''))
+    except (TypeError, ValueError):
+        return JsonResponse({'ok': False, 'error': 'invalid ids'}, status=400)
+
+    if from_id == to_id:
+        return JsonResponse({'ok': False, 'error': 'same menu'}, status=400)
+
+    try:
+        from_menu = Menu.objects.get(id=from_id)
+        to_menu = Menu.objects.get(id=to_id)
+    except Menu.DoesNotExist:
+        return JsonResponse({'ok': False, 'error': 'menu not found'}, status=404)
+
+    if from_menu.meal_slot != to_menu.meal_slot:
+        return JsonResponse({'ok': False, 'error': 'slot mismatch'}, status=400)
+
+    with transaction.atomic():
+        f_recipe = from_menu.recipe
+        f_freetext = from_menu.dish_freetext
+        f_ingredients = from_menu.ingredients_raw
+        f_assignee = from_menu.assignee
+        f_additional = list(from_menu.additional_recipes.all())
+
+        t_recipe = to_menu.recipe
+        t_freetext = to_menu.dish_freetext
+        t_ingredients = to_menu.ingredients_raw
+        t_assignee = to_menu.assignee
+        t_additional = list(to_menu.additional_recipes.all())
+
+        from_menu.recipe = t_recipe
+        from_menu.dish_freetext = t_freetext
+        from_menu.ingredients_raw = t_ingredients
+        from_menu.assignee = t_assignee
+        from_menu.save()
+        from_menu.additional_recipes.set(t_additional)
+
+        to_menu.recipe = f_recipe
+        to_menu.dish_freetext = f_freetext
+        to_menu.ingredients_raw = f_ingredients
+        to_menu.assignee = f_assignee
+        to_menu.save()
+        to_menu.additional_recipes.set(f_additional)
+
+    return JsonResponse({'ok': True})
+
+
+@require_POST
 def menu_log_service(request, menu_id: int):
     """Create a MealService record for this menu (cleanup touchpoint)."""
     from .models import MealService

@@ -3156,6 +3156,88 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class MenuSwapTests(AuthedTestCase):
+    """menu_swap view — quick-swap meal content between two same-slot menus.
+    Calendar edit-mode UI fires this on drag-drop drop.
+    """
+
+    def _make_menu(self, day, slot, dish):
+        return Menu.objects.create(
+            date=date.today() + timedelta(days=day),
+            meal_slot=slot, dish_freetext=dish,
+        )
+
+    def test_swap_swaps_dish_freetext(self):
+        a = self._make_menu(0, 'lunch', 'Monday Lunch')
+        b = self._make_menu(1, 'lunch', 'Tuesday Lunch')
+        r = self.client.post(reverse('menu_swap'), {
+            'from_menu_id': a.id, 'to_menu_id': b.id,
+        })
+        self.assertEqual(r.status_code, 200)
+        self.assertEqual(r.json()['ok'], True)
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertEqual(a.dish_freetext, 'Tuesday Lunch')
+        self.assertEqual(b.dish_freetext, 'Monday Lunch')
+        # Dates + slots are anchored — they don't move
+        self.assertEqual(a.date, date.today())
+        self.assertEqual(b.date, date.today() + timedelta(days=1))
+
+    def test_swap_rejects_different_meal_slots(self):
+        a = self._make_menu(0, 'lunch', 'L1')
+        b = self._make_menu(0, 'dinner', 'D1')
+        r = self.client.post(reverse('menu_swap'), {
+            'from_menu_id': a.id, 'to_menu_id': b.id,
+        })
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()['error'], 'slot mismatch')
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertEqual(a.dish_freetext, 'L1')  # unchanged
+        self.assertEqual(b.dish_freetext, 'D1')
+
+    def test_swap_rejects_same_menu(self):
+        a = self._make_menu(0, 'lunch', 'A')
+        r = self.client.post(reverse('menu_swap'), {
+            'from_menu_id': a.id, 'to_menu_id': a.id,
+        })
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()['error'], 'same menu')
+
+    def test_swap_rejects_missing_menu(self):
+        a = self._make_menu(0, 'lunch', 'A')
+        r = self.client.post(reverse('menu_swap'), {
+            'from_menu_id': a.id, 'to_menu_id': 999999,
+        })
+        self.assertEqual(r.status_code, 404)
+
+    def test_swap_rejects_invalid_ids(self):
+        r = self.client.post(reverse('menu_swap'), {
+            'from_menu_id': 'abc', 'to_menu_id': 'def',
+        })
+        self.assertEqual(r.status_code, 400)
+        self.assertEqual(r.json()['error'], 'invalid ids')
+
+    def test_swap_moves_recipe_and_assignee(self):
+        from myapp.models import Recipe
+        r1 = Recipe.objects.create(name='Test Recipe A', yield_servings=40)
+        r2 = Recipe.objects.create(name='Test Recipe B', yield_servings=40)
+        a = Menu.objects.create(
+            date=date.today(), meal_slot='dinner',
+            recipe=r1, dish_freetext='A', assignee='sean',
+        )
+        b = Menu.objects.create(
+            date=date.today() + timedelta(days=1), meal_slot='dinner',
+            recipe=r2, dish_freetext='B', assignee='albert',
+        )
+        self.client.post(reverse('menu_swap'), {
+            'from_menu_id': a.id, 'to_menu_id': b.id,
+        })
+        a.refresh_from_db(); b.refresh_from_db()
+        self.assertEqual(a.recipe_id, r2.id)
+        self.assertEqual(a.assignee, 'albert')
+        self.assertEqual(b.recipe_id, r1.id)
+        self.assertEqual(b.assignee, 'sean')
+
+
 class MenuFormTests(TestCase):
     """MenuForm — dish_freetext is required (whitespace stripped)."""
 
