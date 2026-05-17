@@ -2792,6 +2792,163 @@ class InvoiceLineAddFlowTests(AuthedTestCase):
         self.assertIn(reverse('invoice_line_add', args=[self.ivs.id]), body)
 
 
+class IVSRevalidateOnEditTests(AuthedTestCase):
+    """L1 Phase 1.2 (Sean 2026-05-17) — auto-revalidate IVS aggregates +
+    section parser_sums + status when user edits/adds an ILI row.
+
+    Without this, the L1 review surface stays stale after edits until the
+    next `validate_all_invoices --apply` cron run. The canonical case
+    Sean cited: milk qty 1→2 audited on Pi 5/14 — DAIRY section
+    reconciliation shows the gap until cron re-validates.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        self.v = Vendor.objects.create(name='IVSRevalVendor')
+        self.p = Product.objects.create(canonical_name='IVSRevalProduct')
+        # Invoice with one DAIRY ILI that's short by $50 (qty=1 captured
+        # vs printed_total of $100). Status starts as REVIEW because
+        # DAIRY section_diff > $0.50.
+        self.ivs = InvoiceValidationStatus.objects.create(
+            vendor=self.v, invoice_number='REVAL-1',
+            invoice_date=date(2026, 4, 25),
+            items_count=1, items_sum=Decimal('50'),
+            invoice_total=Decimal('100'),
+            invoice_gap=Decimal('-50'),
+            invoice_gap_pct=Decimal('50.00'),
+            sections_total=1, sections_reconciled=0, sections_with_gap=1,
+            section_reconciliation=[{
+                'section': 'DAIRY', 'parser_sum': 50.0,
+                'printed_total': 100.0, 'diff_abs': -50.0,
+                'diff_pct': -50.0, 'item_count': 1,
+            }],
+            status='review',
+        )
+        self.ili = InvoiceLineItem.objects.create(
+            vendor=self.v, product=self.p,
+            quantity=Decimal('1'), unit_price=Decimal('50'),
+            extended_amount=Decimal('50'),
+            invoice_date=date(2026, 4, 25),
+            invoice_number='REVAL-1',
+            section_hint='DAIRY',
+            raw_description='REVAL-milk-1gal',
+        )
+
+    def test_revalidate_recomputes_items_sum_from_current_ili(self):
+        """Direct method call — items_sum reflects ILI table state."""
+        # Mutate ILI directly (bypass view) to simulate a write that
+        # bypassed the view-level revalidate hook.
+        self.ili.quantity = Decimal('2')
+        self.ili.extended_amount = Decimal('100')
+        self.ili.save()
+        self.ivs.revalidate_from_ili()
+        self.assertEqual(self.ivs.items_sum, Decimal('100'))
+        self.assertEqual(self.ivs.items_count, 1)
+
+    def test_revalidate_preserves_printed_totals(self):
+        """Section printed_total values are OCR-side state — user edits
+        must not overwrite them."""
+        self.ili.extended_amount = Decimal('100')
+        self.ili.save()
+        self.ivs.revalidate_from_ili()
+        recon = self.ivs.section_reconciliation
+        self.assertEqual(recon[0]['section'], 'DAIRY')
+        self.assertEqual(recon[0]['printed_total'], 100.0)
+
+    def test_revalidate_updates_section_parser_sum(self):
+        """parser_sum + diff_abs reflect current ILI ext per section."""
+        self.ili.extended_amount = Decimal('100')
+        self.ili.save()
+        self.ivs.revalidate_from_ili()
+        recon = self.ivs.section_reconciliation
+        self.assertEqual(recon[0]['parser_sum'], 100.0)
+        self.assertEqual(recon[0]['diff_abs'], 0.0)
+
+    def test_revalidate_transitions_review_to_pass_when_gap_closes(self):
+        """Section diff closes → status reclassifies to PASS."""
+        self.assertEqual(self.ivs.status, 'review')
+        self.ili.extended_amount = Decimal('100')
+        self.ili.save()
+        self.ivs.revalidate_from_ili()
+        self.assertEqual(self.ivs.status, 'pass')
+
+    def test_revalidate_recomputes_gap_fields(self):
+        self.ili.extended_amount = Decimal('100')
+        self.ili.save()
+        self.ivs.revalidate_from_ili()
+        self.assertEqual(self.ivs.invoice_gap, Decimal('0'))
+        self.assertEqual(self.ivs.invoice_gap_pct, Decimal('0.00'))
+
+    def test_revalidate_handles_empty_section_reconciliation(self):
+        """Some invoices (Farm Art, PBM) have no section structure."""
+        self.ivs.section_reconciliation = []
+        self.ivs.save()
+        self.ili.extended_amount = Decimal('100')
+        self.ili.save()
+        # Should not raise
+        self.ivs.revalidate_from_ili()
+        self.assertEqual(self.ivs.items_sum, Decimal('100'))
+        # status with no sections + gap_pct=0 should be 'pass' via path (c)
+        self.assertEqual(self.ivs.status, 'pass')
+
+    def test_edit_view_triggers_revalidate(self):
+        """Integration: invoice_line_edit fires revalidate before redirect."""
+        self.client.post(
+            reverse('invoice_line_edit', args=[self.ivs.id, self.ili.id]),
+            {'quantity': '2', 'unit_price': '50', 'extended_amount': '100',
+             'case_size': '', 'raw_description': 'EDITED-milk'},
+        )
+        self.ivs.refresh_from_db()
+        self.assertEqual(self.ivs.items_sum, Decimal('100'))
+        self.assertEqual(self.ivs.status, 'pass')
+
+    def test_add_view_triggers_revalidate(self):
+        """Integration: invoice_line_add fires revalidate before redirect.
+        Adding a $50 line to an invoice short by $50 closes the gap."""
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'ADDED-cream-1qt',
+             'quantity': '1', 'unit_price': '50', 'extended_amount': '50',
+             'section_hint': 'DAIRY',
+             'reason': 'manual_correction',
+             'note': 'parser missed cream'},
+        )
+        self.ivs.refresh_from_db()
+        # items_sum was $50, added $50 → $100
+        self.assertEqual(self.ivs.items_sum, Decimal('100'))
+        self.assertEqual(self.ivs.items_count, 2)
+        # DAIRY section now sums to $100 = printed → diff closes → PASS
+        self.assertEqual(self.ivs.status, 'pass')
+
+    def test_revalidate_falls_back_to_vendor_date_for_legacy_ili(self):
+        """Historical ILI rows pre-date `backfill_missing_invoice_numbers`
+        (Pi 2026-05-14). IVS has the invoice_number, ILI doesn't. The
+        fallback to (vendor, invoice_date) prevents items_sum from
+        collapsing to 0 on revalidate."""
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        v_legacy = Vendor.objects.create(name='LegacyVendor')
+        ivs_legacy = InvoiceValidationStatus.objects.create(
+            vendor=v_legacy, invoice_number='LEGACY-NO-NUM-1',
+            invoice_date=date(2026, 3, 1),
+            items_count=0, items_sum=Decimal('0'),
+            invoice_total=Decimal('40'),
+            status='partial',
+        )
+        InvoiceLineItem.objects.create(
+            vendor=v_legacy, quantity=Decimal('1'),
+            unit_price=Decimal('40'), extended_amount=Decimal('40'),
+            invoice_date=date(2026, 3, 1),
+            invoice_number='',  # legacy: pre-backfill
+            raw_description='LEGACY-row',
+        )
+        ivs_legacy.revalidate_from_ili()
+        self.assertEqual(ivs_legacy.items_sum, Decimal('40'))
+        self.assertEqual(ivs_legacy.items_count, 1)
+
+
 class MathAnomalyManagementCommandTests(TestCase):
     """B6 mgmt cmds: backfill_math_flagged retroactively flags + clears;
     audit_math_anomalies surfaces flagged rows."""

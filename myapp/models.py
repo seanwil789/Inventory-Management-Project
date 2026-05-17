@@ -1311,3 +1311,116 @@ class InvoiceValidationStatus(models.Model):
     def __str__(self):
         return (f"{self.vendor.name} {self.invoice_number} "
                 f"[{self.status}] {self.invoice_gap_pct or 0}%")
+
+    def revalidate_from_ili(self):
+        """Recompute items_sum / gap / section parser_sums / status from
+        the current state of related InvoiceLineItem rows. Saves the row.
+
+        Called after user edits/adds (invoice_line_edit / invoice_line_add)
+        so the L1 review surface stays fresh without waiting for the next
+        `validate_all_invoices --apply` cron run. The IVS stale-after-edit
+        gap was the audit-flow blocker — Sean fixes milk qty 1→2 via UI,
+        DAIRY section reconciliation should close immediately, not at
+        cron time.
+
+        Distinct from validate_all_invoices in TWO ways:
+          1. Does NOT re-parse OCR caches — trusts current ILI table state
+             (user edits are authoritative; parser output is stale relative
+             to them).
+          2. Preserves printed_total values in section_reconciliation
+             (those came from OCR-side reconciliation; user edits don't
+             change the printed invoice). Only parser_sum / diff_abs /
+             diff_pct fields are recomputed from current ILI.
+
+        Filter strategy: prefer invoice_number when populated (Phase 4c+
+        ILI rows), fall back to (vendor, invoice_date) for older rows
+        that pre-date the invoice_number backfill.
+        """
+        from decimal import Decimal
+        from collections import defaultdict
+
+        # Prefer invoice_number when populated on both sides. Fall back to
+        # (vendor, invoice_date) when the invoice_number filter returns
+        # nothing — historical ILI rows that pre-date the 2026-05-14
+        # backfill_missing_invoice_numbers run may have IVS.invoice_number
+        # set but ILI.invoice_number=''. Matches invoice_detail view's
+        # (vendor, invoice_date) join shape.
+        ilis = []
+        if self.invoice_number:
+            ilis = list(InvoiceLineItem.objects.filter(
+                vendor=self.vendor,
+                invoice_number=self.invoice_number,
+            ))
+        if not ilis:
+            ilis = list(InvoiceLineItem.objects.filter(
+                vendor=self.vendor,
+                invoice_date=self.invoice_date,
+            ))
+
+        items_count = len(ilis)
+        items_sum = sum((ili.extended_amount or Decimal('0')) for ili in ilis)
+
+        # Recompute parser_sum per section from current ILI rows. Preserve
+        # printed_total values from the existing section_reconciliation
+        # JSON (those reflect OCR-side reconciliation that user edits
+        # don't invalidate).
+        sections_with_gap = 0
+        sections_reconciled = 0
+        if self.section_reconciliation:
+            new_parser_by_section: dict = defaultdict(lambda: Decimal('0'))
+            for ili in ilis:
+                sec = ili.section_hint or ''
+                new_parser_by_section[sec] += (ili.extended_amount or Decimal('0'))
+
+            updated_recon = []
+            for r in self.section_reconciliation:
+                sec_name = r.get('section', '')
+                new_parser_sum = float(new_parser_by_section.get(sec_name, 0))
+                printed = r.get('printed_total')
+                new_diff_abs = (round(new_parser_sum - printed, 2)
+                                if printed is not None else None)
+                new_diff_pct = (round(new_diff_abs / printed * 100, 2)
+                                if printed and printed != 0
+                                and new_diff_abs is not None
+                                else None)
+                # Update item_count for this section too (user adds can
+                # change the count distribution).
+                sec_count = sum(1 for ili in ilis if (ili.section_hint or '') == sec_name)
+                updated_recon.append({
+                    **r,
+                    'parser_sum': round(new_parser_sum, 2),
+                    'diff_abs': new_diff_abs,
+                    'diff_pct': new_diff_pct,
+                    'item_count': sec_count,
+                })
+            self.section_reconciliation = updated_recon
+            sections_with_gap = sum(
+                1 for r in updated_recon
+                if r.get('diff_abs') is not None
+                and abs(float(r['diff_abs'])) >= 0.50
+            )
+            sections_reconciled = len(updated_recon) - sections_with_gap
+
+        self.items_sum = items_sum
+        self.items_count = items_count
+        self.sections_with_gap = sections_with_gap
+        self.sections_reconciled = sections_reconciled
+
+        if self.invoice_total:
+            self.invoice_gap = items_sum - self.invoice_total
+            if self.invoice_total != 0:
+                self.invoice_gap_pct = (
+                    abs(self.invoice_gap) / self.invoice_total * Decimal('100')
+                ).quantize(Decimal('0.01'))
+            else:
+                self.invoice_gap_pct = None
+
+        # Re-classify through the same path validate_all_invoices uses.
+        # Import locally to avoid circular import at module load.
+        from myapp.management.commands.validate_all_invoices import _classify
+        self.status = _classify(
+            float(items_sum),
+            float(self.invoice_total) if self.invoice_total else None,
+            self.section_reconciliation or [],
+        )
+        self.save()

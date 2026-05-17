@@ -2667,6 +2667,11 @@ def invoice_line_edit(request, ivs_id: int, ili_id: int):
     else:
         messages.success(request, f'Line edited.')
 
+    # Auto-revalidate IVS so items_sum / section reconciliation / status
+    # reflect the edit immediately. Without this the L1 review surface
+    # stays stale until the next `validate_all_invoices --apply` cron run.
+    ivs.revalidate_from_ili()
+
     return redirect('invoice_detail', ivs_id=ivs_id)
 
 
@@ -2797,6 +2802,10 @@ def invoice_line_add(request, ivs_id: int):
         messages.warning(request, 'Line added — math anomaly flagged (qty × price ≠ ext).')
     else:
         messages.success(request, 'Line added.')
+
+    # Auto-revalidate IVS so items_sum / items_count / section reconciliation
+    # reflect the new row immediately. Same rationale as invoice_line_edit.
+    ivs.revalidate_from_ili()
 
     return redirect('invoice_detail', ivs_id=ivs_id)
 
