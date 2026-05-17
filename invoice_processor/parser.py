@@ -3781,6 +3781,30 @@ def parse_invoice(text: str, vendor: str = None,
         except Exception:
             extracted_fees = {}
 
+        # B-SyscoFeeNoCC (2026-05-17): when SUB TOTAL + TAX = INVOICE TOTAL
+        # exactly, the invoice has NO non-tax fees. Any captured fuel/CC
+        # values came from mid-page MISC CHARGES informational text and
+        # are phantoms. Reference: INV 775632629 — SUB TOTAL $2217.72 +
+        # TAX $37.17 = INVOICE TOTAL $2254.89 exactly; captured CC = $6.50
+        # was a phantom paired with a CREDIT CARD SRCHRG label in a
+        # mid-page block, not a real charge.
+        if invoice_total is not None and extracted_fees:
+            try:
+                from section_validator import extract_sysco_sub_total
+                sub_total = extract_sysco_sub_total(pages or [])
+            except Exception:
+                sub_total = None
+            if sub_total is not None:
+                tax_v = extracted_fees.get('tax', 0.0)
+                if abs(sub_total + tax_v - invoice_total) < 0.50:
+                    for _phantom_key in ('cc_processing', 'fuel_surcharge'):
+                        if _phantom_key in extracted_fees:
+                            print(f"  [!] Sysco: SUB TOTAL ${sub_total:.2f} + "
+                                  f"TAX ${tax_v:.2f} = INVOICE ${invoice_total:.2f}; "
+                                  f"dropping phantom {_phantom_key}="
+                                  f"${extracted_fees[_phantom_key]:.2f}")
+                            del extracted_fees[_phantom_key]
+
         # B-SyscoFeeCap per-fee plausibility (2026-05-12): drop captured fees
         # that exceed sane fractions of invoice_total. Real Sysco fee bounds
         # observed across 100+ invoice corpus:

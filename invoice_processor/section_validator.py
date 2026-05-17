@@ -124,6 +124,68 @@ def extract_group_totals(pages: list[dict]) -> list[tuple[float, float]]:
     return out
 
 
+def extract_sysco_sub_total(pages: list[dict]) -> float | None:
+    """Find the SUB TOTAL value printed in the Sysco totals box.
+
+    SUB TOTAL is the merchandise-only line total (items only, no tax,
+    no fees). When `SUB TOTAL + TAX == INVOICE TOTAL` exactly, the
+    invoice carries no other fees and any CC/fuel captures are phantoms.
+
+    Returns the dollar value or None when no SUB TOTAL label/value
+    pair is found.
+
+    Origin: 2026-05-17. INV 775632629 has SUB TOTAL=$2217.72 + TAX
+    =$37.17 = INVOICE TOTAL=$2254.89 exactly. extract_sysco_fees finds
+    CREDIT CARD SRCHRG label in a mid-page MISC CHARGES informational
+    block and pairs it with $6.50 nearby — a phantom CC fee. Math
+    validation (sub_total + tax == invoice_total) catches it.
+    """
+    if not pages:
+        return None
+    for page in pages:
+        tokens = page.get('tokens') or []
+        if not tokens:
+            continue
+        # SUB tokens in bottom half of page (avoid header zone)
+        sub_tokens = [t for t in tokens
+                      if (t.get('text') or '').upper() == 'SUB'
+                      and _y_mid(t) > 0.5]
+        for sub_t in sub_tokens:
+            sub_y = _y_mid(sub_t)
+            sub_x = _x_mid(sub_t)
+            # Find TOTAL token within ±0.05 y, right of SUB
+            total_t = None
+            for cand in tokens:
+                if (cand.get('text') or '').upper() != 'TOTAL':
+                    continue
+                if abs(_y_mid(cand) - sub_y) > 0.05:
+                    continue
+                if _x_mid(cand) <= sub_x:
+                    continue
+                if total_t is None or abs(_y_mid(cand) - sub_y) < abs(_y_mid(total_t) - sub_y):
+                    total_t = cand
+            if total_t is None:
+                continue
+            pair_y = (sub_y + _y_mid(total_t)) / 2
+            # Right-column decimal within ±0.02 y, closest wins
+            best_val = None
+            best_dy = float('inf')
+            for t in tokens:
+                if _x_mid(t) < _RIGHT_COL_X_MIN:
+                    continue
+                if not _DECIMAL_RE.match(t.get('text') or ''):
+                    continue
+                dy = abs(_y_mid(t) - pair_y)
+                if dy < best_dy and dy < 0.02:
+                    v = _parse_decimal(t['text'])
+                    if v is not None and v > 0:
+                        best_val = v
+                        best_dy = dy
+            if best_val is not None:
+                return best_val
+    return None
+
+
 def _find_footer_y(tokens: list[dict]) -> float:
     """B2c-2 (2026-05-07): find the y where the totals footer begins.
 
