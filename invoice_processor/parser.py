@@ -3590,8 +3590,23 @@ def parse_invoice(text: str, vendor: str = None,
             return None
         # Apply Sysco dedup before summing — without it, multi-photo
         # caches inflate rank/text paths and skew the picker decision.
+        # Also apply Pattern C-1/C-2 non-item filter for fair picker
+        # comparison: rank-pair already drops non-item rows at its
+        # extraction boundary (rank_pair.py:429); spatial doesn't. Without
+        # parity here, spatial's sum is inflated by Pattern C-2 phantoms
+        # the picker doesn't see until AFTER selection, causing spatial
+        # to lose to rank-pair on invoices where spatial post-filter
+        # would actually be closer to truth. Reference: INV 775632629
+        # (2026-05-17) — spatial unfiltered $2549.66 lost to rank-pair
+        # $2126.90 even though spatial post-filter $2158.37 is closer
+        # to invoice_total $2254.89.
         if vendor == "Sysco":
             items_list = _dedup_sysco_items(items_list)
+            try:
+                from rank_pair import _is_non_item_row
+                items_list = [it for it in items_list if not _is_non_item_row(it)]
+            except Exception:
+                pass
         return round(sum((it.get("extended_amount") or 0)
                           for it in items_list), 2)
 
