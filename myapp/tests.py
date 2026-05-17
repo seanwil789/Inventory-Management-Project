@@ -5737,8 +5737,16 @@ Total
         row above it, and pairs it with SUPCs from the row above that.
 
         Origin: INV 775632629 audit 2026-05-17. TOMATO BULK 6X6 FRESH
-        at $288.23 (the substitute that shipped) was dropped entirely;
-        only the OUT/STOCK row appeared as a junk extraction.
+        substitute was dropped because its SUPCs sit in the OUT row above
+        (which Pattern C-2 filters as a phantom). The post-process pairs
+        the substitute desc with the OUT row's SUPCs + ext.
+
+        Ext source (2026-05-17 fix): the substitute ext comes from the
+        sub_anchor row (OUT row's $30.45), NOT from the substitute desc
+        row's right-col decimal. The desc row's right-col decimal can be
+        a misattributed GROUP TOTAL value (INV 775632629 PRODUCE: $288.23
+        GROUP TOTAL clustered into the substitute desc row by row
+        clustering — pre-fix emitted at $288.23, inflating PRODUCE 2×).
         """
         sm, _ = self._import()
         T = self._tok
@@ -5747,40 +5755,42 @@ Total
             T('****',   0.30, 0.20),
             T('PRODUCE',0.40, 0.20),
             T('****',   0.50, 0.20),
-            # OUT/STOCK row at y=0.30 (qty + OUT + ext)
+            # OUT row at y=0.30 (qty + OUT marker + SUPCs + ext)
             T('1',      0.10, 0.30),
+            T('CS',     0.12, 0.30),
             T('OUT',    0.18, 0.30),
             T('/',      0.21, 0.30),
             T('STOCK',  0.23, 0.30),
+            T('1008663',0.47, 0.30),
+            T('1763440',0.53, 0.30),
             T('30.45',  0.78, 0.30),
-            # SUPC row at y=0.32 — between OUT and SUBSTITUTE
-            T('1008663',0.47, 0.32),
-            T('1763440',0.53, 0.32),
-            # SUBSTITUTE desc+ext row at y=0.34
-            T('1',      0.10, 0.34),
-            T('CS',     0.12, 0.34),
-            T('125',    0.15, 0.34),
-            T('LB',     0.17, 0.34),
-            T('IMPFRSH',0.21, 0.34),
-            T('TOMATO', 0.27, 0.34),
-            T('BULK',   0.31, 0.34),
-            T('6X6',    0.34, 0.34),
-            T('288.23', 0.78, 0.34),
-            # SUBSTITUTE marker row at y=0.36
-            T('SUBSTITUTE', 0.22, 0.36),
+            # SUBSTITUTE desc row at y=0.32 (no SUPC, has misattributed
+            # $288.23 GROUP TOTAL value in right-col)
+            T('1',      0.10, 0.32),
+            T('CS',     0.12, 0.32),
+            T('125',    0.15, 0.32),
+            T('LB',     0.17, 0.32),
+            T('IMPFRSH',0.21, 0.32),
+            T('TOMATO', 0.27, 0.32),
+            T('BULK',   0.31, 0.32),
+            T('6X6',    0.34, 0.32),
+            T('288.23', 0.78, 0.32),
+            # SUBSTITUTE marker row at y=0.34
+            T('SUBSTITUTE', 0.22, 0.34),
         ]
         items = sm.match_sysco_spatial([{'page_number': 1, 'tokens': tokens}])
-        # Expected: the substitute row at $288.23 with SUPC from row above
-        substitute_items = [it for it in items
-                            if abs((it.get('extended_amount') or 0) - 288.23) < 0.01]
+        substitute_items = [it for it in items if it.get('is_substitute')]
         self.assertEqual(len(substitute_items), 1,
-            f'Substitute row at $288.23 should be extracted; got items={items}')
+            f'Exactly one substitute item expected; got items={items}')
         sub = substitute_items[0]
+        self.assertEqual(sub['extended_amount'], 30.45,
+            f'Substitute ext must equal OUT row ext ($30.45), NOT the '
+            f'$288.23 GROUP TOTAL stray; got {sub}')
         self.assertIn('TOMATO', (sub.get('raw_description') or '').upper(),
             f'Substitute desc should contain TOMATO; got {sub.get("raw_description")!r}')
         supc = sub.get('sysco_item_code') or ''
         self.assertIn(supc, ('1008663', '1763440'),
-            f'Substitute SUPC should be one of the SUPCs from row above; got {supc!r}')
+            f'Substitute SUPC should come from OUT row; got {supc!r}')
         section = sub.get('section_hint') or sub.get('section') or ''
         self.assertEqual(section, 'PRODUCE',
             f'Substitute should inherit PRODUCE section; got {section!r}')
@@ -16480,9 +16490,13 @@ class RankPairSyscoSubstituteTests(TestCase):
 
     def test_substitute_row_extracted_with_supc_from_row_above(self):
         """Same pattern as the spatial_matcher test, exercised through rank-pair.
-        Layout-detect requires >=3 SUPCs in the qty/desc/price bands, so we
-        seed enough regular rows to anchor layout detection, then add the
-        substitute pattern below.
+
+        Substitute ext comes from the OUT/anchor row's right-col decimal,
+        NOT from the substitute desc row. The desc row's right-col decimal
+        is unreliable — INV 775632629 PRODUCE has a $288.23 GROUP TOTAL
+        value misattributed to the substitute desc row by row clustering.
+        Pre-fix the substitute was emitted at $288.23 (inflating PRODUCE
+        by 2×); the fix uses the OUT row's $30.45 instead.
         """
         self._reset()
         from rank_pair import extract_sysco_rank
@@ -16505,39 +16519,43 @@ class RankPairSyscoSubstituteTests(TestCase):
             T('4.00',    0.78, 0.29),
             T('4.00',    0.60, 0.29),
             T('MUSHROOM',0.20, 0.29),
-            # OUT/STOCK row at y=0.32
+            # OUT row at y=0.32 — qty/uom + OUT marker + ext + double SUPC
             T('1',       0.10, 0.32),
+            T('CS',      0.12, 0.32),
             T('OUT',     0.18, 0.32),
             T('/',       0.21, 0.32),
             T('STOCK',   0.23, 0.32),
+            T('1008663', 0.47, 0.32),
+            T('1763440', 0.53, 0.32),
+            T('30.45',   0.60, 0.32),
             T('30.45',   0.78, 0.32),
-            # SUPCs at y=0.34 between OUT and SUBSTITUTE
-            T('1008663', 0.47, 0.34),
-            T('1763440', 0.53, 0.34),
-            # SUBSTITUTE desc + ext at y=0.36 (no SUPC in this y-cluster)
-            T('1',       0.10, 0.36),
-            T('CS',      0.12, 0.36),
-            T('125',     0.15, 0.36),
-            T('LB',      0.17, 0.36),
-            T('IMPFRSH', 0.21, 0.36),
-            T('TOMATO',  0.27, 0.36),
-            T('BULK',    0.31, 0.36),
-            T('6X6',     0.34, 0.36),
-            T('288.23',  0.78, 0.36),
-            # SUBSTITUTE marker at y=0.38
-            T('SUBSTITUTE', 0.22, 0.38),
+            # SUBSTITUTE desc row at y=0.34 (no SUPC, $288.23 misattributed
+            # GROUP TOTAL value in the right-col band)
+            T('1',       0.10, 0.34),
+            T('CS',      0.12, 0.34),
+            T('125',     0.15, 0.34),
+            T('LB',      0.17, 0.34),
+            T('IMPFRSH', 0.21, 0.34),
+            T('TOMATO',  0.27, 0.34),
+            T('BULK',    0.31, 0.34),
+            T('6X6',     0.34, 0.34),
+            T('288.23',  0.78, 0.34),
+            # SUBSTITUTE marker at y=0.36
+            T('SUBSTITUTE', 0.22, 0.36),
         ]
         items = extract_sysco_rank([{'tokens': tokens}])
-        substitute_items = [it for it in items
-                            if abs((it.get('extended_amount') or 0) - 288.23) < 0.01]
+        substitute_items = [it for it in items if it.get('is_substitute')]
         self.assertEqual(len(substitute_items), 1,
-            f'Substitute $288.23 should be extracted by rank-pair; got items={items}')
+            f'Exactly one substitute should be extracted; got items={items}')
         sub = substitute_items[0]
+        self.assertEqual(sub['extended_amount'], 30.45,
+            f'Substitute ext should match OUT row ($30.45), NOT the '
+            f'$288.23 GROUP TOTAL stray; got {sub}')
         self.assertIn('TOMATO', (sub.get('raw_description') or '').upper(),
             f'Substitute desc should contain TOMATO; got {sub.get("raw_description")!r}')
         supc = sub.get('sysco_item_code') or ''
         self.assertIn(supc, ('1008663', '1763440'),
-            f'Substitute SUPC from row above; got {supc!r}')
+            f'Substitute SUPC from OUT row; got {supc!r}')
         section = sub.get('section') or sub.get('section_hint') or ''
         self.assertEqual(section, 'PRODUCE',
             f'Substitute inherits PRODUCE section; got {section!r}')

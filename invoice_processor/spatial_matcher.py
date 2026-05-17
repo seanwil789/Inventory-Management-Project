@@ -610,6 +610,7 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
                 continue
             # 2. Find SUPCs in row ABOVE substitute row (within 0.025 y)
             sub_anchor = None
+            sub_anchor_row = None
             for row in rows:
                 row_ys = [_y_mid(t) for t in row]
                 if not row_ys:
@@ -628,6 +629,7 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
                         anchor_candidates,
                         key=lambda t: (t["x_min"] + t["x_max"]) / 2,
                     )[-1]
+                    sub_anchor_row = row
                     break
             if sub_anchor is None:
                 continue
@@ -636,9 +638,29 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
             if not sec.strip() and carry_section:
                 sec = carry_section
             sec_clean = re.sub(r"[*\s]+", " ", sec).strip()
-            # 4. Extract the substitute item using the existing helper
+            # 4. Extract description from substitute_row, but ext from
+            # sub_anchor_row (the OUT row carrying the price). The
+            # substitute_row's right-col decimal is unreliable — INV
+            # 775632629 PRODUCE has a $288.23 GROUP TOTAL value
+            # clustered with the substitute desc row. Pre-fix the
+            # substitute was emitted at $288.23 instead of the OUT row's
+            # $30.45, inflating PRODUCE sum by 2× the printed total.
             sub_item = _extract_row_item(substitute_row, sub_anchor, sec_clean)
             if sub_item:
+                # Override ext from sub_anchor_row's right-col decimal
+                anchor_row_prices = sorted(
+                    [t for t in sub_anchor_row
+                     if re.match(r"^\$?\d+\.\d{2}\*?$", t["text"])
+                     and (t["x_min"] + t["x_max"]) / 2 >= 0.65],
+                    key=lambda t: (t["x_min"] + t["x_max"]) / 2,
+                )
+                if anchor_row_prices:
+                    try:
+                        sub_item["extended_amount"] = float(
+                            anchor_row_prices[-1]["text"].lstrip("$").rstrip("*"))
+                        sub_item["unit_price"] = sub_item["extended_amount"]
+                    except ValueError:
+                        pass
                 sub_item["is_substitute"] = True
                 validate_line_math(sub_item, vendor="Sysco")
                 items.append(sub_item)

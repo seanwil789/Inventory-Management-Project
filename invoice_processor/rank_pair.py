@@ -958,6 +958,7 @@ def _extract_sysco_rank_one_page(
             if substitute_row is None:
                 continue
             sub_anchor = None
+            sub_anchor_row = None
             for row in page_rows:
                 row_ys = [_y_mid(t) for t in row]
                 if not row_ys:
@@ -971,6 +972,7 @@ def _extract_sysco_rank_one_page(
                            and cfg["supc_x"][0] <= _x_mid(t) <= cfg["supc_x"][1]]
                 if anchors:
                     sub_anchor = sorted(anchors, key=_x_mid)[-1]
+                    sub_anchor_row = row
                     break
             if sub_anchor is None:
                 continue
@@ -990,14 +992,20 @@ def _extract_sysco_rank_one_page(
                 pass
             if not sec_name and carry_section:
                 sec_name = carry_section
-            # Build the desc + ext from substitute_row tokens
+            # Description from substitute_row (the shipped-substitute desc
+            # row, no SUPC anchor). Ext from sub_anchor's row (the OUT row
+            # that carries the price). substitute_row's right-col decimal
+            # is unreliable — INV 775632629 PRODUCE has a $288.23 GROUP
+            # TOTAL value clustered into the substitute desc row, which
+            # pre-fix was emitted as the substitute ext (item over by
+            # ~$258, inflating PRODUCE sum by 2× the printed total).
             desc_tokens = sorted(
                 [t for t in substitute_row
                  if cfg["desc_x"][0] <= _x_mid(t) <= cfg["desc_x"][1]],
                 key=_x_mid)
             desc = " ".join((t.get("text") or "").strip() for t in desc_tokens).strip()
             ext_tokens = sorted(
-                [t for t in substitute_row
+                [t for t in sub_anchor_row
                  if _SYSCO_PRICE_RE.fullmatch(t.get("text") or "")
                  and _x_mid(t) >= 0.65],
                 key=_x_mid)
