@@ -16619,6 +16619,83 @@ class RankPairSyscoSubstituteTests(TestCase):
             f'Substitute inherits PRODUCE section; got {section!r}')
 
 
+class RankPairSyscoGroupTotalDescFilterTests(TestCase):
+    """rank_pair must exclude tokens on GROUP TOTAL label rows from BOTH
+    the price_pool AND the desc_pool.
+
+    The existing B-GroupTotalLeak fix (2026-05-11) excluded price tokens
+    on GROUP TOTAL rows so the bottom-most SUPC wouldn't accidentally
+    pair with a section's printed total as its ext. But the same row's
+    label tokens ('GROUP', 'TOTAL', '****') were still in desc_pool —
+    when an item's SUPC y was within the desc-y-tolerance of a GROUP
+    TOTAL label row, those label tokens bled into the item's
+    description.
+
+    Origin: 2026-05-17 reprocess_invoices on Jan 2026 Sysco. Produced
+    descriptions like 'C 124 OZ CHOBANI YOGURT GROUP STRAWBERRY TOTAL
+    GRE'. Polluted descriptions broke db_write's (vendor, raw_desc,
+    date) upsert key, creating 50 duplicate ILIs across 4 invoices.
+    Rolled back via targeted delete.
+    """
+
+    def _tok(self, text, x, y, w=0.01, h=0.005):
+        return {'text': text,
+                'x_min': x - w / 2, 'x_max': x + w / 2,
+                'y_min': y - h / 2, 'y_max': y + h / 2}
+
+    def _reset(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+
+    def test_group_total_label_tokens_excluded_from_desc(self):
+        """An item whose SUPC y is within desc-y-tol of a GROUP TOTAL row
+        must not have 'GROUP'/'TOTAL' tokens in its extracted description.
+        """
+        self._reset()
+        from rank_pair import extract_sysco_rank
+        T = self._tok
+        # Three regular items so layout-detect anchors, then GROUP TOTAL
+        # row right after the last item — close enough in y that without
+        # the desc filter the bleed would happen.
+        tokens = [
+            # Section header
+            T('****',    0.30, 0.20),
+            T('PRODUCE', 0.40, 0.20),
+            T('****',    0.50, 0.20),
+            # 3 SUPCs at staggered y
+            T('1234567', 0.55, 0.25), T('5.50', 0.70, 0.25),
+            T('5.50',    0.85, 0.25), T('APPLE', 0.25, 0.25),
+            T('2345678', 0.55, 0.27), T('3.10', 0.70, 0.27),
+            T('3.10',    0.85, 0.27), T('CARROT', 0.25, 0.27),
+            T('3456789', 0.55, 0.29), T('4.00', 0.70, 0.29),
+            T('4.00',    0.85, 0.29), T('MUSHROOM', 0.25, 0.29),
+            # GROUP TOTAL row at y=0.30 — just 0.01 below the last SUPC,
+            # well within _SYSCO_DESC_Y_TOL=0.012.
+            T('GROUP',   0.41, 0.30),
+            T('TOTAL',   0.45, 0.30),
+            T('****',    0.49, 0.30),
+            T('12.60',   0.85, 0.30),  # the GROUP TOTAL value
+        ]
+        items = extract_sysco_rank([{'tokens': tokens}])
+        # The bottom-most item (MUSHROOM, SUPC 3456789) is the most at risk
+        mushroom = next((it for it in items if it['sysco_item_code'] == '3456789'), None)
+        self.assertIsNotNone(mushroom, f'MUSHROOM row not extracted; items={items}')
+        desc = (mushroom.get('raw_description') or '').upper()
+        self.assertNotIn('GROUP', desc,
+            f"'GROUP' label token leaked into MUSHROOM desc: {desc!r}")
+        self.assertNotIn('TOTAL', desc,
+            f"'TOTAL' label token leaked into MUSHROOM desc: {desc!r}")
+        # And MUSHROOM's ext should be $4.00, not $12.60 (the GROUP TOTAL)
+        self.assertEqual(mushroom['extended_amount'], 4.0,
+            f'MUSHROOM ext should be $4.00; got {mushroom}')
+
+
 class RankPairSyscoNonItemFilterTests(TestCase):
     """Sysco rank-pair filters out rows whose extracted description matches
     known non-item patterns (delivery manifest, out-of-stock placeholder).

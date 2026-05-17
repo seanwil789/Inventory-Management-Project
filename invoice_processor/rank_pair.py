@@ -537,6 +537,19 @@ def _extract_sysco_rank_one_page(
             if not any(abs(_y_mid(t) - gy) < _GT_Y_TOL
                         for gy in group_label_ys)
         ]
+        # Same filter for desc_pool — GROUP/TOTAL label tokens (and any
+        # neighbors clustered on the same y) must not bleed into item
+        # description construction. Origin: 2026-05-17 reprocess_invoices
+        # attempt on Jan 2026 Sysco corpus produced descriptions like
+        # 'C 124 OZ CHOBANI YOGURT GROUP STRAWBERRY TOTAL GRE' for items
+        # whose SUPC y was within the desc-y-tolerance of a GROUP TOTAL
+        # label row. The polluted descriptions broke db_write's upsert
+        # dedup key, creating 50 duplicate rows across 4 invoices.
+        desc_pool = [
+            t for t in desc_pool
+            if not any(abs(_y_mid(t) - gy) < _GT_Y_TOL
+                        for gy in group_label_ys)
+        ]
 
     # Pool of digit-only tokens in the qty column (x < 0.17). Used to find
     # qty per row by competitive-y (same rank-pair principle as descriptions).
