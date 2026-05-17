@@ -916,6 +916,114 @@ def _extract_sysco_rank_one_page(
         validate_line_math(item, vendor='Sysco')
         rows.append(item)
 
+    # Substitute-pattern post-process (2026-05-17, parity with
+    # spatial_matcher.match_sysco_spatial). Detects Sysco's OUT/SUBSTITUTE
+    # row pair where the substitute desc+ext lives in a y-cluster with no
+    # SUPC anchor (SUPCs cluster above it with the OUT row's ext echo).
+    # Without this, the substitute row is dropped — the picker has no
+    # parity choice if rank-pair lacks substitute coverage.
+    sub_marker_tokens = [t for t in tokens
+                         if (t.get("text") or "").upper() == "SUBSTITUTE"]
+    if sub_marker_tokens:
+        try:
+            from spatial_matcher import _group_rows as _sm_group_rows
+            page_rows = _sm_group_rows(tokens)
+        except Exception:
+            page_rows = []
+        for marker in sub_marker_tokens:
+            marker_y = _y_mid(marker)
+            substitute_row = None
+            substitute_row_y = None
+            for row in page_rows:
+                row_ys = [_y_mid(t) for t in row]
+                if not row_ys:
+                    continue
+                row_top_y = min(row_ys)
+                if row_top_y >= marker_y or marker_y - row_top_y > 0.025:
+                    continue
+                has_supc = any(_SUPC_RE.fullmatch(t.get("text") or "")
+                               and cfg["supc_x"][0] <= _x_mid(t) <= cfg["supc_x"][1]
+                               for t in row)
+                if has_supc:
+                    continue
+                has_right_dec = any(
+                    _SYSCO_PRICE_RE.fullmatch(t.get("text") or "")
+                    and _x_mid(t) >= 0.65
+                    for t in row)
+                if not has_right_dec:
+                    continue
+                if substitute_row_y is None or row_top_y > substitute_row_y:
+                    substitute_row = row
+                    substitute_row_y = row_top_y
+            if substitute_row is None:
+                continue
+            sub_anchor = None
+            for row in page_rows:
+                row_ys = [_y_mid(t) for t in row]
+                if not row_ys:
+                    continue
+                row_top_y = min(row_ys)
+                if (row_top_y >= substitute_row_y
+                        or substitute_row_y - row_top_y > 0.025):
+                    continue
+                anchors = [t for t in row
+                           if _SUPC_RE.fullmatch(t.get("text") or "")
+                           and cfg["supc_x"][0] <= _x_mid(t) <= cfg["supc_x"][1]]
+                if anchors:
+                    sub_anchor = sorted(anchors, key=_x_mid)[-1]
+                    break
+            if sub_anchor is None:
+                continue
+            # Section: most-recent canonical section header at-or-above the anchor
+            sec_name = ""
+            try:
+                from spatial_matcher import (canonicalize_sysco_section,
+                                              _CANONICAL_SYSCO_SECTIONS as _CSS)
+                for sec_y, sec_label in sorted(sections, key=lambda s: s[0]):
+                    if sec_y <= _y_mid(sub_anchor):
+                        canon = canonicalize_sysco_section(sec_label)
+                        if canon in _CSS:
+                            sec_name = canon
+                    else:
+                        break
+            except Exception:
+                pass
+            if not sec_name and carry_section:
+                sec_name = carry_section
+            # Build the desc + ext from substitute_row tokens
+            desc_tokens = sorted(
+                [t for t in substitute_row
+                 if cfg["desc_x"][0] <= _x_mid(t) <= cfg["desc_x"][1]],
+                key=_x_mid)
+            desc = " ".join((t.get("text") or "").strip() for t in desc_tokens).strip()
+            ext_tokens = sorted(
+                [t for t in substitute_row
+                 if _SYSCO_PRICE_RE.fullmatch(t.get("text") or "")
+                 and _x_mid(t) >= 0.65],
+                key=_x_mid)
+            if not ext_tokens:
+                continue
+            try:
+                ext_f = float(
+                    (ext_tokens[-1].get("text") or "").lstrip("$").rstrip("*")
+                )
+            except (ValueError, AttributeError):
+                continue
+            sub_item = {
+                "raw_description":  desc or f"[Sysco #{sub_anchor['text']}]",
+                "sysco_item_code":  sub_anchor["text"],
+                "unit_price":       ext_f,
+                "extended_amount":  ext_f,
+                "case_size_raw":    "",
+                "section":          sec_name,
+                "quantity":         1,
+                "unit_of_measure":  "CASE",
+                "ambiguous":        False,
+                "is_substitute":    True,
+            }
+            validate_line_math(sub_item, vendor='Sysco')
+            rows.append(sub_item)
+
     # B2b: compute the LAST canonical section detected on this page so
     # the caller can carry it forward to the next page. If no canonical
     # sections detected here, the carry_section we received remains the

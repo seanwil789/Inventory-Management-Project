@@ -16371,6 +16371,93 @@ class RankPairSyscoSectionTaggingTests(TestCase):
             cache_page_order_key('PRODUCE items, LAST PAGE'), 99)
 
 
+class RankPairSyscoSubstituteTests(TestCase):
+    """Sysco substitution-pattern extraction in rank-pair (parity with the
+    spatial_matcher fix). Detects SUBSTITUTE marker rows whose substitute
+    desc+ext lives on the row above (no SUPC in same y-cluster) and pairs
+    them with SUPCs from the row above that.
+    """
+
+    def _tok(self, text, x, y, w=0.01, h=0.005):
+        return {'text': text,
+                'x_min': x - w / 2, 'x_max': x + w / 2,
+                'y_min': y - h / 2, 'y_max': y + h / 2}
+
+    def _reset(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        for m in ('rank_pair', 'spatial_matcher'):
+            if m in sys.modules:
+                del sys.modules[m]
+
+    def test_substitute_row_extracted_with_supc_from_row_above(self):
+        """Same pattern as the spatial_matcher test, exercised through rank-pair.
+        Layout-detect requires >=3 SUPCs in the qty/desc/price bands, so we
+        seed enough regular rows to anchor layout detection, then add the
+        substitute pattern below.
+        """
+        self._reset()
+        from rank_pair import extract_sysco_rank
+        T = self._tok
+        tokens = [
+            # PRODUCE section header
+            T('****',    0.30, 0.20),
+            T('PRODUCE', 0.40, 0.20),
+            T('****',    0.50, 0.20),
+            # 3 regular PRODUCE rows so layout-detect anchors
+            T('1234567', 0.55, 0.25),
+            T('5.50',    0.78, 0.25),
+            T('5.50',    0.60, 0.25),
+            T('APPLE',   0.20, 0.25),
+            T('2345678', 0.55, 0.27),
+            T('3.10',    0.78, 0.27),
+            T('3.10',    0.60, 0.27),
+            T('CARROT',  0.20, 0.27),
+            T('3456789', 0.55, 0.29),
+            T('4.00',    0.78, 0.29),
+            T('4.00',    0.60, 0.29),
+            T('MUSHROOM',0.20, 0.29),
+            # OUT/STOCK row at y=0.32
+            T('1',       0.10, 0.32),
+            T('OUT',     0.18, 0.32),
+            T('/',       0.21, 0.32),
+            T('STOCK',   0.23, 0.32),
+            T('30.45',   0.78, 0.32),
+            # SUPCs at y=0.34 between OUT and SUBSTITUTE
+            T('1008663', 0.47, 0.34),
+            T('1763440', 0.53, 0.34),
+            # SUBSTITUTE desc + ext at y=0.36 (no SUPC in this y-cluster)
+            T('1',       0.10, 0.36),
+            T('CS',      0.12, 0.36),
+            T('125',     0.15, 0.36),
+            T('LB',      0.17, 0.36),
+            T('IMPFRSH', 0.21, 0.36),
+            T('TOMATO',  0.27, 0.36),
+            T('BULK',    0.31, 0.36),
+            T('6X6',     0.34, 0.36),
+            T('288.23',  0.78, 0.36),
+            # SUBSTITUTE marker at y=0.38
+            T('SUBSTITUTE', 0.22, 0.38),
+        ]
+        items = extract_sysco_rank([{'tokens': tokens}])
+        substitute_items = [it for it in items
+                            if abs((it.get('extended_amount') or 0) - 288.23) < 0.01]
+        self.assertEqual(len(substitute_items), 1,
+            f'Substitute $288.23 should be extracted by rank-pair; got items={items}')
+        sub = substitute_items[0]
+        self.assertIn('TOMATO', (sub.get('raw_description') or '').upper(),
+            f'Substitute desc should contain TOMATO; got {sub.get("raw_description")!r}')
+        supc = sub.get('sysco_item_code') or ''
+        self.assertIn(supc, ('1008663', '1763440'),
+            f'Substitute SUPC from row above; got {supc!r}')
+        section = sub.get('section') or sub.get('section_hint') or ''
+        self.assertEqual(section, 'PRODUCE',
+            f'Substitute inherits PRODUCE section; got {section!r}')
+
+
 class RankPairSyscoNonItemFilterTests(TestCase):
     """Sysco rank-pair filters out rows whose extracted description matches
     known non-item patterns (delivery manifest, out-of-stock placeholder).
