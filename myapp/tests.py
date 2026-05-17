@@ -5721,6 +5721,77 @@ Total
         self.assertIn('5555555', codes)
         self.assertIn('6666666', codes)
 
+    def test_carry_section_across_pages(self):
+        """Multi-page Sysco invoices have sections that span page boundaries.
+        Section header appears once on the page where the section begins; on
+        the continuation page items appear with no header re-printed. The
+        matcher MUST carry the last section detected on page N forward to
+        page N+1's items above the first detected section header (if any).
+
+        Origin: INV 775632629 audit 2026-05-17. CANNED & DRY section had
+        its header at y=0.743 on page 1 with 1 item below it; section
+        continued onto page 2 with 24 items that lost section_hint
+        because match_sysco_spatial had no carry_section logic (rank_pair
+        already had this fix via carry_section param). Result on Pi:
+        section_reconciliation reported CANNED & DRY at $63.66 / 1 item
+        when the printed total spanned 25+ items. Silent section gap
+        because no printed_total comparison could surface the leak.
+        """
+        sm, _ = self._import()
+        T = self._tok
+
+        # Page 1: CANNED & DRY header at y=0.85 (near bottom), then 1 item
+        page1_tokens = []
+        # Top of page header info (not section-relevant)
+        page1_tokens += self._build_row(0.10, [("INVOICE", 0.50), ("HEADER", 0.55)])
+        # Section header for CANNED & DRY at y=0.85
+        page1_tokens += [T("****", 0.30, 0.85), T("CANNED", 0.36, 0.85),
+                         T("&", 0.42, 0.85), T("DRY", 0.44, 0.85),
+                         T("****", 0.50, 0.85)]
+        # One item below the header on page 1
+        page1_tokens += self._build_row(0.88, [
+            ("1", 0.13), ("CS", 0.15),
+            ("BEANS", 0.25), ("DRIED", 0.32),
+            ("1111111", 0.57), ("63.66", 0.64),
+        ])
+
+        # Page 2: NO section header — continuation items only
+        page2_tokens = []
+        page2_tokens += self._build_row(0.10, [("INVOICE", 0.50), ("HEADER", 0.55)])
+        # Two continuation items — should inherit CANNED & DRY from page 1
+        page2_tokens += self._build_row(0.20, [
+            ("1", 0.13), ("CS", 0.15),
+            ("CEREAL", 0.25), ("OATS", 0.32),
+            ("2222222", 0.57), ("25.00", 0.64),
+        ])
+        page2_tokens += self._build_row(0.25, [
+            ("1", 0.13), ("CS", 0.15),
+            ("FLOUR", 0.25), ("WHEAT", 0.32),
+            ("3333333", 0.57), ("18.50", 0.64),
+        ])
+
+        pages = [
+            {"page_number": 1, "tokens": page1_tokens},
+            {"page_number": 2, "tokens": page2_tokens},
+        ]
+        items = sm.match_sysco_spatial(pages)
+        by_code = {it["sysco_item_code"]: it for it in items}
+
+        self.assertIn("1111111", by_code,
+            "Page 1 item under CANNED & DRY header should be extracted")
+        self.assertIn("2222222", by_code,
+            "Page 2 continuation item (CEREAL) should be extracted")
+        self.assertIn("3333333", by_code,
+            "Page 2 continuation item (FLOUR) should be extracted")
+
+        # Section attribution — the heart of this test
+        for code in ("1111111", "2222222", "3333333"):
+            sec = (by_code[code].get("section_hint")
+                   or by_code[code].get("section") or "")
+            self.assertIn("CANNED", sec.upper(),
+                f"Item {code} should carry CANNED & DRY section from page 1's "
+                f"header; got section={sec!r}")
+
 
 class SpatialMatcherOtherVendorsTests(TestCase):
     """Per-vendor spatial matchers (PBM, Exceptional, Farm Art, Delaware).

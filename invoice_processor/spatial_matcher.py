@@ -472,9 +472,25 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
     downstream pipeline (mapper → db_write → synergy_sync) doesn't need
     to know which path produced it.
 
+    Section carry across pages (2026-05-17): when page N starts mid-section
+    (its first SUPC is above all section headers detected on page N — or
+    page N has NO headers at all), items at the top of page N inherit the
+    section from the END of page N-1. Without this, multi-page sections
+    silently lose their section_hint on continuation pages and surface as
+    orphan items in section_reconciliation (parser_sum > 0, printed_total
+    None). Mirrors rank_pair.extract_sysco_rank's carry_section logic.
+
+    Reference: INV 775632629 audit 2026-05-17. CANNED & DRY header at
+    y=0.743 on page 1 with 1 item below; section continued onto page 2
+    with 24 items, all losing section_hint. Net effect: ~$800 of CANNED
+    items mis-attributed to the unsectioned bucket on Pi, masquerading as
+    "section_reconciliation passes 8/8 sections" because the unsectioned
+    bucket had no printed_total to surface the gap.
+
     Returns empty list if pages have no tokens (caller should then fall
     back to the raw_text-based parser)."""
     items: list[dict] = []
+    carry_section: str = ""
     for page in pages or []:
         tokens = page.get("tokens") or []
         if not tokens:
@@ -490,6 +506,12 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
             # Multiple anchors on one row = rare OCR artifact; take first.
             anchor = anchors[0]
             sec = _section_for_y(_y_mid(anchor), sections)
+            # Cross-page carry: when no section header on THIS page sits
+            # above this row's y, fall back to carry_section from previous
+            # page's bottom. Critical for items at top of continuation
+            # pages where the originating section's header was on page N-1.
+            if not sec.strip() and carry_section:
+                sec = carry_section
             sec_clean = re.sub(r'[*\s]+', ' ', sec).strip()
             item = _extract_row_item(row, anchor, sec_clean)
             if item:
@@ -498,6 +520,16 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
                 # math_flagged on anomaly.
                 validate_line_math(item, vendor='Sysco')
                 items.append(item)
+        # Update carry_section to the LAST canonical section detected on
+        # this page (sorted by y, last-write-wins). Only canonical Sysco
+        # section labels carry forward — junk labels that survived
+        # _find_sections must not poison the carry. If no canonical
+        # sections detected on this page, carry_section is unchanged.
+        if sections:
+            for sec_y, sec_label in sorted(sections, key=lambda s: s[0]):
+                canon = canonicalize_sysco_section(sec_label)
+                if canon in _CANONICAL_SYSCO_SECTIONS:
+                    carry_section = canon
     return items
 
 
