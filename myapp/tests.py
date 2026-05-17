@@ -2656,6 +2656,142 @@ class InvoiceLineEditFlowTests(AuthedTestCase):
         self.assertIn('Verified', body)
 
 
+class InvoiceLineAddFlowTests(AuthedTestCase):
+    """L1 Phase 1.2 — ADD-line POST flow (Sean 2026-05-17).
+
+    Companion to InvoiceLineEditFlowTests. The ADD-line surface inserts
+    new ILI rows for items missing from parser output. Canonical case:
+    SHRIMP missing entirely from Sysco 775662001 — fixed via Pi shell on
+    5/14 before this UI existed.
+    """
+
+    def setUp(self):
+        super().setUp()
+        from myapp.models import InvoiceValidationStatus
+        from datetime import date
+        self.v = Vendor.objects.create(name='ILAddFlowVendor')
+        self.ivs = InvoiceValidationStatus.objects.create(
+            vendor=self.v, invoice_number='ILA-1',
+            invoice_date=date(2026, 4, 22),
+            items_count=0, items_sum=Decimal('0'),
+            invoice_total=Decimal('100'),
+            status='review',
+        )
+
+    def test_add_creates_ili_with_user_edited_and_invoice_metadata(self):
+        resp = self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'SHRIMP WHT P&D TLOF 21/25',
+             'quantity': '1', 'unit_price': '68.99',
+             'extended_amount': '68.99',
+             'case_size': '', 'section_hint': 'SEAFOOD',
+             'reason': 'manual_correction', 'note': 'parser missed entirely'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        ili = InvoiceLineItem.objects.get(
+            vendor=self.v, invoice_date=self.ivs.invoice_date,
+        )
+        self.assertEqual(ili.raw_description, 'SHRIMP WHT P&D TLOF 21/25')
+        self.assertEqual(ili.quantity, Decimal('1'))
+        self.assertEqual(ili.unit_price, Decimal('68.99'))
+        self.assertEqual(ili.extended_amount, Decimal('68.99'))
+        self.assertEqual(ili.section_hint, 'SEAFOOD')
+        self.assertTrue(ili.user_edited)
+        self.assertEqual(ili.source_file, 'manual')
+        self.assertEqual(ili.invoice_number, 'ILA-1')
+        self.assertEqual(ili.match_confidence, 'manual_review')
+
+    def test_add_creates_audit_row_with_empty_before(self):
+        from myapp.models import InvoiceLineEdit
+        self.assertEqual(InvoiceLineEdit.objects.count(), 0)
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'ADD-test', 'quantity': '2', 'unit_price': '5',
+             'reason': 'handwritten_addition', 'note': 'driver wrote on bottom'},
+        )
+        self.assertEqual(InvoiceLineEdit.objects.count(), 1)
+        edit = InvoiceLineEdit.objects.first()
+        self.assertEqual(edit.before, {})  # ADD has no prior state
+        self.assertEqual(edit.after['raw_description'], 'ADD-test')
+        self.assertEqual(edit.reason, 'handwritten_addition')
+        self.assertIn('driver wrote', edit.note)
+
+    def test_add_extended_defaults_to_qty_times_unit_when_blank(self):
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'AUTO-EXT', 'quantity': '3', 'unit_price': '5'},
+        )
+        ili = InvoiceLineItem.objects.get(raw_description='AUTO-EXT')
+        self.assertEqual(ili.extended_amount, Decimal('15.00'))
+
+    def test_add_explicit_extended_overrides_qty_times_unit(self):
+        """Catch-weight case: explicit ext represents real billed total
+        (weight × $/lb), not qty × unit_price. Must be preserved."""
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'CATCH-WT', 'quantity': '1',
+             'unit_price': '9.06', 'extended_amount': '105.08'},
+        )
+        ili = InvoiceLineItem.objects.get(raw_description='CATCH-WT')
+        self.assertEqual(ili.extended_amount, Decimal('105.08'))
+
+    def test_add_math_anomaly_sets_math_flagged(self):
+        """qty × unit ≠ ext outside tolerance → math_flagged=True."""
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'ANOMALY', 'quantity': '1', 'unit_price': '10',
+             'extended_amount': '200'},  # 1 × 10 = 10, ext = 200 → flagged
+        )
+        ili = InvoiceLineItem.objects.get(raw_description='ANOMALY')
+        self.assertTrue(ili.math_flagged)
+
+    def test_add_math_reconciles_no_flag(self):
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'CLEAN', 'quantity': '2', 'unit_price': '5',
+             'extended_amount': '10'},
+        )
+        ili = InvoiceLineItem.objects.get(raw_description='CLEAN')
+        self.assertFalse(ili.math_flagged)
+
+    def test_add_requires_raw_description(self):
+        resp = self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': '', 'quantity': '1', 'unit_price': '5'},
+        )
+        self.assertEqual(resp.status_code, 302)
+        self.assertFalse(
+            InvoiceLineItem.objects.filter(
+                vendor=self.v, invoice_date=self.ivs.invoice_date,
+            ).exists(),
+        )
+
+    def test_add_requires_quantity_and_unit_price(self):
+        # Missing quantity
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'X', 'unit_price': '5'},
+        )
+        self.assertFalse(InvoiceLineItem.objects.filter(vendor=self.v).exists())
+        # Missing unit_price
+        self.client.post(
+            reverse('invoice_line_add', args=[self.ivs.id]),
+            {'raw_description': 'X', 'quantity': '1'},
+        )
+        self.assertFalse(InvoiceLineItem.objects.filter(vendor=self.v).exists())
+
+    def test_add_GET_redirects_without_creating(self):
+        resp = self.client.get(reverse('invoice_line_add', args=[self.ivs.id]))
+        self.assertEqual(resp.status_code, 302)
+        self.assertFalse(InvoiceLineItem.objects.filter(vendor=self.v).exists())
+
+    def test_detail_page_renders_add_button(self):
+        resp = self.client.get(reverse('invoice_detail', args=[self.ivs.id]))
+        body = resp.content.decode()
+        self.assertIn('Add missing line', body)
+        self.assertIn(reverse('invoice_line_add', args=[self.ivs.id]), body)
+
+
 class MathAnomalyManagementCommandTests(TestCase):
     """B6 mgmt cmds: backfill_math_flagged retroactively flags + clears;
     audit_math_anomalies surfaces flagged rows."""

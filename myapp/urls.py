@@ -49,6 +49,7 @@ urlpatterns = [
     path('invoices/<int:ivs_id>/image/',    views.invoice_image,       name='invoice_image'),
     path('invoices/<int:ivs_id>/image/<int:hash_idx>/', views.invoice_image, name='invoice_image_indexed'),
     path('invoices/<int:ivs_id>/lines/<int:ili_id>/edit/', views.invoice_line_edit, name='invoice_line_edit'),
+    path('invoices/<int:ivs_id>/lines/add/',                views.invoice_line_add,  name='invoice_line_add'),
     path('invoices/<int:ivs_id>/verify/',   views.invoice_verify,      name='invoice_verify'),
     path('invoices/<int:ivs_id>/note/',     views.invoice_note,        name='invoice_note'),
     path('pipeline-health/',                views.pipeline_health,     name='pipeline_health'),

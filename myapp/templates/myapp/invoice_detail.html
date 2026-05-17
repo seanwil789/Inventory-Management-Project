@@ -422,9 +422,98 @@
           </tbody>
         </table>
       </div>
+      <!-- ADD-line trigger + collapsible form (L1 Phase 1.2 — Sean 2026-05-17) -->
+      <div class="border-t border-slate-200 bg-slate-50 px-4 py-3">
+        <button type="button"
+                onclick="document.getElementById('add-line-form').classList.toggle('hidden')"
+                class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded px-3 py-1">
+          + Add missing line
+        </button>
+        <span class="text-xs text-slate-500 ml-2">
+          For items missing from parser output OR hand-written additions on the paper invoice.
+        </span>
+      </div>
+      <div id="add-line-form" class="hidden bg-indigo-50 border-t border-indigo-100 px-4 py-4">
+        <form method="POST" action="{% url 'invoice_line_add' ivs.id %}" class="space-y-3">
+          {% csrf_token %}
+          <h3 class="text-sm font-semibold text-indigo-900">Add line item</h3>
+          <p class="text-xs text-slate-700">
+            Creates a new ILI with vendor + date + invoice# from this invoice.
+            Audit trail captures the addition with reason + note.
+          </p>
+          <label class="text-xs block">
+            <span class="block text-slate-700 font-medium">Raw description <span class="text-red-600">*</span></span>
+            <input type="text" name="raw_description" required
+                   placeholder="e.g. LEPORTCLS SHRIMP WHT P&amp;D TLOF 21/25"
+                   class="w-full border rounded px-2 py-1 text-sm">
+          </label>
+          <div class="grid grid-cols-2 sm:grid-cols-4 gap-2">
+            <label class="text-xs">
+              <span class="block text-slate-700 font-medium">Quantity <span class="text-red-600">*</span></span>
+              <input type="text" name="quantity" required
+                     class="w-full border rounded px-2 py-1 text-sm font-mono">
+            </label>
+            <label class="text-xs">
+              <span class="block text-slate-700 font-medium">Unit price <span class="text-red-600">*</span></span>
+              <input type="text" name="unit_price" required
+                     class="w-full border rounded px-2 py-1 text-sm font-mono">
+            </label>
+            <label class="text-xs">
+              <span class="block text-slate-700 font-medium">Extended</span>
+              <input type="text" name="extended_amount"
+                     placeholder="auto: qty × unit"
+                     class="w-full border rounded px-2 py-1 text-sm font-mono">
+            </label>
+            <label class="text-xs">
+              <span class="block text-slate-700 font-medium">Case size</span>
+              <input type="text" name="case_size"
+                     class="w-full border rounded px-2 py-1 text-sm font-mono">
+            </label>
+          </div>
+          <div class="grid grid-cols-1 sm:grid-cols-3 gap-2">
+            <label class="text-xs">
+              <span class="block text-slate-700 font-medium">Section</span>
+              <input type="text" name="section_hint"
+                     placeholder="e.g. SEAFOOD, DAIRY (optional)"
+                     class="w-full border rounded px-2 py-1 text-sm">
+            </label>
+            <label class="text-xs">
+              <span class="block text-slate-700 font-medium">Reason</span>
+              <select name="reason" class="w-full border rounded px-2 py-1 text-sm">
+                <option value="handwritten_addition" selected>Hand-written invoice / line addition</option>
+                <option value="manual_correction">Manual correction (parser missed it)</option>
+                <option value="damaged_transit">Damaged in transit (driver credit)</option>
+                <option value="short_ship">Short ship</option>
+                <option value="quality_issue">Quality issue / return</option>
+                <option value="pricing_correction">Pricing correction</option>
+                <option value="handwritten_credit">Hand-written credit</option>
+                <option value="portal_credit_match">Reconciled to vendor portal credit</option>
+                <option value="other">Other (see note)</option>
+              </select>
+            </label>
+            <label class="text-xs">
+              <span class="block text-slate-700 font-medium">Note</span>
+              <input type="text" name="note"
+                     placeholder="What and why (visible in audit history)"
+                     class="w-full border rounded px-2 py-1 text-sm">
+            </label>
+          </div>
+          <div class="flex items-center gap-2">
+            <button type="submit"
+                    class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded px-3 py-1">
+              Add line
+            </button>
+            <button type="button"
+                    onclick="document.getElementById('add-line-form').classList.add('hidden')"
+                    class="bg-slate-200 hover:bg-slate-300 text-slate-700 text-sm rounded px-3 py-1">
+              Cancel
+            </button>
+          </div>
+        </form>
+      </div>
+
       <div class="px-4 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-500">
-        Read-only. Edit-in-place + audit trail land in Phase 1.2.
-        Image fetch + side-by-side compare in 1.1b.
+        Per-line edits + ADD captured in <code class="bg-slate-100 px-1 rounded">InvoiceLineEdit</code> audit trail.
       </div>
     </div>
   </div>

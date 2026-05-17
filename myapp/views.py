@@ -2670,6 +2670,137 @@ def invoice_line_edit(request, ivs_id: int, ili_id: int):
     return redirect('invoice_detail', ivs_id=ivs_id)
 
 
+def invoice_line_add(request, ivs_id: int):
+    """L1 Phase 1.2: POST handler — ADD a new InvoiceLineItem to an invoice.
+
+    Companion to `invoice_line_edit`: that view updates existing parser-emitted
+    rows; this view inserts entirely-new rows for items missing from parser
+    output (the canonical use case: parser dropped a line OR Sean is recording
+    a handwritten addition the OCR pipeline never saw).
+
+    Mirrors invoice_line_edit's audit-trail semantics:
+      - New ILI is created with vendor + invoice_date + invoice_number copied
+        from the IVS, `user_edited=True` from creation, `source_file='manual'`
+      - InvoiceLineEdit audit row is written with `before={}` (no prior state —
+        this is an ADD, not an edit) and `after=` full field snapshot
+      - line_math.validate_line_math runs on the new row; math_flagged set
+        when qty × unit_price ≠ ext (per usual catch-weight-aware logic)
+
+    Form fields (all strings, parsed below):
+      raw_description (required) — what was on paper
+      quantity (required)
+      unit_price (required)
+      extended_amount (optional — defaults to qty × unit_price)
+      case_size (optional)
+      section_hint (optional — Sysco section name)
+      reason (categorical) — defaults via the form to 'handwritten_addition'
+      note (recommended — context for the audit trail)
+    """
+    from django.shortcuts import get_object_or_404, redirect
+    from django.contrib import messages
+    from decimal import Decimal, InvalidOperation
+    from myapp.models import InvoiceValidationStatus, InvoiceLineItem, InvoiceLineEdit
+    import sys
+    from django.conf import settings as _s
+    _ip = str(_s.BASE_DIR / 'invoice_processor')
+    if _ip not in sys.path:
+        sys.path.insert(0, _ip)
+    from line_math import validate_line_math
+
+    ivs = get_object_or_404(InvoiceValidationStatus, pk=ivs_id)
+
+    if request.method != 'POST':
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    def _to_decimal(raw):
+        s = (raw or '').strip()
+        if not s:
+            return None
+        try:
+            return Decimal(s)
+        except (InvalidOperation, ValueError):
+            return None
+
+    raw_description = (request.POST.get('raw_description') or '').strip()
+    quantity = _to_decimal(request.POST.get('quantity'))
+    unit_price = _to_decimal(request.POST.get('unit_price'))
+    extended_amount = _to_decimal(request.POST.get('extended_amount'))
+    case_size = (request.POST.get('case_size') or '').strip()
+    section_hint = (request.POST.get('section_hint') or '').strip()[:60]
+    reason = request.POST.get('reason') or 'handwritten_addition'
+    note = request.POST.get('note') or ''
+
+    if not raw_description:
+        messages.error(request, 'raw_description is required.')
+        return redirect('invoice_detail', ivs_id=ivs_id)
+    if quantity is None or unit_price is None:
+        messages.error(request, 'quantity and unit_price are required.')
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    # Default ext to qty × unit when not supplied
+    if extended_amount is None:
+        extended_amount = (quantity * unit_price).quantize(Decimal('0.01'))
+
+    # Build the new ILI. user_edited=True from creation marks this as
+    # Sean-authored vs parser-extracted. source_file='manual' keeps the
+    # row out of Phase 4b/4c dedup paths (those key on parser source_file
+    # patterns).
+    ili = InvoiceLineItem.objects.create(
+        vendor=ivs.vendor,
+        invoice_date=ivs.invoice_date,
+        invoice_number=ivs.invoice_number or '',
+        raw_description=raw_description,
+        quantity=quantity,
+        unit_price=unit_price,
+        extended_amount=extended_amount,
+        case_size=case_size,
+        section_hint=section_hint,
+        source_file='manual',
+        user_edited=True,
+        match_confidence='manual_review',  # Sean-authored → high trust tier
+    )
+
+    # Run line-math validation against the new row's values. Sets math_flagged
+    # only when qty × unit_price (or qty × ppp for catch-weight) ≠ ext outside
+    # the tolerance band. ADD-line rows that math-reconcile pass clean.
+    item_dict = {
+        'quantity': float(quantity),
+        'unit_price': float(unit_price),
+        'extended_amount': float(extended_amount),
+        'raw_description': raw_description,
+    }
+    validate_line_math(item_dict, vendor=(ivs.vendor.name if ivs.vendor else ''))
+    if item_dict.get('math_flagged'):
+        ili.math_flagged = True
+        ili.save(update_fields=['math_flagged'])
+
+    # Audit row — before={} marks this as an ADD (no prior state). after holds
+    # the full field snapshot in the same shape invoice_line_edit emits, so
+    # downstream replay/inspection treats both uniformly.
+    after = {
+        'quantity': str(ili.quantity),
+        'unit_price': str(ili.unit_price),
+        'extended_amount': str(ili.extended_amount),
+        'case_size': ili.case_size or '',
+        'raw_description': ili.raw_description or '',
+    }
+    InvoiceLineEdit.objects.create(
+        ili=ili,
+        edited_by=request.user if request.user.is_authenticated else None,
+        before={},
+        after=after,
+        reason=reason,
+        note=note,
+    )
+
+    if ili.math_flagged:
+        messages.warning(request, 'Line added — math anomaly flagged (qty × price ≠ ext).')
+    else:
+        messages.success(request, 'Line added.')
+
+    return redirect('invoice_detail', ivs_id=ivs_id)
+
+
 def invoice_verify(request, ivs_id: int):
     """L1 Phase 1.2: POST handler — toggle Sean-explicit verified state on
     an invoice. Distinct from auto-PASS; means "Sean reviewed + signed off."
