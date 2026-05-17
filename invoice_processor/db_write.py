@@ -561,7 +561,19 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 # vs 'DAIRY MILK 2 % , 4 / 1 - GAL' (Phase 4b behavior),
                 # but still preserves distinct SKUs that have different
                 # tokens or different SUPC codes embedded.
-                return ''.join((s or '').upper().split())
+                #
+                # Phase 4e (2026-05-17): also drop a leading single-letter
+                # qty-column marker (Sysco prints C/F/T/E/P/Ο at x<0.17).
+                # Older parser versions kept these in the raw_description
+                # ('E 115 LB SYS REL BACON ...'); the fixed parser drops
+                # them ('115 LB SYS REL BACON ...'). Without normalizing
+                # away the prefix here, reprocess can't match these
+                # legacy rows and creates duplicates.
+                parts = (s or '').upper().split()
+                if parts and len(parts[0]) == 1 and (
+                        parts[0].isalpha() or parts[0] == 'Ο'):
+                    parts = parts[1:]
+                return ''.join(parts)
 
             if incoming_fk is not None and invoice_number:
                 norm_incoming = _normalize_desc(raw_desc)
@@ -612,10 +624,26 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                     ).first()
             # Fallback 1: raw_description match (stable across mapping changes;
             # finds rows with no FK assigned yet — pre-Phase-4a era data).
+            # Use normalized comparison so legacy descs with leading single-
+            # letter qty-column markers (E/C/F/Ο) match the fixed parser's
+            # clean output. Origin: 2026-05-17 reprocess attempt — without
+            # this, every row whose legacy desc has a single-letter prefix
+            # creates a duplicate on reprocess.
+            #
+            # When multiple candidates match the normalized desc, defer to
+            # Fallback 2's collapse-on-match logic — leave `existing` None
+            # so Fallback 2 can pick the oldest and mark the rest for
+            # deletion. Single-match case sets `existing` here directly.
             if existing is None:
-                existing = InvoiceLineItem.objects.filter(
-                    vendor=vendor, raw_description=raw_desc, invoice_date=parsed_date
-                ).first()
+                norm_incoming = _normalize_desc(raw_desc)
+                cand_qs = InvoiceLineItem.objects.filter(
+                    vendor=vendor, invoice_date=parsed_date)
+                if invoice_number:
+                    cand_qs = cand_qs.filter(invoice_number=invoice_number)
+                matches = [c for c in cand_qs
+                           if _normalize_desc(c.raw_description) == norm_incoming]
+                if len(matches) == 1:
+                    existing = matches[0]
             # Fallback 2 (Phase 4c, Sean 2026-05-10): COLLAPSE-ON-MATCH.
             # Match on (vendor, product, date, unit_price, quantity). When
             # multiple existing rows match this key (signaling re-photo

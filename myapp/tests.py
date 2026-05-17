@@ -3920,6 +3920,53 @@ class DBWritePricePerPoundTests(TestCase):
         ili = InvoiceLineItem.objects.get(product=p)
         self.assertEqual(ili.price_per_pound, Decimal('11.2500'))
 
+    def test_upsert_matches_legacy_single_letter_prefix_desc(self):
+        """Phase 4e (2026-05-17): db_write's `_normalize_desc` must strip
+        a leading single-letter token so descriptions written by older
+        parser versions ('E 115 LB SYS REL BACON ...') match the fixed
+        parser's clean output ('115 LB SYS REL BACON ...') for upsert
+        dedup purposes. Without this, reprocess creates duplicate ILIs
+        on every cycle because the new desc differs from what's in the
+        DB by exactly the dropped prefix.
+        """
+        from decimal import Decimal
+        dbw = self._import_db_write()
+
+        p = Product.objects.create(canonical_name='Bacon Test')
+        # Seed a legacy row as if older parser had kept the 'E' prefix
+        from datetime import date
+        ili = InvoiceLineItem.objects.create(
+            vendor=Vendor.objects.get_or_create(name='Sysco')[0],
+            invoice_date=date(2026, 1, 20),
+            invoice_number='775632629',
+            raw_description='E 115 LB SYS REL BACON LAYFLAT 22/26 SMOKED 03460',
+            unit_price=Decimal('59.85'),
+            extended_amount=Decimal('59.85'),
+            quantity=Decimal('1'),
+            product=p,
+        )
+        legacy_id = ili.id
+
+        # Reprocess emits the same item with the fixed parser's clean desc
+        items = [{
+            'raw_description': '115 LB SYS REL BACON LAYFLAT 22/26 SMOKED 03460',
+            'canonical': p.canonical_name,
+            'unit_price': 59.85,
+            'sysco_item_code': '0003460',
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Sysco', '2026-01-20', items,
+                                source_file='test.jpg',
+                                invoice_number='775632629')
+
+        # No duplicate created — only one row, still the legacy ILI
+        all_rows = list(InvoiceLineItem.objects.filter(product=p))
+        self.assertEqual(len(all_rows), 1,
+            f'Expected upsert to match legacy row via normalized desc; '
+            f'got {len(all_rows)} rows: {[(r.id, r.raw_description) for r in all_rows]}')
+        self.assertEqual(all_rows[0].id, legacy_id,
+            'Existing legacy row should have been updated, not replaced')
+
     def test_upsert_preserves_user_edited_rows(self):
         """Trust LAW: reprocess_invoices must NOT overwrite user-edited ILIs.
 
