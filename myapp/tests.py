@@ -5857,6 +5857,91 @@ Total
                 f"header; got section={sec!r}")
 
 
+class SpatialMatcherMultiQtyTests(TestCase):
+    """spatial_matcher must detect qty > 1 from the left-column qty token
+    and validate against the ext-column total. Origin: INV 775632629 milk
+    row (2026-05-17) — '2' qty token at x=0.10, unit $30.45, ext $60.90.
+    Pre-fix spatial returned qty=1 ext=$30.45 while rank_pair correctly
+    returned qty=2 ext=$60.90. Picker chose rank_pair so the ILI was
+    correct on this invoice, but spatial would silently lose qty data on
+    any Sysco invoice where it wins the picker.
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import spatial_matcher as sm
+        return sm
+
+    def _tok(self, text, x, y, w=0.04, h=0.015):
+        return {"text": text,
+                "x_min": x, "x_max": x + w,
+                "y_min": y, "y_max": y + h,
+                "char_start": 0, "char_end": 0}
+
+    def _row(self, y, tokens_xt):
+        return [self._tok(text, x, y) for text, x in tokens_xt]
+
+    def test_milk_qty_two_extracted_from_ext_validation(self):
+        sm = self._import()
+        # Milk row mimicking INV 775632629 OCR layout
+        tokens = self._row(0.44, [
+            ("2", 0.10), ("CS", 0.12),
+            ("41", 0.16), ("GAL", 0.18),
+            ("WHLFCLS", 0.23), ("MILK", 0.28),
+            ("2", 0.30), ("%", 0.31),
+            ("GALLON", 0.34),
+            ("61194", 0.51),
+            ("4676280", 0.57),
+            ("30.45", 0.63),
+            ("60.90", 0.75),
+        ])
+        items = sm.match_sysco_spatial([{"page_number": 1, "tokens": tokens}])
+        by_code = {it["sysco_item_code"]: it for it in items}
+        self.assertIn("4676280", by_code)
+        item = by_code["4676280"]
+        self.assertEqual(item["quantity"], 2,
+            f"qty=2 expected from left-col token validated by ext math; got {item}")
+        self.assertEqual(item["extended_amount"], 60.90,
+            f"ext=$60.90 expected (2 × $30.45); got {item}")
+        self.assertEqual(item["unit_price"], 30.45)
+
+    def test_single_qty_unchanged_when_only_one_price_token(self):
+        sm = self._import()
+        tokens = self._row(0.50, [
+            ("1", 0.13), ("CS", 0.15),
+            ("110LB", 0.18), ("PROPACK", 0.25),
+            ("BANANA", 0.32),
+            ("1234567", 0.57),
+            ("13.95", 0.64),
+        ])
+        items = sm.match_sysco_spatial([{"page_number": 1, "tokens": tokens}])
+        by_code = {it["sysco_item_code"]: it for it in items}
+        item = by_code["1234567"]
+        self.assertEqual(item["quantity"], 1)
+        self.assertEqual(item["extended_amount"], 13.95)
+
+    def test_qty_rejected_when_math_does_not_match(self):
+        """If left-col integer × unit ≠ ext, leave qty=1. Guards against
+        OCR garbage like a stray '5' that happens to sit in the qty band
+        but bears no relation to the line math."""
+        sm = self._import()
+        tokens = self._row(0.50, [
+            ("9", 0.10), ("CS", 0.12),
+            ("DESC", 0.25),
+            ("1234567", 0.57),
+            ("30.00", 0.63),
+            ("60.00", 0.75),  # ext = 60, but 9 × 30 = 270 != 60
+        ])
+        items = sm.match_sysco_spatial([{"page_number": 1, "tokens": tokens}])
+        item = {it["sysco_item_code"]: it for it in items}["1234567"]
+        self.assertEqual(item["quantity"], 1,
+            f"qty=9 should be rejected — 9 × $30 != $60; got {item}")
+
+
 class SpatialMatcherOtherVendorsTests(TestCase):
     """Per-vendor spatial matchers (PBM, Exceptional, Farm Art, Delaware).
     Synthetic token-layout fixtures so tests don't depend on DocAI calls."""

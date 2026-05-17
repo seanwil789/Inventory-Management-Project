@@ -287,10 +287,12 @@ def _extract_row_item(row: list[dict], anchor: dict,
         desc_tokens.append(t)
     description = " ".join(t["text"] for t in desc_tokens).strip()
 
-    # Price tokens right of the anchor. First price = unit_price, any
-    # third-decimal token = price_per_lb (catch-weight).
+    # Price tokens right of the anchor. First 2-decimal = unit_price,
+    # second 2-decimal (at higher x) = ext_price; any third-decimal token
+    # = price_per_lb (catch-weight).
     right_tokens = [t for t in row if t["x_min"] > anchor["x_min"]]
     unit_price = None
+    ext_price = None
     price_per_unit = None
     for t in right_tokens:
         txt = t["text"].lstrip("$").rstrip("*")
@@ -300,15 +302,46 @@ def _extract_row_item(row: list[dict], anchor: dict,
             except ValueError:
                 continue
             if "." in txt and len(txt.split(".", 1)[1]) == 3:
-                # Three-decimal token — catch-weight per-lb price
                 if price_per_unit is None:
                     price_per_unit = val
                 continue
             if unit_price is None:
                 unit_price = val
+            elif ext_price is None:
+                ext_price = val
 
     if unit_price is None:
         return None
+
+    # Multi-case qty detection (2026-05-17): when the row has both a
+    # unit_price AND a distinct ext_price token, and a small integer
+    # token sits in the left qty column, validate qty × unit ≈ ext.
+    # Mirrors rank_pair.py's Step 3 left-column qty extraction.
+    # Reference: INV 775632629 milk row — '2' qty token at x=0.10,
+    # unit $30.45 at x=0.63, ext $60.90 at x=0.75. Pre-fix spatial set
+    # qty=1 ext=$30.45; rank_pair set qty=2 ext=$60.90 correctly.
+    quantity = 1
+    extended = unit_price
+    if (price_per_unit is None
+            and ext_price is not None
+            and abs(ext_price - unit_price) > 0.005):
+        for t in row:
+            tx = t["text"]
+            if t["x_min"] >= _PACK_X_MIN:
+                continue
+            if not re.fullmatch(r'\d{1,2}', tx):
+                continue
+            try:
+                cand = int(tx)
+            except ValueError:
+                continue
+            if cand < 2:
+                continue
+            expected = cand * unit_price
+            if expected > 0 and abs(ext_price - expected) / expected < 0.05:
+                quantity = cand
+                extended = ext_price
+                break
 
     # Pack size extraction. Parser.py's _extract_pack_size requires the
     # pack to be at the start of line (re.match anchor) which doesn't fit
@@ -418,11 +451,10 @@ def _extract_row_item(row: list[dict], anchor: dict,
         "raw_description":  description or f"[Sysco #{anchor['text']}]",
         "sysco_item_code":  anchor["text"],
         "unit_price":       unit_price,
-        "extended_amount":  unit_price,
+        "extended_amount":  extended,
         "case_size_raw":    case_size,
         "section":          section_name,
-        # Sysco lines are always 1 case per anchor — same convention as _parse_sysco
-        "quantity":         1,
+        "quantity":         quantity,
         "unit_of_measure":  "CASE",
     }
     if price_per_unit is not None:
