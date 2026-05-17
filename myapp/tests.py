@@ -14991,6 +14991,46 @@ class SectionValidatorTests(TestCase):
         self.assertEqual(by_sec['DAIRY']['printed_total'], 7.80)
         self.assertEqual(by_sec['DAIRY']['diff_abs'], 0.0)
 
+    def test_extract_group_totals_multirow_label_value_clusters(self):
+        """2026-05-17: when the GROUP+TOTAL label tokens and the right-column
+        decimal value land in DIFFERENT y-clusters (Sysco templates where the
+        value prints slightly below/above the label line), extract_group_totals
+        must still find the value via adjacent-y search.
+
+        Reference: INV 775632629 page 2 had GROUP+TOTAL+****+CFR at y=0.429
+        with the $135.29 value at y~0.432. Pre-fix, _group_rows clustered
+        them separately and the GROUP TOTAL row had no decimal in the right
+        column — all 3 page-2 GROUP TOTALs (CANNED & DRY $866.31, PAPER &
+        DISP $135.29, CHEMICAL & JANITORIAL $327.86) were missed.
+        """
+        sv = self._import()
+        T = self._tok
+        # GROUP+TOTAL label tokens at y=0.50, decimal value at y=0.505
+        # (0.005 apart — likely separate _group_rows clusters)
+        tokens = [
+            T('****',   0.30, 0.20),
+            T('PRODUCE',0.40, 0.20),
+            T('****',   0.50, 0.20),
+            T('5.50',   0.78, 0.30),
+            T('6.14',   0.78, 0.40),
+            # GROUP+TOTAL label row (no decimal in this y-cluster)
+            T('GROUP',  0.33, 0.500),
+            T('TOTAL',  0.38, 0.498),
+            T('****',   0.41, 0.498),
+            T('CFR',    0.92, 0.502),
+            # Right-column value on adjacent y-cluster
+            T('11.64',  0.78, 0.505),
+        ]
+        page = {'tokens': tokens}
+        gts = sv.extract_group_totals([page])
+        self.assertEqual(len(gts), 1,
+            f'Expected 1 GROUP TOTAL extracted via adjacent-y search, got {len(gts)}: {gts}')
+        y, val = gts[0]
+        self.assertEqual(val, 11.64,
+            f'Adjacent-y value should be 11.64, got {val}')
+        self.assertAlmostEqual(y, 0.50, places=2,
+            msg=f'GT y should be ≈0.50 (the GROUP label\'s y), got {y}')
+
     def test_reconcile_surfaces_section_diffs(self):
         sv = self._import()
         items = [

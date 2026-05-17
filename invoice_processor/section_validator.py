@@ -53,10 +53,20 @@ def _parse_decimal(text: str) -> float | None:
 def extract_group_totals(pages: list[dict]) -> list[tuple[float, float]]:
     """Find every GROUP TOTAL row and its printed value.
 
-    Returns [(y_mid, value), ...] in y-order. The y is the row's y-mid;
-    callers pair to sections by "most-recent section header above this y".
+    Returns [(y_mid, value), ...] in y-order. The y is the GROUP token's
+    y; callers pair to sections by "most-recent section header above this y".
     Empty list when no GROUP TOTAL rows are found (header-only pages,
     pages that don't have a section ending on them).
+
+    Multi-row tolerance (2026-05-17): when the GROUP+TOTAL label row has
+    no decimal in its right column, the actual value often lives on an
+    adjacent y-cluster within ±0.015 — `_group_rows` clusters labels
+    separately from the right-column decimal on some Sysco templates.
+    Reference: INV 775632629 page 2 had GROUP+TOTAL+****+CFR at y=0.429
+    with the $135.29 value at y~0.432 in a separate cluster. The
+    original "find decimal IN this row" check missed all 3 multi-row
+    GROUP TOTAL rows on this page, leaving CANNED & DRY/PAPER & DISP/
+    CHEMICAL & JANITORIAL un-paired with their printed totals.
     """
     try:
         from spatial_matcher import _group_rows
@@ -72,7 +82,13 @@ def extract_group_totals(pages: list[dict]) -> list[tuple[float, float]]:
             texts_upper = [t["text"].upper() for t in row]
             if "GROUP" not in texts_upper or "TOTAL" not in texts_upper:
                 continue
-            # Find the right-column decimal token in this row.
+            # Anchor on the GROUP token's y for stable across-row pairing.
+            group_t = next(
+                (t for t in row if (t.get("text") or "").upper() == "GROUP"),
+                row[0],
+            )
+            anchor_y = _y_mid(group_t)
+            # Step 1: in-row right-column decimal (the common case)
             value = None
             for t in row:
                 if _x_mid(t) >= _RIGHT_COL_X_MIN and _DECIMAL_RE.match(t["text"]):
@@ -80,10 +96,30 @@ def extract_group_totals(pages: list[dict]) -> list[tuple[float, float]]:
                     if v is not None:
                         value = v
                         break
+            # Step 2: if no in-row decimal, search ALL page tokens for a
+            # right-column decimal within ±0.015 y. Picks the closest-y
+            # candidate. Tolerance 0.015 is ~one row-height — enough to
+            # bridge the label-vs-value clustering gap without reaching
+            # into the next/prior real row.
+            if value is None:
+                best_dy = float("inf")
+                for t in tokens:
+                    tx = t.get("text") or ""
+                    if not _DECIMAL_RE.match(tx):
+                        continue
+                    if _x_mid(t) < _RIGHT_COL_X_MIN:
+                        continue
+                    dy = abs(_y_mid(t) - anchor_y)
+                    if dy > 0.015:
+                        continue
+                    if dy < best_dy:
+                        v = _parse_decimal(tx)
+                        if v is not None:
+                            value = v
+                            best_dy = dy
             if value is None:
                 continue
-            y = _y_mid(row[0])
-            out.append((y, value))
+            out.append((anchor_y, value))
     out.sort(key=lambda r: r[0])
     return out
 
