@@ -492,9 +492,17 @@ def _extract_sysco_rank_one_page(
         text = t.get("text") or ""
         if _SUPC_RE.fullmatch(text) or _SYSCO_PRICE_RE.fullmatch(text):
             continue
-        # Drop standalone qty/marker tokens in the qty column
+        # Drop standalone qty/marker tokens in the qty column.
+        # Sysco uses single-char container/marker tokens here: C=case,
+        # F=freight-bill, T=tare-weight, S=split, A=ALSO, D=delivered,
+        # E=each, P=pack, plus OCR mis-reads like Ο (Greek omicron) for D
+        # or O. Without dropping these, they leak into descriptions on
+        # reprocess and break db_write's (vendor, raw_desc, date) upsert
+        # dedup, creating duplicate ILIs. Origin: 2026-05-17.
         if x < _SYSCO_QTY_DROP_X_MAX:
-            if text in ("D", "S", "A", "CS", "EA", "LB", "T/WT=", "T/WT"):
+            if text in ("CS", "EA", "LB", "T/WT=", "T/WT"):
+                continue
+            if re.fullmatch(r'[A-ZΟ]', text):
                 continue
             if re.fullmatch(r'\d{1,2}', text):
                 continue
@@ -1012,10 +1020,28 @@ def _extract_sysco_rank_one_page(
             # TOTAL value clustered into the substitute desc row, which
             # pre-fix was emitted as the substitute ext (item over by
             # ~$258, inflating PRODUCE sum by 2× the printed total).
-            desc_tokens = sorted(
-                [t for t in substitute_row
-                 if cfg["desc_x"][0] <= _x_mid(t) <= cfg["desc_x"][1]],
-                key=_x_mid)
+            #
+            # Same qty-column marker filter as the main desc_pool — drop
+            # single-letter container markers (C/F/T/Ο etc.) and 1-2 digit
+            # qty integers so substitute desc matches main-extraction
+            # convention. Without this, reprocess produces a different
+            # substitute desc than a manual surgical insert and the upsert
+            # dedup creates duplicate substitute rows.
+            desc_tokens = []
+            for t in substitute_row:
+                x = _x_mid(t)
+                if not (cfg["desc_x"][0] <= x <= cfg["desc_x"][1]):
+                    continue
+                txt = (t.get("text") or "").strip()
+                if x < _SYSCO_QTY_DROP_X_MAX:
+                    if txt in ("CS", "EA", "LB", "T/WT=", "T/WT"):
+                        continue
+                    if re.fullmatch(r'[A-ZΟ]', txt):
+                        continue
+                    if re.fullmatch(r'\d{1,2}', txt):
+                        continue
+                desc_tokens.append(t)
+            desc_tokens.sort(key=_x_mid)
             desc = " ".join((t.get("text") or "").strip() for t in desc_tokens).strip()
             ext_tokens = sorted(
                 [t for t in sub_anchor_row

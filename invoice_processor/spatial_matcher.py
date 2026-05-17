@@ -279,8 +279,15 @@ def _extract_row_item(row: list[dict], anchor: dict,
         if _PRICE_RE.fullmatch(tx) or _SUPC_RE.fullmatch(tx):
             continue
         if t["x_min"] < _PACK_X_MIN:
-            # Qty column — drop marker/qty tokens so they don't pollute desc
+            # Qty column — drop marker/qty tokens so they don't pollute desc.
+            # Any single uppercase letter is a Sysco container marker
+            # (C=case, F=freight-bill, T=tare-weight, etc.) — including
+            # OCR mis-reads like Ο (Greek omicron) for D/O. Reprocess
+            # stability requires both extraction paths to drop the same
+            # token shapes (2026-05-17).
             if tx in _QTY_TOKENS:
+                continue
+            if re.fullmatch(r'[A-ZΟ]', tx):
                 continue
             if re.fullmatch(r'\d{1,2}', tx):
                 continue
