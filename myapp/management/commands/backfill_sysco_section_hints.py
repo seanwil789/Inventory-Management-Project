@@ -131,27 +131,37 @@ class Command(BaseCommand):
             # Run FIXED spatial_matcher
             fresh_items = match_sysco_spatial(pages)
 
-            # SUPC → section_hint map from fresh extraction
+            # Build join maps. Primary: raw_description -> section.
+            # The spatial_matcher's description-construction logic is unchanged
+            # by the section_hint fix, so fresh raw_desc should equal existing
+            # ILI's raw_desc for the same row. Secondary: sysco_item_code map
+            # for raw_desc-mismatch fallback.
+            desc_to_sec: dict = {}
             supc_to_sec: dict = {}
             for it in fresh_items:
-                supc = it.get('sysco_item_code')
                 sec = it.get('section_hint') or it.get('section') or ''
-                if supc and sec and supc not in supc_to_sec:
+                if not sec:
+                    continue
+                desc = (it.get('raw_description') or '').strip()
+                if desc and desc not in desc_to_sec:
+                    desc_to_sec[desc] = sec
+                supc = it.get('sysco_item_code')
+                if supc and supc not in supc_to_sec:
                     supc_to_sec[supc] = sec
 
-            # Match orphans to fresh extraction by SUPC
+            # Match orphans: raw_description first, then SUPC fallback
+            import re as _re
             updates = []
             no_match = []
             for ili in orphan_ilis:
-                supc = ili.sysco_item_code if hasattr(ili, 'sysco_item_code') else None
-                # Sysco SUPC isn't on the model directly — encoded in match data
-                # Fall back: extract from raw_description token (last numeric block)
-                if not supc:
-                    desc = ili.raw_description or ''
-                    import re as _re
-                    m = _re.search(r'\b(\d{6,8})\b', desc)
-                    supc = m.group(1) if m else None
-                new_sec = supc_to_sec.get(supc) if supc else None
+                desc = (ili.raw_description or '').strip()
+                new_sec = desc_to_sec.get(desc)
+                if not new_sec:
+                    # Try every digit-token in the desc as a candidate SUPC
+                    for tok in _re.findall(r'\d{4,13}', desc):
+                        if tok in supc_to_sec:
+                            new_sec = supc_to_sec[tok]
+                            break
                 if new_sec:
                     updates.append((ili, new_sec))
                 else:
