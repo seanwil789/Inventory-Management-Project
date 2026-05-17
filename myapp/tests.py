@@ -5721,6 +5721,70 @@ Total
         self.assertIn('5555555', codes)
         self.assertIn('6666666', codes)
 
+    def test_substitute_row_extracted_with_supc_from_row_above(self):
+        """Sysco substitution pattern: when an ordered item is out of stock
+        and Sysco ships a substitute, the printed layout is:
+
+          UTILITY desc           (original ordered item)
+          OUT marker + ext       (unfulfilled — Pattern C-2 filters)
+          SUPCs + OUT ext echo   (shared SUPCs, OUT's ext repeated)
+          SUBSTITUTE desc + ext  (the row that shipped — but no SUPC anchor)
+          SUBSTITUTE marker
+
+        Standard row-pairing drops the SUBSTITUTE row because it has no
+        SUPC in its y-cluster. This test exercises the post-process that
+        detects the SUBSTITUTE marker, locates the substitute desc+ext
+        row above it, and pairs it with SUPCs from the row above that.
+
+        Origin: INV 775632629 audit 2026-05-17. TOMATO BULK 6X6 FRESH
+        at $288.23 (the substitute that shipped) was dropped entirely;
+        only the OUT/STOCK row appeared as a junk extraction.
+        """
+        sm, _ = self._import()
+        T = self._tok
+        tokens = [
+            # Section header (so substitute gets a section tag via standard logic)
+            T('****',   0.30, 0.20),
+            T('PRODUCE',0.40, 0.20),
+            T('****',   0.50, 0.20),
+            # OUT/STOCK row at y=0.30 (qty + OUT + ext)
+            T('1',      0.10, 0.30),
+            T('OUT',    0.18, 0.30),
+            T('/',      0.21, 0.30),
+            T('STOCK',  0.23, 0.30),
+            T('30.45',  0.78, 0.30),
+            # SUPC row at y=0.32 — between OUT and SUBSTITUTE
+            T('1008663',0.47, 0.32),
+            T('1763440',0.53, 0.32),
+            # SUBSTITUTE desc+ext row at y=0.34
+            T('1',      0.10, 0.34),
+            T('CS',     0.12, 0.34),
+            T('125',    0.15, 0.34),
+            T('LB',     0.17, 0.34),
+            T('IMPFRSH',0.21, 0.34),
+            T('TOMATO', 0.27, 0.34),
+            T('BULK',   0.31, 0.34),
+            T('6X6',    0.34, 0.34),
+            T('288.23', 0.78, 0.34),
+            # SUBSTITUTE marker row at y=0.36
+            T('SUBSTITUTE', 0.22, 0.36),
+        ]
+        items = sm.match_sysco_spatial([{'page_number': 1, 'tokens': tokens}])
+        # Expected: the substitute row at $288.23 with SUPC from row above
+        substitute_items = [it for it in items
+                            if abs((it.get('extended_amount') or 0) - 288.23) < 0.01]
+        self.assertEqual(len(substitute_items), 1,
+            f'Substitute row at $288.23 should be extracted; got items={items}')
+        sub = substitute_items[0]
+        self.assertIn('TOMATO', (sub.get('raw_description') or '').upper(),
+            f'Substitute desc should contain TOMATO; got {sub.get("raw_description")!r}')
+        supc = sub.get('sysco_item_code') or ''
+        self.assertIn(supc, ('1008663', '1763440'),
+            f'Substitute SUPC should be one of the SUPCs from row above; got {supc!r}')
+        section = sub.get('section_hint') or sub.get('section') or ''
+        self.assertEqual(section, 'PRODUCE',
+            f'Substitute should inherit PRODUCE section; got {section!r}')
+
     def test_carry_section_across_pages(self):
         """Multi-page Sysco invoices have sections that span page boundaries.
         Section header appears once on the page where the section begins; on

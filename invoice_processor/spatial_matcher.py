@@ -497,6 +497,7 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
             continue
         rows = _group_rows(tokens)
         sections = _find_sections(rows)
+        anchored_supcs: set[str] = set()  # SUPCs already anchored by standard pass
         for row in rows:
             anchors = [t for t in row
                        if _SUPC_RE.fullmatch(t["text"])
@@ -520,6 +521,96 @@ def match_sysco_spatial(pages: list[dict]) -> list[dict]:
                 # math_flagged on anomaly.
                 validate_line_math(item, vendor='Sysco')
                 items.append(item)
+                anchored_supcs.add(anchor["text"])
+
+        # ── Substitute-pattern post-process (2026-05-17) ─────────────
+        # Sysco prints substitution layout:
+        #   UTILITY desc           (y=N)   ← original ordered, not shipped
+        #   OUT marker + ext       (y=N+1) ← unfulfilled; Pattern C-2 filters
+        #   SUPCs + OUT ext echo   (y=N+2) ← shared SUPCs; emits junk row
+        #                                    that Pattern C-2 also filters
+        #   SUBSTITUTE desc + ext  (y=N+3) ← row that shipped (no SUPC anchor)
+        #   SUBSTITUTE marker      (y=N+4)
+        # Standard row-pairing drops y=N+3 because no SUPC is in its
+        # y-cluster. This post-process detects the SUBSTITUTE marker,
+        # locates the desc+ext row above it, and pairs it with SUPCs
+        # from the row above that.
+        #
+        # Origin: INV 775632629 page 4 — TOMATO BULK 6X6 FRESH at $288.23
+        # was dropped entirely; only the OUT/STOCK junk row emitted (and
+        # filtered). Same pattern on 7 invoices identified via corpus
+        # scan of SUBSTITUTE tokens.
+        sub_marker_tokens = [t for t in tokens
+                             if (t.get("text") or "").upper() == "SUBSTITUTE"]
+        for marker in sub_marker_tokens:
+            marker_y = _y_mid(marker)
+            # 1. Find the substitute row: closest row ABOVE the marker
+            #    with right-column decimal but NO SUPC in SUPC-x-band.
+            substitute_row = None
+            substitute_row_y = None
+            for row in rows:
+                row_ys = [_y_mid(t) for t in row]
+                if not row_ys:
+                    continue
+                row_top_y = min(row_ys)
+                if row_top_y >= marker_y or marker_y - row_top_y > 0.025:
+                    continue
+                has_supc_anchor = any(
+                    _SUPC_RE.fullmatch(t["text"])
+                    and _SUPC_X_MIN <= t["x_min"] <= _SUPC_X_MAX
+                    for t in row)
+                if has_supc_anchor:
+                    continue
+                # 2-decimal token in the ext column (x_mid >= 0.65) —
+                # broader than the totals-page _RIGHT_COL_X_MIN of 0.70
+                # because item ext column on Sysco invoices sits ~x=0.68.
+                has_right_decimal = any(
+                    re.match(r"^\$?\d+\.\d{2}\*?$", t["text"])
+                    and (t["x_min"] + t["x_max"]) / 2 >= 0.65
+                    for t in row)
+                if not has_right_decimal:
+                    continue
+                # Closest-above wins
+                if substitute_row_y is None or row_top_y > substitute_row_y:
+                    substitute_row = row
+                    substitute_row_y = row_top_y
+            if substitute_row is None:
+                continue
+            # 2. Find SUPCs in row ABOVE substitute row (within 0.025 y)
+            sub_anchor = None
+            for row in rows:
+                row_ys = [_y_mid(t) for t in row]
+                if not row_ys:
+                    continue
+                row_top_y = min(row_ys)
+                if (row_top_y >= substitute_row_y
+                        or substitute_row_y - row_top_y > 0.025):
+                    continue
+                anchor_candidates = [t for t in row
+                                     if _SUPC_RE.fullmatch(t["text"])
+                                     and _SUPC_X_MIN <= t["x_min"] <= _SUPC_X_MAX]
+                if anchor_candidates:
+                    # Prefer rightmost SUPC (second one, often the substitute's SKU)
+                    # when multiple SUPCs share the row.
+                    sub_anchor = sorted(
+                        anchor_candidates,
+                        key=lambda t: (t["x_min"] + t["x_max"]) / 2,
+                    )[-1]
+                    break
+            if sub_anchor is None:
+                continue
+            # 3. Determine section via standard logic + carry
+            sec = _section_for_y(_y_mid(sub_anchor), sections)
+            if not sec.strip() and carry_section:
+                sec = carry_section
+            sec_clean = re.sub(r"[*\s]+", " ", sec).strip()
+            # 4. Extract the substitute item using the existing helper
+            sub_item = _extract_row_item(substitute_row, sub_anchor, sec_clean)
+            if sub_item:
+                sub_item["is_substitute"] = True
+                validate_line_math(sub_item, vendor="Sysco")
+                items.append(sub_item)
+                anchored_supcs.add(sub_anchor["text"])
         # Update carry_section to the LAST canonical section detected on
         # this page (sorted by y, last-write-wins). Only canonical Sysco
         # section labels carry forward — junk labels that survived
