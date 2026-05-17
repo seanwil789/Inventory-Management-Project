@@ -659,23 +659,32 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         target_ili = None
         if parsed_date:
             if existing:
-                # Fields where a non-None historical value beats a None incoming
-                # value — backfill or prior write may have populated these from
-                # richer sources than the current parser pass produces.
-                preserve_if_none_fields = {
-                    'price_per_pound',
-                    'quantity', 'purchase_uom',
-                    'case_pack_count', 'case_pack_unit_size',
-                    'case_pack_unit_uom', 'case_total_weight_lb',
-                    'count_per_lb_low', 'count_per_lb_high',
-                }
-                for field, value in common_fields.items():
-                    if (field in preserve_if_none_fields
-                            and (value is None or value == '')
-                            and getattr(existing, field, None) not in (None, '')):
-                        continue
-                    setattr(existing, field, value)
-                existing.save()
+                # Trust LAW: user-edited rows are ground truth. Reprocess
+                # must not overwrite them — Sean's paper-truth audit edits
+                # (InvoiceLineEdit trail) represent direct human-verified
+                # values that outrank any parser output. Skip the field
+                # overwrite entirely; the row is what it is. Duplicate
+                # cleanup below still runs (orphan dedup is structural,
+                # not value-mutating).
+                if not getattr(existing, 'user_edited', False):
+                    # Fields where a non-None historical value beats a None
+                    # incoming value — backfill or prior write may have
+                    # populated these from richer sources than the current
+                    # parser pass produces.
+                    preserve_if_none_fields = {
+                        'price_per_pound',
+                        'quantity', 'purchase_uom',
+                        'case_pack_count', 'case_pack_unit_size',
+                        'case_pack_unit_uom', 'case_total_weight_lb',
+                        'count_per_lb_low', 'count_per_lb_high',
+                    }
+                    for field, value in common_fields.items():
+                        if (field in preserve_if_none_fields
+                                and (value is None or value == '')
+                                and getattr(existing, field, None) not in (None, '')):
+                            continue
+                        setattr(existing, field, value)
+                    existing.save()
                 target_ili = existing
                 # Phase 4c (Sean 2026-05-10): collapse-on-match.
                 # When Fallback 2 found additional rows matching the loose

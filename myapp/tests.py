@@ -3920,6 +3920,64 @@ class DBWritePricePerPoundTests(TestCase):
         ili = InvoiceLineItem.objects.get(product=p)
         self.assertEqual(ili.price_per_pound, Decimal('11.2500'))
 
+    def test_upsert_preserves_user_edited_rows(self):
+        """Trust LAW: reprocess_invoices must NOT overwrite user-edited ILIs.
+
+        When Sean audits an invoice via the paper-truth UI (B6/B7 trust
+        gate), the resulting InvoiceLineEdit + user_edited=True flag marks
+        that row as human-verified ground truth. A subsequent reprocess
+        cycle re-parses the OCR cache and would normally overwrite all
+        fields with the fresh parser output. That destroys audit data.
+
+        Fix: db_write skips the field-overwrite block when existing
+        ILI has user_edited=True.
+
+        Origin: 2026-05-17. INV 775632629 had 4 audit edits when the
+        parser was fixed to extract a previously-missed substitute.
+        Reprocessing to materialize the new ILI would have erased
+        Sean's audit edits on the other 4 rows.
+        """
+        from decimal import Decimal
+        dbw = self._import_db_write()
+
+        p = Product.objects.create(canonical_name='Salmon Test')
+        # v1: initial parser output writes the row at $159.85
+        items_v1 = [{
+            'raw_description': 'Salmon',
+            'canonical': p.canonical_name,
+            'unit_price': 159.85,
+            'case_size_raw': '25LB',
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Sysco', '2026-01-13', items_v1,
+                                 source_file='test.jpg')
+        ili = InvoiceLineItem.objects.get(product=p)
+        # Sean manually corrects this row via the audit UI
+        ili.unit_price = Decimal('165.00')
+        ili.extended_amount = Decimal('165.00')
+        ili.user_edited = True
+        ili.save()
+
+        # v2: reprocess cycle re-parses, sees $159.85 again
+        items_v2 = [{
+            'raw_description': 'Salmon',
+            'canonical': p.canonical_name,
+            'unit_price': 159.85,
+            'case_size_raw': '25LB',
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Sysco', '2026-01-13', items_v2,
+                                 source_file='test.jpg')
+
+        # Sean's audit edit MUST survive — the row is still at $165.00
+        ili.refresh_from_db()
+        self.assertEqual(ili.unit_price, Decimal('165.0000'),
+            f'user_edited row was overwritten by reprocess; got unit_price={ili.unit_price}')
+        self.assertEqual(ili.extended_amount, Decimal('165.0000'),
+            f'extended_amount was overwritten; got {ili.extended_amount}')
+        self.assertTrue(ili.user_edited,
+            'user_edited flag should stay True')
+
 
 class DbWriteSectionHintNormalizationTests(TestCase):
     """B-CorruptSection guard (2026-05-11): db_write._normalize_section_hint
