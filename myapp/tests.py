@@ -16360,10 +16360,20 @@ class RankPairSyscoNonItemFilterTests(TestCase):
             self.assertNotIn('SEAFOOD', d.upper(),
                 f'Section-header row should be filtered: {d!r}')
 
-    def test_real_items_with_OUT_substring_not_filtered(self):
-        """A real product whose description coincidentally starts with
-        'OUT' (e.g., 'OUTDOOR' or 'OUT' as item-prefix) is NOT filtered.
-        The filter only matches 'OUT / STOCK' or 'OUT STOCK' patterns.
+    def test_out_inline_qty_row_filtered(self):
+        """Pattern C-2 extension: Sysco out-of-stock rows print 'OUT' as
+        a leftmost marker token followed by qty/size tokens and the product
+        description, all on the same y-row. Description rebuilt by
+        extraction is 'OUT 21 KG SEAWEED DRIED DASHI ...' — qty+size
+        prefix is the distinguishing signature.
+
+        Origin: 2026-05-17 corpus scan found 6 such rows on 3 Sysco
+        invoices ($263.38 of phantom inventory): INV 775632629 had
+        $71.95 pectin, $41.45 chili ancho, $96.99 seaweed; INV 775872298
+        had $52.99 Uncrustable; INV 775662001 had 2 already-zeroed.
+        The pre-2026-05-17 filter (OUT/STOCK regex requiring 'STOCK'
+        keyword) didn't catch these; the printed invoices show OUT
+        marker WITHOUT a STOCK keyword next to it.
         """
         self._reset_modules()
         from rank_pair import extract_sysco_rank
@@ -16372,20 +16382,49 @@ class RankPairSyscoNonItemFilterTests(TestCase):
             T('****',    0.30, 0.20),
             T('PRODUCE', 0.40, 0.20),
             T('****',    0.50, 0.20),
-            # Real item with 'OUT' as a description token (common Sysco
-            # marker for "out-of-stock substitute" items, but the SUPC
-            # itself is real and should be billed).
+            # Real item
             T('1234567', 0.55, 0.25),
             T('5.50',    0.78, 0.25),
-            T('OUT',     0.10, 0.25),  # marker
-            T('21',      0.13, 0.25),
-            T('KG',      0.16, 0.25),
-            T('SEAWEED', 0.20, 0.25),
-            T('DRIED',   0.24, 0.25),
+            T('APPLE',   0.20, 0.25),
+            # OUT-inline row (the bug shape). 'OUT' is the leftmost
+            # description-column token; '21 KG' is the size info inside the
+            # description column (NOT the qty column at x<0.17). Real
+            # corpus rows look like 'OUT 21 KG WA IMP SEAWEED DRIED...'.
+            T('9999999', 0.55, 0.30),
+            T('96.99',   0.78, 0.30),
+            T('OUT',     0.18, 0.30),
+            T('21',      0.21, 0.30),
+            T('KG',      0.24, 0.30),
+            T('SEAWEED', 0.28, 0.30),
+            T('DRIED',   0.32, 0.30),
         ]
         rows = extract_sysco_rank([{'tokens': tokens}])
+        descs = [r.get('raw_description') or '' for r in rows]
         self.assertEqual(len(rows), 1,
-            f'Real item starting with OUT should be kept: {[r.get("raw_description") for r in rows]}')
+            f'Expected 1 real item (APPLE), got {len(rows)}: {descs}')
+        for d in descs:
+            self.assertFalse(d.upper().startswith('OUT '),
+                f'OUT-inline-qty row should have been filtered: {d!r}')
+
+    def test_real_items_with_OUT_word_prefix_not_filtered(self):
+        """A real product whose description coincidentally STARTS with
+        'OUT' followed by alphabetic text (e.g., 'OUTBACK STEAKHOUSE
+        BURGER') is NOT filtered. The pattern only fires when 'OUT' is
+        followed by a digit/size token — that's the out-of-stock-marker
+        signature. Alphabetic continuations are real product names.
+        """
+        self._reset_modules()
+        from rank_pair import _is_non_item_row
+        # These are hypothetical real product descriptions starting with
+        # OUT-word. The corpus has zero of these as of 2026-05-17 but
+        # the filter must remain narrow enough to allow them.
+        for desc in (
+            'OUTBACK STEAKHOUSE BURGER 4OZ',
+            'OUTDOOR GRILL CHIPS',
+            'OUTRAGEOUS COOKIE 24CT',
+        ):
+            self.assertFalse(_is_non_item_row({'raw_description': desc}),
+                f'Real OUT-word product should NOT be filtered: {desc!r}')
 
 
 class PBMMathPairsStrategyTests(TestCase):

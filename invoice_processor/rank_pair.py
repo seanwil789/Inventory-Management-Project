@@ -53,6 +53,15 @@ _PRICE_RE = re.compile(r"^\$?\d+\.\d{2,4}\*?$")
 _NON_ITEM_DESC_PATTERNS = [
     re.compile(r"\bMANIFEST\b", re.IGNORECASE),
     re.compile(r"^\s*OUT\s*[/\s]\s*STOCK\b", re.IGNORECASE),
+    # Pattern C-2 extension (2026-05-17): Sysco out-of-stock rows print
+    # 'OUT' as a leftmost marker followed by qty/size tokens (digit-prefixed)
+    # and the product description. The pre-extension regex above required
+    # 'STOCK' as a follow-up keyword, which Sysco's printed invoices don't
+    # carry — the OUT marker stands alone. Corpus scan found 6 phantom rows
+    # ($263.38) across INV 775632629, 775662001, 775872298 missed by the
+    # original regex. Restricted to digit-or-pound prefix to avoid matching
+    # legitimate OUT-word products (OUTBACK, OUTDOOR, etc.).
+    re.compile(r"^\s*OUT\s+[\d#]", re.IGNORECASE),
     re.compile(r"^\s*REMOTE[-\s]?STOCK\b", re.IGNORECASE),
     re.compile(r"^\s*\*+\s*[A-Z][A-Z &]*\s*\*+\s*$", re.IGNORECASE),
 ]
