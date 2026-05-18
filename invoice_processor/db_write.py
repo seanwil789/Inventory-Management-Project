@@ -586,6 +586,42 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                         existing = cand_list[0]
                         duplicates_to_merge = cand_list[1:]
 
+            # PHASE 4f-USER-EDIT (Sean 2026-05-18): when Phase 4f SUPC
+            # dedup didn't match, check for a user_edited row with same
+            # (invoice_number, unit_price, extended_amount). User audit
+            # edits often have empty or wrong vendor_item_code (Sean
+            # corrected the desc/price manually without setting the
+            # SUPC field, or backfill assigned a UPC fragment that's
+            # not what the current parser emits). The parser then
+            # re-emits the same item with its proper SUPC — Phase 4f
+            # sees the different SUPCs as different items → creates a
+            # duplicate alongside the user_edited row.
+            #
+            # Trust LAW: the user_edited row is authoritative. Match to
+            # it; the existing.user_edited skip in the field-overwrite
+            # block (commit ec41af4) preserves its values. Net effect:
+            # one row remains (the user_edited one), no duplicate
+            # created, audit edit survives.
+            #
+            # Origin: INV 775662001 — Sean's user_edited Rice Arborio
+            # (no SUPC) coexisted with the parser's new Rice Arborio
+            # (SUPC 2145985). Phase 4f saw different SUPCs → kept
+            # both. 4 similar duplicates accumulated, contributing
+            # $157.71 (18.06%) gap.
+            if existing is None and invoice_number:
+                up = common_fields.get('unit_price')
+                ext = common_fields.get('extended_amount')
+                if up is not None and ext is not None:
+                    ue_matches = list(InvoiceLineItem.objects.filter(
+                        vendor=vendor,
+                        invoice_number=invoice_number,
+                        user_edited=True,
+                        unit_price=up,
+                        extended_amount=ext,
+                    ).order_by('id'))
+                    if ue_matches:
+                        existing = ue_matches[0]
+
             # PRIMARY KEY (Phase 4c, Sean 2026-05-10; Phase 4d 2026-05-12):
             #   (vendor, canonical_FK, invoice_number, invoice_date,
             #    normalized_raw_description)

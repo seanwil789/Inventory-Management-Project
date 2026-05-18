@@ -4015,6 +4015,62 @@ class DBWritePricePerPoundTests(TestCase):
         self.assertEqual(all_rows[0].id, legacy_id,
             'Existing legacy row should have been updated, not replaced')
 
+    def test_upsert_matches_user_edited_row_when_supc_differs(self):
+        """Phase 4f-user-edit (2026-05-18): when a user_edited row exists
+        with the same (invoice_number, unit_price, extended_amount), a
+        new write should match TO that user_edited row even when SUPCs
+        differ. Trust LAW: user edits are authoritative; never accumulate
+        duplicates alongside them.
+
+        Origin: INV 775662001 — Sean's user_edited Rice Arborio (empty
+        SUPC) coexisted with parser's new Rice Arborio (SUPC 2145985).
+        Phase 4f's SUPC mismatch let both rows persist, accumulating
+        \$157.71 (18.06%) gap across 4 similar duplicates.
+        """
+        from decimal import Decimal
+        from datetime import date
+        dbw = self._import_db_write()
+
+        v = Vendor.objects.get_or_create(name='Sysco')[0]
+        # Sean's audit row — no SUPC, custom desc
+        audited = InvoiceLineItem.objects.create(
+            vendor=v,
+            invoice_date=date(2026, 2, 3),
+            invoice_number='775662001',
+            vendor_item_code='',  # Sean didn't set a SUPC
+            raw_description='2S ONLY1KG RICE ARBORIO (Sean corrected)',
+            unit_price=Decimal('15.98'),
+            extended_amount=Decimal('15.98'),
+            quantity=Decimal('1'),
+            user_edited=True,
+        )
+
+        # Parser re-emits the same item with its proper SUPC + different desc
+        items = [{
+            'raw_description': '2S ONLY1KG AREZIMP RICE ARBORIO ITAL SUPERFI',
+            'sysco_item_code': '2145985',
+            'unit_price': 15.98,
+            'extended_amount': 15.98,
+            'quantity': 1,
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Sysco', '2026-02-03', items,
+                                source_file='test.jpg',
+                                invoice_number='775662001')
+
+        rows = InvoiceLineItem.objects.filter(invoice_number='775662001')
+        self.assertEqual(rows.count(), 1,
+            f'Phase 4f-user-edit should match TO the user_edited row; '
+            f'got {rows.count()} rows: {[(r.id, r.raw_description) for r in rows]}')
+        self.assertEqual(rows.first().id, audited.id,
+            'The user_edited row should be the survivor, not a new row.')
+        # Field overwrite skipped per ec41af4 — Sean's desc + values preserved
+        rows[0].refresh_from_db()
+        self.assertEqual(rows[0].raw_description,
+            '2S ONLY1KG RICE ARBORIO (Sean corrected)',
+            'user_edited desc preserved')
+        self.assertTrue(rows[0].user_edited)
+
     def test_upsert_preserves_user_edited_rows(self):
         """Trust LAW: reprocess_invoices must NOT overwrite user-edited ILIs.
 
