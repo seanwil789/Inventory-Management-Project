@@ -804,20 +804,44 @@ def _extract_sysco_rank_one_page(
                         # else: catch-weight — leave ext_f at default unit_f
                         # so B-Salmon below derives correct T/WT = ext/ppp.
 
-        # Description tokens for this row: left-of-SUPC tokens whose y is
-        # closer to THIS supc's y than to any other supc's y.
+        # Description tokens for this row (2026-05-17 rewrite):
+        #
+        # Two-part filter:
+        #   (1) Directional gate — desc token y must be AT or BELOW the
+        #       SUPC y (within a small tolerance for OCR baseline jitter).
+        #       Sysco prints each row's SUPC at the row's TOP-RIGHT, with
+        #       the description tokens at the same y or BELOW. Column
+        #       headers and page-header tokens at the top of each page
+        #       sit ABOVE the first SUPC. Pre-fix they won the
+        #       competitive-y assignment for the first SUPC and bled into
+        #       its description (INV 775632629 page 4: SUPC 1048230 got
+        #       desc '207 QTY PACK SIZE FRESH' from the column headers).
+        #
+        #   (2) Widened y-tolerance — _SYSCO_DESC_Y_TOL=0.012 is too
+        #       tight for the Sysco template, which routinely puts real
+        #       desc tokens 0.011-0.015 below the SUPC. The qty-extraction
+        #       path already uses 1.5x (=0.018) for the same reason
+        #       (line 676, 718). Apply 1.5x here too — the directional
+        #       gate makes this safe (no risk of pulling in column
+        #       headers above the SUPC).
+        #
+        # Reference: SUPC 1048230 on INV 775632629 had real desc
+        # 'PEPPER JALAPENO FRESH' at y=0.241 (dy=0.013 from SUPC y=0.228).
+        # Pre-widening: excluded because dy>0.012. Post-widening: included.
+        _DIR_EPSILON = 0.005
+        _DESC_DY = _SYSCO_DESC_Y_TOL * 1.5
         desc_toks = []
         for t in desc_pool:
             y_t = _y_mid(t)
-            # Distance to this supc rank
+            if y_t < y_supc - _DIR_EPSILON:
+                continue
             dy_self = abs(y_t - y_supc)
-            # Distance to nearest other supc rank
             min_other = min(
                 (abs(y_t - _y_mid(other_supc))
                  for j, other_supc in enumerate(supcs) if j != k),
                 default=float("inf"),
             )
-            if dy_self <= min_other and dy_self < _SYSCO_DESC_Y_TOL:
+            if dy_self <= min_other and dy_self < _DESC_DY:
                 desc_toks.append(t)
 
         desc = " ".join(t["text"] for t in sorted(desc_toks, key=_x_mid))

@@ -491,6 +491,15 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             except Exception:
                 pass
 
+        # Phase 4f (2026-05-17): vendor_item_code (Sysco SUPC, Farm Art
+        # code, etc.) becomes a first-class persisted field. Captured at
+        # parse time from the item dict; used by the primary dedup key
+        # below so reprocess upserts existing rows reliably even when
+        # raw_description has drifted across parser versions.
+        vendor_item_code = (item.get('sysco_item_code')
+                            or item.get('vendor_item_code')
+                            or item.get('item_code')
+                            or '')
         common_fields = dict(
             unit_price=unit_price,
             extended_amount=extended,
@@ -500,6 +509,7 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             invoice_number=invoice_number,
             product=product,
             raw_description=raw_desc,
+            vendor_item_code=vendor_item_code,
             match_confidence=confidence,
             match_score=match_score,
             price_flagged=price_flagged,
@@ -537,6 +547,38 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         existing = None
         duplicates_to_merge: list = []
         if parsed_date:
+            # PHASE 4f PRIMARY KEY (Sean 2026-05-17):
+            #   (vendor, invoice_number, vendor_item_code, invoice_date)
+            # The vendor_item_code (Sysco SUPC, etc.) is stable across
+            # parser-version drift in the raw_description token cluster.
+            # When populated, this is the strongest dedup key — bypasses
+            # the desc-based Phase 4d/4e paths entirely. When empty (other
+            # vendors lacking item-code extraction), Phase 4d takes over.
+            if vendor_item_code and invoice_number:
+                cand_qs = InvoiceLineItem.objects.filter(
+                    vendor=vendor,
+                    invoice_number=invoice_number,
+                    vendor_item_code=vendor_item_code,
+                    invoice_date=parsed_date,
+                )
+                # Multi-row item (qty>1 on multiple cases with same SUPC
+                # printed twice — rare) handled by matching unit_price too.
+                # Single-match: take it. Multi-match: pick lowest id, mark
+                # rest as duplicates_to_merge.
+                cand_list = list(cand_qs.order_by('id'))
+                if len(cand_list) == 1:
+                    existing = cand_list[0]
+                elif len(cand_list) > 1:
+                    # Prefer unit_price match if disambiguates
+                    price_matches = [c for c in cand_list
+                                     if c.unit_price == common_fields.get('unit_price')]
+                    if price_matches:
+                        existing = price_matches[0]
+                        duplicates_to_merge = [c for c in price_matches[1:]]
+                    else:
+                        existing = cand_list[0]
+                        duplicates_to_merge = cand_list[1:]
+
             # PRIMARY KEY (Phase 4c, Sean 2026-05-10; Phase 4d 2026-05-12):
             #   (vendor, canonical_FK, invoice_number, invoice_date,
             #    normalized_raw_description)

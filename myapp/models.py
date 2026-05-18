@@ -493,6 +493,20 @@ class InvoiceLineItem(models.Model):
         help_text="Canonical vendor SKU this line item represents. "
                   "Identity pointer; does NOT replace historical price fields.",
     )
+    # Phase 4f (2026-05-17): SUPC/vendor-item-code captured at parse time.
+    # Decouples dedup from raw_description, which is unstable across parser
+    # versions (token-clustering improvements change which tokens land in
+    # the desc). The SUPC is the stable identity field on the invoice line:
+    # printed in a known column, parsed by anchor recognition, doesn't
+    # depend on neighboring-row token assignment. db_write prefers
+    # (vendor, invoice_number, vendor_item_code) as the primary dedup key
+    # when populated. Sysco populates; other vendors may or may not.
+    vendor_item_code = models.CharField(
+        max_length=32, blank=True, db_index=True,
+        help_text="Vendor's catalog code for this line item (Sysco SUPC, "
+                  "Farm Art item code, etc.). Stable across parser versions; "
+                  "preferred dedup key over raw_description.",
+    )
     imported_at     = models.DateTimeField(auto_now_add=True)
 
     class Meta:

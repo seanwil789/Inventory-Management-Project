@@ -3920,6 +3920,54 @@ class DBWritePricePerPoundTests(TestCase):
         ili = InvoiceLineItem.objects.get(product=p)
         self.assertEqual(ili.price_per_pound, Decimal('11.2500'))
 
+    def test_upsert_matches_via_vendor_item_code_when_desc_differs(self):
+        """Phase 4f (2026-05-17): when vendor_item_code is populated on the
+        existing row and the incoming item carries the same code (+ same
+        invoice_number + same invoice_date), db_write upserts that row
+        REGARDLESS of any raw_description divergence. The SUPC is stable
+        across parser-version drift; the description is not.
+
+        Origin: 2026-05-17 reprocess attempts on Jan 2026 Sysco kept
+        creating duplicates because token-clustering improvements
+        produced different descriptions (e.g. 'JALAPENO FRESH' vs the
+        legacy 'PEPPER JALAPENO FRESH'). Phase 4f makes this irrelevant.
+        """
+        from decimal import Decimal
+        from datetime import date
+        dbw = self._import_db_write()
+
+        v = Vendor.objects.get_or_create(name='Sysco')[0]
+        legacy = InvoiceLineItem.objects.create(
+            vendor=v,
+            invoice_date=date(2026, 1, 20),
+            invoice_number='775632629',
+            vendor_item_code='1048230',
+            raw_description='LEGACY DESC PEPPER JALAPENO FRESH 1048230',
+            unit_price=Decimal('27.75'),
+            extended_amount=Decimal('27.75'),
+            quantity=Decimal('1'),
+        )
+
+        # Reprocess emits a wildly different desc but same SUPC
+        items = [{
+            'raw_description': 'COMPLETELY DIFFERENT TOKENS HERE',
+            'sysco_item_code': '1048230',
+            'unit_price': 27.75,
+            'extended_amount': 27.75,
+            'quantity': 1,
+            'confidence': 'code',
+        }]
+        dbw.write_invoice_to_db('Sysco', '2026-01-20', items,
+                                source_file='test.jpg',
+                                invoice_number='775632629')
+
+        rows = InvoiceLineItem.objects.filter(invoice_number='775632629',
+                                              vendor_item_code='1048230')
+        self.assertEqual(rows.count(), 1,
+            f'Phase 4f dedup should match via SUPC; got {rows.count()} rows')
+        self.assertEqual(rows.first().id, legacy.id,
+            'Existing legacy row should have been upserted, not replaced')
+
     def test_upsert_matches_legacy_single_letter_prefix_desc(self):
         """Phase 4e (2026-05-17): db_write's `_normalize_desc` must strip
         a leading single-letter token so descriptions written by older
