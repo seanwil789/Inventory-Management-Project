@@ -33,20 +33,32 @@ class Command(BaseCommand):
         parser.add_argument('--apply', action='store_true')
         parser.add_argument('--vendor', type=str, default=None,
                             help='Limit to one vendor')
+        parser.add_argument('--mode', choices=('supc', 'price-ext'), default='supc',
+                            help='supc: group by (invoice, supc). '
+                                 'price-ext: group by (invoice, unit_price, ext) — '
+                                 'catches cross-SUPC duplicates where bad backfill '
+                                 'assigned wrong SUPC.')
 
     def handle(self, *args, **opts):
         if not opts['dry_run'] and not opts['apply']:
             self.stdout.write('Pass --dry-run or --apply')
             return
 
-        qs = InvoiceLineItem.objects.exclude(vendor_item_code='').exclude(
-            invoice_number='').select_related('vendor')
+        mode = opts['mode']
+        qs = InvoiceLineItem.objects.exclude(invoice_number='').select_related('vendor')
+        if mode == 'supc':
+            qs = qs.exclude(vendor_item_code='')
         if opts['vendor']:
             qs = qs.filter(vendor__name__iexact=opts['vendor'])
 
         groups: dict[tuple, list] = defaultdict(list)
         for ili in qs:
-            key = (ili.vendor_id, ili.invoice_number, ili.vendor_item_code)
+            if mode == 'supc':
+                key = (ili.vendor_id, ili.invoice_number, ili.vendor_item_code)
+            else:  # price-ext
+                key = (ili.vendor_id, ili.invoice_number,
+                       float(ili.unit_price or 0),
+                       float(ili.extended_amount or 0))
             groups[key].append(ili)
 
         to_delete_ids: list[int] = []
@@ -55,12 +67,16 @@ class Command(BaseCommand):
         for key, rows in groups.items():
             if len(rows) < 2:
                 continue
-            # Prefer user_edited row as the survivor
             user_edited = [r for r in rows if r.user_edited]
             if user_edited:
+                # Survivor: lowest-id user_edited
                 survivor = sorted(user_edited, key=lambda r: r.id)[0]
-            else:
+            elif mode == 'supc':
+                # Survivor: lowest id (oldest)
                 survivor = sorted(rows, key=lambda r: r.id)[0]
+            else:  # price-ext: survivor is the NEWEST (latest reprocess output;
+                   # bad-backfill OLDs likely have older imported_at)
+                survivor = sorted(rows, key=lambda r: r.imported_at or 0, reverse=True)[0]
             keep_ids.append(survivor.id)
             for r in rows:
                 if r.id != survivor.id and not r.user_edited:
@@ -68,12 +84,13 @@ class Command(BaseCommand):
                     inv = r.invoice_number
                     per_invoice[inv] = per_invoice.get(inv, 0) + 1
 
+        self.stdout.write(f"Mode: {mode}")
         self.stdout.write(f"Groups with >1 row: {sum(1 for v in groups.values() if len(v) > 1)}")
         self.stdout.write(f"Rows to delete: {len(to_delete_ids)}")
         self.stdout.write(f"Survivors kept: {len(keep_ids)}")
         if per_invoice:
             self.stdout.write("Top affected invoices:")
-            for inv, n in sorted(per_invoice.items(), key=lambda x: -x[1])[:10]:
+            for inv, n in sorted(per_invoice.items(), key=lambda x: -x[1])[:15]:
                 self.stdout.write(f"  {inv}: {n} deletes")
 
         if opts['apply'] and to_delete_ids:
