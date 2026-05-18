@@ -683,6 +683,14 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             # Fallback 2's collapse-on-match logic — leave `existing` None
             # so Fallback 2 can pick the oldest and mark the rest for
             # deletion. Single-match case sets `existing` here directly.
+            #
+            # Exception for rows with no product (e.g. fee ILIs like
+            # 'Sysco Fuel Surcharge'): Fallback 2 requires `product` to
+            # be populated and would skip these. For productless rows
+            # we must collapse-on-match here OR they accumulate
+            # duplicates on every reprocess cycle. Origin: INV 775687424
+            # accumulated 2 each of Fuel/CC/Tax fee rows ($56.48 total)
+            # across reprocess attempts (2026-05-17).
             if existing is None:
                 norm_incoming = _normalize_desc(raw_desc)
                 cand_qs = InvoiceLineItem.objects.filter(
@@ -693,6 +701,12 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                            if _normalize_desc(c.raw_description) == norm_incoming]
                 if len(matches) == 1:
                     existing = matches[0]
+                elif len(matches) > 1 and not product:
+                    # Productless rows can't be caught by Fallback 2 —
+                    # collapse here. Keep lowest-id, mark rest for delete.
+                    matches.sort(key=lambda c: c.id)
+                    existing = matches[0]
+                    duplicates_to_merge = matches[1:]
             # Fallback 2 (Phase 4c, Sean 2026-05-10): COLLAPSE-ON-MATCH.
             # Match on (vendor, product, date, unit_price, quantity). When
             # multiple existing rows match this key (signaling re-photo
