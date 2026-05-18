@@ -548,18 +548,25 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         duplicates_to_merge: list = []
         if parsed_date:
             # PHASE 4f PRIMARY KEY (Sean 2026-05-17):
-            #   (vendor, invoice_number, vendor_item_code, invoice_date)
+            #   (vendor, invoice_number, vendor_item_code)
             # The vendor_item_code (Sysco SUPC, etc.) is stable across
             # parser-version drift in the raw_description token cluster.
             # When populated, this is the strongest dedup key — bypasses
             # the desc-based Phase 4d/4e paths entirely. When empty (other
             # vendors lacking item-code extraction), Phase 4d takes over.
+            #
+            # invoice_date INTENTIONALLY EXCLUDED from the key: multi-photo
+            # Sysco invoices have date drift across OCR caches (the date
+            # token's OCR result varies per photo). A single invoice can
+            # have rows at two different invoice_dates in the DB. Phase 4f
+            # ignores date so a SUPC/invoice_number pair matches regardless.
+            # invoice_number is the authoritative stable id; date is
+            # advisory.
             if vendor_item_code and invoice_number:
                 cand_qs = InvoiceLineItem.objects.filter(
                     vendor=vendor,
                     invoice_number=invoice_number,
                     vendor_item_code=vendor_item_code,
-                    invoice_date=parsed_date,
                 )
                 # Multi-row item (qty>1 on multiple cases with same SUPC
                 # printed twice — rare) handled by matching unit_price too.
