@@ -693,10 +693,17 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
             # across reprocess attempts (2026-05-17).
             if existing is None:
                 norm_incoming = _normalize_desc(raw_desc)
-                cand_qs = InvoiceLineItem.objects.filter(
-                    vendor=vendor, invoice_date=parsed_date)
+                # When invoice_number is set, scope by invoice_number ONLY
+                # (drop the date filter). Multi-photo invoices can have OCR
+                # date drift — same invoice_number ends up with rows at 2
+                # different invoice_dates in the DB. Same fix Phase 4f
+                # received for the same reason.
                 if invoice_number:
-                    cand_qs = cand_qs.filter(invoice_number=invoice_number)
+                    cand_qs = InvoiceLineItem.objects.filter(
+                        vendor=vendor, invoice_number=invoice_number)
+                else:
+                    cand_qs = InvoiceLineItem.objects.filter(
+                        vendor=vendor, invoice_date=parsed_date)
                 matches = [c for c in cand_qs
                            if _normalize_desc(c.raw_description) == norm_incoming]
                 if len(matches) == 1:
