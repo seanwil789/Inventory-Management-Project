@@ -559,6 +559,33 @@ def _extract_sysco_rank_one_page(
                         for gy in group_label_ys)
         ]
 
+    # MISC CHARGES block filter (2026-05-18): Sysco prints a
+    # "MISC CHARGES / CHARGE FOR CREDIT CARD SRCHRG / FUEL SURCHARGE"
+    # block at the bottom of the totals area. Tokens in this block
+    # ('MISC', 'CHARGES', 'CHARGE', 'CREDIT', 'CARD', 'SRCHRG', 'FUEL',
+    # 'SURCHARGE') leak into desc construction for any item SUPC sitting
+    # just above the block via competitive-y if `_DESC_DY` (0.018) is
+    # wide enough to reach. Reference: INV 775837983 — floor cleaner
+    # SUPC 7260143 at y=0.301 had 'MISC' at y=0.3187 (dy=0.0177 < 0.018)
+    # bleed into desc, producing "MISC NO RINS" instead of "12.5GAL
+    # KEYSTON CLEANER FLOOR ALKLNE NO RINS".
+    #
+    # Detection: y of any token whose text is in the MISC CHARGES label
+    # set. Exclude tokens within ±0.012 y from desc_pool (≈one row).
+    _MISC_LABEL_WORDS = {'MISC', 'CHARGES', 'CHARGE',
+                         'CREDIT', 'CARD', 'SRCHRG',
+                         'FUEL', 'SURCHARGE'}
+    misc_label_ys: list[float] = []
+    for t in tokens:
+        if (t.get("text") or "").upper() in _MISC_LABEL_WORDS:
+            misc_label_ys.append(_y_mid(t))
+    if misc_label_ys:
+        desc_pool = [
+            t for t in desc_pool
+            if not any(abs(_y_mid(t) - my) < 0.012
+                        for my in misc_label_ys)
+        ]
+
     # Pool of digit-only tokens in the qty column (x < 0.17). Used to find
     # qty per row by competitive-y (same rank-pair principle as descriptions).
     # Sysco prints "1 CS" / "2 CS" / "3 EA" — we want the leading integer.
@@ -828,7 +855,18 @@ def _extract_sysco_rank_one_page(
         # Reference: SUPC 1048230 on INV 775632629 had real desc
         # 'PEPPER JALAPENO FRESH' at y=0.241 (dy=0.013 from SUPC y=0.228).
         # Pre-widening: excluded because dy>0.012. Post-widening: included.
-        _DIR_EPSILON = 0.005
+        #
+        # _DIR_EPSILON 0.005 -> 0.015 (2026-05-18): on some invoices the
+        # SUPC sits BELOW its desc tokens by up to 0.010-0.012 (the
+        # opposite-direction case). Reference: INV 775837983 floor
+        # cleaner SUPC 7260143 at y=0.301 had desc tokens '12.5GALKEYSTON
+        # CLEANER FLOOR ALKLNE' at y=0.291-0.296 (above SUPC by 0.005-
+        # 0.010). At epsilon=0.005 these were excluded as "too far above";
+        # at epsilon=0.015 they're included. Column-header protection
+        # remains: those sit 0.020-0.030 above the first SUPC, beyond
+        # this threshold (INV 775632629 first SUPC at y=0.228 with column
+        # headers at y=0.20 — gap 0.028 > 0.015).
+        _DIR_EPSILON = 0.015
         _DESC_DY = _SYSCO_DESC_Y_TOL * 1.5
         desc_toks = []
         for t in desc_pool:
