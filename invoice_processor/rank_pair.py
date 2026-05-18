@@ -506,6 +506,12 @@ def _extract_sysco_rank_one_page(
                 continue
             if re.fullmatch(r'\d{1,2}', text):
                 continue
+        # UoM markers are non-item regardless of x position. 'CS'/'EA'
+        # sometimes land at x=0.1709 — juuust outside the qty drop band
+        # (0.17). Reference INV 775619701 KEYSTON CLEANER FLOOR: pre-fix
+        # desc included 'CS CS' (two case markers).
+        if text in ("CS", "EA"):
+            continue
         desc_pool.append(t)
 
     # Build price-token pool (right of SUPC band)
@@ -557,6 +563,27 @@ def _extract_sysco_rank_one_page(
             t for t in desc_pool
             if not any(abs(_y_mid(t) - gy) < _GT_Y_TOL
                         for gy in group_label_ys)
+        ]
+
+    # Section header block filter (2026-05-18): exclude tokens at the
+    # same y as '****' asterisk-cluster tokens. Sysco section headers
+    # are printed as '**** <SECTION NAME> ****' at y boundaries. With
+    # the widened _DIR_EPSILON=0.015 these tokens can bleed into the
+    # desc of an item whose SUPC sits just below the header. Reference:
+    # INV 775619701 floor cleaner SUPC 7260143 at y=0.2558 had the
+    # '**** CHEMICAL & JANITORIAL ****' header at y=0.237-0.243 bleed
+    # in (dy 0.013-0.019), producing desc 'KEYSTON **** CHEMICAL CLEANER
+    # FLOOR ...'. The same filter shape as GROUP TOTAL above.
+    _ASTERISK_RE = re.compile(r'\*{2,}')
+    section_marker_ys: list[float] = []
+    for t in tokens:
+        if _ASTERISK_RE.fullmatch(t.get("text") or ""):
+            section_marker_ys.append(_y_mid(t))
+    if section_marker_ys:
+        desc_pool = [
+            t for t in desc_pool
+            if not any(abs(_y_mid(t) - sy) < 0.008
+                        for sy in section_marker_ys)
         ]
 
     # MISC CHARGES block filter (2026-05-18): Sysco prints a
@@ -630,6 +657,18 @@ def _extract_sysco_rank_one_page(
     rows: list[dict] = []
     for k, supc in enumerate(supcs):
         y_supc = _y_mid(supc)
+
+        # Skip SUPCs that sit on a section-header row. Section headers
+        # are '**** SECTION_NAME ****' patterns; when OCR misaligns a
+        # SUPC + ext token to the same y, the SUPC is a phantom — it
+        # gets a placeholder desc '[Sysco #NNN]' that pollutes items.
+        # Reuses section_marker_ys built above. Pre-fix the asterisks
+        # ended up in the desc, and a downstream shape-based filter
+        # rejected the row. With the asterisk stripping the shape check
+        # fails — explicit y-band skip here is the cleaner solution.
+        if section_marker_ys and any(
+                abs(y_supc - sy) < 0.008 for sy in section_marker_ys):
+            continue
 
         # Find the unit_price for this row: closest 2-decimal price to y_supc,
         # right of SUPC, that's also closer to THIS rank than to neighbor ranks.
