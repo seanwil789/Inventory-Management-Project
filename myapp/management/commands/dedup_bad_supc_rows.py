@@ -83,8 +83,22 @@ class Command(BaseCommand):
         if opts['vendor']:
             qs = qs.filter(vendor__name__iexact=opts['vendor'])
 
+        # Index DB ILIs per (invoice, price, ext) so we can check whether
+        # a row with a "bad" SUPC has a sibling with a parser-verified
+        # SUPC at the same price/ext. Only THEN is it safe to delete:
+        # otherwise we'd delete legitimate items that the current parser
+        # simply missed.
+        from collections import defaultdict
+        by_key: dict[tuple, list] = defaultdict(list)
+        for ili in qs:
+            key = (ili.invoice_number,
+                   round(float(ili.unit_price or 0), 2),
+                   round(float(ili.extended_amount or 0), 2))
+            by_key[key].append(ili)
+
         to_delete: list[InvoiceLineItem] = []
         no_truth: list[InvoiceLineItem] = []
+        no_sibling: list[InvoiceLineItem] = []
         for ili in qs:
             truth = true_supcs.get(ili.invoice_number)
             if truth is None:
@@ -94,6 +108,20 @@ class Command(BaseCommand):
                 continue
             if ili.user_edited:
                 continue
+            # Require a sibling with a parser-verified SUPC at same (price, ext).
+            # Without a sibling, this might be a legit item the current parser
+            # missed — don't delete blindly.
+            key = (ili.invoice_number,
+                   round(float(ili.unit_price or 0), 2),
+                   round(float(ili.extended_amount or 0), 2))
+            siblings = by_key.get(key, [])
+            has_good_sibling = any(
+                s.id != ili.id and s.vendor_item_code in truth
+                for s in siblings
+            )
+            if not has_good_sibling:
+                no_sibling.append(ili)
+                continue
             to_delete.append(ili)
 
         per_invoice: dict[str, int] = {}
@@ -102,7 +130,8 @@ class Command(BaseCommand):
 
         self.stdout.write(f"Invoices with parser truth set: {len(true_supcs)}")
         self.stdout.write(f"ILIs with no truth (parse failed or no invoice match): {len(no_truth)}")
-        self.stdout.write(f"ILIs with bad vendor_item_code (not in parser output): {len(to_delete)}")
+        self.stdout.write(f"ILIs with bad SUPC but NO sibling — kept (might be legit): {len(no_sibling)}")
+        self.stdout.write(f"ILIs to delete (bad SUPC + good-SUPC sibling at same price/ext): {len(to_delete)}")
         for inv, n in sorted(per_invoice.items(), key=lambda x: -x[1])[:15]:
             self.stdout.write(f"  {inv}: {n}")
 
