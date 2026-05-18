@@ -315,7 +315,16 @@ def extract_sysco_fees(pages: list[dict]) -> dict:
             fuel_row = _label_row(tokens, {'FUEL', 'SURCHARGE'}, 'FUEL',
                                   max_dy=0.02)
             if fuel_row:
-                amt = _value_for_label(tokens, fuel_row, max_dy=0.02)
+                # 2026-05-18: widened from 0.02 to 0.025 because on some
+                # invoices Sysco prints VALUES above LABELS with wider
+                # baseline drift than the typical 0.003-0.012. Reference:
+                # INV 775632629 — FUEL label y=0.385, $6.50 value y=0.3628
+                # (dy=0.0222 > 0.020). Pre-fix FUEL missed → CC then
+                # captured $6.50 (which was actually the FUEL value),
+                # leaving the real CC ($53.87 at y=0.3497) uncaptured.
+                # Post-fix FUEL claims $6.50, CC's exclude-prior-fuel
+                # logic forces it to pick the next-closest = $53.87.
+                amt = _value_for_label(tokens, fuel_row, max_dy=0.025)
                 if amt is not None:
                     fees['fuel_surcharge'] = amt
 
