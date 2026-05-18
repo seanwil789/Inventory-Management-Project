@@ -349,7 +349,17 @@ class Command(BaseCommand):
                     'status':             r['status'],
                 },
             )
+            # Phase 4g (2026-05-17): sync items_sum/gap to actual DB
+            # ILI rows, not just the parser's re-parse output. The UI
+            # shows what's in the DB; cost/inventory dashboards read
+            # the DB. Validate must reflect reality, not what a fresh
+            # re-parse would produce. revalidate_from_ili overwrites
+            # items_sum, invoice_gap, invoice_gap_pct, and recomputes
+            # section parser_sums from current InvoiceLineItem rows.
+            ivs.revalidate_from_ili()
+            ivs.save()
             upsert_count += 1
         self.stdout.write('')
         self.stdout.write(self.style.SUCCESS(
-            f'Wrote {upsert_count} InvoiceValidationStatus rows.'))
+            f'Wrote {upsert_count} InvoiceValidationStatus rows '
+            f'(sync\'d to DB ILI state).'))
