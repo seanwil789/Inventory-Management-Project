@@ -2408,10 +2408,23 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         if in_delivery_note:
             continue
 
-        # Pattern: "N code/abbrev... Product Name"
-        m = re.match(r'^\d+\s+\S+/\S+\.{2,}\s*(.+)', line)
+        # Pattern: "N code/abbrev... Product Name" (single-line case).
+        # The desc capture requires a non-dot character and at least
+        # 3 chars after the dots — otherwise a code-only line like
+        # "1 0258/MedDa..." would falsely match because the regex
+        # backtracks one dot to satisfy (.+), capturing just '.'.
+        # Origin: PBM INV 657529 — pre-fix the code-only wrapped line
+        # got appended as desc='.', producing 5 items instead of 4
+        # and mis-shifting all prices.
+        m = re.match(r'^\d+\s+\S+/\S+\.{2,}\s+([A-Za-z][^.]{2,}.*)', line)
         if m:
             descriptions.append(m.group(1).strip())
+            continue
+        # Wrapped two-line case: "N code/abbrev..." with empty trail,
+        # followed by the product name on the next line. The code line
+        # itself isn't a description — skip it; the next iteration
+        # picks up the wrapped name.
+        if re.match(r'^\d+\s+\S+/\S+\.{2,}\s*$', line):
             continue
         # Standalone product name (no code prefix)
         if (re.search(r'[A-Za-z]{3,}', line)
