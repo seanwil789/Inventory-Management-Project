@@ -38,6 +38,38 @@ SUPPORTED_MIME_TYPES = {
     "image/jpeg", "image/png", "image/jpg", "application/pdf"
 }
 
+
+# Vendors whose parsers reliably extract invoice_number from cleanly-OCR'd
+# invoices. When a parse for one of these vendors comes back with an empty
+# invoice_number, it's a parser/OCR failure rather than a vendor-without-
+# numbers — writing ILIs with invoice_number='' creates orphans that can't
+# link to InvoiceValidationStatus and bypass dedup phases on reprocess.
+# Colonial Meat is intentionally absent: handwritten invoices don't
+# always carry a numeric identifier.
+_INVOICE_NUMBER_REQUIRED_VENDORS = frozenset({
+    "Sysco",
+    "Philadelphia Bakery Merchants",
+    "Farm Art",
+    "Delaware County Linen",
+    "Exceptional Foods",
+})
+
+
+def should_skip_empty_invoice_number(parsed: dict) -> bool:
+    """Trust LAW guard: True when the parsed result is for a vendor that
+    normally extracts invoice_number but came back empty. Caller skips
+    the DB write so the file stays in the inbox for a future retry.
+
+    Origin: 2026-05-19 PBM INV 8329 surfaced 6 orphan ILIs with empty
+    invoice_number AND wrong ext math — the parser at write time
+    produced partial results that the current parser does not. Without
+    this guard the orphans accumulated silently and shifted IVS
+    items_sum to a stale value.
+    """
+    vendor = (parsed.get("vendor") or "").strip()
+    invnum = (parsed.get("invoice_number") or "").strip()
+    return vendor in _INVOICE_NUMBER_REQUIRED_VENDORS and not invnum
+
 # ── Invoice total cache for budget sync ─────────────────────────────────
 import json
 
@@ -537,6 +569,13 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
         matched   = sum(1 for i in mapped_items if i["confidence"] != "unmatched")
         unmatched = len(mapped_items) - matched
         print(f"   Matched: {matched}  |  Unmatched: {unmatched}")
+
+        # Trust LAW guard (2026-05-19): see should_skip_empty_invoice_number.
+        if should_skip_empty_invoice_number(parsed):
+            print(f"   [!] GUARD: {parsed.get('vendor')} parser produced "
+                  f"empty invoice_number — skipping DB write to avoid "
+                  f"creating orphan ILIs. File left in inbox for retry.")
+            return False
 
         if dry_run:
             print("\n[DRY RUN] Skipping Data Sheets write, Drive archive, and inbox deletion.")

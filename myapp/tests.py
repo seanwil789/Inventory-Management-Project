@@ -12364,6 +12364,62 @@ class CacheInvoiceTotalDedupTests(TestCase):
         self.assertEqual(len(entries), 2)
 
 
+class BatchEmptyInvoiceNumberGuardTests(TestCase):
+    """Trust LAW guard: batch.py refuses to write ILIs when a vendor that
+    normally extracts an invoice_number returns empty. Prevents orphan
+    ILIs that bypass IVS linkage + dedup. Origin: 2026-05-19 PBM 8329."""
+
+    def _import(self):
+        from invoice_processor.batch import should_skip_empty_invoice_number
+        return should_skip_empty_invoice_number
+
+    def test_pbm_empty_invnum_skipped(self):
+        skip = self._import()
+        self.assertTrue(skip({
+            'vendor': 'Philadelphia Bakery Merchants',
+            'invoice_number': '',
+        }))
+
+    def test_pbm_with_invnum_not_skipped(self):
+        skip = self._import()
+        self.assertFalse(skip({
+            'vendor': 'Philadelphia Bakery Merchants',
+            'invoice_number': '8329',
+        }))
+
+    def test_sysco_empty_invnum_skipped(self):
+        skip = self._import()
+        self.assertTrue(skip({
+            'vendor': 'Sysco',
+            'invoice_number': None,
+        }))
+
+    def test_farm_art_empty_invnum_skipped(self):
+        skip = self._import()
+        self.assertTrue(skip({
+            'vendor': 'Farm Art',
+            'invoice_number': '   ',  # whitespace-only counts as empty
+        }))
+
+    def test_colonial_meat_not_guarded(self):
+        """Handwritten Colonial Meat invoices don't carry a numeric ID;
+        guard must allow them through even when invoice_number is empty."""
+        skip = self._import()
+        self.assertFalse(skip({
+            'vendor': 'Colonial Meat',
+            'invoice_number': '',
+        }))
+
+    def test_unknown_vendor_not_guarded(self):
+        """Unknown vendor → fall through to existing handling. The guard
+        only fires for vendors we've explicitly opted in."""
+        skip = self._import()
+        self.assertFalse(skip({
+            'vendor': 'Unknown',
+            'invoice_number': '',
+        }))
+
+
 class DBWriteUpsertKeyTighteningTests(TestCase):
     """#2 — db_write upsert finds existing rows by raw_description even
     when product was NULL at original write (fuzzy quarantine path) and
