@@ -3745,11 +3745,27 @@ def parse_invoice(text: str, vendor: str = None,
             def _placeholder_count(items_list):
                 return sum(1 for it in (items_list or [])
                            if _placeholder_re.match(it.get('raw_description') or ''))
+
+            # Qty-coverage tiebreaker (2026-05-19, PBM INV 8329): when two
+            # paths tie on (section_quality, placeholder_count, gap), prefer
+            # the path with MORE items carrying a known quantity. A path
+            # that reports qty=None is structurally less complete than one
+            # that derives qty via line math (ext/unit). Surfaced when
+            # PBM column-form spatial parsing produced shifted descriptions
+            # (Kaiser Rullu Gut, etc.) tied with correct text-path
+            # descriptions on gap=0; spatial lost row 1's qty because OCR
+            # missed the qty column for that row, while text-path's
+            # B-MathPairs-Qty derived qty=2. Higher coverage = winner.
+            def _qty_coverage(items_list):
+                return sum(1 for it in (items_list or [])
+                           if it.get('quantity') is not None)
+
             scored = [(name, items_list, gap,
                        _section_quality(items_list),
-                       _placeholder_count(items_list))
+                       _placeholder_count(items_list),
+                       _qty_coverage(items_list))
                       for name, items_list, gap in candidates]
-            scored.sort(key=lambda c: (-c[3][0], c[4], c[2]))
+            scored.sort(key=lambda c: (-c[3][0], c[4], -c[5], c[2]))
             items = scored[0][1]
         elif rank_pair_items is not None:
             items = rank_pair_items
