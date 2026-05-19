@@ -580,7 +580,10 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 # printed twice — rare) handled by matching unit_price too.
                 # Single-match: take it. Multi-match: pick lowest id, mark
                 # rest as duplicates_to_merge.
-                cand_list = list(cand_qs.order_by('id'))
+                # Filter out rows already claimed by an earlier item in
+                # this batch.
+                cand_list = [c for c in cand_qs.order_by('id')
+                             if c.id not in claimed_ili_ids]
                 if len(cand_list) == 1:
                     existing = cand_list[0]
                 elif len(cand_list) > 1:
@@ -627,6 +630,8 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                         unit_price=up,
                         extended_amount=ext,
                     ).order_by('id'))
+                    ue_matches = [c for c in ue_matches
+                                  if c.id not in claimed_ili_ids]
                     if ue_matches:
                         existing = ue_matches[0]
 
@@ -676,9 +681,17 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                     invoice_number=invoice_number,
                     invoice_date=parsed_date,
                 ))
+                # Skip rows already claimed by an earlier item in this
+                # batch — prevents intra-batch normalized-desc collisions
+                # from overwriting prior writes. Origin: Farm Art INV
+                # 1650121 had 2 legit pepper rows both mapping to the
+                # same canonical FK + same normalized_desc but different
+                # prices. Phase 4d was matching the second to the just-
+                # updated first, overwriting the first's values.
                 existing = next(
                     (c for c in candidates
-                     if _normalize_desc(c.raw_description) == norm_incoming),
+                     if _normalize_desc(c.raw_description) == norm_incoming
+                     and c.id not in claimed_ili_ids),
                     None,
                 )
             # PRIMARY KEY (legacy, Phase 4b — source_file based):
