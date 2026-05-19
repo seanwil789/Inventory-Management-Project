@@ -454,6 +454,12 @@ _NON_PRODUCT_PATTERNS = (
     "FUEL SURCHARGE",
     "DELIVERY FEE",
     "DELIVERY CHG",
+    # 2026-05-19: Delaware Linen invoices print "Delivery Charge" (spelled
+    # out), not "Delivery Chg" — the parser-emitted synthetic_fee rows
+    # landed at confidence='unmatched' because no existing pattern matched.
+    # Surfaced 2026-05-19 mapping-review cleanup: 7 historical Delivery
+    # Charge rows leaked into discover_unmapped PMP queue.
+    "DELIVERY CHARGE",
     "CREDIT MEMO",
     "ORDER SUMMARY",
     "MISC CHARGES",

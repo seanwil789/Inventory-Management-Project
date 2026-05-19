@@ -5757,6 +5757,17 @@ class MapperNonProductClassifierTests(TestCase):
         self.assertEqual(r["confidence"], "non_product")
         self.assertIsNone(r["canonical"])
 
+    def test_delivery_charge_tagged_non_product(self):
+        """Delaware Linen prints 'Delivery Charge' (spelled out). Pre-fix
+        (2026-05-19) the DELIVERY CHG / DELIVERY FEE patterns didn't match
+        — 7 historical rows leaked into discover_unmapped as 'unmatched'."""
+        m = self._import()
+        r = m.resolve_item(
+            {"raw_description": "Delivery Charge", "sysco_item_code": ""},
+            self._empty_mappings(), vendor="Delaware County Linen")
+        self.assertEqual(r["confidence"], "non_product")
+        self.assertIsNone(r["canonical"])
+
     def test_real_product_not_tagged_non_product(self):
         """Ordinary product descriptions must not accidentally trip the
         non-product filter (would cost mapping rate)."""
