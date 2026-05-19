@@ -131,10 +131,12 @@
             <td class="py-2 px-3 text-right">
               {% if ivs.invoice_gap_pct is not None %}
                 <span class="
-                  {% if ivs.invoice_gap_pct|floatformat:0|add:0 >= 10 %}text-red-700
+                  {% if ivs.credits_pending %}text-blue-700
+                  {% elif ivs.invoice_gap_pct|floatformat:0|add:0 >= 10 %}text-red-700
                   {% elif ivs.invoice_gap_pct|floatformat:0|add:0 >= 5 %}text-amber-700
-                  {% else %}text-slate-600{% endif %}">
-                  {{ ivs.invoice_gap_pct }}%
+                  {% else %}text-slate-600{% endif %}"
+                  {% if ivs.credits_pending %}title="Gap explained by ${{ ivs.credits_pending }} pending vendor credit"{% endif %}>
+                  {{ ivs.invoice_gap_pct }}%{% if ivs.credits_pending %} 💳{% endif %}
                 </span>
               {% else %}
                 <span class="text-slate-400">—</span>

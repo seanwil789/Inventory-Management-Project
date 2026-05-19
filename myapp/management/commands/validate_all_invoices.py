@@ -49,34 +49,32 @@ _SECTION_DIFF_TOLERANCE = 0.50  # per-section diff < $0.50 = reconciled
 
 def _classify(items_sum: float, invoice_total: float | None,
               section_recon: list[dict],
-              non_item_charges: float = 0.0) -> str:
+              non_item_charges: float = 0.0,
+              credits_pending: float = 0.0) -> str:
     """Return 'pass' / 'review' / 'fail' / 'partial'.
 
-    Three paths to PASS:
+    Four paths to PASS:
       (a) Invoice-total math with charges: items_sum + non_item_charges
-          reconciles to invoice_total within $0.50. For vendors whose
-          parsers extract fees/taxes (Delaware Linen).
+          reconciles to invoice_total within $0.50.
       (b) Invoice-total math without charges: gap_pct < 5%.
       (c) Section reconciliation AND invoice-total gap is reasonable.
-          Every section reconciles to its printed GROUP TOTAL within
-          tolerance, AND items_sum vs invoice_total gap is below the
-          FAIL threshold.
+      (d) **Credit-pending reconciliation** (L1 Phase 2, 2026-05-18):
+          when user audit edits with credit-pending reasons explain
+          the gap (items_sum + credits_pending ≈ invoice_total within
+          $0.50), the gap represents money the vendor owes back rather
+          than parser error. Treated as PASS — pending credit-memo
+          match against L2 InvoiceCredit ledger.
 
-          The gap-guard is critical: when OCR captures only PART of a
-          multi-page invoice (missing pages), the sections we DO see
-          reconcile to their printed GROUP TOTALs, but items_sum is far
-          short of invoice_total. Without the guard, invoices with 78%+
-          missing pages were silently classified as PASS because the
-          surface that was captured looked clean. See INV 1282480
-          (2026-04-06): 1 of N pages OCR'd, $559 items_sum vs $2559
-          invoice_total, sections reconcile, classifier said PASS.
-          That hid $2000 of missing data from downstream consumers.
-          (Bug surfaced by Sean 2026-05-09.)
+          Origin: PBM INV 2476 — Sean audit-zeroed Medium Danish
+          ($29.84) for quality issue. items_sum=$76.46 vs total=$106.30
+          showed as 28% FAIL until path (d) recognized the $29.84
+          credit-pending as expected gap.
     """
     if invoice_total is None or invoice_total == 0:
         return 'partial'
     gap_pct = abs(items_sum - invoice_total) / invoice_total * 100
     gap_with_charges = abs(items_sum + non_item_charges - invoice_total)
+    gap_with_credits = abs(items_sum + credits_pending - invoice_total)
     sections_total = len(section_recon)
     sections_with_gap = sum(
         1 for r in section_recon
@@ -93,6 +91,10 @@ def _classify(items_sum: float, invoice_total: float | None,
     # missing-pages false-PASS class (INV 1282480: items=$559, total=$2559,
     # gap_with_charges=$2000 — far above $0.50, still fails path (a)).
     if gap_with_charges < 0.50:
+        return 'pass'
+    # Path (d): credit-pending reconciliation — gap fully explained by
+    # audit edits with credit-pending reasons. Within $0.50 tolerance.
+    if credits_pending > 0 and gap_with_credits < 0.50:
         return 'pass'
     # Path (c): section reconciliation passes ONLY when invoice-total gap is
     # also reasonable. Catches the missing-pages case described above.

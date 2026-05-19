@@ -84,13 +84,19 @@
       <div>
         <div class="text-xs text-slate-500 uppercase tracking-wide">Gap</div>
         <div class="font-mono
-          {% if ivs.invoice_gap_pct is not None and ivs.invoice_gap_pct|floatformat:0|add:0 >= 10 %}text-red-700
+          {% if ivs.credits_pending %}text-blue-700
+          {% elif ivs.invoice_gap_pct is not None and ivs.invoice_gap_pct|floatformat:0|add:0 >= 10 %}text-red-700
           {% elif ivs.invoice_gap_pct is not None and ivs.invoice_gap_pct|floatformat:0|add:0 >= 5 %}text-amber-700
           {% else %}text-slate-900{% endif %}">
           {% if ivs.invoice_gap is not None %}
             ${{ ivs.invoice_gap }} ({{ ivs.invoice_gap_pct }}%)
           {% else %}—{% endif %}
         </div>
+        {% if ivs.credits_pending %}
+          <div class="text-xs text-blue-700 mt-0.5">
+            ${{ ivs.credits_pending }} credit pending
+          </div>
+        {% endif %}
       </div>
     </div>
   </div>

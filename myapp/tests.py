@@ -1931,6 +1931,29 @@ class ValidateAllInvoicesClassifierTests(TestCase):
         recon = [{'diff_abs': 0.0}, {'diff_abs': 0.0}]
         self.assertEqual(self._classify(108.0, 100.0, recon), 'pass')
 
+    def test_pass_credit_pending_reconciles_gap(self):
+        """Path (d) — L1 Phase 2 (2026-05-18): gap fully explained by
+        user audit edits with credit-pending reasons. PBM INV 2476:
+        items_sum=$76.46, invoice_total=$106.30 (28% gap). User audit
+        zeroed Medium Danish for quality_issue, recording $29.84 of
+        credit_pending. Without path (d) this is FAIL; with path (d)
+        the gap reconciles via expected vendor credit → PASS.
+        """
+        # 28% raw gap, but credits_pending closes it to <$0.50
+        self.assertEqual(
+            self._classify(76.46, 106.30, [], credits_pending=29.84),
+            'pass')
+
+    def test_credit_pending_without_match_still_classifies_by_gap(self):
+        """credits_pending only flips status when the math reconciles.
+        If credits_pending doesn't close the gap, fall through to the
+        usual classification (FAIL/REVIEW).
+        """
+        # 28% gap, credits only $5 — doesn't reconcile → FAIL
+        self.assertEqual(
+            self._classify(76.46, 106.30, [], credits_pending=5.00),
+            'fail')
+
     def test_pass_with_extracted_charges(self):
         """Path (a): items + extracted fees reconcile to total within $0.50."""
         # items=$76.00 + non_item_charges=$15.37 = $91.37 = invoice_total

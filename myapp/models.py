@@ -1276,6 +1276,23 @@ class InvoiceValidationStatus(models.Model):
                                            null=True, blank=True,
                                            help_text="abs(invoice_gap) / invoice_total × 100.")
 
+    # L1 Phase 2 (2026-05-18): credits expected from the vendor.
+    # Sum of (audit_edit.before.extended_amount − audit_edit.after.extended_amount)
+    # across InvoiceLineEdit rows whose reason flags a pending credit
+    # (damaged_transit, short_ship, quality_issue, handwritten_credit).
+    # When items_sum + credits_pending ≈ invoice_total, the invoice
+    # is fully explained — the gap represents money the vendor owes us,
+    # not a parser bug. Status classifier treats this as PASS.
+    # Pairs with L2 InvoiceCredit table (roadmapped) for credit-memo
+    # reconciliation against QuickBooks ledger.
+    credits_pending = models.DecimalField(
+        max_digits=10, decimal_places=2,
+        null=True, blank=True,
+        help_text="$ of audit edits with credit-pending reason "
+                  "(damaged_transit/short_ship/quality_issue/handwritten_credit). "
+                  "Expected credit-memo amount from vendor.",
+    )
+
     sections_total      = models.IntegerField(default=0,
                                               help_text="Number of distinct sections detected.")
     sections_reconciled = models.IntegerField(default=0,
@@ -1415,10 +1432,35 @@ class InvoiceValidationStatus(models.Model):
             )
             sections_reconciled = len(updated_recon) - sections_with_gap
 
+        # L1 Phase 2 (2026-05-18): compute credits_pending — the $
+        # the vendor owes back due to audit reductions with credit-
+        # pending reasons. When items_sum + credits_pending ≈
+        # invoice_total, the invoice fully reconciles (the gap is
+        # expected-credit, not parser error).
+        CREDIT_REASONS = ('damaged_transit', 'short_ship',
+                          'quality_issue', 'handwritten_credit')
+        credits_pending = Decimal('0')
+        ili_ids = [i.id for i in ilis]
+        if ili_ids:
+            from myapp.models import InvoiceLineEdit
+            for edit in InvoiceLineEdit.objects.filter(
+                    ili_id__in=ili_ids, reason__in=CREDIT_REASONS):
+                try:
+                    before_ext = Decimal(str(edit.before.get(
+                        'extended_amount', '0')))
+                    after_ext = Decimal(str(edit.after.get(
+                        'extended_amount', '0')))
+                    delta = before_ext - after_ext
+                    if delta > 0:
+                        credits_pending += delta
+                except (TypeError, ValueError, KeyError):
+                    pass
+
         self.items_sum = items_sum
         self.items_count = items_count
         self.sections_with_gap = sections_with_gap
         self.sections_reconciled = sections_reconciled
+        self.credits_pending = credits_pending if credits_pending > 0 else None
 
         if self.invoice_total:
             self.invoice_gap = items_sum - self.invoice_total
@@ -1431,10 +1473,13 @@ class InvoiceValidationStatus(models.Model):
 
         # Re-classify through the same path validate_all_invoices uses.
         # Import locally to avoid circular import at module load.
+        # L1 Phase 2: pass credits_pending so classifier treats fully-
+        # explained gaps as PASS (gap matches expected vendor credit).
         from myapp.management.commands.validate_all_invoices import _classify
         self.status = _classify(
             float(items_sum),
             float(self.invoice_total) if self.invoice_total else None,
             self.section_reconciliation or [],
+            credits_pending=float(credits_pending),
         )
         self.save()
