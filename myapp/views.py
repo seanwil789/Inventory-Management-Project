@@ -3020,13 +3020,24 @@ def pipeline_health(request):
     window_start = today - timedelta(days=30)
 
     # --- DB-side coverage ---
+    # Fidelity excludes intentionally-non-mappable rows from the denominator:
+    # fees/taxes (non_product), parser garbles (unmatched_garbled), class
+    # mismatches (unmatched_class_mismatch), and sheet/DB drift markers
+    # (unmatched_drift) all SHOULDN'T have a Product FK by design. Counting
+    # them as "missing" tanks vendor scores misleadingly (Delaware looked
+    # like 34% pre-fix because all surcharge/tax rows were in the denominator).
+    NON_MAPPABLE = ['non_product', 'unmatched_class_mismatch',
+                    'unmatched_drift', 'unmatched_garbled']
     total_ili = InvoiceLineItem.objects.count()
+    mappable = InvoiceLineItem.objects.exclude(
+        match_confidence__in=NON_MAPPABLE).count()
     mapped = InvoiceLineItem.objects.filter(product__isnull=False).count()
     with_price = InvoiceLineItem.objects.filter(unit_price__isnull=False).count()
     flagged = InvoiceLineItem.objects.filter(
         price_flagged=True, invoice_date__gte=window_start,
     ).count()
     unmatched = InvoiceLineItem.objects.filter(match_confidence='unmatched').count()
+    non_mappable_total = total_ili - mappable
 
     # --- Match confidence histogram ---
     conf_rows = (InvoiceLineItem.objects
@@ -3039,14 +3050,25 @@ def pipeline_health(request):
     ]
 
     # --- Per-vendor fidelity ---
+    # `mappable` excludes intentionally-non-mappable rows (fees, garble,
+    # drift, class-mismatch) so the % reflects "did mapper succeed on rows
+    # that SHOULD have mapped" rather than "what fraction has a Product FK"
+    # (the latter penalizes vendors with lots of legitimate fees).
     vendor_rows = []
     for v in Vendor.objects.all().order_by('name'):
         vt = InvoiceLineItem.objects.filter(vendor=v).count()
+        v_mappable = InvoiceLineItem.objects.filter(vendor=v).exclude(
+            match_confidence__in=NON_MAPPABLE).count()
         vm = InvoiceLineItem.objects.filter(vendor=v, product__isnull=False).count()
         if vt:
+            # Clip to 100 — if a row was hand-mapped but still tagged
+            # non_product (data inconsistency), the raw ratio can exceed 1.
+            pct = min(round(vm / v_mappable * 100, 1), 100.0) if v_mappable else 0
             vendor_rows.append({
                 'name': v.name, 'total': vt, 'mapped': vm,
-                'pct': round(vm / vt * 100, 1),
+                'mappable': v_mappable,
+                'non_mappable': vt - v_mappable,
+                'pct': pct,
             })
     vendor_rows.sort(key=lambda r: -r['total'])
 
@@ -3099,11 +3121,19 @@ def pipeline_health(request):
     ri_with_qty = RecipeIngredient.objects.filter(quantity__isnull=False).count()
     ri_with_yieldref = RecipeIngredient.objects.filter(yield_ref__isnull=False).count()
 
+    # Top-line fidelity uses the same mappable-only denominator. Clip to
+    # 100 to absorb the rare data-inconsistency case where a row is
+    # hand-mapped but still tagged non_product.
+    mapped_pct = (min(round(mapped / mappable * 100, 1), 100.0)
+                  if mappable else 0)
+
     return render(request, 'myapp/pipeline_health.html', {
         'today': today,
         'total_ili': total_ili,
+        'mappable': mappable,
+        'non_mappable_total': non_mappable_total,
         'mapped': mapped,
-        'mapped_pct': round(mapped / total_ili * 100, 1) if total_ili else 0,
+        'mapped_pct': mapped_pct,
         'with_price': with_price,
         'with_price_pct': round(with_price / total_ili * 100, 1) if total_ili else 0,
         'unmatched': unmatched,
