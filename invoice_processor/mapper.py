@@ -916,7 +916,7 @@ _SECTION_NAME_STRIP_RE = re.compile(
 )
 
 
-def _is_junk_item(item: dict) -> bool:
+def _is_junk_item(item: dict, vendor: str = "") -> bool:
     """Return True if the item is a non-product line (surcharge, header, etc.).
 
     Exception 1: items whose description is the '[Sysco #NNN]' placeholder —
@@ -978,6 +978,22 @@ def _is_junk_item(item: dict) -> bool:
         if len(stripped) >= 5:
             return False
 
+    # Exception 4 (2026-05-18): Farm Art substitute markers. Farm Art
+    # invoices use '***' to denote substitutions, not section headers.
+    # Pattern: 'EGGPLANT , SICILIAN *** * , SUB 22 REGULAR EGGPLANT ***'.
+    # These are real items with real prices. Vendor scope: only Farm Art
+    # uses this convention; Sysco's '***' clusters are section headers
+    # that should still be filtered when SUPC is missing.
+    # Origin: Farm Art INV 1629573 had its Sicilian Eggplant substitute
+    # (\$40.49) dropped, leaving a 26% items_sum gap.
+    if vendor and vendor.lower() == 'farm art':
+        ext = item.get('extended_amount') or 0
+        if (_SECTION_HEADER_BLEED_RE.search(desc)
+                and ext > 5):
+            stripped = _SECTION_NAME_STRIP_RE.sub('', desc).strip()
+            if len(stripped) >= 10:
+                return False
+
     return True
 
 
@@ -1002,7 +1018,7 @@ def map_items(parsed_items: list[dict], force_refresh: bool = False,
     clean_items = []
     junk_count = 0
     for item in parsed_items:
-        if _is_junk_item(item):
+        if _is_junk_item(item, vendor=vendor):
             junk_count += 1
         else:
             clean_items.append(item)
