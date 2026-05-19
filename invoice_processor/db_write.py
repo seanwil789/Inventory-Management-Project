@@ -284,6 +284,14 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
         vpl_candidates = build_candidate_index(vendor)
 
     written = 0
+    # Track which existing ILI IDs have already been claimed by an
+    # incoming item in this batch. Used by the Fallback 1 path to
+    # avoid having a second incoming item (with same normalized desc
+    # but different unit_price) overwrite the first one's update.
+    # Origin: Farm Art INV 1650121 has two real pepper rows at
+    # different prices; without intra-batch tracking the second write
+    # overwrote the first.
+    claimed_ili_ids: set = set()
     for item in items:
         canonical = item.get('canonical')
         product   = Product.objects.filter(canonical_name=canonical).first() if canonical else None
@@ -742,20 +750,15 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                         vendor=vendor, invoice_date=parsed_date)
                 matches = [c for c in cand_qs
                            if _normalize_desc(c.raw_description) == norm_incoming]
-                # Tiebreak by unit_price: when multiple rows share the
-                # normalized desc but represent DISTINCT line items at
-                # different prices, narrow to rows matching the incoming
-                # unit_price first. Farm Art INV 1650121 had two
-                # 'PPR PEPPERS , RED , 11 # X FANCY' lines — one at
-                # \$21/case (\$20.79 ext) and one at \$4.60/case (\$9.11
-                # ext). Pre-fix Fallback 1 matched both as same row,
-                # overwriting the first with the second's values.
-                incoming_unit = common_fields.get('unit_price')
-                if len(matches) > 1 and incoming_unit is not None:
-                    price_matches = [c for c in matches
-                                     if c.unit_price == incoming_unit]
-                    if len(price_matches) >= 1:
-                        matches = price_matches
+                # Intra-batch tracking: if a prior item in this same
+                # write_invoice_to_db call already claimed an existing
+                # row, exclude it from this item's match candidates.
+                # Prevents second incoming pepper from overwriting the
+                # first's update. Re-ingest case (different batch) is
+                # unaffected — claimed_ili_ids resets per call.
+                if claimed_ili_ids:
+                    matches = [c for c in matches
+                               if c.id not in claimed_ili_ids]
                 if len(matches) == 1:
                     existing = matches[0]
                 elif len(matches) > 1 and not product:
@@ -858,6 +861,11 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                 invoice_date=parsed_date,
                 **common_fields,
             )
+
+        # Track this ILI as claimed by current batch — prevents a later
+        # incoming item in the same call from re-matching the same row.
+        if target_ili is not None:
+            claimed_ili_ids.add(target_ili.id)
 
         # Phase 4a (Sean 2026-05-06): assign canonical FK on the resolved row.
         # `incoming_fk` was already computed above for dedup; reuse it here
