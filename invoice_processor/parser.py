@@ -2547,35 +2547,63 @@ def _parse_pbm(text: str) -> list[dict]:
         re.IGNORECASE
     )
 
+    # Scan range \u2014 items may appear before AND/OR after the Description
+    # header. PBM 5726 has 'Description' as a column-header label printed
+    # mid-list: the first 2 items (H100 Club White, L8005 Blueberry
+    # Muffins) are ABOVE the header, the remaining 9 items below. When
+    # we only scan after desc_idx, those first 2 items get missed and
+    # parser drops back from alternating to grouped price-pairing (with
+    # 9 descs + 22 prices, grouped picks indexes 9-17 as exts, summing
+    # to \$143.56 vs the correct \$131.49). Fix: include the range above
+    # the Description header when U/M tokens are present there (real
+    # items have a U/M token preceding their description).
+    items_above = any(
+        um_pattern.match(lines[i].strip())
+        for i in range(desc_idx)
+    )
+    scan_ranges = []
+    if items_above:
+        # Find first U/M token; descriptions are 1+ lines below each U/M.
+        first_um_above = next(
+            (i for i in range(desc_idx)
+             if um_pattern.match(lines[i].strip())),
+            None,
+        )
+        if first_um_above is not None:
+            # Walk from first U/M up to desc_idx
+            scan_ranges.append(range(first_um_above, desc_idx))
+    scan_ranges.append(range(desc_idx + 1, len(lines)))
+
     descriptions = []
-    for i in range(desc_idx + 1, len(lines)):
-        line = lines[i].strip()
-        if stop_pattern.match(line):
-            break
-        if not line or len(line) < 4:
-            continue
-        if re.match(r'^[\d.]+$', line):            # pure number
-            continue
-        if re.match(r'^[\d.]+\s*$', line):         # number with whitespace
-            continue
-        if um_pattern.match(line):                  # bare U/M token (DZ, EA, etc.)
-            continue
-        if re.match(r'^[A-Z]\d{2,}$', line):       # item code like L202, H106, G105
-            continue
-        if re.match(r'^0\d{2,}$', line):           # item code like 0290, 0389
-            continue
-        if re.match(r'^[A-Z]{1,2}\d+$', line):     # item code like R1012
-            continue
-        if skip_desc.match(line):                   # header text
-            continue
-        if re.match(r'^[\u1780-\u17FF\s]+$', line): # OCR garbage (Khmer chars etc.)
-            continue
-        # Must contain a word with 3+ letters (product name, not code)
-        if re.search(r'[A-Za-z]{3,}', line):
-            # Strip leading "DZ " or "PACK " if merged into description
-            clean = re.sub(r'^(DZ|EA|LB|CS|PACK)\s+', '', line, flags=re.IGNORECASE).strip()
-            if clean and len(clean) >= 4:
-                descriptions.append(clean)
+    for rng in scan_ranges:
+        for i in rng:
+            line = lines[i].strip()
+            if stop_pattern.match(line):
+                break
+            if not line or len(line) < 4:
+                continue
+            if re.match(r'^[\d.]+$', line):            # pure number
+                continue
+            if re.match(r'^[\d.]+\s*$', line):         # number with whitespace
+                continue
+            if um_pattern.match(line):                  # bare U/M token
+                continue
+            if re.match(r'^[A-Z]\d{2,}$', line):       # item code L202, H106
+                continue
+            if re.match(r'^0\d{2,}$', line):           # item code 0290, 0389
+                continue
+            if re.match(r'^[A-Z]{1,2}\d+$', line):     # item code R1012
+                continue
+            if skip_desc.match(line):                   # header text
+                continue
+            if re.match(r'^[\u1780-\u17FF\s]+$', line): # OCR garbage
+                continue
+            # Must contain a word with 3+ letters (product, not code)
+            if re.search(r'[A-Za-z]{3,}', line):
+                clean = re.sub(r'^(DZ|EA|LB|CS|PACK)\s+', '',
+                               line, flags=re.IGNORECASE).strip()
+                if clean and len(clean) >= 4:
+                    descriptions.append(clean)
 
     # Late-header fallback: primary scan found nothing AND the footer has
     # the Description/UnitPrice/Amount triple. Rescan the range between the
@@ -2613,7 +2641,12 @@ def _parse_pbm(text: str) -> list[dict]:
     # PBM OCR has varying layouts — prices can be before/after descriptions,
     # alternating (unit, ext, unit, ext) or grouped (all units, all exts).
     # Strategy: collect ALL prices, then pair with descriptions using the
-    # subtotal as a validation check.
+    # subtotal OR invoice_total as a validation check. Invoice 5726
+    # (2026-05-18) surfaced a case where Subtotal label is far from its
+    # value in OCR (Routeperson/Contact lines intervene) → subtotal
+    # extraction fails → fallback picks the strategy with largest sum,
+    # which was the wrong one. Extracting invoice_total here too gives
+    # us a second validation anchor.
     subtotal = None
     for i, line in enumerate(lines):
         m = re.match(r'^Subtotal\s*\(\$\)\s*:\s*$', line, re.IGNORECASE)
@@ -2624,6 +2657,27 @@ def _parse_pbm(text: str) -> list[dict]:
                     subtotal = float(nm.group(1).replace(",", ""))
                     break
             break
+
+    # Pre-extract invoice_total for use as fallback validation target.
+    invoice_total_pre = None
+    for i, line in enumerate(lines):
+        m = re.match(r'^Invoice\s+Total\s*\(\$\)\s*:\s*$', line, re.IGNORECASE)
+        if m:
+            for j in range(i + 1, min(i + 3, len(lines))):
+                nm = re.match(r'^(\d+[,\d]*\.\d{2})\s*$', lines[j])
+                if nm:
+                    invoice_total_pre = float(nm.group(1).replace(",", ""))
+                    break
+            break
+        m = re.match(r'^Invoice\s+Total\s*\(\$\)\s*:\s*(\d+[,\d]*\.\d{2})',
+                     line, re.IGNORECASE)
+        if m:
+            invoice_total_pre = float(m.group(1).replace(",", ""))
+            break
+    # Use whichever validation target is available; prefer subtotal
+    # when both present (subtotal is items-only, invoice_total may
+    # include tax/fees on some PBM templates).
+    validation_target = subtotal if subtotal is not None else invoice_total_pre
 
     # Collect prices — strategy depends on whether descriptions were found via U/M (method 1)
     # or fallback (method 2). Method 1 = row-by-row (prices between desc and Subtotal).
@@ -2730,17 +2784,27 @@ def _parse_pbm(text: str) -> list[dict]:
             mp_sum = round(sum(mp_ext), 2)
             candidates.append(("math_pairs", mp_unit, mp_ext, mp_sum))
 
-        # Pick the strategy that matches subtotal
+        # Pick the strategy that matches subtotal or invoice_total
         best = None
         for name, units, exts, total in candidates:
-            if subtotal and abs(total - subtotal) < 0.50:
+            if validation_target and abs(total - validation_target) < 0.50:
                 best = (name, units, exts)
                 break
 
         if best:
             _, unit_prices, ext_amounts = best
+        elif validation_target:
+            # No exact match — pick the strategy closest to the
+            # validation_target. Better than blindly picking the largest
+            # when totals are available. PBM 5726: alternating sum
+            # \$131.49 vs grouped \$174.34, target \$131.49 → alternating
+            # is closer by \$42.85; previous "largest" fallback wrongly
+            # picked grouped.
+            candidates.sort(key=lambda x: abs(x[3] - validation_target))
+            _, unit_prices, ext_amounts = candidates[0][1], candidates[0][1], candidates[0][2]
         else:
-            # No subtotal match — pick the one with the largest sum (most likely extended)
+            # No validation target at all — pick the largest sum (most
+            # likely extended).
             candidates.sort(key=lambda x: x[3], reverse=True)
             _, unit_prices, ext_amounts = candidates[0][1], candidates[0][1], candidates[0][2]
 
