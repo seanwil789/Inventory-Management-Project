@@ -742,6 +742,20 @@ def write_invoice_to_db(vendor_name: str, invoice_date: str,
                         vendor=vendor, invoice_date=parsed_date)
                 matches = [c for c in cand_qs
                            if _normalize_desc(c.raw_description) == norm_incoming]
+                # Tiebreak by unit_price: when multiple rows share the
+                # normalized desc but represent DISTINCT line items at
+                # different prices, narrow to rows matching the incoming
+                # unit_price first. Farm Art INV 1650121 had two
+                # 'PPR PEPPERS , RED , 11 # X FANCY' lines — one at
+                # \$21/case (\$20.79 ext) and one at \$4.60/case (\$9.11
+                # ext). Pre-fix Fallback 1 matched both as same row,
+                # overwriting the first with the second's values.
+                incoming_unit = common_fields.get('unit_price')
+                if len(matches) > 1 and incoming_unit is not None:
+                    price_matches = [c for c in matches
+                                     if c.unit_price == incoming_unit]
+                    if len(price_matches) >= 1:
+                        matches = price_matches
                 if len(matches) == 1:
                     existing = matches[0]
                 elif len(matches) > 1 and not product:
