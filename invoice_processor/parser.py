@@ -3903,6 +3903,60 @@ def parse_invoice(text: str, vendor: str = None,
                               f"subtotal mispairing)")
                         del extracted_fees[_key]
 
+        # Swap-and-recover (2026-05-18): if CC got dropped by cap AND
+        # captured fuel is suspiciously high (>\$15), the invoice likely
+        # has the "values below labels" layout — the captured "fuel"
+        # is actually the real CC, and the real fuel sits BELOW the
+        # FUEL label. Look for a small ($5-15) value just below FUEL
+        # label and swap.
+        # Origin: INV 775808085 had CC=\$77 (capped out) + FUEL=\$21.09
+        # captured. Real values: CC=\$21.09 + FUEL=\$8.95 (below the
+        # FUEL label). Same pattern on 775825138 (CC=\$30.28 / FUEL=
+        # \$8.95).
+        if (invoice_total is not None
+                and 'fuel_surcharge' in extracted_fees
+                and 'cc_processing' not in extracted_fees
+                and extracted_fees['fuel_surcharge'] > 15):
+            from section_validator import _label_row, _y_mid, _x_mid, _FEE_PRICE_RE
+            captured_fuel = extracted_fees['fuel_surcharge']
+            for p in (pages or []):
+                p_tokens = p.get('tokens') or []
+                fuel_lbl = _label_row(p_tokens, {'FUEL', 'SURCHARGE'},
+                                       'FUEL', max_dy=0.02)
+                if not fuel_lbl:
+                    continue
+                fuel_y = sum(_y_mid(t) for t in fuel_lbl) / len(fuel_lbl)
+                below_candidates = []
+                for t in p_tokens:
+                    if not _FEE_PRICE_RE.fullmatch(t.get('text') or ''):
+                        continue
+                    ty = _y_mid(t)
+                    if ty <= fuel_y:
+                        continue
+                    if ty - fuel_y > 0.025:
+                        continue
+                    if _x_mid(t) < 0.5:
+                        continue
+                    try:
+                        v = float(t['text'])
+                    except ValueError:
+                        continue
+                    if v == captured_fuel:
+                        continue
+                    if 5 <= v <= 15:
+                        below_candidates.append((ty - fuel_y, v))
+                if below_candidates:
+                    below_candidates.sort()
+                    new_fuel = below_candidates[0][1]
+                    # Verify new CC is in plausibility cap too
+                    if captured_fuel < invoice_total * 0.07:
+                        print(f"  [✓] Sysco fee swap (values-below-labels): "
+                              f"FUEL ${captured_fuel:.2f} → CC, "
+                              f"${new_fuel:.2f} → FUEL")
+                        extracted_fees['cc_processing'] = captured_fuel
+                        extracted_fees['fuel_surcharge'] = new_fuel
+                    break
+
         fee_sum = round(sum(extracted_fees.values()), 2) if extracted_fees else 0.0
 
         # B-SyscoFeeILI (2026-05-12): when label extraction returns plausible

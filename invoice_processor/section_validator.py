@@ -311,53 +311,42 @@ def extract_sysco_fees(pages: list[dict]) -> dict:
         if not tokens:
             continue
 
-        if 'fuel_surcharge' not in fees:
-            fuel_row = _label_row(tokens, {'FUEL', 'SURCHARGE'}, 'FUEL',
-                                  max_dy=0.02)
-            if fuel_row:
-                # 2026-05-18: widened from 0.02 to 0.025 because on some
-                # invoices Sysco prints VALUES above LABELS with wider
-                # baseline drift than the typical 0.003-0.012. Reference:
-                # INV 775632629 — FUEL label y=0.385, $6.50 value y=0.3628
-                # (dy=0.0222 > 0.020). Pre-fix FUEL missed → CC then
-                # captured $6.50 (which was actually the FUEL value),
-                # leaving the real CC ($53.87 at y=0.3497) uncaptured.
-                # Post-fix FUEL claims $6.50, CC's exclude-prior-fuel
-                # logic forces it to pick the next-closest = $53.87.
-                amt = _value_for_label(tokens, fuel_row, max_dy=0.025)
-                if amt is not None:
-                    fees['fuel_surcharge'] = amt
+        # 2026-05-18: Sysco fee layout varies — some invoices have values
+        # ABOVE labels (775632629 pattern), others BELOW (775808085,
+        # 775825138 pattern). The closest-y heuristic can pair CC label
+        # with a wrong value (sometimes a MISC SUBTOTAL above) that
+        # exceeds plausibility caps. Strategy: gather candidates and
+        # extract by closest-y for both FUEL and CC; if results are
+        # plausible (within caps), use them. Plausibility caps in
+        # parser.py catch implausible captures.
+        fuel_row = (_label_row(tokens, {'FUEL', 'SURCHARGE'}, 'FUEL',
+                               max_dy=0.02)
+                    if 'fuel_surcharge' not in fees else None)
+        cc_row = (_label_row(tokens, {'CREDIT', 'CARD'}, 'CREDIT',
+                             max_dy=0.02)
+                  if 'cc_processing' not in fees else None)
 
-        if 'cc_processing' not in fees:
-            cc_row = _label_row(tokens, {'CREDIT', 'CARD'}, 'CREDIT',
-                                max_dy=0.02)
-            if cc_row:
-                # Escalating dy: try tight (0.02) first, fall back to 0.03
-                # for invoices with wider OCR baseline drift between the
-                # label row and the value row. Reference: INV 775605601
-                # cache 9bc38973 — CREDIT CARD label at y=0.791,
-                # value $60.03 at y=0.767 (dy=0.024 > 0.020). Tight match
-                # missed the real CC; widening recovers it. Plausibility
-                # cap at the caller (cc < 7% of invoice_total) catches any
-                # wrong values introduced by the wider band.
-                #
-                # Token deduplication (2026-05-12): exclude any value
-                # already assigned to fuel_surcharge. When FUEL and CC
-                # labels are vertically close (~0.014 apart), both
-                # closest-y to the same value (e.g., INV 775808085
-                # captured fuel=$21.09 and CC=$21.09 — same token
-                # attributed twice). Excluding lets CC find a different
-                # candidate.
-                exclude_vals = set()
-                if 'fuel_surcharge' in fees:
-                    exclude_vals.add(round(fees['fuel_surcharge'], 2))
-                amt = _value_for_label(tokens, cc_row, max_dy=0.02,
+        if fuel_row:
+            amt = _value_for_label(tokens, fuel_row, max_dy=0.025)
+            if amt is not None:
+                fees['fuel_surcharge'] = amt
+
+        if cc_row:
+            # exclude value already paired with FUEL to avoid double-count
+            exclude_vals = set()
+            if 'fuel_surcharge' in fees:
+                exclude_vals.add(round(fees['fuel_surcharge'], 2))
+            amt = _value_for_label(tokens, cc_row, max_dy=0.02,
+                                   exclude_vals=exclude_vals)
+            if amt is None:
+                amt = _value_for_label(tokens, cc_row, max_dy=0.03,
                                        exclude_vals=exclude_vals)
-                if amt is None:
-                    amt = _value_for_label(tokens, cc_row, max_dy=0.03,
-                                           exclude_vals=exclude_vals)
-                if amt is not None:
-                    fees['cc_processing'] = amt
+            if amt is not None:
+                fees['cc_processing'] = amt
+
+        # NOTE: swap-and-recover for "values-below-labels" layout lives
+        # in parser.py, after the plausibility cap drops the misattributed
+        # CC. That's the only point where we know the cap fired.
 
         if 'tax' not in fees:
             # TAX: bottom half only (column-header "TAX" tokens sit in
