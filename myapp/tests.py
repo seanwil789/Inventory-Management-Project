@@ -1889,6 +1889,24 @@ class ParserInvoiceNumberExtractionTests(TestCase):
         result = self._parse(text, 'Philadelphia Bakery Merchants')
         self.assertEqual(result.get('invoice_number'), '6597')
 
+    def test_pbm_wide_displaced_address_block(self):
+        """2026-05-19 Pass 3: some PBM invoices put the address block
+        BETWEEN the 'Invoice:' label stack and the number+date values.
+        Pass 2's 5-line window misses the displaced number. Pass 3 uses
+        a 'digit-only line immediately followed by M/DD/YY date' anchor
+        to find it without false-positives on zip codes (which lack the
+        following date).
+
+        Origin: PBM INVs 1916, 2657, 3089 (March 2026) — successful
+        parses but invoice_number=None, never ingested into DB."""
+        text = ('Philadelphia Bakery Merchants\n'
+                'Invoice:\nInvoice Date:\nOrder Date:\nDelivery Time:\n'
+                'Synergy Bakery\n72 Crestline Rd\nWayne, PA\n'
+                '835-222-6110\n19807\n'      # <- zip code (digit-only) shouldn't win
+                '2657\n03/17/26\n03/16/26\n')  # <- real number followed by date
+        result = self._parse(text, 'Philadelphia Bakery Merchants')
+        self.assertEqual(result.get('invoice_number'), '2657')
+
     def test_colonial_returns_none(self):
         """Colonial has no invoice_number extraction. Returns None,
         which db_write coerces to empty string and falls through to

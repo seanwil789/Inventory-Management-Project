@@ -828,6 +828,34 @@ def extract_invoice_number(text: str, vendor: str) -> str | None:
                     cand = re.match(r'^\s*(\d{4,10})\s*$', lines[j])
                     if cand:
                         return cand.group(1)
+        # Pass 3 (2026-05-19): wide-displaced layout. Some PBM invoices put
+        # the address block BETWEEN the "Invoice:" label stack and the
+        # actual number+date values, pushing the value 8-15 lines below
+        # its label. Pass 2's tight 5-line window misses it.
+        # Origin: 3 PBM March 2026 orphan caches (INVs 1916, 2657, 3089)
+        # had successful parses but no invoice_number, never ingested.
+        # Strategy: anchor on "digit-only line IMMEDIATELY followed by a
+        # M/DD/YY date" — the date pattern proves we found the
+        # invoice_number+invoice_date pair, not a zip code or phone digit.
+        # Scoped to AFTER an "Invoice:" label so we don't accept random
+        # mid-document number/date pairs.
+        _date_re = re.compile(r'^\s*\d{1,2}/\d{1,2}/\d{2,4}\s*$')
+        for i, line in enumerate(lines):
+            if not re.match(r'^\s*Invoice\s*(?:No\.?|Number|#)?:?\s*$',
+                            line, re.IGNORECASE):
+                continue
+            for j in range(i + 1, min(i + 20, len(lines))):
+                cand = re.match(r'^\s*(\d{4,10})\s*$', lines[j])
+                if not cand:
+                    continue
+                # Require the date to be the IMMEDIATELY next line — looser
+                # windows accept the zip-then-number-then-date layout where
+                # the zip's "next 3 lines" include the real number's date,
+                # producing a false positive.
+                if j + 1 < len(lines) and _date_re.match(lines[j + 1]):
+                    return cand.group(1)
+            # Only check the first "Invoice:" label per pass.
+            break
     return None
 
 
