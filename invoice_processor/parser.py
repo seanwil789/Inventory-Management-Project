@@ -3715,12 +3715,28 @@ def parse_invoice(text: str, vendor: str = None,
         if text_items and tx_sum is not None:
             candidates.append(("text", text_items, abs(tx_sum - invoice_total)))
         if candidates:
-            # Sort by: (sections-reconciled DESC, gap ASC).
+            # Sort by: (sections-reconciled DESC, placeholder-count ASC,
+            # gap ASC).
             # `_section_quality` returns (reconciled_count, sections_with_printed).
-            # Higher reconciled_count wins; tie-break by smaller gap.
-            scored = [(name, items_list, gap, _section_quality(items_list))
+            # Higher reconciled_count wins; tie-break by FEWER placeholder
+            # descriptions ('[Vendor #code]' shape from spatial fallback
+            # when a code couldn't pair with desc tokens), then smaller
+            # gap. Origin: PBM INV 655001 — spatial emits 2 placeholders
+            # ('[PBM #L7408]', '[PBM #D013]'), text emits real descs
+            # ('Brioche Buns', 'Kaiser Rolls'). Both reconcile to total
+            # exactly. Pre-fix spatial won (declared first in candidates
+            # list, stable sort preserved order on equal scores). Now
+            # text wins because it has fewer placeholders.
+            import re as _re
+            _placeholder_re = _re.compile(r'^\[\w+\s*#')
+            def _placeholder_count(items_list):
+                return sum(1 for it in (items_list or [])
+                           if _placeholder_re.match(it.get('raw_description') or ''))
+            scored = [(name, items_list, gap,
+                       _section_quality(items_list),
+                       _placeholder_count(items_list))
                       for name, items_list, gap in candidates]
-            scored.sort(key=lambda c: (-c[3][0], c[2]))
+            scored.sort(key=lambda c: (-c[3][0], c[4], c[2]))
             items = scored[0][1]
         elif rank_pair_items is not None:
             items = rank_pair_items
