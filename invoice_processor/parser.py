@@ -856,6 +856,19 @@ def extract_invoice_number(text: str, vendor: str) -> str | None:
                     return cand.group(1)
             # Only check the first "Invoice:" label per pass.
             break
+        # Pass 4 (2026-05-19): some PBM invoices place the invoice
+        # number+date pair at the END of the OCR text (after the items
+        # list), far from the "Invoice:" label. Pass 3's 20-line window
+        # doesn't reach. Scan the whole text for the digit+date adjacency
+        # pattern — the date anchor is strong enough that false positives
+        # are rare. Origin: PBM INV 3089 cache (d8fa93284) — number sits
+        # 30+ lines below the "Invoice:" label.
+        for j, line in enumerate(lines):
+            cand = re.match(r'^\s*(\d{4,10})\s*$', line)
+            if not cand:
+                continue
+            if j + 1 < len(lines) and _date_re.match(lines[j + 1]):
+                return cand.group(1)
     return None
 
 

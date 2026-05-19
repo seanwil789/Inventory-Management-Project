@@ -1907,6 +1907,21 @@ class ParserInvoiceNumberExtractionTests(TestCase):
         result = self._parse(text, 'Philadelphia Bakery Merchants')
         self.assertEqual(result.get('invoice_number'), '2657')
 
+    def test_pbm_number_after_items_pass4(self):
+        """2026-05-19 Pass 4: some PBM invoices place the invoice
+        number+date pair at the very END of the OCR text (after the
+        items list), 30+ lines past the 'Invoice:' label. Pass 3's
+        20-line window doesn't reach. Pass 4 scans globally for the
+        digit+date adjacency pattern.
+
+        Origin: PBM INV 3089 cache — number sits at the bottom after
+        'QTY Totals: 5.00' and 's Printed:' footer."""
+        text = ('Philadelphia Bakery Merchants\nInvoice:\nInvoice Date:\n'
+                + '\n'.join(['Filler line %d' % i for i in range(30)])
+                + '\nQTY Totals:\n5.00\n3089\n03/19/26\n03/18/26\n')
+        result = self._parse(text, 'Philadelphia Bakery Merchants')
+        self.assertEqual(result.get('invoice_number'), '3089')
+
     def test_colonial_returns_none(self):
         """Colonial has no invoice_number extraction. Returns None,
         which db_write coerces to empty string and falls through to
