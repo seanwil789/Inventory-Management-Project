@@ -3670,6 +3670,263 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class ParserPbmFormat1CorpusTests(TestCase):
+    """B-PbmFormat1Corpus (2026-05-20): _parse_pbm_format1 must handle six
+    real-corpus PBM Jan-Feb 2026 invoice layouts without regression.
+
+    Surfaced via PBM INV 656884 (FAIL pre-fix). Initial fix attempt
+    broke 657529 ("Total" as column header) and 655790 (handwritten
+    substitution notes after the prices block). Real fix:
+      - "Total" disambiguation via lookahead (footer iff next non-empty
+        line starts with '$').
+      - Post-prices-region standalone-name capture gated on pending qty
+        from a recent wrapped code line.
+      - Wrapped regex broadened to catch "N code" / "N code/abbrev"
+        variants without trailing dots.
+      - qty extracted from leading digit in both single-line and wrapped.
+    """
+
+    def _parse(self, raw):
+        p = _import_parser()
+        return p.parse_invoice(raw, vendor='PBM')
+
+    # ---------- 656884 (the original FAIL) — wraps below prices column ----------
+    def test_656884_wrapped_items_below_prices_column(self):
+        raw = """ABC Invoice
+2/24/2026
+Description
+2 L118/SeedItal... Seeded Italian Hoagies
+2 0258/MedDa... Medium Danish/Assorted
+2 0290/AsstDo... Assorted Donuts
+2 0389/AsstMu... Assorted Muffins/ CupSize
+2 L4606
+Price Each
+Amount
+10.37
+20.74
+14.92
+29.84
+20.00
+40.00
+10.00
+20.00
+Brioche Sandwich Loaf Thick Sliced
+7.93
+15.86
+3 H103/Ham
+Hamburger Rolls
+4.15
+12.45
+2 G105/PlainBa... Plain Bagels/Original not open due to the snow
+6.42
+12.84
+Total
+$151.73
+"""
+        r = self._parse(raw)
+        items = r['items']
+        self.assertEqual(len(items), 7, f'expected 7, got {len(items)}: {items}')
+        self.assertEqual(r['invoice_total'], 151.73)
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 151.73, places=2)
+        by_desc = {it['raw_description']: it for it in items}
+        self.assertEqual(by_desc['Hamburger Rolls']['quantity'], 3)
+        self.assertEqual(by_desc['Brioche Sandwich Loaf Thick Sliced']['quantity'], 2)
+        self.assertEqual(by_desc['Seeded Italian Hoagies']['quantity'], 2)
+
+    # ---------- 656375 (PASS pre-fix) — wrapped before Price Each ----------
+    def test_656375_wrapped_before_price_each(self):
+        raw = """ABC Invoice
+2/17/2026
+Description
+3 L202/PotatoH... Potato Hamburger/8 Pk/Sliced/ 3 1/2"
+2 L7408
+2 0290/AsstDo...
+Brioche Buns
+Assorted Donuts
+2 0326/TrayMi... Tray Mini Muffins
+2 0389/AsstMu... Assorted Muffins/ CupSize
+Price Each
+Amount
+3.50
+10.50
+9.37
+18.74
+20.00
+40.00
+25.00
+50.00
+10.00
+20.00
+Total
+$139.24
+"""
+        r = self._parse(raw)
+        items = r['items']
+        self.assertEqual(len(items), 5)
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 139.24, places=2)
+        by_desc = {it['raw_description']: it for it in items}
+        self.assertEqual(
+            by_desc['Potato Hamburger/8 Pk/Sliced/ 3 1/2"']['quantity'], 3)
+        self.assertEqual(by_desc['Brioche Buns']['quantity'], 2)
+        self.assertEqual(by_desc['Assorted Donuts']['quantity'], 2)
+
+    # ---------- 657529 (must stay PASS) — Total as column HEADER ----------
+    def test_657529_total_as_column_header(self):
+        raw = """ABC Invoice
+2/28/2026
+Description
+21 18 egHoag... Regular Hoagie Wrapped
+1 0258/MedDa...
+Medium Danish/Assorted
+1 0290/AsstDo... Assorted Donuts
+1 0326/TrayMi... Tray Mini Muffins
+Price Each
+Amount
+Total
+8.23
+16.46
+14.92
+14.92
+20.00
+20.00
+25.00
+25.00
+$76.38
+"""
+        r = self._parse(raw)
+        items = r['items']
+        self.assertEqual(len(items), 4, f'expected 4, got {len(items)}: {items}')
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 76.38, places=2)
+        descs = [it['raw_description'] for it in items]
+        # The OCR-mangled "21 18 egHoag... Regular Hoagie Wrapped" must be
+        # captured as a standalone description (current behavior preserved).
+        self.assertTrue(any('Hoagie Wrapped' in d for d in descs),
+                        f'Hoagie line missing: {descs}')
+
+    # ---------- 656218 (must stay PASS) — Total as header + inline desc ----------
+    def test_656218_total_header_with_inline_description(self):
+        raw = """ABC Invoice
+2/12/2026
+Description
+2 0290/AsstDo... Assorted Donuts
+2 0258/MedDa... Medium Danish/Assorted
+2 0326/TrayMi... Tray Mini Muffins
+2 H100/CWhite Club White
+Price Each
+Amount
+Total
+20.00
+40.00
+14.92
+29.84
+25.00
+50.00
+4.15
+8.30
+$128.14
+"""
+        r = self._parse(raw)
+        items = r['items']
+        self.assertEqual(len(items), 4)
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 128.14, places=2)
+
+    # ---------- 655001 (PASS) — wrapped code BEFORE Description header ----------
+    def test_655001_wrapped_before_description_header(self):
+        raw = """ABC Invoice
+1/29/2026
+3 L7408
+Description
+***Deliver to side entrance located on Hemlock
+Alley. There is a white man door. Wrap order
+up and leave at that door.***
+Brioche Buns
+3 D013/KaiserR... Kaiser Rolls
+Price Each
+Amount
+9.37
+28.11
+5.65
+16.95
+Total
+$45.06
+"""
+        r = self._parse(raw)
+        items = r['items']
+        self.assertEqual(len(items), 2)
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 45.06, places=2)
+        by_desc = {it['raw_description']: it for it in items}
+        # Kaiser Rolls captured via single-line — qty=3 extracted.
+        self.assertEqual(by_desc['Kaiser Rolls']['quantity'], 3)
+
+    # ---------- 655790 (handwritten notes must be rejected) ----------
+    def test_655790_handwritten_notes_rejected_in_post_prices_region(self):
+        raw = """ABC Invoice
+2/10/2026
+Club White
+Item Code
+1 0290/AsstDo...
+Description
+***Deliver to side entrance located on Hemlock
+Alley. There is a white man door. Wrap order
+and leave at that door.***
+up
+Assorted Donuts
+1 0258/MedDa... Medium Danish/Assorted
+1 0326/TrayMi... Tray Mini Muffins
+3 H097/WhitePi... White Pita dz
+2 H100/CWhite
+Price Each
+Amount
+20.00
+20.00
+14.92
+14.92
+25.00
+25.00
+5.25
+15.75
+4.15
+8.30
+3 L118/SeedItal... Seeded Italian Hoagies
+10.37
+31.11
+1 L18/RegHoag... Regular Hoagie Wrapped
+8.23
+8.23
+0 K346/3#WW... 3 LB. Whole Wheat Sandwich Sliced/Sorry this
+9.33
+0.00
+bread is no longer available.
+I can send 2 whole wheat from Stroehman and
+we can figure something else out. Lebus has a
+Golden wheat but it is a 2 day notice and Baker
+St has a wheat which is a 2 day notice
+Total
+$123.31
+"""
+        r = self._parse(raw)
+        items = r['items']
+        descs = [it['raw_description'] for it in items]
+
+        # Handwritten substitution-note lines MUST NOT be captured.
+        for forbidden in ('bread is no longer available.',
+                          'I can send 2 whole wheat from Stroehman and',
+                          'we can figure something else out. Lebus has a',
+                          'Golden wheat but it is a 2 day notice and Baker',
+                          'St has a wheat which is a 2 day notice'):
+            self.assertNotIn(forbidden, descs,
+                             f'forbidden handwritten note captured: {forbidden!r}')
+
+        # The 0-qty Whole Wheat line (with handwritten suffix) stays out too.
+        self.assertFalse(any('Whole Wheat Sandwich' in d for d in descs),
+                         f'0-qty whole wheat captured: {descs}')
+
+
 class MenuSwapTests(AuthedTestCase):
     """menu_swap view — quick-swap meal content between two same-slot menus.
     Calendar edit-mode UI fires this on drag-drop drop.

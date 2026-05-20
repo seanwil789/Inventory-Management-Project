@@ -2417,9 +2417,24 @@ def _parse_farmart(text: str) -> list[dict]:
 def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
     """
     PBM old-style invoices (Jan-Feb 2026 and earlier).
-    Items appear as: "2 0290/AsstDo... Assorted Donuts"
+    Items appear as: "2 0290/AsstDo... Assorted Donuts" (single-line) OR
+    wrapped: "2 L7408" / "3 H103/Ham" code-only line followed by the
+    description on a separate standalone line.
     Prices in "Price Each" / "Amount" block.
     Total as "$XX.XX".
+
+    Layout variants handled:
+      - 656884: items 5-7 emit their descriptions AFTER "Price Each" in
+        OCR raster order (their physical row position on the printed
+        invoice extends below the price column's vertical span). Loop
+        scans the whole document; "Total" is disambiguated via lookahead
+        (footer if next line starts with '$', else column header).
+      - 657529: "Total" appears as a column HEADER between "Amount" and
+        the price values (not a footer). Lookahead skips it.
+      - 655790-style: handwritten substitution notes after the prices
+        block are rejected via post-prices-region guard — standalone-name
+        capture in that region requires a pending qty from a recent
+        wrapped code line.
     """
     lines = [l.strip() for l in text.splitlines()]
 
@@ -2432,14 +2447,40 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
     if desc_idx is None:
         return [], None
 
-    # Extract descriptions: lines matching "N code/abbrev... Product Name"
-    # or just product name lines after the delivery instructions
-    descriptions = []
+    def _lookahead_total_is_footer(idx: int) -> bool:
+        """True if next non-empty line after lines[idx] starts with '$'."""
+        for j in range(idx + 1, min(idx + 5, len(lines))):
+            if lines[j]:
+                return bool(re.match(r'^\$\d', lines[j]))
+        return False  # no more content — treat as column header (continue)
+
+    # Description + qty scan. Scans the whole document; break only on a
+    # "Total" footer per lookahead. In post-prices region, standalone-name
+    # capture is gated on pending_qty to skip handwritten notes.
+    descriptions: list[str] = []
+    qtys: list[int | None] = []   # parallel to descriptions
+    pending_qtys: list[int] = []  # FIFO queue of wrapped-code qtys
     in_delivery_note = False
+    seen_price_marker = False
     for i in range(desc_idx + 1, len(lines)):
         line = lines[i]
-        if re.match(r'^(Price Each|Amount|Total)\b', line, re.IGNORECASE):
-            break
+
+        # "Total" disambiguation: footer (break) vs column header (skip).
+        if re.match(r'^(Total|Subtotal)\s*$', line, re.IGNORECASE):
+            if _lookahead_total_is_footer(i):
+                break
+            continue
+        if re.match(r'^(Total|Subtotal)\s+\$?\d', line, re.IGNORECASE):
+            break  # explicit "Total $X" footer form
+
+        # Column headers in the prices block — skip without capturing.
+        if re.match(r'^(Price Each|Amount)\s*$', line, re.IGNORECASE):
+            seen_price_marker = True
+            continue
+        if re.match(r'^(Quantity|Item Code|Description)\s*$', line, re.IGNORECASE):
+            continue
+
+        # Delivery-note block (***...***).
         if line.startswith('***'):
             in_delivery_note = True
             continue
@@ -2457,21 +2498,35 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         # Origin: PBM INV 657529 — pre-fix the code-only wrapped line
         # got appended as desc='.', producing 5 items instead of 4
         # and mis-shifting all prices.
-        m = re.match(r'^\d+\s+\S+/\S+\.{2,}\s+([A-Za-z][^.]{2,}.*)', line)
+        m = re.match(r'^(\d+)\s+\S+/\S+\.{2,}\s+([A-Za-z][^.]{2,}.*)', line)
         if m:
-            descriptions.append(m.group(1).strip())
+            descriptions.append(m.group(2).strip())
+            qtys.append(int(m.group(1)))
+            pending_qtys.clear()   # any prior wrapped that never got desc is stale
             continue
-        # Wrapped two-line case: "N code/abbrev..." with empty trail,
-        # followed by the product name on the next line. The code line
-        # itself isn't a description — skip it; the next iteration
-        # picks up the wrapped name.
-        if re.match(r'^\d+\s+\S+/\S+\.{2,}\s*$', line):
+
+        # Wrapped: "N code" / "N code/abbrev" / "N code/abbrev..." with no
+        # trailing description text. Variants:
+        #   "2 L7408"          — code-only (655001, 656884)
+        #   "3 H103/Ham"       — slash+abbrev, no dots (656884)
+        #   "2 0290/AsstDo..." — slash+abbrev with trailing dots only (656375)
+        # Qty queues for the next standalone-name line.
+        m = re.match(r'^(\d+)\s+(?:[A-Z]?\d{3,5})(?:/\S*)?\.{0,}\s*$', line)
+        if m:
+            pending_qtys.append(int(m.group(1)))
             continue
-        # Standalone product name (no code prefix)
+
+        # Standalone product name (no code prefix). Post-prices region
+        # requires a pending qty (from a recent wrapped code) — guards
+        # against handwritten substitution notes / freeform text after
+        # the prices block (655790-class invoices).
         if (re.search(r'[A-Za-z]{3,}', line)
                 and not re.match(r'^\d+\s+[A-Z]\d+$', line)
                 and len(line) >= 4):
+            if seen_price_marker and not pending_qtys:
+                continue
             descriptions.append(line)
+            qtys.append(pending_qtys.pop(0) if pending_qtys else None)
 
     # Extract prices: after "Price Each" / "Amount", alternating (unit, ext)
     raw_amounts = []
@@ -2505,22 +2560,28 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         for i in range(n):
             unit = raw_amounts[i * 2]
             ext = raw_amounts[i * 2 + 1]
-            items.append({
+            item = {
                 "raw_description": descriptions[i],
                 "unit_price": unit,
                 "extended_amount": ext,
                 "case_size_raw": "",
-            })
+            }
+            if i < len(qtys) and qtys[i] is not None:
+                item["quantity"] = qtys[i]
+            items.append(item)
     elif n > 0 and raw_amounts:
         # Fallback: just pair what we have
         for i, desc in enumerate(descriptions):
             if i < len(raw_amounts):
-                items.append({
+                item = {
                     "raw_description": desc,
                     "unit_price": raw_amounts[i],
                     "extended_amount": raw_amounts[i],
                     "case_size_raw": "",
-                })
+                }
+                if i < len(qtys) and qtys[i] is not None:
+                    item["quantity"] = qtys[i]
+                items.append(item)
 
     items_sum = round(sum(it.get("extended_amount", 0) for it in items), 2)
     if invoice_total is not None:
