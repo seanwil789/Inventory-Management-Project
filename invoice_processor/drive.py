@@ -120,12 +120,17 @@ def _week_label(invoice_date: datetime) -> str:
 
 def archive_invoice(file_id: str, file_name: str,
                     vendor: str, invoice_date_str: str,
-                    inbox_folder_id: str) -> None:
+                    inbox_folder_id: str) -> str:
     """
     Move a file that's already in the Drive inbox into the archive hierarchy.
     Uses files().update() to change parents — no upload, no quota required.
 
     invoice_date_str: YYYY-MM-DD
+
+    Returns the archive path ('YYYY/MM MonthName YYYY/Vendor/Week N MM.DD - MM.DD'),
+    which callers can pass to image_cache.update_index() to backfill the cache
+    entry's drive_path + vendor fields. (At image_cache write time those fields
+    aren't known yet because the cache write fires before parse + archive.)
     """
     drive = get_drive_client()
     date  = datetime.strptime(invoice_date_str, "%Y-%m-%d")
@@ -153,4 +158,6 @@ def archive_invoice(file_id: str, file_name: str,
         fields="id, parents",
     ).execute()
 
-    print(f"   Moved to: {year_folder}/{month_folder}/{vendor}/{week_folder}/{file_name}")
+    archive_path = f"{year_folder}/{month_folder}/{vendor}/{week_folder}"
+    print(f"   Moved to: {archive_path}/{file_name}")
+    return archive_path

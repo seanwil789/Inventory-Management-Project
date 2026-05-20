@@ -2421,6 +2421,171 @@ class ImageCacheModuleTests(TestCase):
         self.assertEqual(s['index_entries'], 1)
 
 
+class ImageCacheMetadataBackfillTests(TestCase):
+    """Class Bug #1 (Drive-archive audit 2026-05-20): image_cache cache writes
+    happen at inbox-processing time, BEFORE parse + archive — so the dict
+    passed to cache_image_bytes lacks `vendor` and `drive_path`. The
+    _backfill_image_cache_metadata() helper in batch.py is called after
+    archive_invoice() succeeds to populate those fields.
+
+    Without the backfill, every image_cache entry written via the inbox flow
+    permanently lacks vendor + drive_path, which blinds downstream Drive↔DB
+    mis-archive audits. These tests pin the backfill behavior."""
+
+    def setUp(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import image_cache
+        import tempfile
+        from pathlib import Path
+        self._tmp = tempfile.mkdtemp(prefix='ictest_backfill_')
+        self._orig_cache_dir = image_cache._CACHE_DIR
+        self._orig_index_path = image_cache._INDEX_PATH
+        image_cache._CACHE_DIR = Path(self._tmp)
+        image_cache._INDEX_PATH = image_cache._CACHE_DIR / '_index.json'
+        self.image_cache = image_cache
+
+    def tearDown(self):
+        self.image_cache._CACHE_DIR = self._orig_cache_dir
+        self.image_cache._INDEX_PATH = self._orig_index_path
+        import shutil
+        shutil.rmtree(self._tmp, ignore_errors=True)
+
+    def test_backfill_populates_vendor_and_drive_path(self):
+        """Calling _backfill_image_cache_metadata after archive populates
+        the previously-missing vendor + drive_path fields on the existing
+        cache entry."""
+        # Simulate the batch.py:474 inbox-time cache write — minimal
+        # metadata, no vendor/drive_path yet.
+        sha = 'a' * 64
+        self.image_cache.cache_image_bytes(sha, b'data', ext='.jpg', drive_metadata={
+            'drive_file_id': 'drive123',
+            'drive_name': '20260420_103642.jpg',
+            'ext': '.jpg',
+            'size_bytes': 4,
+            'cached_at': '2026-05-20T12:00:00',
+        })
+        # At this point the entry exists but vendor + drive_path are empty
+        meta = self.image_cache.get_drive_metadata(sha)
+        self.assertEqual(meta.get('drive_file_id'), 'drive123')
+        self.assertNotIn('vendor', meta)
+        self.assertNotIn('drive_path', meta)
+
+        # Now run the post-archive backfill helper from batch.py
+        from batch import _backfill_image_cache_metadata
+        _backfill_image_cache_metadata(
+            sha=sha,
+            vendor='Sysco',
+            drive_path='2026/04 April 2026/Sysco/Week 3 04.20-04.26',
+        )
+
+        # Entry should now have vendor + drive_path set
+        meta = self.image_cache.get_drive_metadata(sha)
+        self.assertEqual(meta['vendor'], 'Sysco')
+        self.assertEqual(meta['drive_path'],
+                         '2026/04 April 2026/Sysco/Week 3 04.20-04.26')
+        # Original fields preserved
+        self.assertEqual(meta['drive_file_id'], 'drive123')
+        self.assertEqual(meta['drive_name'], '20260420_103642.jpg')
+
+    def test_backfill_canonicalizes_vendor(self):
+        """Short-form vendor names (e.g. 'PBM', 'FarmArt') are canonicalized
+        before storage, so the cache index always carries the canonical form."""
+        sha = 'b' * 64
+        self.image_cache.cache_image_bytes(sha, b'data', drive_metadata={
+            'drive_file_id': 'd2',
+        })
+        from batch import _backfill_image_cache_metadata
+        _backfill_image_cache_metadata(sha=sha, vendor='PBM',
+                                        drive_path='2026/04/PBM/Week 3')
+        meta = self.image_cache.get_drive_metadata(sha)
+        self.assertEqual(meta['vendor'], 'Philadelphia Bakery Merchants')
+
+    def test_backfill_noop_on_missing_sha(self):
+        """Helper is a no-op when sha is None (cache write was skipped
+        earlier in batch.py) — must not raise."""
+        from batch import _backfill_image_cache_metadata
+        # Should not raise
+        _backfill_image_cache_metadata(sha=None, vendor='Sysco', drive_path='x')
+        _backfill_image_cache_metadata(sha='', vendor='Sysco', drive_path='x')
+        # Index stays empty
+        self.assertEqual(self.image_cache.read_index(), {})
+
+    def test_backfill_noop_on_missing_vendor_or_path(self):
+        """Defensive: skip backfill if vendor or drive_path is empty
+        (would be a caller bug but we don't want to write garbage)."""
+        from batch import _backfill_image_cache_metadata
+        sha = 'c' * 64
+        self.image_cache.cache_image_bytes(sha, b'data', drive_metadata={
+            'drive_file_id': 'd3',
+        })
+        _backfill_image_cache_metadata(sha=sha, vendor='', drive_path='x')
+        _backfill_image_cache_metadata(sha=sha, vendor='Sysco', drive_path='')
+        meta = self.image_cache.get_drive_metadata(sha)
+        self.assertNotIn('vendor', meta)
+        self.assertNotIn('drive_path', meta)
+
+
+class DriveArchiveInvoiceReturnTests(TestCase):
+    """drive.archive_invoice now returns the archive_path string so callers
+    can backfill image_cache metadata. Pin the return shape so future edits
+    can't break the contract image_cache backfill depends on."""
+
+    def test_archive_path_format(self):
+        """The returned path string matches the convention image_cache
+        records: 'YYYY/MM MonthName YYYY/Vendor/Week N MM.DD - MM.DD'."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from unittest.mock import patch, MagicMock
+        import drive as drive_module
+
+        # Mock the Drive API client + folder lookups
+        mock_drive = MagicMock()
+        with patch.object(drive_module, 'get_drive_client', return_value=mock_drive), \
+             patch.object(drive_module, '_find_or_create_folder',
+                          side_effect=['year_id', 'month_id', 'vendor_id', 'week_id']):
+            result = drive_module.archive_invoice(
+                file_id='file_xyz',
+                file_name='IMG_001.jpg',
+                vendor='Sysco',
+                invoice_date_str='2026-04-20',
+                inbox_folder_id='inbox_id',
+            )
+
+        # Expected shape: 'YYYY/MM MonthName YYYY/Vendor/Week N MM.DD - MM.DD'
+        # Week 3 starts Monday 04-20 / ends Sunday 04-26 per _week_label semantics
+        self.assertTrue(result.startswith('2026/'))
+        self.assertIn('04 April 2026', result)
+        self.assertIn('/Sysco/', result)
+        self.assertRegex(result, r'Week \d+ \d+\.\d+ - \d+\.\d+')
+
+    def test_archive_path_canonicalizes_vendor(self):
+        """Short-form vendor names get canonicalized in the returned path."""
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        from unittest.mock import patch, MagicMock
+        import drive as drive_module
+
+        mock_drive = MagicMock()
+        with patch.object(drive_module, 'get_drive_client', return_value=mock_drive), \
+             patch.object(drive_module, '_find_or_create_folder',
+                          side_effect=['y', 'm', 'v', 'w']):
+            result = drive_module.archive_invoice(
+                file_id='f', file_name='n', vendor='PBM',
+                invoice_date_str='2026-04-20', inbox_folder_id='i',
+            )
+        self.assertIn('/Philadelphia Bakery Merchants/', result)
+
+
 class InvoiceImageViewTests(AuthedTestCase):
     """L1 Phase 1.1b — `/invoices/<id>/image/` view tests."""
 

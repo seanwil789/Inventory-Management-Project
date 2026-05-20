@@ -356,6 +356,31 @@ def _file_sha(path: str) -> str:
     return h.hexdigest()
 
 
+def _backfill_image_cache_metadata(sha: str | None, vendor: str, drive_path: str) -> None:
+    """Backfill `vendor` + `drive_path` on an image_cache index entry.
+
+    Cache writes happen at inbox-processing time (batch.py:474 ish) before
+    parse + archive — so vendor + final drive_path aren't known yet. This
+    helper is called after archive_invoice() succeeds to populate those
+    fields. Without it, recent image_cache entries have empty vendor +
+    drive_path, which blinds downstream mis-archive audits.
+
+    Non-blocking — pipeline continues on any failure. No-op when sha is None
+    (cache write was skipped earlier).
+    """
+    if not sha or not vendor or not drive_path:
+        return
+    try:
+        from drive import canonical_vendor
+        from image_cache import update_index
+        update_index(sha, {
+            'vendor': canonical_vendor(vendor),
+            'drive_path': drive_path,
+        })
+    except Exception as e:
+        print(f"   [image_cache] metadata backfill warning: {e}")
+
+
 def process_csv(drive_file: dict, dry_run: bool) -> bool:
     """
     Download a Sysco CSV from Drive, run the SUPC code ingestor, then archive.
@@ -462,6 +487,10 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
 
         # 1b. Cache source image bytes locally for the rectification UI
         # (B6 / L1.1b). Non-blocking — pipeline continues on cache failure.
+        # NOTE: this write fires BEFORE parse + archive, so `vendor` and
+        # `drive_path` aren't known yet. They're backfilled via
+        # _backfill_image_cache_metadata() after archive_invoice() succeeds.
+        _img_sha = None  # captured for later metadata backfill
         try:
             from image_cache import (cache_image_bytes, compute_sha256,
                                       is_cached as _img_is_cached)
@@ -556,8 +585,9 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
                 return True
             if parsed["invoice_date"]:
                 print("\n   Archiving non-itemized page to Drive...")
-                archive_invoice(file_id, file_name, parsed["vendor"],
+                _archive_path = archive_invoice(file_id, file_name, parsed["vendor"],
                                 parsed["invoice_date"], DRIVE_INBOX_FOLDER_ID)
+                _backfill_image_cache_metadata(_img_sha, parsed["vendor"], _archive_path)
             else:
                 print("\n   Removing from inbox (no date, skipping archive)...")
                 delete_from_inbox(file_id, file_name)
@@ -613,8 +643,9 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
         # 6. Move original file from inbox to archive hierarchy in Drive
         if parsed["invoice_date"]:
             print("\n6. Archiving to Google Drive...")
-            archive_invoice(file_id, file_name, parsed["vendor"],
+            _archive_path = archive_invoice(file_id, file_name, parsed["vendor"],
                             parsed["invoice_date"], DRIVE_INBOX_FOLDER_ID)
+            _backfill_image_cache_metadata(_img_sha, parsed["vendor"], _archive_path)
         else:
             print("\n6. Skipping Drive archive (no date) — removing from inbox...")
             delete_from_inbox(file_id, file_name)
