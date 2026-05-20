@@ -6779,6 +6779,90 @@ class SpatialMatcherOtherVendorsTests(TestCase):
         self.assertNotIn("price_per_unit", items[0])
         self.assertEqual(items[0]["extended_amount"], 30.00)
 
+    def test_exceptional_328785_left_shifted_columns(self):
+        """B-Exc328785 (2026-05-20): INV 328785 (2026-02-16) had the entire
+        right-column region shifted ~0.015 left from calibrated x-bands —
+        ext at x_min ≈0.87 (below 0.88), qty_ship at ≈0.64 (below 0.66),
+        unit at ≈0.735 for wider tokens like "86.04" (below 0.74), and
+        first-word desc tokens (Bacon/Butter) at x_min ≈0.253 (below 0.26).
+
+        Pre-fix: code-anchor sanity-filter rejected all 6 codes because
+        no EXT token fell in the band → spatial returned 0 items.
+
+        Fix: widened EXT/UNIT/QTY_SHIP/DESC lower bounds + nearest-anchor
+        description assignment so adjacent rows' description tokens don't
+        bleed when half_win windows overlap.
+
+        Fixture mirrors the actual 328785 OCR token positions.
+        """
+        sm = self._import()
+        tokens = []
+
+        # Bacon: code 30035, qty 20.00, unit 4.19, LB, ext 83.80.
+        # Code at y=0.3026, prices at y=0.2872-0.2928 (above code by ~0.013),
+        # desc tokens at y=0.297-0.302 (within row).
+        # x positions: code 0.037, qty 0.644, unit 0.742, ext 0.868;
+        # first desc word "Bacon" at x_min 0.253 (below original 0.26 band).
+        tokens += [
+            self._tok("30035", 0.037, 0.3026),
+            self._tok("20.00", 0.644, 0.2928),
+            self._tok("4.19",  0.742, 0.2900),
+            self._tok("LB",    0.795, 0.2895),
+            self._tok("83.80", 0.868, 0.2872),
+            self._tok("Bacon",     0.253, 0.3018),
+            self._tok("Applewood", 0.324, 0.3006),
+            self._tok("Smk",       0.384, 0.2995),
+        ]
+        # Butter: unit price "86.04" 5 chars wide → x_min 0.735 (below
+        # original 0.74 UNIT band).
+        tokens += [
+            self._tok("35040", 0.037, 0.3161),
+            self._tok("1.00",  0.654, 0.3064),
+            self._tok("86.04", 0.735, 0.3039),
+            self._tok("CS",    0.797, 0.3034),
+            self._tok("86.04", 0.869, 0.3011),
+            self._tok("Butter", 0.253, 0.3146),
+            self._tok("Prints", 0.340, 0.3140),
+        ]
+        # Chicken Brst (non-catch-weight)
+        tokens += [
+            self._tok("C0374", 0.037, 0.3300),
+            self._tok("20.00", 0.645, 0.3203),
+            self._tok("3.99",  0.744, 0.3176),
+            self._tok("LB",    0.798, 0.3172),
+            self._tok("79.80", 0.870, 0.3146),
+            self._tok("Chicken", 0.284, 0.3274),
+            self._tok("Brst",    0.323, 0.3274),
+        ]
+
+        items = sm.match_exceptional_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 3, f'expected 3 items, got {len(items)}: {items}')
+
+        by_ext = {it["extended_amount"]: it for it in items}
+        self.assertIn(83.80, by_ext, f'Bacon row missing: {[it["extended_amount"] for it in items]}')
+        self.assertIn(86.04, by_ext)
+        self.assertIn(79.80, by_ext)
+
+        # Descriptions must be cleanly partitioned — Bacon row doesn't get
+        # Butter tokens and vice versa.
+        bacon = by_ext[83.80]
+        self.assertIn('Bacon', bacon['raw_description'])
+        self.assertNotIn('Butter', bacon['raw_description'])
+        self.assertNotIn('Prints', bacon['raw_description'])
+
+        butter = by_ext[86.04]
+        self.assertIn('Butter', butter['raw_description'])
+        self.assertNotIn('Bacon', butter['raw_description'])
+
+        chicken = by_ext[79.80]
+        self.assertIn('Chicken', chicken['raw_description'])
+        self.assertIn('Brst', chicken['raw_description'])
+
+        # qty extracted from QTY_SHIP column (now in widened band).
+        self.assertEqual(bacon.get('quantity'), 20.0)
+        self.assertEqual(butter.get('quantity'), 1.0)
+        self.assertEqual(chicken.get('quantity'), 20.0)
+
     # ── Farm Art ───────────────────────────────────────────────────────
     def test_farmart_extracts_items_ignoring_cool_column(self):
         """COOL (country of origin) tokens like 'United States' sit between

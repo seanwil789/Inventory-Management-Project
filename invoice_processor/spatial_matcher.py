@@ -1032,14 +1032,26 @@ _EXC_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,3}$')
 _EXC_CODE_X_RANGE    = (0.03, 0.14)
 _EXC_QTY_X_RANGE     = (0.18, 0.26)
 _EXC_UM_X_RANGE      = (0.23, 0.30)
-_EXC_DESC_X_RANGE    = (0.26, 0.66)
+# INV 328785: first-word desc tokens (Bacon/Butter/Wafer) at x_min ≈0.253,
+# below the 0.26 band. Widened to 0.25 so they're captured; UM tokens
+# (CS/LB at x_min 0.235) stay excluded via the UM-regex filter.
+_EXC_DESC_X_RANGE    = (0.25, 0.66)
 # Non-overlapping bands — phone-photo and scanner-PDF column x_min values
 # both fit. Phone: qty_ship≈0.69, unit≈0.79, per_um≈0.85, ext≈0.92.
 # Scanner: qty_ship≈0.67, unit≈0.77, per_um≈0.83, ext≈0.91.
-_EXC_QTY_SHIP_X      = (0.66, 0.74)
-_EXC_UNIT_X_RANGE    = (0.74, 0.82)
+# INV 328785 (2026-02-16) had the whole right-column region shifted left
+# by ~0.015 vs the calibrated bands — qty_ship at x_min ≈0.64 (below 0.66),
+# unit at x_min ≈0.735 for wider tokens like "86.04" (below 0.74), ext at
+# x_min ≈0.87 (below 0.88). Widened lower bounds + shifted QTY_SHIP upper
+# to keep bands non-overlapping. The code-anchor sanity-filter requires
+# an EXT token in band within ±0.025y; pre-fix this rejected all 6 codes
+# → spatial returned 0 items. Corpus survey 2026-05-20: similar shift in
+# cache 038c9116 (2026-03-02). Standard layouts have x_min 0.88+ for EXT,
+# 0.74+ for UNIT — unaffected by the widened ranges.
+_EXC_QTY_SHIP_X      = (0.63, 0.73)
+_EXC_UNIT_X_RANGE    = (0.73, 0.82)
 _EXC_PER_UM_X_RANGE  = (0.82, 0.88)
-_EXC_EXT_X_RANGE     = (0.88, 0.98)
+_EXC_EXT_X_RANGE     = (0.85, 0.98)
 
 
 def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
@@ -1163,6 +1175,30 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
             and len(ext_col) == len(code_anchors)
             and len(unit_col) == len(code_anchors)
         )
+
+        # Pre-compute description-token → nearest-anchor assignment.
+        # Half_win-bounded row gathering bleeds desc tokens across rows when
+        # row windows overlap (row_spacing < 2×half_win). Nearest-anchor
+        # partitioning is robust: each desc token is assigned to whichever
+        # code anchor has the closest y, gated on within-one-row-spacing.
+        # Origin: INV 328785 (2026-02-16) had "Unsalted Sweet" (Butter)
+        # bleeding into Bacon's row before this fix.
+        desc_by_anchor: dict[int, list[dict]] = {id(a): [] for a in code_anchors}
+        if code_anchors:
+            for t in tokens:
+                if not _in_x(t, _EXC_DESC_X_RANGE):
+                    continue
+                if (_EXC_PRICE_RE.fullmatch(t["text"])
+                        or _EXC_UM_RE.fullmatch(t["text"])
+                        or _EXC_ITEM_CODE_RE.fullmatch(t["text"])):
+                    continue
+                ty = _ymid_t(t)
+                if not ((code_y_min - 0.020) <= ty <= (code_y_max + 0.020)):
+                    continue
+                nearest = min(code_anchors, key=lambda a: abs(_ymid_t(a) - ty))
+                if abs(_ymid_t(nearest) - ty) <= row_spacing:
+                    desc_by_anchor[id(nearest)].append(t)
+
         for ri, row in enumerate(rows):
             code_toks = [t for t in row if _in_x(t, _EXC_CODE_X_RANGE)
                          and _EXC_ITEM_CODE_RE.fullmatch(t["text"])]
@@ -1204,10 +1240,19 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
             qty_shipped = float(qty_ship_t["text"]) if qty_ship_t else None
             um = um_t["text"].upper() if um_t else ""
 
-            desc_toks = [t for t in row if _in_x(t, _EXC_DESC_X_RANGE)
-                         and not _EXC_PRICE_RE.fullmatch(t["text"])
-                         and not _EXC_UM_RE.fullmatch(t["text"])
-                         and not _EXC_ITEM_CODE_RE.fullmatch(t["text"])]
+            # Nearest-anchor desc assignment (computed above). Falls back to
+            # per-row half_win-bounded gathering when code_anchors is empty
+            # (legacy _group_rows path).
+            if code_anchors:
+                desc_toks = sorted(
+                    desc_by_anchor.get(id(code_toks[0]), []),
+                    key=lambda t: t["x_min"],
+                )
+            else:
+                desc_toks = [t for t in row if _in_x(t, _EXC_DESC_X_RANGE)
+                             and not _EXC_PRICE_RE.fullmatch(t["text"])
+                             and not _EXC_UM_RE.fullmatch(t["text"])
+                             and not _EXC_ITEM_CODE_RE.fullmatch(t["text"])]
             description = " ".join(t["text"] for t in desc_toks).strip()
             if not description:
                 description = f"[Exceptional #{code}]"
