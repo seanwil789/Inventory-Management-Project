@@ -2432,14 +2432,32 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
     if desc_idx is None:
         return [], None
 
-    # Extract descriptions: lines matching "N code/abbrev... Product Name"
-    # or just product name lines after the delivery instructions
+    # Extract descriptions + qty from item lines. Scan the WHOLE document
+    # (break only at "Total" / "Subtotal" footer markers). Items beyond the
+    # price column's visual vertical extent emit their descriptions AFTER
+    # the "Price Each" / "Amount" markers in OCR raster order.
+    # Origin: PBM INV 656884 (2026-02-24) — 4 items above the price column
+    # fit visually + 3 items wrap below; their descriptions land after
+    # "Price Each" in raw_text. Previous "break at Price Each" rule
+    # captured only 4 of 7 items.
     descriptions = []
+    qtys = []                # parallel to descriptions; None when unknown
+    pending_qtys: list[int] = []   # FIFO queue: wrapped-code-line qtys
+                                   # waiting for the next standalone-name
     in_delivery_note = False
     for i in range(desc_idx + 1, len(lines)):
         line = lines[i]
-        if re.match(r'^(Price Each|Amount|Total)\b', line, re.IGNORECASE):
+        # Footer break — column "Total" / "Subtotal" on its own line.
+        if re.match(r'^(Total|Subtotal)\s*$', line, re.IGNORECASE):
             break
+        # Footer "Total $X" form (some templates inline the total value).
+        if re.match(r'^(Total|Subtotal)\s+\$?\d', line, re.IGNORECASE):
+            break
+        # Skip column headers in the prices block — would otherwise trip
+        # the standalone-name capture below.
+        if re.match(r'^(Price Each|Amount|Quantity|Item Code|Description)\s*$',
+                    line, re.IGNORECASE):
+            continue
         if line.startswith('***'):
             in_delivery_note = True
             continue
@@ -2457,21 +2475,30 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         # Origin: PBM INV 657529 — pre-fix the code-only wrapped line
         # got appended as desc='.', producing 5 items instead of 4
         # and mis-shifting all prices.
-        m = re.match(r'^\d+\s+\S+/\S+\.{2,}\s+([A-Za-z][^.]{2,}.*)', line)
+        m = re.match(r'^(\d+)\s+\S+/\S+\.{2,}\s+([A-Za-z][^.]{2,}.*)', line)
         if m:
-            descriptions.append(m.group(1).strip())
+            descriptions.append(m.group(2).strip())
+            qtys.append(int(m.group(1)))
             continue
-        # Wrapped two-line case: "N code/abbrev..." with empty trail,
-        # followed by the product name on the next line. The code line
-        # itself isn't a description — skip it; the next iteration
-        # picks up the wrapped name.
-        if re.match(r'^\d+\s+\S+/\S+\.{2,}\s*$', line):
+        # Wrapped: "N code" or "N code/abbrev" or "N code/abbrev..." with
+        # no trailing description text. Variants seen:
+        #   "2 L7408"          — code-only, no slash/dots (656375)
+        #   "2 L4606"          — same shape (656884)
+        #   "3 H103/Ham"       — slash+abbrev, no dots (656884)
+        #   "2 0290/AsstDo..." — slash+abbrev with trailing dots only (656375)
+        # In all cases qty carries to the next standalone-name line.
+        m = re.match(r'^(\d+)\s+(?:[A-Z]?\d{3,5})(?:/\S*)?\.{0,}\s*$', line)
+        if m:
+            pending_qtys.append(int(m.group(1)))
             continue
-        # Standalone product name (no code prefix)
+        # Standalone product name (no code prefix) — consume pending qty
+        # if a wrapped code line preceded.
         if (re.search(r'[A-Za-z]{3,}', line)
                 and not re.match(r'^\d+\s+[A-Z]\d+$', line)
+                and not re.match(r'^\$?\d', line)        # skip price-shaped lines
                 and len(line) >= 4):
             descriptions.append(line)
+            qtys.append(pending_qtys.pop(0) if pending_qtys else None)
 
     # Extract prices: after "Price Each" / "Amount", alternating (unit, ext)
     raw_amounts = []
@@ -2505,22 +2532,28 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         for i in range(n):
             unit = raw_amounts[i * 2]
             ext = raw_amounts[i * 2 + 1]
-            items.append({
+            item = {
                 "raw_description": descriptions[i],
                 "unit_price": unit,
                 "extended_amount": ext,
                 "case_size_raw": "",
-            })
+            }
+            if i < len(qtys) and qtys[i] is not None:
+                item["quantity"] = qtys[i]
+            items.append(item)
     elif n > 0 and raw_amounts:
         # Fallback: just pair what we have
         for i, desc in enumerate(descriptions):
             if i < len(raw_amounts):
-                items.append({
+                item = {
                     "raw_description": desc,
                     "unit_price": raw_amounts[i],
                     "extended_amount": raw_amounts[i],
                     "case_size_raw": "",
-                })
+                }
+                if i < len(qtys) and qtys[i] is not None:
+                    item["quantity"] = qtys[i]
+                items.append(item)
 
     items_sum = round(sum(it.get("extended_amount", 0) for it in items), 2)
     if invoice_total is not None:

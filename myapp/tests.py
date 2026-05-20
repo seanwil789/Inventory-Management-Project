@@ -3670,6 +3670,152 @@ $5.25
         self.assertAlmostEqual(items_sum, 5.25, places=2)
 
 
+class ParserPbmFormat1WrappedItemsTests(TestCase):
+    """B-PbmWrappedItems (2026-05-20): _parse_pbm_format1 must continue
+    scanning past 'Price Each' / 'Amount' headers when items wrap below
+    the price column's visual extent and their descriptions land AFTER
+    the prices block in OCR raster order.
+
+    Origin: PBM INV 656884 (2026-02-24). 7 items total; items 1-4 fit
+    visually beside the prices column, items 5-7 wrap below. OCR text:
+        items 1-4 descriptions
+        code-only wrapped marker for item 5
+        "Price Each" / "Amount"
+        prices 1-4
+        description 5  ← previously lost (loop broke at "Price Each")
+        prices 5
+        wrapped marker for item 6
+        description 6  ← previously lost
+        prices 6
+        description 7 (std-format)  ← previously lost
+        prices 7
+        "Total"
+        "$151.73"
+
+    Fix: break only at "Total" / "Subtotal", skip "Price Each" / "Amount"
+    headers explicitly, extract qty from leading digit (single-line and
+    wrapped), carry wrapped qty to next standalone name via FIFO queue.
+    """
+
+    def test_wrapped_items_below_prices_column(self):
+        p = _import_parser()
+        # Mirrors PBM 656884 OCR raster shape exactly.
+        raw = """ABC Bakery Invoice
+Invoice #656884
+2/24/2026
+Description
+2 L118/SeedItal... Seeded Italian Hoagies
+2 0258/MedDa... Medium Danish/Assorted
+2 0290/AsstDo... Assorted Donuts
+2 0389/AsstMu... Assorted Muffins/ CupSize
+2 L4606
+Price Each
+Amount
+10.37
+20.74
+14.92
+29.84
+20.00
+40.00
+10.00
+20.00
+Brioche Sandwich Loaf Thick Sliced
+7.93
+15.86
+3 H103/Ham
+Hamburger Rolls
+4.15
+12.45
+2 G105/PlainBa... Plain Bagels/Original not open due to the snow
+6.42
+12.84
+Total
+$151.73
+"""
+        result = p.parse_invoice(raw, vendor='PBM')
+        items = result['items']
+
+        # All 7 items must be captured.
+        self.assertEqual(len(items), 7, f'expected 7 items, got {len(items)}')
+
+        descs = [it['raw_description'] for it in items]
+        self.assertIn('Seeded Italian Hoagies', descs)
+        self.assertIn('Medium Danish/Assorted', descs)
+        self.assertIn('Assorted Donuts', descs)
+        self.assertIn('Assorted Muffins/ CupSize', descs)
+        self.assertIn('Brioche Sandwich Loaf Thick Sliced', descs)
+        self.assertIn('Hamburger Rolls', descs)
+        # Plain Bagels single-line capture (includes trailing weather note)
+        self.assertTrue(any('Plain Bagels' in d for d in descs),
+                        f'Plain Bagels missing from descs: {descs}')
+
+        # Items sum reconciles to invoice_total $151.73.
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 151.73, places=2)
+        self.assertEqual(result.get('invoice_total'), 151.73)
+
+        # qty extracted from leading digit. Items 1-4 + item 7 = qty 2;
+        # item 5 (Brioche, wrapped) = qty 2 from "2 L4606"; item 6
+        # (Hamburger, wrapped) = qty 3 from "3 H103/Ham".
+        for it in items:
+            self.assertIn('quantity', it,
+                          f"item missing quantity: {it['raw_description']!r}")
+        by_desc = {it['raw_description']: it for it in items}
+        self.assertEqual(by_desc['Hamburger Rolls']['quantity'], 3)
+        # All non-Hamburger items in this fixture have qty=2
+        for desc, it in by_desc.items():
+            if desc == 'Hamburger Rolls':
+                continue
+            self.assertEqual(it['quantity'], 2,
+                             f"expected qty=2 for {desc!r}, got {it['quantity']}")
+
+    def test_pre_existing_format1_still_passes(self):
+        """Regression: existing PBM format1 invoice (656375 shape) — all
+        descriptions appear BEFORE 'Price Each'. Behavior unchanged after
+        the fix; alternating-pair pricing same as before, with qty now
+        populated as a bonus."""
+        p = _import_parser()
+        # Mirrors PBM 656375 (2026-02-17) OCR shape.
+        raw = """ABC Bakery Invoice
+Invoice #656375
+2/17/2026
+Description
+3 L202/PotatoH... Potato Hamburger/8 Pk/Sliced/ 3 1/2"
+2 L7408
+2 0290/AsstDo...
+Brioche Buns
+Assorted Donuts
+2 0326/TrayMi... Tray Mini Muffins
+2 0389/AsstMu... Assorted Muffins/ CupSize
+Price Each
+Amount
+3.50
+10.50
+9.37
+18.74
+20.00
+40.00
+25.00
+50.00
+10.00
+20.00
+Total
+$139.24
+"""
+        result = p.parse_invoice(raw, vendor='PBM')
+        items = result['items']
+        self.assertEqual(len(items), 5, f'expected 5 items, got {len(items)}')
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 139.24, places=2)
+        # qty extracted: row 1 = 3 (Potato Hamburger), others = 2
+        by_desc = {it['raw_description']: it for it in items}
+        self.assertEqual(by_desc['Potato Hamburger/8 Pk/Sliced/ 3 1/2"']['quantity'], 3)
+        self.assertEqual(by_desc['Brioche Buns']['quantity'], 2)
+        self.assertEqual(by_desc['Assorted Donuts']['quantity'], 2)
+        self.assertEqual(by_desc['Tray Mini Muffins']['quantity'], 2)
+        self.assertEqual(by_desc['Assorted Muffins/ CupSize']['quantity'], 2)
+
+
 class MenuSwapTests(AuthedTestCase):
     """menu_swap view — quick-swap meal content between two same-slot menus.
     Calendar edit-mode UI fires this on drag-drop drop.
