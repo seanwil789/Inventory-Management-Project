@@ -2459,7 +2459,7 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
     # capture is gated on pending_qty to skip handwritten notes.
     descriptions: list[str] = []
     qtys: list[int | None] = []   # parallel to descriptions
-    pending_qtys: list[int] = []  # FIFO queue of wrapped-code qtys
+    pending: list[tuple[int, str]] = []  # FIFO queue of (qty, code) from wrapped lines
     in_delivery_note = False
     seen_price_marker = False
     for i in range(desc_idx + 1, len(lines)):
@@ -2500,9 +2500,19 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         # and mis-shifting all prices.
         m = re.match(r'^(\d+)\s+\S+/\S+\.{2,}\s+([A-Za-z][^.]{2,}.*)', line)
         if m:
+            # Orphan placeholder emission: if pending wrapped code(s) never
+            # got their standalone-name description (e.g., 655790's
+            # "2 H100/CWhite" wrapped → desc "Club White" floats BEFORE
+            # Description header, out of scope), emit "[PBM #<code>]"
+            # placeholder items so the price-block alternating-pair
+            # alignment is preserved. Without this, all subsequent
+            # description-to-price pairings shift by one pair.
+            for orphan_qty, orphan_code in pending:
+                descriptions.append(f'[PBM #{orphan_code}]')
+                qtys.append(orphan_qty)
+            pending.clear()
             descriptions.append(m.group(2).strip())
             qtys.append(int(m.group(1)))
-            pending_qtys.clear()   # any prior wrapped that never got desc is stale
             continue
 
         # Wrapped: "N code" / "N code/abbrev" / "N code/abbrev..." with no
@@ -2510,10 +2520,12 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         #   "2 L7408"          — code-only (655001, 656884)
         #   "3 H103/Ham"       — slash+abbrev, no dots (656884)
         #   "2 0290/AsstDo..." — slash+abbrev with trailing dots only (656375)
-        # Qty queues for the next standalone-name line.
-        m = re.match(r'^(\d+)\s+(?:[A-Z]?\d{3,5})(?:/\S*)?\.{0,}\s*$', line)
+        # Qty queues for the next standalone-name line. Second capture
+        # group preserves the code text for placeholder emission if the
+        # description never lands in scope.
+        m = re.match(r'^(\d+)\s+([A-Z]?\d{3,5}(?:/\S*)?)\.{0,}\s*$', line)
         if m:
-            pending_qtys.append(int(m.group(1)))
+            pending.append((int(m.group(1)), m.group(2)))
             continue
 
         # Standalone product name (no code prefix). Post-prices region
@@ -2523,10 +2535,21 @@ def _parse_pbm_format1(text: str) -> tuple[list[dict], float | None]:
         if (re.search(r'[A-Za-z]{3,}', line)
                 and not re.match(r'^\d+\s+[A-Z]\d+$', line)
                 and len(line) >= 4):
-            if seen_price_marker and not pending_qtys:
+            if seen_price_marker and not pending:
                 continue
             descriptions.append(line)
-            qtys.append(pending_qtys.pop(0) if pending_qtys else None)
+            if pending:
+                qtys.append(pending.pop(0)[0])
+            else:
+                qtys.append(None)
+
+    # End-of-loop orphan emission: any pending wrapped codes whose
+    # descriptions never appeared get placeholder items so price alignment
+    # is preserved on invoices where the last item(s) are orphan wrapped.
+    for orphan_qty, orphan_code in pending:
+        descriptions.append(f'[PBM #{orphan_code}]')
+        qtys.append(orphan_qty)
+    pending.clear()
 
     # Extract prices: after "Price Each" / "Amount", alternating (unit, ext)
     raw_amounts = []

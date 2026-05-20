@@ -3926,6 +3926,28 @@ $123.31
         self.assertFalse(any('Whole Wheat Sandwich' in d for d in descs),
                          f'0-qty whole wheat captured: {descs}')
 
+        # Orphan placeholder for "2 H100/CWhite" — its description "Club
+        # White" floats BEFORE the Description header (out of scope). The
+        # wrapped code's pending qty would otherwise propagate a pairing
+        # offset; the placeholder preserves alignment so the remaining
+        # descriptions land on their correct prices.
+        placeholder = '[PBM #H100/CWhite]'
+        self.assertIn(placeholder, descs,
+                      f'expected orphan placeholder {placeholder!r}, got {descs}')
+
+        # With the placeholder, items_sum should reconcile to invoice_total.
+        items_sum = sum(it.get('extended_amount', 0) or 0 for it in items)
+        self.assertAlmostEqual(items_sum, 123.31, places=2,
+                               msg=f'items_sum=${items_sum} should be $123.31')
+
+        # Verify pairing alignment: Seeded Italian got its real prices
+        # (10.37 × 3 = 31.11), Regular Hoagie got its (8.23 × 1 = 8.23).
+        by_desc = {it['raw_description']: it for it in items}
+        self.assertEqual(by_desc['Seeded Italian Hoagies']['extended_amount'], 31.11)
+        self.assertEqual(by_desc['Regular Hoagie Wrapped']['extended_amount'], 8.23)
+        # Placeholder gets the orphan price pair (4.15 × 2 = 8.30).
+        self.assertEqual(by_desc[placeholder]['extended_amount'], 8.30)
+
 
 class MenuSwapTests(AuthedTestCase):
     """menu_swap view — quick-swap meal content between two same-slot menus.
