@@ -2081,6 +2081,201 @@ class DocAIEntitiesInvoiceNumberTests(TestCase):
         self.assertEqual(merged.get('invoice_number'), '')
 
 
+class DocAIEntitiesExtendedAmountTests(TestCase):
+    """Regression: `_process_single_document` must derive `extended_amount`
+    per line, not let it default to unit_price.
+
+    Origin (Sean 2026-05-21): PBM portal-export PDFs (Inv_NNNNNN_*.pdf) tag
+    line items with `line_item/unit_price` + `line_item/quantity` but no
+    `line_item/amount` entity. Before this fix, `_build_item` set unit_price
+    but never built extended_amount; db_write.py:404 fell back to
+    `extended = unit_price`. A row at unit_price=$20 qty=3 wrote
+    extended_amount=$20 instead of $60. inv#654601 ($44.92 of printed
+    $74.92) and inv#655164 ($73.57 of printed $210.01) FAILed IVS
+    classification — every line was off by (qty-1)*unit_price.
+
+    Fix: capture DocAI's `amount` entity separately and derive
+    extended_amount with explicit priority:
+        1. DocAI `amount` entity (line total) when present
+        2. unit_price * quantity when both known
+        3. unit_price (fallback — single-unit lines or qty unknown)
+    """
+
+    @staticmethod
+    def _import_docai():
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import docai
+        return docai
+
+    def _make_line_item(self, *, description, unit_price=None,
+                        quantity=None, amount=None, unit_of_measure=None):
+        """Build a FakeEntity simulating a DocAI line_item with the given
+        child properties. Only child types provided as non-None args are
+        attached. text_anchor stubbed with empty segments (irrelevant
+        when description text is provided directly)."""
+        class FakeProp:
+            def __init__(self, t, m):
+                self.type_ = t
+                self.mention_text = m
+        class FakeAnchor:
+            text_segments = []
+        class FakeEntity:
+            def __init__(self):
+                self.type_ = "line_item"
+                self.mention_text = ""
+                self.properties = []
+                self.text_anchor = FakeAnchor()
+        e = FakeEntity()
+        e.properties.append(FakeProp("line_item/description", description))
+        if unit_price is not None:
+            e.properties.append(FakeProp("line_item/unit_price", str(unit_price)))
+        if quantity is not None:
+            e.properties.append(FakeProp("line_item/quantity", str(quantity)))
+        if amount is not None:
+            e.properties.append(FakeProp("line_item/amount", str(amount)))
+        if unit_of_measure is not None:
+            e.properties.append(FakeProp("line_item/unit", unit_of_measure))
+        return e
+
+    def _make_result(self, line_items, text="", header_entities=None):
+        """Wrap the line_item FakeEntities in a FakeDocument/Result."""
+        class FakeDoc:
+            pass
+        class FakeResult:
+            pass
+        ents = list(header_entities or [])
+        ents.extend(line_items)
+        doc = FakeDoc()
+        doc.text = text
+        doc.entities = ents
+        r = FakeResult()
+        r.document = doc
+        return r
+
+    def test_pbm_portal_pattern_unit_price_times_quantity(self):
+        """PBM portal PDF: unit_price=$20, qty=3, no amount entity →
+        extended_amount = $60.00 (not $20.00, the pre-fix bug)."""
+        docai = self._import_docai()
+        line = self._make_line_item(
+            description="Assorted Donuts", unit_price="20.00", quantity="3")
+        result = self._make_result([line])
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result):
+            out = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        items = out.get('items', [])
+        self.assertEqual(len(items), 1, f"Expected 1 item, got {items}")
+        self.assertEqual(items[0]['unit_price'], 20.00)
+        self.assertEqual(items[0]['quantity'], 3.0)
+        self.assertEqual(items[0]['extended_amount'], 60.00,
+            "extended_amount must be unit_price * quantity when DocAI "
+            "doesn't provide amount entity.")
+
+    def test_docai_amount_entity_preferred_over_computed(self):
+        """When DocAI provides `amount` entity (line total), use it
+        directly — even if unit_price*qty math would compute differently
+        (e.g. invoice has rounding or discount adjustment)."""
+        docai = self._import_docai()
+        line = self._make_line_item(
+            description="Widget", unit_price="10.00",
+            quantity="3", amount="29.99")  # discounted by $0.01
+        result = self._make_result([line])
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result):
+            out = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        items = out.get('items', [])
+        self.assertEqual(items[0]['unit_price'], 10.00)
+        self.assertEqual(items[0]['extended_amount'], 29.99,
+            "When DocAI provides amount entity, use it directly "
+            "(authoritative line total, may differ from unit*qty math).")
+
+    def test_unit_price_only_no_quantity_falls_back(self):
+        """If quantity is missing/null, extended_amount falls back to
+        unit_price (single-unit or unknown-qty line)."""
+        docai = self._import_docai()
+        line = self._make_line_item(
+            description="Standing fee", unit_price="50.00")
+        result = self._make_result([line])
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result):
+            out = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        items = out.get('items', [])
+        self.assertEqual(items[0]['unit_price'], 50.00)
+        self.assertEqual(items[0]['quantity'], None)
+        self.assertEqual(items[0]['extended_amount'], 50.00,
+            "No quantity → extended_amount = unit_price (no multiplication).")
+
+    def test_quantity_one_returns_unit_price(self):
+        """qty=1 multiplies cleanly: extended = unit_price * 1 = unit_price."""
+        docai = self._import_docai()
+        line = self._make_line_item(
+            description="Brioche Slider Buns",
+            unit_price="5.35", quantity="1")
+        result = self._make_result([line])
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result):
+            out = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        items = out.get('items', [])
+        self.assertEqual(items[0]['extended_amount'], 5.35)
+
+    def test_quantity_zero_falls_back_to_unit_price(self):
+        """qty=0 is treated as missing (avoid 0×N edge cases)."""
+        docai = self._import_docai()
+        line = self._make_line_item(
+            description="Free sample", unit_price="0.99", quantity="0")
+        result = self._make_result([line])
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result):
+            out = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        items = out.get('items', [])
+        self.assertEqual(items[0]['extended_amount'], 0.99)
+
+    def test_pbm_inv_655164_replay(self):
+        """Replay of inv#655164 (Sean 2026-05-21): 6 line items,
+        DocAI provided unit_price + qty but no amount.
+        Pre-fix items_sum = $73.57 (sum of unit_prices), printed $210.01.
+        Post-fix items_sum should be $210.01 (sum of unit_price × qty)."""
+        docai = self._import_docai()
+        lines = [
+            self._make_line_item(description="Assorted Donuts",
+                                 unit_price="20.00", quantity="3"),
+            self._make_line_item(description="Medium Danish/Assorted",
+                                 unit_price="14.92", quantity="3"),
+            self._make_line_item(description="Tray Mini Muffins",
+                                 unit_price="25.00", quantity="3"),
+            self._make_line_item(description="Brioche Slider Buns",
+                                 unit_price="5.35", quantity="1"),
+            self._make_line_item(description="Hot Dog Rolls",
+                                 unit_price="4.80", quantity="3"),
+            self._make_line_item(description="Potato Hamburger",
+                                 unit_price="3.50", quantity="3"),
+        ]
+        result = self._make_result(lines)
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result):
+            out = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        items = out.get('items', [])
+        total = sum(i.get('extended_amount') or 0 for i in items)
+        self.assertEqual(round(total, 2), 210.01,
+            f"Sum of extended_amount across the 6 inv#655164 items "
+            f"should be $210.01. Got {round(total, 2)}.")
+
+
 class ValidateAllInvoicesClassifierTests(TestCase):
     """Regression coverage for `validate_all_invoices._classify`.
 

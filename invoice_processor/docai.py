@@ -410,27 +410,38 @@ def _process_single_document(file_content: bytes, mime_type: str,
         unit_price = None
         needs_review = False
 
+        # Capture DocAI 'amount' entity values upfront (line totals).
+        # `line_item/amount` is DocAI's documented line-total field, distinct
+        # from `line_item/unit_price` (per-unit). Some invoice formats provide
+        # only one or the other; PBM portal-export PDFs provide unit_price +
+        # quantity but no amount. Tracking these separately lets us derive
+        # extended_amount correctly regardless of which fields DocAI tagged.
+        desc_amount = None
+        if desc_entry["amount_prop"]:
+            desc_amount = _parse_price(_get_entity_text(desc_entry["amount_prop"]))
+        price_amount = None
+        if price_entry and price_entry["amount_prop"]:
+            price_amount = _parse_price(_get_entity_text(price_entry["amount_prop"]))
+
         # Try price from the desc entity itself (combined case)
         if desc_entry["price_prop"]:
             unit_price = _parse_price(_get_entity_text(desc_entry["price_prop"]))
-        if unit_price is None and desc_entry["amount_prop"]:
-            amount = _parse_price(_get_entity_text(desc_entry["amount_prop"]))
-            if amount is not None and quantity and quantity > 0:
-                unit_price = round(amount / quantity, 2)
-            elif amount is not None:
-                unit_price = amount
+        if unit_price is None and desc_amount is not None:
+            if quantity and quantity > 0:
+                unit_price = round(desc_amount / quantity, 2)
+            else:
+                unit_price = desc_amount
                 needs_review = True
 
         # Try price from paired price entity
         if unit_price is None and price_entry:
             if price_entry["price_prop"]:
                 unit_price = _parse_price(_get_entity_text(price_entry["price_prop"]))
-            if unit_price is None and price_entry["amount_prop"]:
-                amount = _parse_price(_get_entity_text(price_entry["amount_prop"]))
-                if amount is not None and quantity and quantity > 0:
-                    unit_price = round(amount / quantity, 2)
-                elif amount is not None:
-                    unit_price = amount
+            if unit_price is None and price_amount is not None:
+                if quantity and quantity > 0:
+                    unit_price = round(price_amount / quantity, 2)
+                else:
+                    unit_price = price_amount
                     needs_review = True
 
         # Last resort: recover price from raw text near the entity
@@ -438,6 +449,27 @@ def _process_single_document(file_content: bytes, mime_type: str,
             unit_price = _recover_price_from_raw(entity, raw_text, description)
             if unit_price is not None:
                 needs_review = True
+
+        # Derive extended_amount (line total) explicitly. Priority:
+        #   1. DocAI 'amount' entity if provided (line total directly)
+        #   2. unit_price * quantity when both known
+        #   3. unit_price (fallback — single-unit lines or qty unknown)
+        # Origin (Sean 2026-05-21): PBM portal PDFs (Inv_NNNNNN_*.pdf) tag
+        # line items with unit_price + quantity but no amount entity. Without
+        # this computation, downstream db_write fell back to extended=unit_price
+        # (db_write.py:404), under-counting items_sum by (qty-1)*unit_price
+        # per line. inv#654601 ($44.92 of $74.92) and inv#655164 ($73.57 of
+        # $210.01) FAILed IVS classification due to this.
+        extended_amount = None
+        if desc_amount is not None:
+            extended_amount = desc_amount
+        elif price_amount is not None:
+            extended_amount = price_amount
+        elif unit_price is not None:
+            if quantity is not None and quantity > 0:
+                extended_amount = round(unit_price * quantity, 2)
+            else:
+                extended_amount = unit_price
 
         # Case size: use quantity if available, fall back to regex
         case_size_raw = ""
@@ -459,6 +491,7 @@ def _process_single_document(file_content: bytes, mime_type: str,
         item = {
             "raw_description": description,
             "unit_price":      unit_price if unit_price and unit_price > 0 else None,
+            "extended_amount": extended_amount,
             "case_size_raw":   case_size_raw,
             "quantity":        quantity,
             "unit_of_measure": unit_of_measure,
