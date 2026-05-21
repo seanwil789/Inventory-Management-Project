@@ -1035,7 +1035,7 @@ _EXC_UM_X_RANGE      = (0.23, 0.30)
 # INV 328785: first-word desc tokens (Bacon/Butter/Wafer) at x_min ≈0.253,
 # below the 0.26 band. Widened to 0.25 so they're captured; UM tokens
 # (CS/LB at x_min 0.235) stay excluded via the UM-regex filter.
-_EXC_DESC_X_RANGE    = (0.25, 0.66)
+_EXC_DESC_X_RANGE    = (0.24, 0.66)  # lowered 0.25→0.24 2026-05-21 inv#335103: first-word desc tokens ("Egg"/"Chicken"/"Beef") sit at x_min≈0.246-0.247
 # Non-overlapping bands — phone-photo and scanner-PDF column x_min values
 # both fit. Phone: qty_ship≈0.69, unit≈0.79, per_um≈0.85, ext≈0.92.
 # Scanner: qty_ship≈0.67, unit≈0.77, per_um≈0.83, ext≈0.91.
@@ -1168,8 +1168,70 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
             [t for t in tokens if _items_range_filter(t, _EXC_UM_X_RANGE, _EXC_UM_RE)],
             key=_ymid_t,
         )
+        # Shift-alignment recovery (Sean 2026-05-21, inv#335103):
+        # When OCR misses one ext token (e.g., DocAI fails to recognize
+        # the $22.12 on the eggs row), ext_col is short by 1 vs code_anchors.
+        # The pre-fix per-row "nearest in y" picker then pulls each code's
+        # ext from the row ABOVE (since the missing-eggs cascade shifts all
+        # remaining exts up by ~1 row spacing), assigning chicken's $87.87
+        # to eggs, beef-flat's $110.06 to chicken, etc. — every line fails
+        # line_math. Fix: when ext_col is short by 1-2 from code_anchors
+        # AND unit_col fully matches code_anchors (so unit pairs are
+        # reliable), try every contiguous alignment of ext_col onto
+        # code_anchors and pick the one with the most line_math passes.
+        # Pad with None at the gap positions so ordinal pairing downstream
+        # cleanly skips the no-ext code(s) via the `if ext_t is None:
+        # continue` guard at line ~1233.
+        def _alignment_passes(shift):
+            """Score shift: count rows where qty × unit ≈ ext within tolerance.
+            Tolerance mirrors line_math.validate_line_math defaults: pass
+            when either diff_pct ≤ 5% OR diff_abs ≤ $2 (matches the
+            "BOTH must exceed to flag" rule)."""
+            passes = 0
+            for i in range(len(ext_col)):
+                ci = shift + i
+                if ci >= len(code_anchors):
+                    break
+                if ci >= len(unit_col) or ci >= len(qty_ship_col):
+                    continue
+                try:
+                    up = float(unit_col[ci]['text'].lstrip('$'))
+                    qty = float(qty_ship_col[ci]['text'])
+                    ext = float(ext_col[i]['text'].lstrip('$'))
+                except Exception:
+                    continue
+                if up <= 0 or qty <= 0 or ext <= 0:
+                    continue
+                expected = up * qty
+                diff_abs = abs(expected - ext)
+                diff_pct = (diff_abs / expected * 100) if expected else 999
+                if diff_pct <= 5.0 or diff_abs <= 2.0:
+                    passes += 1
+            return passes
+
+        if (len(code_anchors) > 0
+                and len(unit_col) == len(code_anchors)
+                and len(qty_ship_col) == len(code_anchors)
+                and 0 < (len(code_anchors) - len(ext_col)) <= 2):
+            max_shift = len(code_anchors) - len(ext_col)
+            shift_scores = [(s, _alignment_passes(s))
+                            for s in range(max_shift + 1)]
+            best_shift, best_score = max(shift_scores, key=lambda x: x[1])
+            shift_0_score = next(s for sh, s in shift_scores if sh == 0)
+            # Only realign when the best shift strictly beats shift=0 AND
+            # achieves at least one line_math pass. Defensive default: don't
+            # alter the current behavior unless realignment demonstrably
+            # produces correct math on at least one row.
+            if best_shift != 0 and best_score > shift_0_score and best_score >= 1:
+                padded = [None] * len(code_anchors)
+                for i, tok in enumerate(ext_col):
+                    padded[best_shift + i] = tok
+                ext_col = padded
+
         # Ordinal pairing only used when all columns have the same length
         # as code_anchors. Otherwise fall back to per-row search below.
+        # ext_col may now contain None entries (post shift-alignment) — those
+        # rows skip via the `if ext_t is None: continue` guard downstream.
         ordinal_ok = (
             len(code_anchors) > 0
             and len(ext_col) == len(code_anchors)
@@ -1200,11 +1262,20 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
                     desc_by_anchor[id(nearest)].append(t)
 
         for ri, row in enumerate(rows):
-            code_toks = [t for t in row if _in_x(t, _EXC_CODE_X_RANGE)
-                         and _EXC_ITEM_CODE_RE.fullmatch(t["text"])]
-            if not code_toks:
+            # Use the row's OWN anchor (code_anchors[ri]), not just the first
+            # code token in row. When row windows overlap (half_win >
+            # row_spacing/2), multiple codes can fall inside a row's window
+            # — code_toks[0] picks the earliest in tokenlist order which may
+            # be a neighbor's anchor. Sean 2026-05-21 on inv#335103: eggs
+            # window y=[0.3001, 0.3309] contained BOTH 35200 (eggs) AND
+            # c0670 (chicken); chicken window y=[0.3141, 0.3449] contained
+            # BOTH codes too. Chicken row picked code_toks[0]=35200 (eggs)
+            # for desc_by_anchor lookup → chicken row showed eggs desc.
+            row_anchor = code_anchors[ri] if ri < len(code_anchors) else None
+            if row_anchor is None:
                 continue
-            anchor_y = _ymid(code_toks[0])
+            anchor_y = _ymid(row_anchor)
+            code_toks = [row_anchor]
 
             def _nearest_in_band(in_row, band, regex):
                 cands = [t for t in in_row
@@ -1231,7 +1302,25 @@ def match_exceptional_spatial(pages: list[dict]) -> list[dict]:
                 um_t = _nearest_in_band(row, _EXC_UM_X_RANGE, _EXC_UM_RE)
 
             if ext_t is None:
-                continue
+                # Recover ext from unit × qty when OCR missed the ext token
+                # but unit_price + qty_shipped are extracted. Mirrors the
+                # 795101f fix in docai.py for the DocAI-entities path.
+                # Surfaced 2026-05-21 on inv#335103: eggs row's $22.12 ext
+                # was missed by DocAI, leaving 3 ext tokens for 4 codes.
+                # With shift-alignment above, eggs slot gets None; here we
+                # synthesize the line total from unit × qty so the row
+                # writes to ILI correctly instead of being dropped.
+                if unit_t is not None and qty_ship_t is not None:
+                    try:
+                        up = float(unit_t["text"].lstrip("$"))
+                        qty = float(qty_ship_t["text"])
+                        if up > 0 and qty > 0:
+                            ext_synth = round(up * qty, 2)
+                            ext_t = {"text": str(ext_synth)}
+                    except Exception:
+                        pass
+                if ext_t is None:
+                    continue
 
             code = code_toks[0]["text"]
             extended = float(ext_t["text"].lstrip("$"))

@@ -7230,6 +7230,160 @@ class SpatialMatcherOtherVendorsTests(TestCase):
         self.assertEqual(butter.get('quantity'), 1.0)
         self.assertEqual(chicken.get('quantity'), 20.0)
 
+    def test_exceptional_335103_missing_ext_token(self):
+        """B-Exc335103 (2026-05-21): inv#335103 (2026-05-21) shipped with
+        4 line items (1 CS Eggs + 3 LB catch-weight proteins), but DocAI
+        failed to OCR the eggs ext token ($22.12). Pre-fix sequence of
+        bugs:
+          1. ext_col had 3 tokens for 4 code anchors → ordinal_ok=False
+          2. Per-row "nearest in y" picker pulled chicken's $87.87 into
+             eggs row (closer to eggs anchor than eggs' own missing ext)
+          3. unit_price + qty_ship cascaded the same way — eggs row got
+             chicken's column data attached to eggs' description
+          4. code_toks[0] picked the FIRST code in overlapping windows
+             → chicken row's desc lookup keyed on eggs' code → eggs desc
+          5. Beef Ground row got no ext (window ran off the end) → dropped
+          6. First-word desc tokens (Egg/Chicken/Beef) at x_min≈0.246-0.247
+             fell outside DESC range lower-bound (0.25) → stripped from
+             every description
+        Net pre-fix: 3 garbage rows summing $305.24 vs printed $332.36.
+
+        Fix (this commit):
+          A. Shift-alignment: when ext_col is short by 1-2 vs code_anchors
+             AND unit_col matches code_anchors, try every contiguous
+             shift of ext_col onto code_anchors, score by line_math
+             passes, pick the best. Pad ext_col with None at the gap.
+          B. Ext recovery: when ext_t is None but unit + qty available,
+             compute extended = unit × qty (mirrors 795101f docai fix).
+          C. Row anchor: each row uses code_anchors[ri] (its OWN anchor)
+             for desc_by_anchor lookup, not code_toks[0] (first code in
+             potentially-overlapping window).
+          D. DESC range widened (0.25→0.24) to capture first-word desc
+             tokens that sit at x_min≈0.246-0.247.
+
+        Post-fix: 4 rows summing $327.36; +$5 freight via post-picker
+        injection → invoice_total $332.36 → PASS.
+
+        Fixture mirrors actual 335103 OCR token positions.
+        """
+        sm = self._import()
+        tokens = []
+        # Row 1 — Eggs (2 CS @ $11.06 = $22.12; ext token MISSING from OCR)
+        tokens += [
+            self._tok("35200",   0.060, 0.3155),      # code
+            self._tok("11.06",   0.756, 0.3037),      # unit price
+            self._tok("2.00",    0.671, 0.3060),      # qty shipped
+            self._tok("CS",      0.807, 0.3005),      # per/UM (above row)
+            self._tok("Egg",     0.246, 0.3095),      # desc (x_min=0.246!)
+            self._tok("Extra",   0.283, 0.3095),
+            self._tok("Large",   0.340, 0.3095),
+            self._tok("White",   0.393, 0.3095),
+            self._tok("Loose",   0.446, 0.3095),
+            self._tok("15",      0.504, 0.3095),
+            self._tok("Dozen",   0.523, 0.3095),
+            # No $22.12 ext token — simulates the OCR miss
+        ]
+        # Row 2 — Chicken (20.2 LB @ $4.35 = $87.87)
+        tokens += [
+            self._tok("c0670",   0.060, 0.3295),
+            self._tok("4.35",    0.760, 0.3179),
+            self._tok("20.20",   0.667, 0.3203),
+            self._tok("LB",      0.808, 0.3153),
+            self._tok("87.87",   0.897, 0.3095),       # ext (above row)
+            self._tok("Chicken", 0.246, 0.3235),       # desc
+            self._tok("Breast",  0.320, 0.3235),
+        ]
+        # Row 3 — Beef Flat Bottom Round (20.65 LB @ $5.33 = $110.06)
+        tokens += [
+            self._tok("b1405",   0.060, 0.3571),
+            self._tok("5.33",    0.761, 0.3459),
+            self._tok("20.65",   0.668, 0.3483),
+            self._tok("LB",      0.808, 0.3443),
+            self._tok("110.06",  0.893, 0.3391),
+            self._tok("Beef",    0.247, 0.3520),
+            self._tok("Flat",    0.294, 0.3522),
+            self._tok("Bottom",  0.367, 0.3526),
+            self._tok("Round",   0.423, 0.3530),
+        ]
+        # Row 4 — Beef Ground Tubes (21.00 LB @ $5.11 = $107.31)
+        tokens += [
+            self._tok("61565",   0.060, 0.3853),
+            self._tok("5.11",    0.762, 0.3742),
+            self._tok("21.00",   0.669, 0.3766),
+            self._tok("LB",      0.809, 0.3727),
+            self._tok("107.31",  0.894, 0.3686),
+            self._tok("Beef",    0.247, 0.3806),
+            self._tok("Ground",  0.294, 0.3806),
+            self._tok("Tubes",   0.380, 0.3806),
+            self._tok("National",0.498, 0.3806),
+            self._tok("Beef",    0.541, 0.3806),
+        ]
+        items = sm.match_exceptional_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 4,
+            f'Expected 4 items (shift-alignment + ext-recovery should '
+            f'find eggs row), got {len(items)}: '
+            f'{[(i.get("raw_description","")[:20], i.get("extended_amount")) for i in items]}')
+
+        by_ext = {it["extended_amount"]: it for it in items}
+        self.assertIn(22.12, by_ext, 'Eggs row missing (ext recovery via unit×qty failed)')
+        self.assertIn(87.87, by_ext, 'Chicken row missing')
+        self.assertIn(110.06, by_ext, 'Beef Flat row missing')
+        self.assertIn(107.31, by_ext, 'Beef Ground row missing')
+
+        total = sum(i['extended_amount'] for i in items)
+        self.assertEqual(round(total, 2), 327.36,
+            f'Total of 4 lines should be $327.36 (printed total minus $5 freight). Got {round(total,2)}.')
+
+        # Descriptions: first-word recovery via widened DESC range
+        eggs = by_ext[22.12]
+        self.assertIn('Egg', eggs['raw_description'],
+            f'"Egg" prefix must survive DESC-range widening. desc={eggs["raw_description"]!r}')
+        chicken = by_ext[87.87]
+        self.assertIn('Chicken', chicken['raw_description'])
+        beef_flat = by_ext[110.06]
+        self.assertIn('Beef', beef_flat['raw_description'])
+        beef_ground = by_ext[107.31]
+        self.assertIn('Beef', beef_ground['raw_description'])
+        self.assertIn('Ground', beef_ground['raw_description'])
+
+        # Cascade-free assignment: each row's desc matches its code
+        self.assertNotIn('Chicken', eggs['raw_description'],
+            'Eggs row must NOT contain Chicken (was the cascade bug)')
+        self.assertNotIn('Egg', chicken['raw_description'])
+        self.assertNotIn('Egg', beef_flat['raw_description'])
+
+        # Column data on eggs row is eggs' own (not cascaded from chicken)
+        self.assertEqual(eggs['unit_price'], 11.06,
+            f'Eggs unit_price should be $11.06 (per CS), not chicken\'s $4.35. Got {eggs["unit_price"]}.')
+        self.assertEqual(eggs['quantity'], 2.0,
+            f'Eggs qty should be 2 cases, not chicken\'s 20.2. Got {eggs["quantity"]}.')
+
+    def test_exceptional_shift_alignment_does_not_disrupt_clean_invoices(self):
+        """Defensive: when ext_col matches code_anchors (the common case),
+        shift-alignment code path should be a no-op. Synthesize 3 catch-
+        weight rows with all columns balanced — must extract all 3 with
+        correct values and no shift applied."""
+        sm = self._import()
+        tokens = []
+        for i, (code, qty, unit, ext, descw) in enumerate([
+            ("11111", "10.00", "5.00", "50.00", "Alpha"),
+            ("22222", "20.00", "3.50", "70.00", "Bravo"),
+            ("33333", "15.00", "4.00", "60.00", "Charlie"),
+        ]):
+            y_anchor = 0.30 + i * 0.03
+            tokens += [
+                self._tok(code, 0.060, y_anchor),
+                self._tok(unit, 0.760, y_anchor - 0.012),
+                self._tok(qty, 0.670, y_anchor - 0.010),
+                self._tok("LB", 0.808, y_anchor - 0.014),
+                self._tok(ext, 0.895, y_anchor - 0.018),
+                self._tok(descw, 0.300, y_anchor - 0.005),
+            ]
+        items = sm.match_exceptional_spatial([{"page_number": 1, "tokens": tokens}])
+        self.assertEqual(len(items), 3, f'Clean invoice should produce 3 items unchanged. Got {len(items)}.')
+        exts = sorted(it['extended_amount'] for it in items)
+        self.assertEqual(exts, [50.00, 60.00, 70.00])
+
     # ── Farm Art ───────────────────────────────────────────────────────
     def test_farmart_extracts_items_ignoring_cool_column(self):
         """COOL (country of origin) tokens like 'United States' sit between
