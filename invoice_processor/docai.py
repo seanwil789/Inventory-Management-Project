@@ -24,7 +24,7 @@ from config import (
     DOCAI_LOCATION,
     DOCAI_PROCESSOR_ID,
 )
-from parser import _extract_case_size, detect_vendor, extract_date
+from parser import _extract_case_size, detect_vendor, extract_date, extract_invoice_number
 
 
 # ── Vendor normalisation ────────────────────────────────────────────────────
@@ -297,6 +297,7 @@ def _process_single_document(file_content: bytes, mime_type: str,
     raw_text = document.text or ""
     vendor = "Unknown"
     invoice_date = ""
+    invoice_number = ""
 
     for entity in document.entities:
         etype = entity.type_
@@ -306,6 +307,8 @@ def _process_single_document(file_content: bytes, mime_type: str,
             vendor = _normalize_vendor(etext)
         elif etype == "invoice_date":
             invoice_date = _parse_docai_date(etext)
+        elif etype == "invoice_id":
+            invoice_number = (etext or "").strip()
 
     # Fallback: use keyword detection on raw text if vendor not recognised
     if vendor == "Unknown" and raw_text:
@@ -314,6 +317,15 @@ def _process_single_document(file_content: bytes, mime_type: str,
     # Fallback: use regex date extraction on raw text
     if not invoice_date and raw_text:
         invoice_date = extract_date(raw_text)
+
+    # Fallback: extract invoice_number from raw_text using the same
+    # vendor-aware helper the text path uses. DocAI's `invoice_id` entity
+    # is missing on portal-export PDFs (PBM `Inv_NNNNNN_*.pdf`) and
+    # inconsistent across templates. Without this, the GUARD in batch.py
+    # (added 2026-05-19) blocks every DB write from the DocAI-entities
+    # path. Phase 4c primary key depends on invoice_number being populated.
+    if not invoice_number and raw_text:
+        invoice_number = (extract_invoice_number(raw_text, vendor) or "").strip()
 
     # ── Extract line items ──────────────────────────────────────────────
     #
@@ -587,6 +599,7 @@ def _process_single_document(file_content: bytes, mime_type: str,
     return {
         "vendor": vendor,
         "invoice_date": invoice_date,
+        "invoice_number": invoice_number,
         "items": split_items,
     }
 
@@ -615,6 +628,7 @@ def _merge_results(results: list[dict]) -> dict:
     """Merge multiple per-page DocAI results into one."""
     vendor = "Unknown"
     invoice_date = ""
+    invoice_number = ""
     all_items = []
 
     for r in results:
@@ -622,11 +636,14 @@ def _merge_results(results: list[dict]) -> dict:
             vendor = r["vendor"]
         if r["invoice_date"] and not invoice_date:
             invoice_date = r["invoice_date"]
+        if r.get("invoice_number") and not invoice_number:
+            invoice_number = r["invoice_number"]
         all_items.extend(r["items"])
 
     return {
         "vendor": vendor,
         "invoice_date": invoice_date,
+        "invoice_number": invoice_number,
         "items": all_items,
     }
 

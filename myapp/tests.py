@@ -1931,6 +1931,156 @@ class ParserInvoiceNumberExtractionTests(TestCase):
         self.assertIsNone(result.get('invoice_number'))
 
 
+class DocAIEntitiesInvoiceNumberTests(TestCase):
+    """Regression: `parse_with_docai` must populate invoice_number.
+
+    Origin (Sean 2026-05-21): 6 PBM portal-PDFs sat in inbox for 6 days
+    because batch.py's GUARD (added 2026-05-19) blocked them — every one
+    produced empty invoice_number on the DocAI-entities path. Root cause:
+    `_process_single_document` in docai.py never extracted `invoice_id`
+    from DocAI entities and had no text-fallback, so the dict it returned
+    lacked `invoice_number`. Phase 4c (2026-05-10) made invoice_number
+    the dedup primary key — without it, db_write must be blocked.
+
+    Fix: extract `invoice_id` entity in the loop; fallback to
+    `extract_invoice_number(raw_text, vendor)` (same helper the text
+    path uses). Also propagate through `_merge_results` for multi-page.
+    """
+
+    @staticmethod
+    def _import_docai():
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import docai
+        return docai
+
+    def _make_result(self, text, entities):
+        """Build a minimal mock of DocAI's return value: `result.document`
+        with `.text` and `.entities`. Each entity has `.type_` and
+        `.mention_text` (the only fields `_get_entity_text` reads)."""
+        class FakeEntity:
+            def __init__(self, t, m):
+                self.type_ = t
+                self.mention_text = m
+        class FakeDoc:
+            def __init__(self, text, entities):
+                self.text = text
+                self.entities = entities
+        class FakeResult:
+            def __init__(self, doc):
+                self.document = doc
+        ents = [FakeEntity(t, m) for t, m in entities]
+        return FakeResult(FakeDoc(text, ents))
+
+    def test_extracts_from_invoice_id_entity(self):
+        """Primary path: DocAI provides invoice_id entity."""
+        docai = self._import_docai()
+        result_obj = self._make_result(
+            text='Philadelphia Bakery Merchants\nInvoice: 7053\n',
+            entities=[
+                ('supplier_name', 'Philadelphia Bakery Merchants'),
+                ('invoice_date', '2026-05-05'),
+                ('invoice_id', '7053'),
+            ],
+        )
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result_obj):
+            result = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        self.assertEqual(result.get('invoice_number'), '7053')
+        self.assertEqual(result.get('vendor'), 'Philadelphia Bakery Merchants')
+
+    def test_text_fallback_when_invoice_id_entity_missing(self):
+        """Portal-PDF path: DocAI omits invoice_id entity (observed on PBM
+        portal exports `Inv_NNNNNN_from_*.pdf`). Text-fallback via
+        `extract_invoice_number` recovers from raw_text."""
+        docai = self._import_docai()
+        result_obj = self._make_result(
+            text='Philadelphia Bakery Merchants\nInvoice No. 655001\n01/29/26\n',
+            entities=[
+                ('supplier_name', 'Philadelphia Bakery Merchants'),
+                ('invoice_date', '2026-01-29'),
+                # NO invoice_id entity
+            ],
+        )
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result_obj):
+            result = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        self.assertEqual(result.get('invoice_number'), '655001')
+
+    def test_text_fallback_pbm_2x2_grid_layout(self):
+        """PBM column-header pattern: 'Invoice:' label stacked above values.
+        Pass 2 of extract_invoice_number handles this; text-fallback must
+        wire through correctly."""
+        docai = self._import_docai()
+        result_obj = self._make_result(
+            text=('Philadelphia Bakery Merchants\n'
+                  'Invoice:\nInvoice Date:\n6597\n05/01/26\n'),
+            entities=[
+                ('supplier_name', 'Philadelphia Bakery Merchants'),
+                ('invoice_date', '2026-05-01'),
+            ],
+        )
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result_obj):
+            result = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        self.assertEqual(result.get('invoice_number'), '6597')
+
+    def test_empty_when_no_entity_and_no_text_match(self):
+        """If neither path yields invoice_number, return empty string —
+        GUARD will block; file stays in inbox; Sean inspects."""
+        docai = self._import_docai()
+        result_obj = self._make_result(
+            text='Philadelphia Bakery Merchants\nsome non-matching text\n',
+            entities=[
+                ('supplier_name', 'Philadelphia Bakery Merchants'),
+            ],
+        )
+        from unittest.mock import patch
+        with patch.object(docai, '_docai_call_with_retry',
+                          return_value=result_obj):
+            result = docai._process_single_document(
+                b'', 'application/pdf', None, '')
+        self.assertEqual(result.get('invoice_number'), '')
+
+    def test_merge_results_preserves_invoice_number(self):
+        """Multi-page DocAI: first non-empty invoice_number across pages
+        wins. Mirrors how vendor/date are merged."""
+        docai = self._import_docai()
+        merged = docai._merge_results([
+            {'vendor': 'Unknown', 'invoice_date': '',
+             'invoice_number': '', 'items': []},
+            {'vendor': 'Philadelphia Bakery Merchants',
+             'invoice_date': '2026-01-29',
+             'invoice_number': '655001', 'items': []},
+            {'vendor': 'Philadelphia Bakery Merchants',
+             'invoice_date': '',
+             'invoice_number': '655002', 'items': []},
+        ])
+        self.assertEqual(merged.get('invoice_number'), '655001')
+
+    def test_merge_results_empty_when_all_pages_empty(self):
+        """No page provided invoice_number → merged result is empty."""
+        docai = self._import_docai()
+        merged = docai._merge_results([
+            {'vendor': 'Philadelphia Bakery Merchants',
+             'invoice_date': '2026-01-29',
+             'invoice_number': '', 'items': []},
+            {'vendor': 'Philadelphia Bakery Merchants',
+             'invoice_date': '',
+             'invoice_number': '', 'items': []},
+        ])
+        self.assertEqual(merged.get('invoice_number'), '')
+
+
 class ValidateAllInvoicesClassifierTests(TestCase):
     """Regression coverage for `validate_all_invoices._classify`.
 
