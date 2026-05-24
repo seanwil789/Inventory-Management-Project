@@ -1155,6 +1155,18 @@ def find_new_items(
     tab = sheet_tab or ACTIVE_SHEET_TAB
     products, _ = build_sheet_index(tab)
     product_names = [p["product"] for p in products]
+    # Exact-match index (case-insensitive) — short-circuits the fuzzy
+    # pass below. Origin (Sean 2026-05-24): 304 redundant "Honey" rows
+    # inserted by the hourly `--insert-new` cron. Root cause:
+    # `process.extractOne("Honey", [...])` picks ONE of multiple
+    # 100-score token_set_ratio ties. "Turkey/ Deli Honey Baked"
+    # (Proteins, low row#) returns first; its token_sort_ratio against
+    # "Honey" is 35.7 — below the 45 sort cutoff — so the canonical is
+    # treated as "not found" and re-inserted. Bug affects any short
+    # single-token canonical that's a subset of a longer compound name
+    # (Salt vs Salt Kosher, Tea vs Iced Tea, etc.). Exact-match check
+    # before fuzzy eliminates the false-negative entirely.
+    product_names_lower = {p.lower() for p in product_names}
 
     new_items = []
     seen_canonicals: set[str] = set()
@@ -1164,6 +1176,12 @@ def find_new_items(
         if not canonical or canonical in seen_canonicals:
             continue
         seen_canonicals.add(canonical)
+
+        # Skip if exact (case-insensitive) match exists in sheet — the
+        # canonical is already present and fuzzy matching can't improve
+        # on that signal.
+        if canonical.lower() in product_names_lower:
+            continue
 
         result = process.extractOne(
             canonical,

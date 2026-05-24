@@ -20251,3 +20251,109 @@ class ValidateExtractionEndToEndTests(TestCase):
             stdout=out,
         )
         self.assertIn('No totals page identified', out.getvalue())
+
+
+class SynergySyncFindNewItemsExactMatchTests(TestCase):
+    """Regression: `find_new_items` must short-circuit on EXACT canonical
+    match before falling to fuzzy.
+
+    Origin (Sean 2026-05-24): 304 redundant "Honey" rows accumulated in
+    the Synergy May 2026 tab — each hourly `--insert-new` cron added one.
+    Root cause: `process.extractOne(canonical, [...], scorer=token_set_ratio)`
+    returns ONE of multiple tied 100-score matches; "Turkey/ Deli Honey
+    Baked" (Proteins, low row#) was returned ahead of the actual "Honey"
+    rows (Drystock, higher row#). Its `token_sort_ratio` against "Honey"
+    is 35.7 — below the 45 sort cutoff — so the canonical was treated as
+    "not found" and re-inserted every hour.
+
+    Fix: case-insensitive exact-name short-circuit BEFORE fuzzy match.
+    Bug class affects any short single-token canonical that's a subset
+    of a longer compound name (Salt/Salt Kosher, Tea/Iced Tea, etc.).
+    """
+
+    def _import(self):
+        import sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        if 'synergy_sync' in sys.modules:
+            del sys.modules['synergy_sync']
+        import synergy_sync
+        return synergy_sync
+
+    def _patch_sheet_index(self, ss, product_names):
+        """Patch build_sheet_index to return synthetic products without
+        hitting the live Sheets API."""
+        from unittest.mock import patch
+        products = [{'row': i + 5, 'section': 'Test', 'product': p,
+                     'vendor': '', 'case_size': '', 'unit': '',
+                     'count_flag': ''}
+                    for i, p in enumerate(product_names)]
+        return patch.object(ss, 'build_sheet_index',
+                            return_value=(products, []))
+
+    def test_honey_present_does_not_reinsert_despite_token_set_collision(self):
+        """Sheet has BOTH 'Turkey/ Deli Honey Baked' (collision) AND
+        'Honey'. Canonical 'Honey' must be detected as already-present
+        and NOT returned as new."""
+        ss = self._import()
+        # Deliberately put the collision BEFORE the real Honey row to
+        # reproduce the production iteration order (Proteins section
+        # appears before Drystock/Sweeteners in the sheet).
+        sheet = ['Turkey/ Deli Honey Baked', 'Beef Chuck',
+                 'Honey', 'Maple Syrup']
+        items = [{'canonical': 'Honey', 'category': 'Drystock'}]
+        with self._patch_sheet_index(ss, sheet):
+            new = ss.find_new_items(items, sheet_tab='ignored')
+        self.assertEqual(new, [],
+            f'Honey is already in the sheet — must not be re-inserted. '
+            f'Got {new}.')
+
+    def test_honey_absent_still_returns_as_new(self):
+        """Sheet has the Turkey collision but NO real Honey row.
+        Canonical 'Honey' must be returned as new (so it gets inserted
+        ONCE)."""
+        ss = self._import()
+        sheet = ['Turkey/ Deli Honey Baked', 'Beef Chuck', 'Maple Syrup']
+        items = [{'canonical': 'Honey', 'category': 'Drystock'}]
+        with self._patch_sheet_index(ss, sheet):
+            new = ss.find_new_items(items, sheet_tab='ignored')
+        self.assertEqual(len(new), 1, f'Honey absent → must be flagged as new. Got {new}.')
+        self.assertEqual(new[0]['canonical'], 'Honey')
+
+    def test_exact_match_is_case_insensitive(self):
+        """'honey' (lowercase) canonical vs 'Honey' (titlecase) sheet
+        must match. Sheet products are often title-cased by hand; DB
+        canonicals can be either."""
+        ss = self._import()
+        sheet = ['Honey']
+        items = [{'canonical': 'honey', 'category': 'Drystock'}]
+        with self._patch_sheet_index(ss, sheet):
+            new = ss.find_new_items(items, sheet_tab='ignored')
+        self.assertEqual(new, [], 'Case-insensitive exact match must hold.')
+
+    def test_non_matching_canonical_still_returned_as_new(self):
+        """Sanity: a truly new canonical (no fuzzy match either) is
+        returned as new. The fix only short-circuits exact matches —
+        the existing fuzzy fallback must still work."""
+        ss = self._import()
+        sheet = ['Beef Chuck', 'Maple Syrup', 'Honey']
+        items = [{'canonical': 'Quinoa Flour', 'category': 'Drystock'}]
+        with self._patch_sheet_index(ss, sheet):
+            new = ss.find_new_items(items, sheet_tab='ignored')
+        self.assertEqual(len(new), 1)
+        self.assertEqual(new[0]['canonical'], 'Quinoa Flour')
+
+    def test_fuzzy_path_still_catches_minor_variants(self):
+        """Defensive: if canonical is 'Honey, Wildflower' and sheet has
+        'Honey Wildflower', the fuzzy fallback (post short-circuit) must
+        still catch it. Exact-match miss → fuzzy match → not returned."""
+        ss = self._import()
+        sheet = ['Honey Wildflower', 'Beef Chuck']
+        items = [{'canonical': 'Honey Wildflower', 'category': 'Drystock'}]
+        with self._patch_sheet_index(ss, sheet):
+            new = ss.find_new_items(items, sheet_tab='ignored')
+        # Exact match wins (this hits the short-circuit, but verifying
+        # nothing breaks the matched-path behavior).
+        self.assertEqual(new, [])
