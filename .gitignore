@@ -49,3 +49,6 @@ The-Book-of-Yields*.pdf
 .historical_stats/
 .archive/
 .csv_ingest_log.json
+
+# Audit workflow durable artifacts (timestamped JSON snapshots per run)
+.audits/
