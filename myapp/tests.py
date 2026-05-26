@@ -20357,3 +20357,264 @@ class SynergySyncFindNewItemsExactMatchTests(TestCase):
         # Exact match wins (this hits the short-circuit, but verifying
         # nothing breaks the matched-path behavior).
         self.assertEqual(new, [])
+
+
+class AuditInventoryTier1Tests(TestCase):
+    """Tier 1 — schema completeness. Pure SQL aggregation; tests verify the
+    counts and structure of the output against synthetic products."""
+
+    def test_tier1_counts_products_by_category(self):
+        from myapp.management.commands.audit_inventory import run_tier1
+        from myapp.models import Product
+        Product.objects.create(canonical_name='Beef Test', category='Proteins',
+                               inventory_class='weighed', default_case_size='50LB',
+                               inventory_unit_descriptor='#')
+        Product.objects.create(canonical_name='Onion Test', category='Produce',
+                               inventory_class='', default_case_size='',
+                               inventory_unit_descriptor='')
+        result = run_tier1()
+        self.assertEqual(result['tier'], 1)
+        self.assertEqual(result['name'], 'schema_completeness')
+        # Total counts include test fixtures + any existing
+        self.assertGreaterEqual(result['total_products'], 2)
+        # Proteins category should have at least one with class filled
+        prot = result['by_category'].get('Proteins')
+        if prot:
+            self.assertGreaterEqual(prot['inventory_class_filled'], 1)
+
+    def test_tier1_category_filter(self):
+        from myapp.management.commands.audit_inventory import run_tier1
+        from myapp.models import Product
+        Product.objects.create(canonical_name='Filtered Test', category='Proteins',
+                               inventory_class='weighed')
+        Product.objects.create(canonical_name='Excluded Test', category='Produce')
+        result = run_tier1(category_filter='Proteins')
+        self.assertIn('Proteins', result['by_category'])
+        self.assertNotIn('Produce', result['by_category'])
+
+
+class AuditInventoryTier2Tests(TestCase):
+    """Tier 2 — semantic correctness. Patterns fire on configurable input;
+    tests verify each named pattern catches its intended bug class."""
+
+    def _mk_product_with_ili(self, **kwargs):
+        """Helper: create a Product + a latest ILI with given fields."""
+        from myapp.models import Product, InvoiceLineItem, Vendor
+        vendor = (Vendor.objects.filter(name='Sysco').first()
+                  or Vendor.objects.create(name='Sysco'))
+        prod_kwargs = {
+            'canonical_name': kwargs.get('canonical_name', 'Test Product'),
+            'category': kwargs.get('category', 'Drystock'),
+            'inventory_class': kwargs.get('inventory_class', ''),
+            'default_case_size': kwargs.get('default_case_size', ''),
+            'inventory_unit_descriptor': kwargs.get('inventory_unit_descriptor', ''),
+        }
+        p = Product.objects.create(**prod_kwargs)
+        from datetime import date
+        InvoiceLineItem.objects.create(
+            vendor=vendor, product=p,
+            raw_description='TEST RAW DESC',
+            unit_price=kwargs.get('unit_price', 10.00),
+            extended_amount=kwargs.get('extended_amount', 10.00),
+            quantity=kwargs.get('quantity', 1),
+            case_size=kwargs.get('case_size', ''),
+            case_pack_count=kwargs.get('case_pack_count', None),
+            case_pack_unit_size=kwargs.get('case_pack_unit_size', None),
+            case_pack_unit_uom=kwargs.get('case_pack_unit_uom', ''),
+            case_total_weight_lb=kwargs.get('case_total_weight_lb', None),
+            invoice_date=kwargs.get('invoice_date', date(2026, 1, 1)),
+            match_confidence='vendor_exact',
+        )
+        return p
+
+    def test_K_on_non_weighed_category_fires(self):
+        """K populated on Coffee/Concessions → severity 3 K_on_non_weighed_category."""
+        from myapp.management.commands.audit_inventory import run_tier2
+        self._mk_product_with_ili(
+            canonical_name='LaCroix Test',
+            category='Coffee/Concessions',
+            inventory_class='counted_with_weight',
+            inventory_unit_descriptor='12 oz Container',
+            unit_price=18.00,
+            case_total_weight_lb=18.0,  # would compute K=$1/lb (meaningless)
+        )
+        result = run_tier2()
+        patterns = [s['pattern'] for s in result['suspects']]
+        self.assertIn('K_on_non_weighed_category', patterns)
+
+    def test_normalization_bypassed_catches_pringles_fusion(self):
+        """case_size='121.3OZ' would normalize to '12/1.3OZ' but didn't.
+        Severity 4 normalization_bypassed. The flagship pattern."""
+        from myapp.management.commands.audit_inventory import run_tier2
+        self._mk_product_with_ili(
+            canonical_name='Pringles Test',
+            category='Coffee/Concessions',
+            inventory_class='counted_with_weight',
+            inventory_unit_descriptor='121.3 oz Container',
+            case_size='121.3OZ',
+            case_pack_count=1,
+            case_pack_unit_size=121.3,
+            case_pack_unit_uom='OZ',
+            case_total_weight_lb=7.581,
+            unit_price=11.65,
+        )
+        result = run_tier2()
+        bypass_suspects = [s for s in result['suspects']
+                          if s['pattern'] == 'normalization_bypassed'
+                          and 'Pringles Test' in s['product']]
+        self.assertEqual(len(bypass_suspects), 1)
+        s = bypass_suspects[0]
+        self.assertEqual(s['severity'], 4)
+        self.assertEqual(s['suggested_case_size'], '12/1.3OZ')
+
+    def test_normalization_bypass_does_not_fire_on_correct_cases(self):
+        """case_size='12/1.3OZ' already correctly normalized — no bypass flag."""
+        from myapp.management.commands.audit_inventory import run_tier2
+        self._mk_product_with_ili(
+            canonical_name='AlreadyNormalized Test',
+            category='Coffee/Concessions',
+            inventory_class='counted_with_weight',
+            case_size='12/1.3OZ',  # already in the right form
+            case_pack_count=12,
+            case_pack_unit_size=1.3,
+            case_pack_unit_uom='OZ',
+        )
+        result = run_tier2()
+        for s in result['suspects']:
+            if 'AlreadyNormalized Test' in s.get('product', ''):
+                self.assertNotEqual(s['pattern'], 'normalization_bypassed',
+                                    'Should not flag correctly-normalized case_size')
+
+
+class AuditInventoryTier3PatternTests(TestCase):
+    """Tier 3 — paper-truth pattern detection. Tests _detect_discrepancies
+    directly with synthetic Product + ILI + OCR snippet inputs."""
+
+    def _mk_pringles_fusion_inputs(self):
+        """Shared fixture: Pringles SOS-shape product + ILI for fusion testing."""
+        from myapp.models import Product, InvoiceLineItem, Vendor
+        from datetime import date
+        vendor = (Vendor.objects.filter(name='Sysco').first()
+                  or Vendor.objects.create(name='Sysco'))
+        p = Product.objects.create(
+            canonical_name='Pringles SOS Fixture',
+            category='Coffee/Concessions',
+            inventory_class='counted_with_weight',
+            inventory_unit_descriptor='121.3 oz Container',
+        )
+        ili = InvoiceLineItem.objects.create(
+            vendor=vendor, product=p,
+            raw_description='121.30Z PRINGLE CHIP POTATO SR CRM',
+            unit_price=11.65, extended_amount=11.65, quantity=1,
+            case_size='121.3OZ',
+            case_pack_count=1, case_pack_unit_size=121.3,
+            case_pack_unit_uom='OZ', case_total_weight_lb=7.581,
+            invoice_date=date(2026, 1, 27),
+            match_confidence='vendor_exact',
+        )
+        snippet = '1 CS | 121.30Z PRINGLE CHIP POTATO SR CRM & ON 3800084555 1978309 11.65'
+        return p, ili, snippet
+
+    def test_pattern_A_number_token_fusion_fires(self):
+        from myapp.management.commands.audit_inventory import _detect_discrepancies
+        p, ili, snippet = self._mk_pringles_fusion_inputs()
+        discs = _detect_discrepancies(p, ili, snippet)
+        patterns = [d['pattern'] for d in discs]
+        self.assertIn('number_token_fusion', patterns)
+        ntf = [d for d in discs if d['pattern'] == 'number_token_fusion'][0]
+        self.assertEqual(ntf['severity'], 4)
+        # Should suggest 12/1.3OZ split
+        self.assertEqual(ntf.get('suggested_fix'), '12/1.3OZ')
+
+    def test_pattern_C_fluid_oz_as_weight_fires(self):
+        from myapp.management.commands.audit_inventory import _detect_discrepancies
+        p, ili, snippet = self._mk_pringles_fusion_inputs()
+        discs = _detect_discrepancies(p, ili, snippet)
+        patterns = [d['pattern'] for d in discs]
+        self.assertIn('fluid_oz_as_weight', patterns)
+
+    def test_pattern_D_qty_mismatch_fires(self):
+        from myapp.management.commands.audit_inventory import _detect_discrepancies
+        from myapp.models import Product, InvoiceLineItem, Vendor
+        from datetime import date
+        vendor = (Vendor.objects.filter(name='Sysco').first()
+                  or Vendor.objects.create(name='Sysco'))
+        p = Product.objects.create(
+            canonical_name='QtyMismatch Fixture',
+            category='Coffee/Concessions',
+            inventory_class='counted_with_weight',
+        )
+        ili = InvoiceLineItem.objects.create(
+            vendor=vendor, product=p,
+            raw_description='LACROIX TEST',
+            unit_price=8.99, quantity=1,  # stored as 1
+            invoice_date=date(2026, 1, 1),
+            match_confidence='vendor_exact',
+        )
+        snippet = 'D | 10 CS | 21.412OZ LACROIX TEST 0123456'  # OCR shows 10 CS
+        discs = _detect_discrepancies(p, ili, snippet)
+        qty_mismatch = [d for d in discs if d['pattern'] == 'qty_mismatch']
+        self.assertEqual(len(qty_mismatch), 1)
+        self.assertIn('10', qty_mismatch[0]['detail'])
+
+    def test_clean_product_produces_no_discrepancies(self):
+        """A correctly-stored product should fire no Tier 3 patterns."""
+        from myapp.management.commands.audit_inventory import _detect_discrepancies
+        from myapp.models import Product, InvoiceLineItem, Vendor
+        from datetime import date
+        vendor = (Vendor.objects.filter(name='Sysco').first()
+                  or Vendor.objects.create(name='Sysco'))
+        p = Product.objects.create(
+            canonical_name='Clean Pringles',
+            category='Coffee/Concessions',
+            inventory_class='counted_with_weight',
+            inventory_unit_descriptor='1.3 oz Container',
+        )
+        ili = InvoiceLineItem.objects.create(
+            vendor=vendor, product=p,
+            raw_description='PRINGLE CHIP POTATO CLEAN',
+            unit_price=11.65, quantity=1,
+            case_size='12/1.3OZ',  # correctly normalized
+            case_pack_count=12, case_pack_unit_size=1.3,
+            case_pack_unit_uom='OZ',
+            # No case_total_weight_lb — fluid-OZ-as-weight pattern doesn't fire
+            invoice_date=date(2026, 1, 1),
+            match_confidence='vendor_exact',
+        )
+        snippet = '1 CS | 12/1.3OZ PRINGLE CHIP POTATO CLEAN 12345 1234567 11.65'
+        discs = _detect_discrepancies(p, ili, snippet)
+        self.assertEqual(discs, [],
+                         f'Clean product should have no discrepancies; got: {discs}')
+
+
+class AuditInventoryAggregationTests(TestCase):
+    """Tier-aggregator + report builder."""
+
+    def test_aggregate_combines_three_tiers(self):
+        from myapp.management.commands.audit_inventory import aggregate_report
+        t1 = {'tier': 1, 'name': 'schema_completeness', 'total_products': 5,
+              'by_category': {'Drystock': {'total': 5}}}
+        t2 = {'tier': 2, 'name': 'semantic_correctness', 'suspect_count': 2,
+              'suspects': [
+                  {'severity': 4, 'pattern': 'normalization_bypassed',
+                   'category': 'Coffee/Concessions', 'product': 'Pringles'},
+                  {'severity': 3, 'pattern': 'K_on_non_weighed_category',
+                   'category': 'Coffee/Concessions', 'product': 'Chobani'},
+              ]}
+        t3 = {'tier': 3, 'name': 'paper_truth_sweep',
+              'coverage': {'total': 5, 'verified_clean': 3, 'no_ili_history': 0,
+                          'no_cache_match': 0},
+              'discrepancies': [
+                  {'severity': 4, 'pattern': 'number_token_fusion',
+                   'category': 'Coffee/Concessions', 'product': 'Pringles'},
+              ]}
+        report = aggregate_report(t1, t2, t3)
+        self.assertIn('summary', report)
+        s = report['summary']
+        self.assertEqual(s['total_products'], 5)
+        # Severity counts roll up across tiers
+        self.assertEqual(s['severity_distribution'].get(4), 2)  # 1 from t2 + 1 from t3
+        self.assertEqual(s['severity_distribution'].get(3), 1)  # 1 from t2
+        # By pattern aggregation
+        self.assertEqual(s['by_pattern'].get('normalization_bypassed'), 1)
+        self.assertEqual(s['by_pattern'].get('number_token_fusion'), 1)
