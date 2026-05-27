@@ -530,7 +530,8 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
                 print(f"   [DocAI] vendor={vendor}, date={docai_ocr['invoice_date'] or '?'}")
 
                 if vendor in ("Sysco", "Exceptional Foods", "Farm Art",
-                              "Philadelphia Bakery Merchants", "PBM"):
+                              "Philadelphia Bakery Merchants", "PBM",
+                              "Delaware County Linen"):
                     # These vendors have structured column layouts that our
                     # spatial/text parsers (parse_invoice + DocAI token bbox
                     # in `pages`) handle better than DocAI entity extraction.
@@ -540,6 +541,11 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
                     # row; masked because rotated values sum to the right
                     # total). match_pbm_spatial pairs by bbox and resolves it.
                     # Bug register: B-PBM-DocAI-Entity-Pairing-Cascade (inv#8738).
+                    # Delaware added 2026-05-27: no cascade observed, but
+                    # routed for consistency/defense-in-depth — match_delaware_spatial
+                    # + _parse_delaware_linen are already validate/reprocess's
+                    # source of truth (all 8 caches verify to the $91.37
+                    # standing-order total via this path).
                     raw_text = docai_ocr["raw_text"]
                     parsed = parse_invoice(raw_text, vendor=vendor,
                                            pages=docai_ocr.get("pages"))
