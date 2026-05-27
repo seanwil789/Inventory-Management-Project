@@ -7501,6 +7501,52 @@ class SpatialMatcherOtherVendorsTests(TestCase):
                                  pages=pages)
         self.assertEqual(len(result['items']), 4)
 
+    def test_pbm_inv_8738_replay_spatial_pairs_prices_correctly(self):
+        """Replay inv#8738 (Sean 2026-05-27, bug register
+        B-PBM-DocAI-Entity-Pairing-Cascade). The DocAI *entities* path rotated
+        unit_price across rows (Danish got $20, Muffins $14.92, Donuts $10 —
+        real values $14.92/$10/$20) and leaked an "Amount" header phantom.
+        It was MASKED because the rotated values sum to the correct $57.37 →
+        IVS PASS. Fix: route PBM through parse_invoice + DocAI token bbox
+        (`pages`) → match_pbm_spatial, which pairs price↔desc by row position.
+        This replays the real cached OCR fixture and asserts the per-line
+        prices are CORRECT (not merely that the total sums right)."""
+        import json, sys
+        from django.conf import settings
+        path = str(settings.BASE_DIR / 'invoice_processor')
+        if path not in sys.path:
+            sys.path.insert(0, path)
+        import parser as p
+        fixture = (settings.BASE_DIR / 'invoice_processor' /
+                   'test_fixtures' / 'pbm_8738_docai_ocr.json')
+        d = json.loads(fixture.read_text())
+        out = p.parse_invoice(d['raw_text'],
+                              vendor='Philadelphia Bakery Merchants',
+                              pages=d.get('pages'))
+        items = out['items']
+
+        def _price(keyword):
+            for it in items:
+                if keyword in (it.get('raw_description') or '').lower():
+                    return it.get('unit_price')
+            return None
+
+        # Identifiable descriptions → paper-truth unit_price
+        self.assertEqual(_price('danish'), 14.92, f"Danish unit_price; items={items}")
+        self.assertEqual(_price('muffin'), 10.0, f"Muffins unit_price; items={items}")
+        self.assertEqual(_price('club'), 4.15, f"Club White unit_price; items={items}")
+        # Donuts row's desc truncates to "Assorted" in the spatial path — assert
+        # via the residual: the item that is none of the above carries $20.00.
+        residual = [it.get('unit_price') for it in items
+                    if not any(k in (it.get('raw_description') or '').lower()
+                               for k in ('danish', 'muffin', 'club'))]
+        self.assertIn(20.0, residual, f"Donuts unit_price ($20) missing; items={items}")
+        # Total reconciles, and no phantom "Amount" column-header row leaked in.
+        total = sum((it.get('extended_amount') or 0) for it in items)
+        self.assertEqual(round(total, 2), 57.37, f"items_sum; items={items}")
+        descs = [(it.get('raw_description') or '').strip().lower() for it in items]
+        self.assertNotIn('amount', descs, f"phantom 'Amount' row leaked; items={items}")
+
 
 class ParserPipelineIntegrationTest(TestCase):
     """T4: full parse → map → write_invoice_to_db round-trip. Verifies the

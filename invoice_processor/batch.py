@@ -529,10 +529,17 @@ def process_one(drive_file: dict, dry_run: bool, mappings: dict) -> bool:
                 vendor = docai_ocr["vendor"]
                 print(f"   [DocAI] vendor={vendor}, date={docai_ocr['invoice_date'] or '?'}")
 
-                if vendor in ("Sysco", "Exceptional Foods", "Farm Art"):
-                    # Sysco + Exceptional + Farm Art: DocAI OCR text + vendor-specific parser
-                    # These vendors have structured column layouts that our parsers
-                    # handle better than DocAI entity extraction
+                if vendor in ("Sysco", "Exceptional Foods", "Farm Art",
+                              "Philadelphia Bakery Merchants", "PBM"):
+                    # These vendors have structured column layouts that our
+                    # spatial/text parsers (parse_invoice + DocAI token bbox
+                    # in `pages`) handle better than DocAI entity extraction.
+                    # PBM added 2026-05-27: the entities path mis-pairs
+                    # unit_price across rows on PBM portal PDFs (column-major
+                    # DocAI read → FIFO desc↔price rotation + phantom "Amount"
+                    # row; masked because rotated values sum to the right
+                    # total). match_pbm_spatial pairs by bbox and resolves it.
+                    # Bug register: B-PBM-DocAI-Entity-Pairing-Cascade (inv#8738).
                     raw_text = docai_ocr["raw_text"]
                     parsed = parse_invoice(raw_text, vendor=vendor,
                                            pages=docai_ocr.get("pages"))
