@@ -919,6 +919,12 @@ class Menu(models.Model):
     dish_freetext       = models.CharField(max_length=200, blank=True)
     ingredients_raw     = models.TextField(blank=True)
     assignee            = models.CharField(max_length=20, choices=ASSIGNEE_CHOICES, blank=True)
+    created_at          = models.DateTimeField(
+        auto_now_add=True, null=True,
+        help_text="Authoring timestamp — drives the recipe-coverage Flow metric "
+                  "(% of newly-authored cells that got a recipe at authoring). "
+                  "NULL on rows that predate instrumentation (2026-05-28).",
+    )
 
     class Meta:
         unique_together = [('date', 'meal_slot')]
