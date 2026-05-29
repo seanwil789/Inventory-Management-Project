@@ -7411,6 +7411,43 @@ class SpatialMatcherOtherVendorsTests(TestCase):
         self.assertEqual(items[0]["purchase_uom"], "EACH")
         self.assertEqual(items[0]["unit_of_measure"], "EACH")
 
+    def test_farmart_tilted_photo_no_row_drop(self):
+        """Regression (inv 1666956, 2026-05-29): on tilted Farm Art photos the
+        right-hand columns (unit/ext) sit ~0.012 lower in y than the left
+        (code/desc/qty). The legacy _group_rows(tol=0.010) split each line so a
+        row qualified with a neighbor's ext or none at all — celery was dropped
+        and its $11.88 leaked onto the carrot row. Code-anchored construction +
+        ordinal column pairing keeps each line whole. Also covers the 2-decimal
+        qty ('4.00') that the old _FARM_DEC_RE (3-dec only) missed."""
+        sm = self._import()
+        tokens = []
+        # Row A (garlic): left columns at y=0.600, right columns skewed to 0.612
+        tokens += [self._tok("1.000", 0.07, 0.600), self._tok("1.000", 0.12, 0.600),
+                   self._tok("GAR", 0.19, 0.600), self._tok("GARLIC", 0.27, 0.600),
+                   self._tok("PEELED", 0.34, 0.600),
+                   self._tok("16.20", 0.83, 0.612), self._tok("16.04", 0.90, 0.612)]
+        # Row B (celery): left at y=0.621, right skewed to 0.633; qty OCR'd "4.00"
+        tokens += [self._tok("4.00", 0.07, 0.621), self._tok("4.00", 0.12, 0.621),
+                   self._tok("CL2", 0.19, 0.621), self._tok("CELERY", 0.27, 0.621),
+                   self._tok("24-30", 0.34, 0.621), self._tok("CT", 0.38, 0.621),
+                   self._tok("3.00", 0.83, 0.633), self._tok("11.88", 0.90, 0.633)]
+        items = sm.match_farmart_spatial([{"page_number": 1, "tokens": tokens}])
+        by = {}
+        for it in items:
+            d = it["raw_description"].upper()
+            if "CELERY" in d:
+                by["celery"] = it
+            elif "GARLIC" in d:
+                by["garlic"] = it
+        # Celery is NOT dropped, and gets its OWN price (not garlic's, not lost).
+        self.assertIn("celery", by, "celery row was dropped (tilt skew regression)")
+        self.assertEqual(by["celery"]["extended_amount"], 11.88)
+        self.assertEqual(by["celery"]["unit_price"], 3.00)
+        self.assertEqual(by["celery"]["quantity"], 4.0)  # 2-decimal "4.00" qty parses
+        # Garlic keeps its own ext — celery's 11.88 did NOT leak onto it.
+        self.assertIn("garlic", by)
+        self.assertEqual(by["garlic"]["extended_amount"], 16.04)
+
     # ── Delaware ───────────────────────────────────────────────────────
     def test_delaware_small_volume_extraction(self):
         sm = self._import()

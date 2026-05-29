@@ -1608,6 +1608,7 @@ _FARM_DESC_NOISE_RE = re.compile(
 )
 _FARM_PRICE_RE = re.compile(r'^\$?\d+\.\d{2,4}$')
 _FARM_DEC_RE = re.compile(r'^\d+\.\d{3}$')  # qty format "1.000"
+_FARM_QTY_RE = re.compile(r'^\d+\.\d{2,4}$')  # qty: "1.000" or OCR-dropped-zero "4.00"
 
 _FARM_QTY_ORD_X   = (0.04, 0.11)
 _FARM_QTY_SHP_X   = (0.10, 0.16)
@@ -1640,58 +1641,141 @@ def match_farmart_spatial(pages: list[dict]) -> list[dict]:
         tokens = page.get("tokens") or []
         if not tokens:
             continue
-        rows = _group_rows(tokens, tol=0.010)
-        for row in rows:
-            # Farm Art items have qty ORDERED at far-left and a price at
-            # far-right. Both are required to qualify as an item row.
-            qty_ord_toks = [t for t in row if _in_x(t, _FARM_QTY_ORD_X)
-                            and _FARM_DEC_RE.fullmatch(t["text"])]
-            if not qty_ord_toks:
-                continue
-            ext_toks = [t for t in row if _in_x(t, _FARM_EXT_X)
-                        and _FARM_PRICE_RE.fullmatch(t["text"])]
-            if not ext_toks:
-                continue
+        def _ymid(t):
+            return (t["y_min"] + t["y_max"]) / 2
 
-            extended = float(ext_toks[0]["text"].lstrip("$"))
-            unit_toks = [t for t in row if _in_x(t, _FARM_UNIT_X)
-                         and _FARM_PRICE_RE.fullmatch(t["text"])]
-            unit_price = float(unit_toks[0]["text"].lstrip("$")) \
-                         if unit_toks else extended
+        # Code-anchored row construction (2026-05-29). The legacy
+        # `_group_rows(tol=0.010)` mis-grouped rows on tilted Farm Art photos:
+        # with a ~0.012 left->right y-skew, a line's price/ext tokens fall into
+        # a different y-cluster than its code+desc, so the row qualified with
+        # the WRONG ext (a neighbor's) or no ext at all and got dropped
+        # (inv 1666956 celery). Mirrors the code-anchored fix already proven on
+        # PBM + Exceptional: anchor on each item code, then pair columns by
+        # ORDINAL y-order — robust to the skew because a column's token order
+        # still matches the code order.
+        raw_anchors = sorted(
+            [t for t in tokens
+             if _in_x(t, _FARM_CODE_X) and _FARM_ITEM_CODE_RE.fullmatch(t["text"])
+             and any(_in_x(p, _FARM_EXT_X) and _FARM_PRICE_RE.fullmatch(p["text"])
+                     and abs(_ymid(p) - _ymid(t)) <= 0.025 for p in tokens)],
+            key=_ymid,
+        )
+        # The code band (0.18-0.28) overlaps the desc band (0.26-0.68), and a
+        # description's first word ("CELERY", "DAIRY", "MELONS") matches the
+        # code regex -> phantom 2nd anchor for the same row. Collapse anchors
+        # within ~half a row of each other, keeping the leftmost (the real
+        # item code sits ~x0.19, left of the desc).
+        code_anchors: list[dict] = []
+        for a in raw_anchors:
+            if code_anchors and abs(_ymid(a) - _ymid(code_anchors[-1])) <= 0.008:
+                if a["x_min"] < code_anchors[-1]["x_min"]:
+                    code_anchors[-1] = a
+                continue
+            code_anchors.append(a)
 
-            qty_ord = float(qty_ord_toks[0]["text"])
-            qty_shp_toks = [t for t in row if _in_x(t, _FARM_QTY_SHP_X)
-                            and _FARM_DEC_RE.fullmatch(t["text"])
-                            and t != qty_ord_toks[0]]
-            qty_shipped = float(qty_shp_toks[0]["text"]) if qty_shp_toks else qty_ord
-            # Sean 2026-05-02: skip rows where extended (billed amount) is 0.
-            # Farm Art uses zz prefix for out-of-stock items; the row appears
-            # on invoice paperwork but with no money paid. ext=0 means the
-            # line wasn't billed regardless of qty value (some "ordered but
-            # not delivered" rows have qty>0 but ext=0 — zz BAKING YEAST,
-            # zz SPICE CUMIN, etc.). No money paid = no ILI row needed.
-            # Note: zz alone isn't disqualifying — fulfilled-substitution
-            # zz items have real qty + ext and should generate ILI rows.
+        if code_anchors:
+            ys = [_ymid(a) for a in code_anchors]
+            if len(ys) >= 2:
+                gaps = sorted(ys[i + 1] - ys[i] for i in range(len(ys) - 1))
+                row_spacing = gaps[len(gaps) // 2] or 0.021
+            else:
+                row_spacing = 0.021
+            half_win = max(row_spacing * 0.55, 0.010)
+            cy_min, cy_max = min(ys), max(ys)
+
+            def _col(band, regex):
+                return sorted(
+                    [t for t in tokens
+                     if _in_x(t, band) and regex.fullmatch(t["text"])
+                     and (cy_min - 0.020) <= _ymid(t) <= (cy_max + 0.020)],
+                    key=_ymid,
+                )
+            ext_col = _col(_FARM_EXT_X, _FARM_PRICE_RE)
+            unit_col = _col(_FARM_UNIT_X, _FARM_PRICE_RE)
+            ordinal_ok = (len(ext_col) == len(code_anchors))
+            rows = [[t for t in tokens if abs(_ymid(t) - ay) <= half_win]
+                    for ay in ys]
+            # Description tokens -> nearest code anchor by y (robust to the
+            # half_win windows overlapping on tilted pages).
+            desc_by_anchor: dict[int, list[dict]] = {id(a): [] for a in code_anchors}
+            for t in tokens:
+                if not _in_x(t, _FARM_DESC_X):
+                    continue
+                if (_FARM_PRICE_RE.fullmatch(t["text"])
+                        or _FARM_QTY_RE.fullmatch(t["text"])
+                        or _FARM_DESC_NOISE_RE.fullmatch(t["text"])):
+                    continue
+                ty = _ymid(t)
+                if not (cy_min - 0.020) <= ty <= (cy_max + 0.020):
+                    continue
+                nearest = min(code_anchors, key=lambda a: abs(_ymid(a) - ty))
+                if abs(_ymid(nearest) - ty) <= row_spacing:
+                    desc_by_anchor[id(nearest)].append(t)
+        else:
+            # No codes detected — legacy clustering keeps code-less fixtures /
+            # non-item pages behaving as before.
+            rows = _group_rows(tokens, tol=0.010)
+            ext_col = unit_col = []
+            ordinal_ok = False
+            code_anchors = []
+            desc_by_anchor = {}
+
+        for ri, row in enumerate(rows):
+            anchor = code_anchors[ri] if ri < len(code_anchors) else None
+            ay = _ymid(anchor) if anchor is not None else (
+                sum(_ymid(t) for t in row) / len(row) if row else 0.0)
+
+            def _nearest(band, regex, exclude=None):
+                cands = [t for t in row if _in_x(t, band)
+                         and regex.fullmatch(t["text"]) and t is not exclude]
+                return min(cands, key=lambda t: abs(_ymid(t) - ay)) if cands else None
+
+            # ext + unit: ordinal pairing when every code has an ext (robust to
+            # tilt skew); else nearest-in-row.
+            if ordinal_ok and anchor is not None and ri < len(ext_col):
+                ext_t = ext_col[ri]
+                unit_t = unit_col[ri] if ri < len(unit_col) else _nearest(_FARM_UNIT_X, _FARM_PRICE_RE)
+            else:
+                ext_t = _nearest(_FARM_EXT_X, _FARM_PRICE_RE)
+                unit_t = _nearest(_FARM_UNIT_X, _FARM_PRICE_RE)
+            if ext_t is None:
+                continue
+            extended = float(ext_t["text"].lstrip("$"))
+            # Sean 2026-05-02: skip ext=0 rows (zz out-of-stock — on paperwork,
+            # no money paid, no ILI row needed).
             if extended == 0:
                 continue
+            # Sean 2026-05-03: unit_price is the per-unit U/P column value, not
+            # the line amount (overstating per-unit by qty x broke calc_iup).
+            unit_price = float(unit_t["text"].lstrip("$")) if unit_t else extended
 
-            um_toks = [t for t in row if _in_x(t, _FARM_UM_X)
-                       and _FARM_UM_RE.fullmatch(t["text"])]
-            um = um_toks[0]["text"].upper() if um_toks else ""
+            # qty: far-left ORDERED + adjacent SHIPPED. _FARM_QTY_RE accepts
+            # 2-4 decimals so OCR-dropped-zero qtys ("4.00" vs "4.000") parse.
+            qty_ord_t = _nearest(_FARM_QTY_ORD_X, _FARM_QTY_RE)
+            qty_shp_t = _nearest(_FARM_QTY_SHP_X, _FARM_QTY_RE, exclude=qty_ord_t)
+            if qty_ord_t is None and qty_shp_t is None:
+                continue
+            qty_shipped = float((qty_shp_t or qty_ord_t)["text"])
 
-            # Description: everything in the desc x-band that isn't COOL
-            # (country name) or a recognizable numeric/noise token.
-            # Uses _FARM_DESC_NOISE_RE (narrower than _FARM_UM_RE) so size
-            # tokens like GAL/QT in description text stay (e.g. "4 / 1 - GAL"
-            # for Shallot). Only business-note words like CASE/EACH get
-            # filtered as noise.
-            desc_toks = [t for t in row if _in_x(t, _FARM_DESC_X)
-                         and not _FARM_PRICE_RE.fullmatch(t["text"])
-                         and not _FARM_DEC_RE.fullmatch(t["text"])
-                         and not _FARM_DESC_NOISE_RE.fullmatch(t["text"])]
-            description = " ".join(t["text"] for t in desc_toks).strip()
-            # Strip leading comma if desc starts with one (OCR noise)
-            description = re.sub(r'^,\s*', '', description)
+            um_t = _nearest(_FARM_UM_X, _FARM_UM_RE)
+            um = um_t["text"].upper() if um_t else ""
+
+            # Description: desc-band tokens (excludes the leftmost code ~x0.19
+            # and the COOL country column at 0.68+); keeps real desc words like
+            # "DAIRY"/"MELONS" that match the code regex. Nearest-anchor set
+            # when code-anchored, else the row window.
+            if anchor is not None:
+                desc_toks = sorted(desc_by_anchor.get(id(anchor), []),
+                                   key=lambda t: t["x_min"])
+            else:
+                desc_toks = sorted(
+                    [t for t in row if _in_x(t, _FARM_DESC_X)
+                     and not _FARM_PRICE_RE.fullmatch(t["text"])
+                     and not _FARM_QTY_RE.fullmatch(t["text"])
+                     and not _FARM_DESC_NOISE_RE.fullmatch(t["text"])],
+                    key=lambda t: t["x_min"])
+            description = re.sub(r'^,\s*', '',
+                                 " ".join(t["text"] for t in desc_toks).strip())
             if not description:
                 continue
 
