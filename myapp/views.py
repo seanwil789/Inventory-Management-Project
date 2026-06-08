@@ -2506,22 +2506,30 @@ def invoices_list(request):
     for row in flagged_by_date_vendor:
         per_invoice_flagged[(row['vendor_id'], row['invoice_date'])] = row['n']
 
-    # Per-invoice department/account — dominant account name per (vendor, date).
+    # Per-invoice department/account — dominant account name. Keyed by
+    # (vendor, invoice_number) when available (date is not unique), with a
+    # (vendor, date) fallback for rows lacking an invoice_number.
     from collections import Counter
-    per_invoice_account = {}
-    _acct_counter: dict = {}
+    _by_num: dict = {}
+    _by_date: dict = {}
     for r in (InvoiceLineItem.objects
               .filter(invoice_date__year=year_filter)
-              .values('vendor_id', 'invoice_date', 'account__name')):
-        key = (r['vendor_id'], r['invoice_date'])
-        _acct_counter.setdefault(key, Counter())[r['account__name'] or 'Food/Kitchen'] += 1
-    per_invoice_account = {k: c.most_common(1)[0][0] for k, c in _acct_counter.items()}
+              .values('vendor_id', 'invoice_number', 'invoice_date', 'account__name')):
+        name = r['account__name'] or 'Food/Kitchen'
+        if r['invoice_number']:
+            _by_num.setdefault((r['vendor_id'], r['invoice_number']), Counter())[name] += 1
+        _by_date.setdefault((r['vendor_id'], r['invoice_date']), Counter())[name] += 1
+    acct_by_num = {k: c.most_common(1)[0][0] for k, c in _by_num.items()}
+    acct_by_date = {k: c.most_common(1)[0][0] for k, c in _by_date.items()}
 
     # Decorate invoice rows with derived display values
     invoices = []
     for ivs in qs:
-        acct_name = per_invoice_account.get(
-            (ivs.vendor_id, ivs.invoice_date), 'Food/Kitchen')
+        acct_name = None
+        if ivs.invoice_number:
+            acct_name = acct_by_num.get((ivs.vendor_id, ivs.invoice_number))
+        if acct_name is None:
+            acct_name = acct_by_date.get((ivs.vendor_id, ivs.invoice_date), 'Food/Kitchen')
         if account_filter and acct_name != account_filter:
             continue
 
@@ -2896,9 +2904,16 @@ def invoice_set_account(request, ivs_id: int):
         messages.error(request, 'Unknown account.')
         return redirect('invoice_detail', ivs_id=ivs_id)
 
-    n = (InvoiceLineItem.objects
-         .filter(vendor=ivs.vendor, invoice_date=ivs.invoice_date)
-         .update(account=account))
+    # Scope to THIS invoice. Prefer invoice_number — (vendor, invoice_date) is
+    # NOT unique (e.g. two Sysco invoices on the same delivery day), and tagging
+    # by date would mis-attribute a co-dated sibling invoice. Fall back to date
+    # only when invoice_number is absent (Colonial / some PBM/Delaware).
+    lines = InvoiceLineItem.objects.filter(vendor=ivs.vendor)
+    if ivs.invoice_number and lines.filter(invoice_number=ivs.invoice_number).exists():
+        lines = lines.filter(invoice_number=ivs.invoice_number)
+    else:
+        lines = lines.filter(invoice_date=ivs.invoice_date)
+    n = lines.update(account=account)
     messages.success(request, f'Attributed {n} line(s) to {account.name}.')
     return redirect('invoice_detail', ivs_id=ivs_id)
 
@@ -3000,8 +3015,15 @@ def invoice_detail(request, ivs_id: int):
     # but invoice_number isn't stored on ILI). Per-vendor groupings are
     # tight enough that vendor + date is unique in practice. Future:
     # add ILI.invoice_validation_status FK for direct join.
-    ili_qs = (InvoiceLineItem.objects
-              .filter(vendor=ivs.vendor, invoice_date=ivs.invoice_date)
+    # Prefer invoice_number — (vendor, invoice_date) is not unique (two invoices
+    # from one vendor on the same day collide), which would conflate their
+    # lines here. Fall back to date only when invoice_number is absent.
+    _base = InvoiceLineItem.objects.filter(vendor=ivs.vendor)
+    if ivs.invoice_number and _base.filter(invoice_number=ivs.invoice_number).exists():
+        _base = _base.filter(invoice_number=ivs.invoice_number)
+    else:
+        _base = _base.filter(invoice_date=ivs.invoice_date)
+    ili_qs = (_base
               .select_related('product', 'vendor')
               .order_by('section_hint', 'id'))
 

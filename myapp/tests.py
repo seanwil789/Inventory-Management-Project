@@ -5413,6 +5413,42 @@ class InvoiceSetAccountViewTests(TestCase):
         self.assertEqual(
             InvoiceLineItem.objects.filter(vendor=v, account=ops).count(), 3)
 
+    def test_codated_sibling_invoice_not_mis_tagged(self):
+        # Two invoices, same vendor + same date, different invoice_number.
+        # Tagging one must NOT touch the other (the (vendor, date) conflation bug).
+        from django.urls import reverse
+        from django.contrib.auth.models import User
+        from myapp.models import (Vendor, Account, InvoiceValidationStatus,
+                                  InvoiceLineItem)
+        from datetime import date
+        v = Vendor.objects.create(name='CoDateVendor')
+        food = Account.objects.get(name='Food/Kitchen')
+        ops = Account.objects.get(name='Operations')
+        d = date(2026, 6, 1)
+        ivs_ops = InvoiceValidationStatus.objects.create(
+            vendor=v, invoice_number='OPS1', invoice_date=d)
+        InvoiceValidationStatus.objects.create(
+            vendor=v, invoice_number='FOOD1', invoice_date=d)
+        for i in range(3):
+            InvoiceLineItem.objects.create(
+                vendor=v, invoice_date=d, invoice_number='OPS1',
+                raw_description=f'o{i}', account=food)
+        for i in range(4):
+            InvoiceLineItem.objects.create(
+                vendor=v, invoice_date=d, invoice_number='FOOD1',
+                raw_description=f'f{i}', account=food)
+
+        user = User.objects.create_user('codate', 'c@x.com', 'pw')
+        self.client.force_login(user)
+        self.client.post(reverse('invoice_set_account', args=[ivs_ops.id]),
+                         {'account': ops.id})
+        self.assertEqual(InvoiceLineItem.objects.filter(
+            invoice_number='OPS1', account=ops).count(), 3)
+        self.assertEqual(InvoiceLineItem.objects.filter(
+            invoice_number='FOOD1', account=ops).count(), 0)
+        self.assertEqual(InvoiceLineItem.objects.filter(
+            invoice_number='FOOD1', account=food).count(), 4)
+
 
 class SynergySyncPricePerLbTests(TestCase):
     """`calc_price_per_lb` — Track B consumer wiring.
