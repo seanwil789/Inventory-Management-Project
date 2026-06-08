@@ -2551,6 +2551,26 @@ def invoices_list(request):
             'account': acct_name,
         })
 
+    # ── Group rows by quarter for the collapsible quarter bars ───
+    # Rows arrive already date-sorted (newest first), so each quarter's
+    # rows are contiguous. The template renders one foldable header bar
+    # per quarter (e.g. "Q1 2026") so older quarters can be collapsed.
+    from collections import OrderedDict
+    _groups: dict = OrderedDict()
+    for row in invoices:
+        d = row['ivs'].invoice_date
+        if d:
+            q = (d.month - 1) // 3 + 1
+            gkey, glabel = f'{d.year}_Q{q}', f'Q{q} {d.year}'
+        else:
+            gkey, glabel = 'undated', 'No date'
+        grp = _groups.setdefault(
+            gkey, {'key': gkey, 'label': glabel, 'rows': [], 'count': 0, 'total': 0.0})
+        grp['rows'].append(row)
+        grp['count'] += 1
+        grp['total'] += float(row['ivs'].items_sum or 0)
+    invoice_groups = list(_groups.values())
+
     # ── Filter dropdown options ──────────────────────────────────
     years_available = sorted(
         {d.year for d in
@@ -2575,6 +2595,7 @@ def invoices_list(request):
         'status_filter': status_filter,
         'vendor_filter': vendor_filter,
         'account_filter': account_filter,
+        'invoice_groups': invoice_groups,
         'years_available': years_available,
         'vendors_available': vendors_available,
         'accounts_available': accounts_available,

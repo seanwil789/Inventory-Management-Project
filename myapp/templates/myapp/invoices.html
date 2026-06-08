@@ -113,9 +113,17 @@
         </tr>
       </thead>
       <tbody>
-        {% for row in invoices %}
+        {% for g in invoice_groups %}
+          <tr class="bg-slate-100 border-y border-slate-300 cursor-pointer select-none hover:bg-slate-200"
+              onclick="toggleQuarter('{{ g.key }}', this)">
+            <td colspan="10" class="py-2 px-3 font-semibold text-slate-700">
+              <span class="qcaret inline-block w-4 text-slate-500">▾</span>{{ g.label }}
+              <span class="text-xs font-normal text-slate-500">— {{ g.count }} invoice{{ g.count|pluralize }} · ${{ g.total|floatformat:2 }}</span>
+            </td>
+          </tr>
+          {% for row in g.rows %}
           {% with ivs=row.ivs %}
-          <tr class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
+          <tr class="grp-{{ g.key }} border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
               onclick="window.location='{% url 'invoice_detail' ivs.id %}'">
             <td class="py-2 px-3">{{ ivs.vendor.name }}</td>
             <td class="py-2 px-3">
@@ -170,7 +178,7 @@
             </td>
           </tr>
           {% if row.is_non_pass %}
-          <tr class="bg-slate-50 border-b border-slate-100">
+          <tr class="grp-{{ g.key }} bg-slate-50 border-b border-slate-100">
             <td colspan="10" class="py-2 px-3">
               <div class="text-xs text-slate-700 space-y-1">
                 {% if ivs.status == 'partial' %}
@@ -211,6 +219,7 @@
           </tr>
           {% endif %}
           {% endwith %}
+          {% endfor %}
         {% empty %}
           <tr>
             <td colspan="10" class="py-6 px-3 text-center text-slate-500 text-sm">
@@ -228,4 +237,15 @@
     parser-time validation (every ingestion).
   </p>
 </div>
+
+<script>
+  // Quarter bars: click a quarter header to fold/unfold its invoice rows.
+  function toggleQuarter(key, hdr) {
+    var rows = document.querySelectorAll('tr.grp-' + key);
+    var caret = hdr.querySelector('.qcaret');
+    var collapse = caret.textContent.trim() === '▾';  // currently expanded → collapse
+    rows.forEach(function (r) { r.style.display = collapse ? 'none' : ''; });
+    caret.textContent = collapse ? '▸' : '▾';
+  }
+</script>
 {% endblock %}
