@@ -5322,6 +5322,33 @@ class BackfillPricePerPoundTests(TestCase):
         self.assertIn('No matching caches found', out.getvalue())
 
 
+class ValidateAllInvoicesResilienceTests(TestCase):
+    """Regression: one corrupt OCR cache must NOT abort the whole validation
+    run. Before the fix (validate_all_invoices.py cache-load loop), an empty or
+    garbage `_docai_ocr.json` threw JSONDecodeError and NO
+    InvoiceValidationStatus rows were written for any invoice — silently
+    dropping recent invoices from /invoices/. The loop now skips + warns."""
+
+    def test_corrupt_cache_is_skipped_not_fatal(self):
+        from django.core.management import call_command
+        from io import StringIO
+        import tempfile
+        import os as _os
+        out, err = StringIO(), StringIO()
+        with tempfile.TemporaryDirectory() as td:
+            # Empty file → JSONDecodeError; garbage file → JSONDecodeError.
+            with open(_os.path.join(td, 'deadbeef_docai_ocr.json'), 'w') as fh:
+                fh.write('')
+            with open(_os.path.join(td, 'badcafe_docai_ocr.json'), 'w') as fh:
+                fh.write('{not valid json')
+            # Must complete without raising.
+            call_command('validate_all_invoices', cache_dir=td,
+                         stdout=out, stderr=err)
+        combined = out.getvalue() + err.getvalue()
+        self.assertIn('skipped corrupt cache', combined)
+        self.assertIn('Validated 0 invoices', out.getvalue())
+
+
 class SynergySyncPricePerLbTests(TestCase):
     """`calc_price_per_lb` — Track B consumer wiring.
 

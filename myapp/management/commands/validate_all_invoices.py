@@ -136,11 +136,22 @@ class Command(BaseCommand):
 
         # Load all caches that match filters
         caches = []
+        skipped_bad = []
         for f in os.listdir(cache_dir):
             if not f.endswith('_docai_ocr.json'):
                 continue
-            with open(os.path.join(cache_dir, f)) as fh:
-                d = json.load(fh)
+            # Resilient read: a single empty/corrupt cache JSON must NOT abort
+            # the whole validation pass. Before this guard, one bad file threw
+            # JSONDecodeError and no IVS rows were written for any invoice —
+            # silently dropping recent invoices from /invoices/. Skip + warn.
+            try:
+                with open(os.path.join(cache_dir, f)) as fh:
+                    d = json.load(fh)
+            except (json.JSONDecodeError, OSError, ValueError) as e:
+                skipped_bad.append(f)
+                self.stderr.write(self.style.WARNING(
+                    f'  skipped corrupt cache {f}: {e}'))
+                continue
             if vendor_filter and d.get('vendor') != vendor_filter:
                 continue
             inv_date = d.get('invoice_date') or ''
@@ -294,6 +305,10 @@ class Command(BaseCommand):
 
         # Print summary
         self.stdout.write('')
+        if skipped_bad:
+            self.stdout.write(self.style.WARNING(
+                f'Skipped {len(skipped_bad)} corrupt cache file(s) '
+                f'(did not abort the run): {", ".join(skipped_bad)}'))
         self.stdout.write(f'Validated {len(groups)} invoices:')
         for s, n in sorted(stats.items()):
             self.stdout.write(f'  {s.upper():<8}: {n}')
