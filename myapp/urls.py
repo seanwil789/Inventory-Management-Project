@@ -52,6 +52,7 @@ urlpatterns = [
     path('invoices/<int:ivs_id>/lines/add/',                views.invoice_line_add,  name='invoice_line_add'),
     path('invoices/<int:ivs_id>/verify/',   views.invoice_verify,      name='invoice_verify'),
     path('invoices/<int:ivs_id>/note/',     views.invoice_note,        name='invoice_note'),
+    path('invoices/<int:ivs_id>/account/',  views.invoice_set_account, name='invoice_set_account'),
     path('pipeline-health/',                views.pipeline_health,     name='pipeline_health'),
     path('mapping-health/',                 views.mapping_health,      name='mapping_health'),
     path('mapping-review/',                 views.mapping_review,      name='mapping_review'),

@@ -5349,6 +5349,71 @@ class ValidateAllInvoicesResilienceTests(TestCase):
         self.assertIn('Validated 0 invoices', out.getvalue())
 
 
+class AccountSuggestTests(TestCase):
+    """suggest_account — the department auto-classifier (suggest-only,
+    PACKAGE_department_accounts.md §6)."""
+
+    def _line(self, section='', category='', fee=False):
+        return {'section_hint': section, 'product_category': category, 'is_fee': fee}
+
+    def test_all_chem_paper_suggests_operations(self):
+        from myapp.account_utils import suggest_account
+        lines = [self._line('PAPER & DISP'), self._line('CHEMICAL & JANITORIAL'),
+                 self._line('SUPPLY & EQUIPMENT'),
+                 self._line(fee=True), self._line(fee=True)]  # fees ignored
+        r = suggest_account(lines)
+        self.assertEqual(r['suggested'], 'Operations')
+        self.assertFalse(r['mixed'])
+
+    def test_all_coffee_suggests_concessions(self):
+        from myapp.account_utils import suggest_account
+        lines = [self._line(category='Coffee/Concessions') for _ in range(5)]
+        self.assertEqual(suggest_account(lines)['suggested'], 'Coffee/Concessions')
+
+    def test_all_food_defaults_to_food(self):
+        from myapp.account_utils import suggest_account
+        r = suggest_account([self._line('MEATS'), self._line('DAIRY')])
+        self.assertEqual(r['suggested'], 'Food/Kitchen')
+        self.assertFalse(r['mixed'])
+
+    def test_one_cleaning_item_in_food_order_stays_food(self):
+        # confident-wrong guard: a lone chem line among food lines is NOT Operations.
+        from myapp.account_utils import suggest_account
+        lines = [self._line('CHEMICAL & JANITORIAL')] + [self._line('PRODUCE')] * 9
+        r = suggest_account(lines)
+        self.assertEqual(r['suggested'], 'Food/Kitchen')
+        self.assertTrue(r['mixed'])
+
+
+class InvoiceSetAccountViewTests(TestCase):
+    """invoice_set_account — bulk-attribute a whole invoice to a department."""
+
+    def test_set_account_bulk_updates_all_invoice_lines(self):
+        from django.urls import reverse
+        from django.contrib.auth.models import User
+        from myapp.models import (Vendor, Account, InvoiceValidationStatus,
+                                  InvoiceLineItem)
+        from datetime import date
+        v = Vendor.objects.create(name='SetAcctVendor')
+        # Accounts are seeded by migration 0077 in the test DB.
+        food = Account.objects.get(name='Food/Kitchen')
+        ops = Account.objects.get(name='Operations')
+        ivs = InvoiceValidationStatus.objects.create(
+            vendor=v, invoice_number='SA1', invoice_date=date(2026, 6, 1))
+        for i in range(3):
+            InvoiceLineItem.objects.create(
+                vendor=v, invoice_date=date(2026, 6, 1),
+                raw_description=f'row{i}', account=food)
+
+        user = User.objects.create_user('acct_tester', 'a@x.com', 'pw')
+        self.client.force_login(user)
+        resp = self.client.post(reverse('invoice_set_account', args=[ivs.id]),
+                                {'account': ops.id})
+        self.assertEqual(resp.status_code, 302)
+        self.assertEqual(
+            InvoiceLineItem.objects.filter(vendor=v, account=ops).count(), 3)
+
+
 class SynergySyncPricePerLbTests(TestCase):
     """`calc_price_per_lb` — Track B consumer wiring.
 

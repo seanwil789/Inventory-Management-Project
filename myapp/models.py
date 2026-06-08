@@ -8,6 +8,48 @@ class Vendor(models.Model):
         return self.name
 
 
+class Account(models.Model):
+    """Department / cost-center for invoice attribution (Sean 2026-06-08).
+
+    Partitions spend so non-food departments (Operations cleaning supplies,
+    Coffee/Concessions) leave the FOOD budget while still informing prices.
+    Maps 1:1 to a QuickBooks Class so accounting gets pre-coded per-account
+    data. See PACKAGE_department_accounts.md.
+
+    Two flags, each serving a downstream consumer (schema-encodes-operating-model):
+      - is_default:     account that untagged invoices fall to (Food/Kitchen).
+      - is_food_budget: included in food-budget / COGS aggregations (Food only
+                        today). The account-aware consumers filter on this.
+
+    The price/mapping layer is account-BLIND — attribution never touches the
+    catalog. Only budget/COGS consumers filter by account.
+    """
+    name           = models.CharField(max_length=80, unique=True)
+    qb_class       = models.CharField(
+        max_length=40, blank=True,
+        help_text="QuickBooks Class name/code this account maps to (1:1).")
+    is_default     = models.BooleanField(
+        default=False,
+        help_text="Account untagged invoices fall to (Food/Kitchen). Exactly one.")
+    is_food_budget = models.BooleanField(
+        default=False,
+        help_text="Included in food-budget / COGS aggregations. Account-aware "
+                  "consumers filter on this; account-blind (price/mapping) ignore it.")
+    sort_order     = models.IntegerField(default=0)
+
+    class Meta:
+        ordering = ['sort_order', 'name']
+
+    def __str__(self):
+        return self.name
+
+    @classmethod
+    def default(cls):
+        """The default (Food/Kitchen) account, or None if not seeded yet.
+        Consumers treat a NULL ILI.account as this default."""
+        return cls.objects.filter(is_default=True).order_by('sort_order').first()
+
+
 class Product(models.Model):
     """Canonical product — mirrors Item Mapping col F + category columns."""
     canonical_name       = models.CharField(max_length=200, unique=True)
@@ -369,6 +411,16 @@ class InvoiceLineItem(models.Model):
 
     vendor          = models.ForeignKey(Vendor, null=True, blank=True, on_delete=models.SET_NULL)
     product         = models.ForeignKey(Product, null=True, blank=True, on_delete=models.SET_NULL)
+    # Department / cost-center attribution (Sean 2026-06-08). NULL = the default
+    # (Food/Kitchen) account — backfilled on existing rows, treated as Food by
+    # account-aware consumers. Set per-invoice (bulk) in the UI; line-level
+    # supported for the rare mixed invoice. ACCOUNT-BLIND consumers (price,
+    # mapping, VendorPriceList, alerts) ignore this field entirely.
+    account         = models.ForeignKey(
+        'Account', null=True, blank=True, on_delete=models.SET_NULL,
+        related_name='line_items',
+        help_text="Department/cost-center this line is attributed to. "
+                  "NULL = Food/Kitchen default. Drives budget/COGS filtering only.")
     raw_description = models.CharField(max_length=500, blank=True)  # fallback if unmatched
     unit_price      = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
     extended_amount = models.DecimalField(

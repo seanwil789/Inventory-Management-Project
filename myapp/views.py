@@ -2442,7 +2442,7 @@ def invoices_list(request):
     QB GL). See project_quickbooks_roadmap.md.
     """
     from django.db.models import Count, Q
-    from myapp.models import InvoiceValidationStatus, Vendor
+    from myapp.models import InvoiceValidationStatus, Vendor, Account
 
     today = date.today()
 
@@ -2457,6 +2457,7 @@ def invoices_list(request):
         status_filter = ''
 
     vendor_filter = (request.GET.get('vendor') or '').strip()
+    account_filter = (request.GET.get('account') or '').strip()
 
     # ── Base queryset ────────────────────────────────────────────
     qs = (InvoiceValidationStatus.objects
@@ -2505,9 +2506,25 @@ def invoices_list(request):
     for row in flagged_by_date_vendor:
         per_invoice_flagged[(row['vendor_id'], row['invoice_date'])] = row['n']
 
+    # Per-invoice department/account — dominant account name per (vendor, date).
+    from collections import Counter
+    per_invoice_account = {}
+    _acct_counter: dict = {}
+    for r in (InvoiceLineItem.objects
+              .filter(invoice_date__year=year_filter)
+              .values('vendor_id', 'invoice_date', 'account__name')):
+        key = (r['vendor_id'], r['invoice_date'])
+        _acct_counter.setdefault(key, Counter())[r['account__name'] or 'Food/Kitchen'] += 1
+    per_invoice_account = {k: c.most_common(1)[0][0] for k, c in _acct_counter.items()}
+
     # Decorate invoice rows with derived display values
     invoices = []
     for ivs in qs:
+        acct_name = per_invoice_account.get(
+            (ivs.vendor_id, ivs.invoice_date), 'Food/Kitchen')
+        if account_filter and acct_name != account_filter:
+            continue
+
         section_diffs = []
         for s in (ivs.section_reconciliation or []):
             diff_abs = s.get('diff_abs')
@@ -2523,6 +2540,7 @@ def invoices_list(request):
             'section_diffs': section_diffs,
             'flagged_lines': flagged_lines,
             'is_non_pass': ivs.status != 'pass',
+            'account': acct_name,
         })
 
     # ── Filter dropdown options ──────────────────────────────────
@@ -2541,14 +2559,17 @@ def invoices_list(request):
          .values_list('vendor__name', flat=True)
          if v}
     )
+    accounts_available = list(Account.objects.values_list('name', flat=True))
 
     return render(request, 'myapp/invoices.html', {
         'today': today,
         'year_filter': year_filter,
         'status_filter': status_filter,
         'vendor_filter': vendor_filter,
+        'account_filter': account_filter,
         'years_available': years_available,
         'vendors_available': vendors_available,
+        'accounts_available': accounts_available,
         'invoices': invoices,
         'invoices_shown': len(invoices),
         # KPIs
@@ -2856,6 +2877,32 @@ def invoice_note(request, ivs_id: int):
     return redirect('invoice_detail', ivs_id=ivs_id)
 
 
+def invoice_set_account(request, ivs_id: int):
+    """Attribute a whole invoice to a department Account — bulk-sets every
+    line in the (vendor, invoice_date) group (the same join invoice_detail
+    renders). PACKAGE_department_accounts.md step 3. Account-blind consumers
+    (price/mapping) are unaffected; only budget/COGS read this field."""
+    from django.shortcuts import get_object_or_404, redirect
+    from django.contrib import messages
+    from myapp.models import InvoiceValidationStatus, Account
+
+    ivs = get_object_or_404(
+        InvoiceValidationStatus.objects.select_related('vendor'), pk=ivs_id)
+    if request.method != 'POST':
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    account = Account.objects.filter(pk=request.POST.get('account')).first()
+    if account is None:
+        messages.error(request, 'Unknown account.')
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    n = (InvoiceLineItem.objects
+         .filter(vendor=ivs.vendor, invoice_date=ivs.invoice_date)
+         .update(account=account))
+    messages.success(request, f'Attributed {n} line(s) to {account.name}.')
+    return redirect('invoice_detail', ivs_id=ivs_id)
+
+
 def invoice_image(request, ivs_id: int, hash_idx: int = 0):
     """L1 Phase 1.1b: serve the original paper-invoice image for an
     InvoiceValidationStatus row.
@@ -2990,6 +3037,15 @@ def invoice_detail(request, ivs_id: int):
     flagged_count = len(flagged_lines)
     total_extended = sum((float(it.extended_amount or 0) for it in ili_qs), 0.0)
 
+    # Department/account attribution (PACKAGE_department_accounts.md step 3).
+    from myapp.account_utils import suggest_account_for_ili
+    from myapp.models import Account
+    line_list = list(ili_qs)
+    acct_ids = {it.account_id for it in line_list}
+    current_account = line_list[0].account if (len(acct_ids) == 1 and line_list) else None
+    account_mixed = len(acct_ids) > 1
+    account_suggestion = suggest_account_for_ili(line_list)
+
     return render(request, 'myapp/invoice_detail.html', {
         'ivs': ivs,
         'section_rows': section_rows,
@@ -2997,6 +3053,10 @@ def invoice_detail(request, ivs_id: int):
         'flagged_count': flagged_count,
         'flagged_lines': flagged_lines,
         'total_extended': round(total_extended, 2),
+        'current_account': current_account,
+        'account_mixed': account_mixed,
+        'account_suggestion': account_suggestion,
+        'accounts': list(Account.objects.all()),
     })
 
 

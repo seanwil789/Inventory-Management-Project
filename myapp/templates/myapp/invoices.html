@@ -79,8 +79,17 @@
         {% endfor %}
       </select>
     </label>
+    <label class="text-sm">
+      Dept
+      <select name="account" class="ml-1 border rounded px-2 py-1 text-sm">
+        <option value="" {% if not account_filter %}selected{% endif %}>All</option>
+        {% for a in accounts_available %}
+          <option value="{{ a }}" {% if a == account_filter %}selected{% endif %}>{{ a }}</option>
+        {% endfor %}
+      </select>
+    </label>
     <button type="submit" class="bg-indigo-600 hover:bg-indigo-700 text-white text-sm rounded px-3 py-1">Filter</button>
-    {% if status_filter or vendor_filter %}
+    {% if status_filter or vendor_filter or account_filter %}
       <a href="{% url 'invoices_list' %}?year={{ year_filter }}" class="text-sm text-slate-500 hover:underline">clear</a>
     {% endif %}
     <span class="ml-auto text-sm text-slate-500">{{ invoices_shown }} shown</span>
@@ -92,6 +101,7 @@
       <thead class="text-xs uppercase text-slate-500 tracking-wide bg-slate-50">
         <tr class="border-b border-slate-200">
           <th class="text-left py-2 px-3">Vendor</th>
+          <th class="text-left py-2 px-3">Dept</th>
           <th class="text-left py-2 px-3">Invoice #</th>
           <th class="text-left py-2 px-3">Date</th>
           <th class="text-left py-2 px-3">Status</th>
@@ -108,6 +118,13 @@
           <tr class="border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
               onclick="window.location='{% url 'invoice_detail' ivs.id %}'">
             <td class="py-2 px-3">{{ ivs.vendor.name }}</td>
+            <td class="py-2 px-3">
+              {% if row.account and row.account != 'Food/Kitchen' %}
+                <span class="inline-block px-2 py-0.5 rounded text-xs font-medium bg-violet-100 text-violet-800">{{ row.account }}</span>
+              {% else %}
+                <span class="text-xs text-slate-400">Food</span>
+              {% endif %}
+            </td>
             <td class="py-2 px-3 font-mono">
               <a href="{% url 'invoice_detail' ivs.id %}" class="hover:text-indigo-700">{{ ivs.invoice_number }}</a>
             </td>
@@ -154,7 +171,7 @@
           </tr>
           {% if row.is_non_pass %}
           <tr class="bg-slate-50 border-b border-slate-100">
-            <td colspan="9" class="py-2 px-3">
+            <td colspan="10" class="py-2 px-3">
               <div class="text-xs text-slate-700 space-y-1">
                 {% if ivs.status == 'partial' %}
                   <div class="text-slate-700">
@@ -196,7 +213,7 @@
           {% endwith %}
         {% empty %}
           <tr>
-            <td colspan="9" class="py-6 px-3 text-center text-slate-500 text-sm">
+            <td colspan="10" class="py-6 px-3 text-center text-slate-500 text-sm">
               No invoices match the current filters.
             </td>
           </tr>
