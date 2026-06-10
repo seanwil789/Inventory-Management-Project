@@ -198,9 +198,17 @@
           </div>
         {% endif %}
       </div>
-      <div class="px-4 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-500">
+      <div class="px-4 py-2 border-t border-slate-200 bg-slate-50 text-xs text-slate-500 flex items-center justify-between gap-2">
         {% if ivs.cache_hashes %}
           <span id="hash-display">Hash: <code class="font-mono">{{ ivs.cache_hashes.0 }}</code></span>
+          <form method="POST" action="{% url 'invoice_reload_images' ivs.id %}" class="shrink-0">
+            {% csrf_token %}
+            <button type="submit"
+                    class="text-xs px-2 py-1 rounded bg-slate-100 hover:bg-slate-200 text-slate-600 border border-slate-200"
+                    title="Re-pull every page image for this invoice from Google Drive into the local cache (fixes missing or out-of-date pictures)">
+              ↻ Reload from Drive
+            </button>
+          </form>
         {% endif %}
       </div>
     </div>

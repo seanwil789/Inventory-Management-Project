@@ -114,16 +114,27 @@
       </thead>
       <tbody>
         {% for g in invoice_groups %}
+          <!-- Quarter bar: collapses the whole quarter (month bars + rows). -->
           <tr class="bg-slate-100 border-y border-slate-300 cursor-pointer select-none hover:bg-slate-200"
-              onclick="toggleQuarter('{{ g.key }}', this)">
+              onclick="toggleGroup('q-{{ g.key }}', this)">
             <td colspan="10" class="py-2 px-3 font-semibold text-slate-700">
-              <span class="qcaret inline-block w-4 text-slate-500">▾</span>{{ g.label }}
+              <span class="gcaret inline-block w-4 text-slate-500">▾</span>{{ g.label }}
               <span class="text-xs font-normal text-slate-500">— {{ g.count }} invoice{{ g.count|pluralize }} · ${{ g.total|floatformat:2 }}</span>
             </td>
           </tr>
-          {% for row in g.rows %}
+          {% for m in g.months %}
+          <!-- Month bar (nested): hidden when the quarter folds (q- class);
+               its own caret collapses just this month's rows (m- class). -->
+          <tr class="q-{{ g.key }} monthbar bg-slate-50 border-b border-slate-200 cursor-pointer select-none hover:bg-slate-100"
+              onclick="toggleGroup('m-{{ m.key }}', this)">
+            <td colspan="10" class="py-1.5 px-3 pl-8 text-slate-600">
+              <span class="gcaret inline-block w-4 text-slate-400">▾</span>{{ m.label }}
+              <span class="text-xs text-slate-400">— {{ m.count }} invoice{{ m.count|pluralize }} · ${{ m.total|floatformat:2 }}</span>
+            </td>
+          </tr>
+          {% for row in m.rows %}
           {% with ivs=row.ivs %}
-          <tr class="grp-{{ g.key }} border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
+          <tr class="q-{{ g.key }} m-{{ m.key }} border-b border-slate-100 hover:bg-slate-50 cursor-pointer"
               onclick="window.location='{% url 'invoice_detail' ivs.id %}'">
             <td class="py-2 px-3">{{ ivs.vendor.name }}</td>
             <td class="py-2 px-3">
@@ -178,7 +189,7 @@
             </td>
           </tr>
           {% if row.is_non_pass %}
-          <tr class="grp-{{ g.key }} bg-slate-50 border-b border-slate-100">
+          <tr class="q-{{ g.key }} m-{{ m.key }} bg-slate-50 border-b border-slate-100">
             <td colspan="10" class="py-2 px-3">
               <div class="text-xs text-slate-700 space-y-1">
                 {% if ivs.status == 'partial' %}
@@ -220,6 +231,7 @@
           {% endif %}
           {% endwith %}
           {% endfor %}
+          {% endfor %}
         {% empty %}
           <tr>
             <td colspan="10" class="py-6 px-3 text-center text-slate-500 text-sm">
@@ -239,13 +251,24 @@
 </div>
 
 <script>
-  // Quarter bars: click a quarter header to fold/unfold its invoice rows.
-  function toggleQuarter(key, hdr) {
-    var rows = document.querySelectorAll('tr.grp-' + key);
-    var caret = hdr.querySelector('.qcaret');
+  // Collapsible quarter + month bars. A bar carries a caret (.gcaret) and
+  // toggles every element bearing its group class:
+  //   quarter bar → 'q-<key>'  (its month bars AND all its invoice rows)
+  //   month bar   → 'm-<key>'  (just that month's invoice rows)
+  // Invoice rows carry BOTH classes; month bars carry only the quarter class,
+  // so folding a quarter hides its months, and folding a month hides its rows.
+  function toggleGroup(cls, hdr) {
+    var els = document.querySelectorAll('.' + cls);
+    var caret = hdr.querySelector('.gcaret');
     var collapse = caret.textContent.trim() === '▾';  // currently expanded → collapse
-    rows.forEach(function (r) { r.style.display = collapse ? 'none' : ''; });
+    els.forEach(function (e) { e.style.display = collapse ? 'none' : ''; });
     caret.textContent = collapse ? '▸' : '▾';
+    // Re-expanding a quarter reveals its month rows too (they share the q-
+    // class), so reset the month carets to match and avoid a stale '▸'.
+    if (!collapse && cls.charAt(0) === 'q') {
+      document.querySelectorAll('.' + cls + '.monthbar .gcaret')
+        .forEach(function (c) { c.textContent = '▾'; });
+    }
   }
 </script>
 {% endblock %}
