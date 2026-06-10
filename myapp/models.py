@@ -95,6 +95,36 @@ class Product(models.Model):
                   "'Half-pint Clamshell' / 'Gal' / 'Btl' / 'Ea'. "
                   "Replaces sheet col G's ad-hoc strings with controlled values.",
     )
+    # ── Nutrition schema (Phase 1, 2026-06-09) ────────────────────────────
+    # Per-product macro profile for the provided-nutrition-from-orders
+    # pipeline (project_nutrition_estimation, purchase-based variant). Macros
+    # stored per 100g, denormalized from USDA FoodData Central for speed.
+    # Populated by the FDC matcher + human review loop (mirrors the
+    # ProductMapping fuzzy-match-then-confirm pattern); NULL until matched.
+    fdc_id = models.CharField(
+        max_length=20, blank=True, db_index=True,
+        help_text="USDA FoodData Central ID this product is matched to — "
+                  "source of the per-100g macros below.",
+    )
+    kcal_per_100g      = models.DecimalField(max_digits=7, decimal_places=2, null=True, blank=True)
+    protein_g_per_100g = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    fat_g_per_100g     = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    carb_g_per_100g    = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    fiber_g_per_100g   = models.DecimalField(max_digits=6, decimal_places=2, null=True, blank=True)
+    nutrition_confidence = models.CharField(
+        max_length=20, blank=True,
+        choices=[
+            ('',            '— unmatched —'),
+            ('auto',        'Auto-matched (high-confidence fuzzy → FDC)'),
+            ('ai_reviewed', 'AI-reviewed (Claude-curated; spot-check)'),
+            ('reviewed',    'Human-reviewed / confirmed'),
+            ('estimated',   'Estimated (no direct FDC match — e.g. branded approximation)'),
+            ('no_match',    'No usable match (reviewed, left blank)'),
+        ],
+        help_text="Provenance of the macro profile — mirrors match_confidence. "
+                  "Drives the coverage % in the provided-nutrition rollup so the "
+                  "number never overstates its own accuracy.",
+    )
 
     def __str__(self):
         return self.canonical_name

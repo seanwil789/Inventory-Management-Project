@@ -18,6 +18,7 @@ logs/
 .ocr_cache.pre-*/
 .invoice_totals/
 .image_cache/
+.fdc_cache/
 
 # Transient session backups (DB snapshots + intermediate PDFs)
 db.sqlite3.pre-*

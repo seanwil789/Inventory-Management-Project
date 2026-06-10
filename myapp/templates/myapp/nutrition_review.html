@@ -1,0 +1,93 @@
+{% extends 'myapp/base.html' %}
+{% block title %}Nutrition Review{% endblock %}
+
+{% block content %}
+<div class="space-y-6 max-w-3xl">
+
+  <div>
+    <h1 class="text-2xl sm:text-3xl font-semibold text-slate-900">Nutrition Review</h1>
+    <p class="text-sm text-slate-500 mt-1">
+      Confirm a USDA FoodData Central match for each product → writes its per-100g macros
+      (<code>reviewed</code> = trusted tier). Ordered by spend, so the highest-impact items come first.
+    </p>
+    <p class="text-sm text-slate-600 mt-2">
+      <span class="font-medium text-emerald-700">{{ reviewed }}</span> reviewed ·
+      <span class="font-medium text-indigo-700">{{ auto }}</span> auto ·
+      <span class="font-medium text-amber-700">{{ remaining }}</span> left to review
+    </p>
+  </div>
+
+  {% if messages %}
+    <div class="space-y-2">
+      {% for message in messages %}
+        <div class="rounded-lg border p-3 text-sm
+          {% if message.tags == 'success' %}border-emerald-200 bg-emerald-50 text-emerald-900
+          {% elif message.tags == 'warning' %}border-amber-200 bg-amber-50 text-amber-900
+          {% elif message.tags == 'error' %}border-red-200 bg-red-50 text-red-900
+          {% else %}border-slate-200 bg-slate-50 text-slate-900{% endif %}">
+          {{ message }}
+        </div>
+      {% endfor %}
+    </div>
+  {% endif %}
+
+  {% if not product %}
+    <div class="rounded-lg border border-emerald-200 bg-emerald-50 p-6 text-emerald-900">
+      🎉 Review queue clear — every food product is matched or marked no-match.
+    </div>
+  {% else %}
+    <div class="rounded-xl border border-slate-200 bg-white p-5 shadow-sm">
+      <div class="flex items-baseline justify-between">
+        <h2 class="text-xl font-semibold text-slate-900">{{ product.canonical_name }}</h2>
+        <span class="text-sm text-slate-500">{{ product.category }}{% if spend %} · ${{ spend|floatformat:0 }} spend{% endif %}</span>
+      </div>
+
+      {% if candidates %}
+        <table class="w-full mt-4 text-sm">
+          <thead class="text-slate-500 text-left">
+            <tr><th class="py-1">FDC candidate</th><th>kcal</th><th>prot</th><th>fat</th><th>carb</th><th>fiber</th><th></th></tr>
+          </thead>
+          <tbody class="divide-y divide-slate-100">
+            {% for c in candidates %}
+              <tr>
+                <td class="py-2 pr-2">
+                  <div class="text-slate-800">{{ c.description }}</div>
+                  <div class="text-xs text-slate-400">{{ c.data_type }} #{{ c.fdc_id }} · score {{ c.score }}</div>
+                </td>
+                <td>{{ c.macros.kcal_per_100g|default:"—" }}</td>
+                <td>{{ c.macros.protein_g_per_100g|default:"—" }}</td>
+                <td>{{ c.macros.fat_g_per_100g|default:"—" }}</td>
+                <td>{{ c.macros.carb_g_per_100g|default:"—" }}</td>
+                <td>{{ c.macros.fiber_g_per_100g|default:"—" }}</td>
+                <td class="text-right">
+                  <form method="post" action="{% url 'nutrition_review_apply' product.id %}">
+                    {% csrf_token %}
+                    <input type="hidden" name="action" value="pick">
+                    <input type="hidden" name="fdc_id" value="{{ c.fdc_id }}">
+                    <button class="px-3 py-1 rounded-lg bg-emerald-600 text-white hover:bg-emerald-700">Pick</button>
+                  </form>
+                </td>
+              </tr>
+            {% endfor %}
+          </tbody>
+        </table>
+        <p class="text-xs text-slate-400 mt-2">Per 100 g, from USDA FDC. "Pick" writes these macros and marks the product reviewed.</p>
+      {% else %}
+        <p class="mt-4 text-sm text-slate-500">No usable FDC candidates for this product.</p>
+      {% endif %}
+
+      <div class="flex gap-2 mt-5 pt-4 border-t border-slate-100">
+        <form method="post" action="{% url 'nutrition_review_apply' product.id %}">
+          {% csrf_token %}<input type="hidden" name="action" value="none">
+          <button class="px-3 py-1 rounded-lg border border-amber-300 bg-amber-50 text-amber-900 hover:bg-amber-100">No good match</button>
+        </form>
+        <form method="post" action="{% url 'nutrition_review_apply' product.id %}">
+          {% csrf_token %}<input type="hidden" name="action" value="skip">
+          <button class="px-3 py-1 rounded-lg border border-slate-300 bg-slate-50 text-slate-700 hover:bg-slate-100">Skip</button>
+        </form>
+      </div>
+    </div>
+  {% endif %}
+
+</div>
+{% endblock %}

@@ -56,3 +56,7 @@ COL_CASE_SIZE    = 6   # F
 DOCAI_PROJECT_ID   = os.getenv("DOCAI_PROJECT_ID", "")
 DOCAI_LOCATION     = os.getenv("DOCAI_LOCATION", "us")
 DOCAI_PROCESSOR_ID = os.getenv("DOCAI_PROCESSOR_ID", "")
+
+# USDA FoodData Central API key (free, api.data.gov). Source of per-100g
+# macros for the provided-nutrition-from-orders pipeline. See invoice_processor/fdc.py.
+FDC_API_KEY = os.getenv("FDC_API_KEY", "")
