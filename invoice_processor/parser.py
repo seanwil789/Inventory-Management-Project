@@ -1658,6 +1658,18 @@ def _parse_sysco(text: str) -> list[dict]:
     #   3. GROUP TOTAL sum — for pages without either marker.
     invoice_total = None
 
+    # Sanity floor for the label / LAST-PAGE methods: a grand total can
+    # never be less than the sum of its own line items (charges are
+    # additive). The text path only ever UNDER-counts (catch-weight rows),
+    # so flooring at items_total is conservative — it can reject a stray
+    # surcharge fragment but never a real total. Bug INV 775935994
+    # (2026-06-10): the 8-line window after "INVOICE TOTAL" captured an
+    # $11.04 fuel surcharge while the true $818.25 total sat one line past
+    # the window, behind a PACA legal block — max([11.04]) bound the
+    # surcharge as the total. Rejecting sub-items_total candidates forces
+    # fall-through to LAST PAGE / page-wide scan, which return the real max.
+    items_total = round(sum(it.get("extended_amount", 0) or 0 for it in items), 2)
+
     # Method 1: "INVOICE TOTAL" label — LAST occurrence in the page.
     # Sysco OCR often stacks multiple label pairs (TAX TOTAL, INVOICE
     # TOTAL) followed by a block of values. The value ordering matches
@@ -1692,6 +1704,7 @@ def _parse_sysco(text: str) -> list[dict]:
                     val = float(m.group(1).replace(",", ""))
                     if val > 1.0:
                         nums.append(val)
+            nums = [n for n in nums if n >= items_total]  # reject sub-total fragments
             if nums:
                 invoice_total = max(nums)
                 print(f"  [✓] Sysco invoice total from INVOICE TOTAL label: ${invoice_total:.2f}")
@@ -1715,6 +1728,7 @@ def _parse_sysco(text: str) -> list[dict]:
                         val = float(m.group(1).replace(",", ""))
                         if val > 1.0:
                             nums.append(val)
+                nums = [n for n in nums if n >= items_total]  # same sub-total floor
                 if nums:
                     invoice_total = max(nums)
                     print(f"  [✓] Sysco invoice total from LAST PAGE: ${invoice_total:.2f}")
@@ -1764,7 +1778,6 @@ def _parse_sysco(text: str) -> list[dict]:
             print(f"  [~] Sysco partial total from GROUP TOTALs: ${invoice_total:.2f} "
                   f"(not last page — may be incomplete)")
 
-    items_total = round(sum(it.get("extended_amount", 0) or 0 for it in items), 2)
     # B-ParserSum-Diagnostic fix (2026-05-10): the prior unconditional warning
     # was misleading because it compared the TEXT-PATH's items_total vs
     # invoice_total, but parse_invoice runs 3 extractors in parallel
