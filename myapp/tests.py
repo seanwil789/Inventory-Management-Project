@@ -1226,6 +1226,57 @@ class ParserSyscoInvoiceTotalTests(TestCase):
         result = self._parse(text)
         self.assertEqual(result.get('invoice_total'), 525.00)
 
+    def test_invoice_total_window_fragment_rejected_by_items_floor(self):
+        """Sysco INV 775935994: the 8-line window after 'INVOICE TOTAL'
+        captured only a tax/surcharge fragment ($11.04) while the real grand
+        total ($857.07) sat one line past the window, behind a PACA legal
+        block. Pre-fix, max([11.04]) bound the fragment as invoice_total.
+        The items-sum floor must reject any sub-items_total candidate and
+        fall through to the LAST PAGE method, which returns the real total."""
+        text = '\n'.join([
+            # Items page — three lines summing to $811.04 (well above the
+            # $11.04 fragment, so the floor has clear separation).
+            '110 LB BEEF CHUCK',
+            '1234567 400.00',
+            '400.00',
+            '120 LB CHICKEN BREAST',
+            '2345678 311.04',
+            '311.04',
+            '130 CS BEVERAGE',
+            '3456789 100.00',
+            '100.00',
+            'GROUP TOTAL****',
+            '811.04',
+            # Totals page
+            'SUB',
+            'TOTAL',
+            '846.03',
+            'TAX',
+            'TOTAL',
+            'INVOICE',
+            'TOTAL',
+            '11.04',     # fragment inside the 8-line window — must be rejected
+            'IMPORTANT PACA PROVISION: THE PERISHABLE AGRICULTURAL COMMODITIES',
+            'AUTHORIZED BY SECTION 5 OF THE PERISHABLE AGRICULTURAL COMMODITIES ACT',
+            'RETAINS A TRUST CLAIM OVER THESE COMMODITIES',
+            'AND ANY RECEIVABLES OR PROCEEDS FROM THE SALE OF THESE COMMODITIES',
+            'RESPECT TO ANY DISPUTE ARISING OUT OF YOUR RECEIPT OF THESE PRODUCTS',
+            'REPRESENTATIVE CAPACITY, OR TO PARTICIPATE AS A MEMBER OF A CLASS',
+            'PAYABLE ON OR BEFORE',
+            '857.07',    # real grand total — one line past the window
+            '6/15/26',
+            'LAST PAGE',
+        ])
+        result = self._parse(text)
+        self.assertEqual(
+            result.get('invoice_total'), 857.07,
+            'Real $857.07 total (past the legal block, near LAST PAGE) should '
+            'be picked; the $11.04 fragment in the INVOICE TOTAL window must '
+            'be rejected by the items-sum floor. '
+            f'Got {result.get("invoice_total")} '
+            '(if $11.04, the Method-1 floor regressed — Bug 775935994).',
+        )
+
     def test_stacked_tax_then_invoice_pair_picks_max(self):
         """Original Method 1 design case: stacked TAX TOTAL + INVOICE TOTAL
         labels followed by stacked values. The pair containing the largest
@@ -20829,3 +20880,69 @@ class AuditInventoryAggregationTests(TestCase):
         # By pattern aggregation
         self.assertEqual(s['by_pattern'].get('normalization_bypassed'), 1)
         self.assertEqual(s['by_pattern'].get('number_token_fusion'), 1)
+
+
+class TestFDCExtractMacros(TestCase):
+    """Pure-function tests for invoice_processor.fdc.extract_macros — no live API."""
+
+    def _detail(self, pairs):
+        return {"foodNutrients": [
+            {"nutrient": {"number": num}, "amount": amt} for num, amt in pairs
+        ]}
+
+    def test_sr_legacy_energy_208(self):
+        from invoice_processor import fdc
+        m = fdc.extract_macros(self._detail(
+            [("208", 165), ("203", 31.0), ("204", 3.6), ("205", 0), ("291", 0)]))
+        self.assertEqual(m["kcal_per_100g"], 165)
+        self.assertEqual(m["protein_g_per_100g"], 31.0)
+        self.assertEqual(m["fiber_g_per_100g"], 0)
+
+    def test_foundation_atwater_energy_and_missing_fiber(self):
+        from invoice_processor import fdc
+        m = fdc.extract_macros(self._detail(
+            [("957", 106.0), ("958", 112.2), ("203", 22.5), ("204", 1.9), ("205", 0)]))
+        self.assertEqual(m["kcal_per_100g"], 106.0)   # 208 absent -> Atwater general
+        self.assertIsNone(m["fiber_g_per_100g"])      # 291 absent -> None, not 0
+
+    def test_kilojoule_fallback(self):
+        from invoice_processor import fdc
+        m = fdc.extract_macros(self._detail([("268", 418.4), ("203", 5)]))
+        self.assertEqual(m["kcal_per_100g"], 100.0)   # 418.4 / 4.184
+
+    def test_empty_returns_all_none(self):
+        from invoice_processor import fdc
+        m = fdc.extract_macros({"foodNutrients": []})
+        self.assertEqual(set(m.values()), {None})
+
+
+class TestFDCMatchScore(TestCase):
+    """Lock the matcher's safety behavior — guards confident-wrong matches."""
+
+    def test_disqualifying_token_rejected(self):
+        from invoice_processor import fdc_match
+        fruit = fdc_match.score("avocado", "avocados raw florida")
+        oil   = fdc_match.score("avocado", "oil avocado")
+        self.assertGreater(fruit, oil)            # the fruit must beat the oil
+        self.assertLess(oil, 0.6)                 # oil match firmly rejected
+
+    def test_plural_head_noun_matches(self):
+        from invoice_processor import fdc_match
+        s = fdc_match.score("apple granny smith", "apples granny smith with skin raw")
+        self.assertGreater(s, 0.7)                # apple ~ apples
+
+    def test_category_prefix_not_penalized(self):
+        from invoice_processor import fdc_match
+        s = fdc_match.score("almonds", "nuts almonds")
+        self.assertGreater(s, 0.8)                # "Nuts, almonds" is a fine match
+
+    def test_clean_query_strips_slash(self):
+        from invoice_processor import fdc
+        self.assertEqual(fdc._clean_query("90/10 Cooking Oil"), "90 10 Cooking Oil")
+
+    def test_substitute_food_rejected(self):
+        from invoice_processor import fdc_match
+        real = fdc_match.score("yogurt", "yogurt plain nonfat")
+        tofu = fdc_match.score("yogurt", "tofu yogurt")
+        self.assertGreater(real, tofu)        # real food beats the substitute
+        self.assertLess(tofu, 0.85)           # tofu-yogurt must not clear AUTO

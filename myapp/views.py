@@ -2551,25 +2551,36 @@ def invoices_list(request):
             'account': acct_name,
         })
 
-    # ── Group rows by quarter for the collapsible quarter bars ───
-    # Rows arrive already date-sorted (newest first), so each quarter's
-    # rows are contiguous. The template renders one foldable header bar
-    # per quarter (e.g. "Q1 2026") so older quarters can be collapsed.
+    # ── Group rows by quarter → month for the collapsible bars ───
+    # Rows arrive already date-sorted (newest first), so each quarter and
+    # each month within it is contiguous. The template renders a foldable
+    # quarter bar (e.g. "Q1 2026") and, nested inside, a foldable month bar
+    # (e.g. "March 2026") — so an old quarter OR a single month can collapse.
     from collections import OrderedDict
-    _groups: dict = OrderedDict()
+    _quarters: dict = OrderedDict()
     for row in invoices:
         d = row['ivs'].invoice_date
         if d:
             q = (d.month - 1) // 3 + 1
-            gkey, glabel = f'{d.year}_Q{q}', f'Q{q} {d.year}'
+            qkey, qlabel = f'{d.year}_Q{q}', f'Q{q} {d.year}'
+            mkey, mlabel = f'{d.year}_M{d.month:02d}', d.strftime('%B %Y')
         else:
-            gkey, glabel = 'undated', 'No date'
-        grp = _groups.setdefault(
-            gkey, {'key': gkey, 'label': glabel, 'rows': [], 'count': 0, 'total': 0.0})
-        grp['rows'].append(row)
-        grp['count'] += 1
-        grp['total'] += float(row['ivs'].items_sum or 0)
-    invoice_groups = list(_groups.values())
+            qkey, qlabel = 'undated', 'No date'
+            mkey, mlabel = 'undated_m', 'No date'
+        qgrp = _quarters.setdefault(
+            qkey, {'key': qkey, 'label': qlabel, 'months': OrderedDict(),
+                   'count': 0, 'total': 0.0})
+        mgrp = qgrp['months'].setdefault(
+            mkey, {'key': mkey, 'label': mlabel, 'rows': [], 'count': 0, 'total': 0.0})
+        mgrp['rows'].append(row)
+        mgrp['count'] += 1
+        mgrp['total'] += float(row['ivs'].items_sum or 0)
+        qgrp['count'] += 1
+        qgrp['total'] += float(row['ivs'].items_sum or 0)
+    invoice_groups = []
+    for qgrp in _quarters.values():
+        qgrp['months'] = list(qgrp['months'].values())
+        invoice_groups.append(qgrp)
 
     # ── Filter dropdown options ──────────────────────────────────
     years_available = sorted(
@@ -3012,6 +3023,91 @@ def invoice_image(request, ivs_id: int, hash_idx: int = 0):
     }.get(ext, 'application/octet-stream')
 
     return FileResponse(open(img_path, 'rb'), content_type=content_type)
+
+
+def invoice_reload_images(request, ivs_id: int):
+    """QoL: re-pull every page image for this invoice from Drive into the
+    local cache — fixes pictures that are missing or out of date locally.
+    For each cache hash, re-download via the SHA→drive_file_id index and
+    re-cache. If a page's Drive content changed (new SHA), repoint that
+    cache_hashes entry so the detail view shows the current image."""
+    from django.shortcuts import get_object_or_404, redirect
+    from django.contrib import messages
+    from myapp.models import InvoiceValidationStatus
+    import sys, io
+    from django.conf import settings as _s
+    _ip = str(_s.BASE_DIR / 'invoice_processor')
+    if _ip not in sys.path:
+        sys.path.insert(0, _ip)
+    from image_cache import get_drive_metadata, cache_image_bytes, compute_sha256
+
+    ivs = get_object_or_404(InvoiceValidationStatus, pk=ivs_id)
+    if request.method != 'POST':
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    hashes = list(ivs.cache_hashes or [])
+    if not hashes:
+        messages.error(request, 'No page images recorded for this invoice.')
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    try:
+        from drive import get_drive_client
+        from googleapiclient.http import MediaIoBaseDownload
+        drive = get_drive_client()
+    except Exception as e:
+        messages.error(request, f'Drive client unavailable: {e}')
+        return redirect('invoice_detail', ivs_id=ivs_id)
+
+    refetched = updated = unlinked = failed = 0
+    for idx, sha in enumerate(hashes):
+        meta = get_drive_metadata(sha)
+        if not (meta and meta.get('drive_file_id')):
+            unlinked += 1
+            continue
+        try:
+            buf = io.BytesIO()
+            dl = MediaIoBaseDownload(
+                buf, drive.files().get_media(fileId=meta['drive_file_id']))
+            done = False
+            while not done:
+                _, done = dl.next_chunk()
+            data = buf.getvalue()
+            new_sha = compute_sha256(data)
+            cache_image_bytes(new_sha, data, ext=meta.get('ext') or '.jpg',
+                              drive_metadata={**meta})
+            refetched += 1
+            # Stored hash is a 16-char prefix; if the freshly-pulled content
+            # no longer matches it, the Drive file changed — repoint the IVS.
+            if not new_sha.startswith(sha):
+                hashes[idx] = new_sha[:16]
+                updated += 1
+        except Exception:
+            failed += 1
+
+    if updated:
+        ivs.cache_hashes = hashes
+        ivs.save(update_fields=['cache_hashes'])
+
+    if refetched:
+        parts = [f'Re-pulled {refetched} page image(s) from Drive']
+        if updated:
+            parts.append(f'{updated} updated to the current version')
+        if unlinked:
+            parts.append(f'{unlinked} had no Drive link')
+        if failed:
+            parts.append(f'{failed} failed to download')
+        messages.success(request, ' · '.join(parts) + '.')
+    else:
+        detail = []
+        if unlinked:
+            detail.append(f'{unlinked} page(s) have no Drive link')
+        if failed:
+            detail.append(f'{failed} failed')
+        messages.error(
+            request,
+            'Nothing re-pulled — ' + ('; '.join(detail) or 'no Drive metadata')
+            + '. Try: manage.py backfill_image_cache --apply.')
+    return redirect('invoice_detail', ivs_id=ivs_id)
 
 
 def invoice_detail(request, ivs_id: int):
@@ -4775,3 +4871,74 @@ def cogs_dashboard(request):
         'partial_cache': partial_cache,
         'cache_spend': cache_spend,
     })
+
+
+# ── Nutrition review (step 3c) — confirm Product→FDC macro matches ──────────
+_NUTRI_NONFOOD = {"Smallwares", "Chemicals", "Pseudo"}
+_NUTRI_FIELDS = ["kcal_per_100g", "protein_g_per_100g", "fat_g_per_100g",
+                 "carb_g_per_100g", "fiber_g_per_100g"]
+
+
+def _nutri_dec(v):
+    if v is None:
+        return None
+    try:
+        return Decimal(str(round(float(v), 2)))
+    except Exception:
+        return None
+
+
+def nutrition_review(request):
+    """Flashcard review of unmatched food products, highest-spend first."""
+    from invoice_processor import fdc_match
+    skipped = request.session.get("nutri_skipped", [])
+    qs = (Product.objects
+          .exclude(category__in=_NUTRI_NONFOOD)
+          .filter(nutrition_confidence="")
+          .exclude(id__in=skipped)
+          .annotate(spend=models.Sum("invoicelineitem__extended_amount"))
+          .order_by(models.F("spend").desc(nulls_last=True)))
+    remaining = qs.count()
+    product = qs.first()
+    candidates = []
+    if product:
+        try:
+            candidates = fdc_match.candidates_for(product.canonical_name, n=5)
+        except Exception as e:
+            messages.error(request, f"FDC lookup failed: {e}")
+    return render(request, "myapp/nutrition_review.html", {
+        "product": product,
+        "candidates": candidates,
+        "remaining": remaining,
+        "reviewed": Product.objects.filter(nutrition_confidence="reviewed").count(),
+        "auto": Product.objects.filter(nutrition_confidence="auto").count(),
+        "spend": getattr(product, "spend", None) if product else None,
+    })
+
+
+@require_POST
+def nutrition_review_apply(request, product_id):
+    from invoice_processor import fdc
+    p = get_object_or_404(Product, id=product_id)
+    action = request.POST.get("action")
+    if action == "skip":
+        sk = request.session.get("nutri_skipped", [])
+        sk.append(product_id)
+        request.session["nutri_skipped"] = sk
+        messages.info(request, f"Skipped {p.canonical_name}.")
+    elif action == "none":
+        p.fdc_id = ""
+        for f in _NUTRI_FIELDS:
+            setattr(p, f, None)
+        p.nutrition_confidence = "no_match"
+        p.save(update_fields=["fdc_id", "nutrition_confidence"] + _NUTRI_FIELDS)
+        messages.warning(request, f"{p.canonical_name} marked no-match.")
+    elif action == "pick":
+        macros = fdc.extract_macros(fdc.get_food(request.POST.get("fdc_id", "")))
+        p.fdc_id = str(request.POST.get("fdc_id", ""))
+        for f in _NUTRI_FIELDS:
+            setattr(p, f, _nutri_dec(macros.get(f)))
+        p.nutrition_confidence = "reviewed"
+        p.save(update_fields=["fdc_id", "nutrition_confidence"] + _NUTRI_FIELDS)
+        messages.success(request, f"{p.canonical_name} confirmed → reviewed.")
+    return redirect("nutrition_review")
