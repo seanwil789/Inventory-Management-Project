@@ -32,7 +32,15 @@ def _normalize(s: str) -> str:
 # CHIPS) — hard-penalize, or the auto-tier writes wrong macros. (Stemmed forms.)
 _DISQUALIFY = {"oil", "juice", "chip", "imitation", "kernel", "meatless",
                "powder", "substitute", "drink", "beverage", "snack", "concentrate",
-               "tofu", "vegan", "plant"}   # substitute/alt foods: dairy yogurt != "tofu yogurt"
+               "tofu", "vegan", "plant",   # substitute/alt foods: dairy yogurt != "tofu yogurt"
+               "flour", "sauce", "blood", "blend", "mix"}
+# form/type mismatch: rice != rice FLOUR, horseradish != horseradish SAUCE,
+# sausage != BLOOD sausage, juice != juice BLEND, muffin != muffin MIX. Safe —
+# a real flour/sauce product carries the word in its OWN canonical too, so the
+# penalty only fires on a mismatch. ("canned" was deliberately NOT added: it
+# wrongly demoted legit canned-veg matches like Capers and Stewed Tomatoes;
+# the lone "canned" error — Chicken Broth -> canned chicken — is fixed in the
+# review UI instead.)
 
 
 def _stem(t: str) -> str:
