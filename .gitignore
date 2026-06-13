@@ -53,3 +53,9 @@ The-Book-of-Yields*.pdf
 
 # Audit workflow durable artifacts (timestamped JSON snapshots per run)
 .audits/
+
+# File-drop staging (2026-06-13 reorg): local vendor exports, budgets,
+# reference PDFs, generated CSVs, big archives. Sync externally, not via git.
+# The manifest IS tracked so the layout + provenance survive in history.
+data/*
+!data/INDEX.md
