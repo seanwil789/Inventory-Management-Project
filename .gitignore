@@ -59,3 +59,6 @@ The-Book-of-Yields*.pdf
 # The manifest IS tracked so the layout + provenance survive in history.
 data/*
 !data/INDEX.md
+!data/inbox/
+data/inbox/*
+!data/inbox/README.md
