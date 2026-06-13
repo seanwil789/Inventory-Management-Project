@@ -57,6 +57,7 @@ tailscale ssh sean@server "cd ~/my-saas && .venv/bin/python manage.py pi_state_d
 - `myapp/yield_parsing/` — Per-section parsers for Book of Yields PDF
 - `docs/` — Pi migration runbook, IT access request, deployment notes
 - `.claude/` — Harness configuration, session_snapshot, time_log
+- `data/` — **Reference-file shelf** (gitignored except the manifest). Loose usable files — vendor catalogs, budget workbooks, reference PDFs, generated reports — dropped here instead of the repo root. **When a task relates to budgets, vendor catalogs/exports, or reference docs, check `data/INDEX.md` first** — it's the tracked manifest (file / source / date / purpose) of everything on the shelf. New drops land in `data/inbox/` (or `~/inbox`, a symlink) for triage into a subfolder + INDEX entry.
 
 ## Environment
 
