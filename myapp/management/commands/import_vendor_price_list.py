@@ -12,7 +12,7 @@ for other vendors.
 Usage:
     # Dry-run (preview)
     python manage.py import_vendor_price_list \\
-        --vendor "Farm Art" --csv "Synergy - Default Order Guide (1).csv"
+        --vendor "Farm Art" --csv "data/vendor_exports/Synergy - Default Order Guide (1).csv"
 
     # Apply with Farm Art's 1% ACH discount
     python manage.py import_vendor_price_list \\

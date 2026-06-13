@@ -45,13 +45,14 @@ INCLUDE=(
     ".env"
     "invoice_processor/credentials"
     "invoice_processor/mappings"
-    "The-Book-of-Yields-Accuracy-in-Food-Costing-and-Purchasing.pdf"
-    "aramark-sample.pdf"
+    "data/reference/The-Book-of-Yields-Accuracy-in-Food-Costing-and-Purchasing.pdf"
+    "data/invoices_misc/aramark-sample.pdf"
 )
 
-# Optional: include latest budget CSV if present (filename has spaces + parens)
+# Optional: include latest budget CSV if present (filename has spaces + parens).
+# Lives under data/budget/ since the 2026-06-13 file-drop reorg.
 shopt -s nullglob
-BUDGET_FILES=("$REPO_DIR"/Men\'s\ Wentworth\ Food\ Budget\ *.csv)
+BUDGET_FILES=("$REPO_DIR"/data/budget/Men\'s\ Wentworth\ Food\ Budget\ *.csv)
 shopt -u nullglob
 
 # Verify everything we plan to include actually exists; warn but don't fail

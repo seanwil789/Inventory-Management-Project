@@ -8,7 +8,7 @@ entries into .invoice_totals/YYYY-MM.json, tagging each as source=
 
 Usage:
   python manage.py import_budget_csv <csv_path>
-  python manage.py import_budget_csv "Men's Wentworth Food Budget 2026(Mar).csv"
+  python manage.py import_budget_csv "data/budget/Men's Wentworth Food Budget 2026(Mar).csv"
   python manage.py import_budget_csv <csv_path> --dry-run
 """
 from __future__ import annotations

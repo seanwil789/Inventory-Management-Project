@@ -16,6 +16,7 @@ Usage:
 import os
 import sys
 import re
+import glob
 import argparse
 import tempfile
 from datetime import date
@@ -29,7 +30,24 @@ from docai import ocr_with_docai
 from parser import parse_invoice
 
 _PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-BUDGET_FILE = os.path.join(_PROJECT_ROOT, "Men's Wentworth Food Budget 2026.xlsx")
+_BUDGET_DIR = os.path.join(_PROJECT_ROOT, "data", "budget")
+
+
+def _resolve_budget_file():
+    """Newest Wentworth budget workbook under data/budget/.
+
+    Browser downloads land as 'Men's Wentworth Food Budget 2026 (1).xlsx',
+    '... (3).xlsx', etc. — pick the most recently modified so a fresh drop
+    is picked up automatically (file-drop reorg 2026-06-13). Falls back to
+    the canonical bare name so the not-found path below still reports cleanly.
+    """
+    matches = glob.glob(os.path.join(_BUDGET_DIR, "Men's Wentworth Food Budget *.xlsx"))
+    if matches:
+        return max(matches, key=os.path.getmtime)
+    return os.path.join(_BUDGET_DIR, "Men's Wentworth Food Budget 2026.xlsx")
+
+
+BUDGET_FILE = _resolve_budget_file()
 _INVOICE_TOTALS_DIR = os.path.join(_PROJECT_ROOT, ".invoice_totals")
 
 
